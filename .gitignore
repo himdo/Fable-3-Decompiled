@@ -1,0 +1,48 @@
+# ============================================================
+#  Fable 3 Decomp Project — root .gitignore
+#
+#  Covers repo-root-level junk and agent tooling. The
+#  Fable 3 Launcher\ subproject has its own .gitignore that
+#  handles its build output (Release\, Debug\, *.obj, *.res,
+#  .vs\, MSBuild intermediates, etc.).
+# ============================================================
+
+# ---- Agent / tooling working directory (pi) ----
+# Holds cloned tools (e.g. ida-mcp), Python venvs, node_modules,
+# a nested .git, and background-task state. Never commit this.
+.pi/
+
+# ---- Accidental Windows `nul` redirect artifact ----
+# Created by a stray `... > nul` run under a POSIX shell.
+nul
+
+# ---- OS junk ----
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---- Editor / IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- Python / Node caches (defensive) ----
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+node_modules/
+
+# ---- Reverse-engineering / large binary artifacts ----
+# Uncomment to keep IDA Pro databases & workspace files out of git
+# (they're large binaries; usually kept alongside, not committed).
+# *.i64
+# *.idb
+# *.id0
+# *.id1
+# *.id2
+# *.nam
+# *.til
