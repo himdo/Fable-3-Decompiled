@@ -1,0 +1,13 @@
+{
+  "name": "fable3-launcher",
+  "title": "Fable 3 Launcher",
+  "tagline": "Byte-identical decompilation of Fable 3's SecuROM launcher",
+  "github": "https://github.com/himdo/Fable-3-Decompiled",
+  "compiler": "MSVC 15.00.30729.01 (VS2008 SP1, x86) + Windows SDK 7.1 — cl /nologo /c /O2 /Ob2 /Oi /DNDEBUG /DWIN32 /D_WINDOWS /W3 /EHsc /GS /MT /GL /Z7 /Fds ; link /nologo /LTCG /subsystem:windows /machine:x86 /base:0x400000 /DYNAMICBASE /NXCOMPAT",
+  "cppNote": "Target is MSVC 2008 C++ (static CRT /MT, /EHsc). The original has no .pdata section, so the source must not generate any unwind tables — avoid RAII objects / try-catch in hot paths.",
+  "setup": "Clone {github}, open 'Fable 3 Launcher/Fable 3 Launcher.slnx' with Visual Studio 2008 SP1 (x86-native toolchain + Windows SDK 7.1 in the locations listed in the README) and build with 'Fable 3 Launcher/build_vs2008.bat'.",
+  "verifyCommand": "rebuild with 'Fable 3 Launcher/build_vs2008.bat', then byte-compare the rebuilt FableLauncher.exe .text range 0x{addrHex} (0x{sizeHex} bytes) against the original FableLauncher.exe",
+  "readFirst": "Fable 3 Launcher/README.md and Fable 3 Launcher/compiler-analysis.md",
+  "rules": "The build must be byte-for-byte identical to the original FableLauncher.exe. Use the genuine VS2008 SP1 x86 toolchain and the exact flags in the README; do not work around mismatches by changing toolchain or flags.",
+  "nearMissNote": "If a function is within a few instructions of matching, record it in chaos-viewer/nearmiss.json so the viewer shows a NEAR-MISS badge and it ranks in 'Nearly done'."
+}
