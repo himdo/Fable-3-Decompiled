@@ -11,9 +11,13 @@ Matched / near-miss status comes from (optional, in this directory):
   nearmiss.json  - list of {"name", "div", "cat", "floor"?}
 
 Outputs:
-  data/chaos-db.json         lean index read by the viewer
+  <repo root>/chaos-db.json  lean index, at the location the hosted viewer
+                             probes (<branch>/chaos-db.json)
   (optionally synced into a local Chaos Viewer clone via --viewer DIR:
    DIR/data/chaos-db.json and DIR/public/details/*)
+
+Committed alongside on the branch (regenerate after IDA renames, see README):
+  <repo root>/details/fable3-launcher.json   per-function IDA detail chunk
 
 Usage:
   python chaos-viewer/scripts/generate_chaos_db.py [--repo <decomp root>]
@@ -129,8 +133,7 @@ def main():
         },
         "functions": functions,
     }
-    out = here / "data" / "chaos-db.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
+    out = root / "chaos-db.json"
     out.write_text(json.dumps(db), encoding="utf-8")
     print(f"wrote {out} ({out.stat().st_size // 1024} KB)")
     print(f"stats: {matched_n}/{len(universe)} funcs, {matched_bytes}/{total_bytes} bytes")
@@ -141,7 +144,7 @@ def main():
         if (viewer / "package.json").exists():
             (viewer / "data").mkdir(exist_ok=True)
             shutil.copy2(out, viewer / "data" / "chaos-db.json")
-            dsrc, ddst = here / "data" / "details", viewer / "public" / "details"
+            dsrc, ddst = root / "details", viewer / "public" / "details"
             if dsrc.is_dir():
                 ddst.mkdir(parents=True, exist_ok=True)
                 for f in dsrc.glob("*.json"):
