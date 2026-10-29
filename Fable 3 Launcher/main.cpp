@@ -11,6 +11,11 @@
 // Each stub is annotated with its original address range so that the
 // decompiled bodies can be slotted in function by function.
 #include <windows.h>
+#include <sstream>
+#include <string>
+
+// Forward declaration: WinMain calls this helper before its definition.
+void sub_403DB0(std::wostream& os);
 
 // ---------------------------------------------------------------------------
 // 0x00401000 - 0x00404099 : application functions (IDA name  ->  stub)
@@ -197,13 +202,46 @@ void sub_401B80(void)
 }
 
 // _WinMain@16  (0x00401BB0 - 0x00401D71)
+//
+// Builds the command line into a wide stringstream, then (if it is empty)
+// lets sub_403DB0 massage it. The resulting string is launched with
+// CreateProcessW in a retry loop: a child exit code of 291 (0x123) causes
+// an immediate re-launch (the SecuROM tamper-detection re-spawn).
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow)
 {
     (void)hInstance;
     (void)hPrevInstance;
-    (void)lpCmdLine;
-    (void)nCmdShow;
+
+    std::wstringstream ss;
+    if (lpCmdLine != NULL)
+        ss << lpCmdLine;
+
+    if (ss.str() == L"")
+        sub_403DB0(ss);
+
+    std::wstring app = ss.str();
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    BOOL retry;
+    do
+    {
+        retry = FALSE;
+        memset(&si, 0, sizeof(si));
+        memset(&pi, 0, sizeof(pi));
+        si.cb = sizeof(si);
+        if (!CreateProcessW(app.c_str(), NULL, NULL, NULL, TRUE, 0,
+                            NULL, NULL, &si, &pi))
+            break;
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD exitCode = 0;
+        if (GetExitCodeProcess(pi.hProcess, &exitCode) && exitCode == 291)
+            retry = TRUE;
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    } while (retry);
+
     return 0;
 }
 
@@ -493,8 +531,9 @@ void sub_403AA0(void)
 }
 
 // sub_403DB0  (0x00403DB0 - 0x00404010)
-void sub_403DB0(void)
+void sub_403DB0(std::wostream& os)
 {
+    (void)os;
 }
 
 // sub_404010  (0x00404010 - 0x00404029)
