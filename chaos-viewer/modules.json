@@ -1,0 +1,19 @@
+{
+  "_comment": "Module registry for the Fable 3 Decomp atlas. Each entry defines one module. 'universe' is where the function list comes from: {'type':'main_cpp','path':...} parses '// name  (0x<start> - 0x<end>)' annotations, or {'type':'json','path':...} reads [{'name','addr','size'}]. 'matched'/'nearmiss' are per-module status lists (relative to this directory).",
+  "modules": [
+    {
+      "label": "fable3-launcher",
+      "universe": { "type": "json", "path": "fable3-launcher/functions.json" },
+      "matched": "fable3-launcher/matched.json",
+      "nearmiss": "fable3-launcher/nearmiss.json",
+      "details": "fable3-launcher"
+    },
+    {
+      "label": "fable3-game",
+      "universe": { "type": "json", "path": "fable3-game/functions.json" },
+      "matched": "fable3-game/matched.json",
+      "nearmiss": "fable3-game/nearmiss.json",
+      "details": "fable3-game"
+    }
+  ]
+}
