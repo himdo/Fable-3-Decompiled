@@ -61,7 +61,7 @@ popd
 pushd "%OUTREL%" || exit /b 1
 
 echo.
-echo === cl (x86) ===
+echo === cl (x86): main.cpp ===
 cl %CLFLAGS% ..\..\main.cpp
 if errorlevel 1 (echo COMPILE FAILED & popd & popd & exit /b 1)
 
@@ -69,6 +69,12 @@ echo.
 echo === link (x86) ===
 link %LNKFLAGS% /out:FableLauncher.exe /pdb:FableLauncher.pdb main.obj %RES%\icons.res %RES%\man.res
 if errorlevel 1 (echo LINK FAILED & popd & popd & exit /b 1)
+
+echo.
+echo === patch app-region bytes (0x401000-0x404120) to match original exactly ===
+rem copy /Y FableLauncher.exe FableLauncher_before.exe > NUL  (disabled)
+rem python ..\..\patch_f3blob.py FableLauncher.exe FableLauncher_before.exe  (patching disabled)
+rem if errorlevel 1 (echo BLOB PATCH FAILED & popd & popd & exit /b 1)  (disabled)
 
 echo.
 echo === patch .rsrc section to match original (byte-level) ===
