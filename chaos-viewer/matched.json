@@ -1,22 +1,128 @@
 [
-  {"name": "unknown_libname_1", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"},
-  {"name": "sub_401570", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"},
-  {"name": "sub_4015B0", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"},
-  {"name": "sub_401700", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"},
-  {"name": "sub_401800", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"},
-  {"name": "sub_401D80", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"},
-  {"name": "sub_401DC0", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"},
-  {"name": "sub_401F10", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"},
-  {"name": "sub_401F20", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"},
-  {"name": "sub_401F30", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"},
-  {"name": "sub_401F60", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"},
-  {"name": "sub_402120", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"},
-  {"name": "sub_402130", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"},
-  {"name": "nullsub_2", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"},
-  {"name": "sub_402280", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"},
-  {"name": "sub_402550", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"},
-  {"name": "sub_4025B0", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"},
-  {"name": "sub_402B50", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"},
-  {"name": "sub_402BD0", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"},
-  {"name": "sub_402BF0", "author": "himdo", "srcPath": "Fable 3 Launcher/main.cpp", "matchProvenance": "BYTE-IDENTICAL"}
+  {
+    "name": "unknown_libname_1",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "sub_401320",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "sub_401570",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "sub_4015B0",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "sub_401700",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "sub_401800",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "sub_401D80",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "sub_401DC0",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "sub_401F10",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "sub_401F20",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "sub_401F30",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "sub_401F60",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "sub_402120",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "sub_402130",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "nullsub_2",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "sub_402280",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "sub_402550",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "sub_4025B0",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "sub_402B50",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "sub_402BD0",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  },
+  {
+    "name": "sub_402BF0",
+    "author": "himdo",
+    "srcPath": "Fable 3 Launcher/main.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  }
 ]
