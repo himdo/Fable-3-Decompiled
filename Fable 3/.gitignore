@@ -1,0 +1,33 @@
+# ============================================================
+#  Fable 3 — .gitignore
+#  Ignores IDE caches, per-user settings, and build output so
+#  only source (.cpp/.rc/.xml/.bat/.py) and the res\ source
+#  assets are tracked.
+# ============================================================
+
+# ---- Visual Studio / MSBuild ----
+.vs/
+*.user
+Release/
+Debug/
+
+# ---- Extracted copyrighted icon assets (regenerated at build time) ----
+res/*.ico
+res/*.bin
+
+# ---- Compiled build artifacts (safety net if any land elsewhere) ----
+*.obj
+*.iobj
+*.ipdb
+*.pdb
+*.res
+*.tlog
+*.recipe
+*.lastbuildstate
+*.Build.CppClean.log
+*.FileListAbsolute.txt
+
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
