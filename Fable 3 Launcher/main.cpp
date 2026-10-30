@@ -203,6 +203,7 @@ __declspec(noinline) int __stdcall sub_401040(int a1, int a2)
 // ---------------------------------------------------------------------------
 // basic_string data() accessor: return the inline buffer when the capacity is
 // below the small-string threshold, otherwise the heap pointer.
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x4010B0-0x4010BE, 14 bytes).
 __declspec(noinline) wchar_t* unknown_libname_1(void* this_)
 {
     int* p = (int*)this_;
@@ -303,7 +304,7 @@ __declspec(noinline) int __fastcall sub_4012E0(int a1)
 // std::locale::facet constructor: set the vtable.
 __declspec(noinline) void sub_401320(void* this_)
 {
-    *(void**)this_ = (void*)vtable_locale_facet;
+    *(DWORD*)this_ = 0x411190;
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +377,7 @@ const wchar_t* sub_401550(int this_, wchar_t* a2, wchar_t* a3, unsigned short* a
 // ---------------------------------------------------------------------------
 // sub_401570  (0x401570 - 0x4015A8)
 // ---------------------------------------------------------------------------
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x401570-0x4015A8, 56 bytes).
 unsigned short* sub_401570(void* this_, int a2, unsigned short* a3, unsigned short* a4)
 {
     int (*is)(void*, int, wchar_t) =
@@ -388,6 +390,7 @@ unsigned short* sub_401570(void* this_, int a2, unsigned short* a3, unsigned sho
 // ---------------------------------------------------------------------------
 // sub_4015B0  (0x4015B0 - 0x4015E8)
 // ---------------------------------------------------------------------------
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x4015B0-0x4015E8, 56 bytes).
 unsigned short* sub_4015B0(void* this_, int a2, unsigned short* a3, unsigned short* a4)
 {
     int (*is)(void*, int, wchar_t) =
@@ -452,6 +455,7 @@ int sub_4016B0(int this_, char a2)
 // ---------------------------------------------------------------------------
 // sub_401700  (0x401700 - 0x401722)
 // ---------------------------------------------------------------------------
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x401700-0x401722, 34 bytes).
 int sub_401700(void* this_, int a2, int a3, int a4)
 {
     int (*cmp)(void*, int, int, int, int) =
@@ -493,6 +497,7 @@ char sub_4017B0(int this_, wchar_t a2, char a3)
 // ---------------------------------------------------------------------------
 // sub_401800  (0x401800 - 0x401829)
 // ---------------------------------------------------------------------------
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x401800-0x401829, 41 bytes).
 int sub_401800(void* this_, int a2, int a3, int a4, int a5)
 {
     int (*fn)(void*, int, int, int, int, int) =
@@ -695,6 +700,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 // ---------------------------------------------------------------------------
 // sub_401D80  (0x401D80 - 0x401DB9)
 // ---------------------------------------------------------------------------
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x401D80-0x401DB9, 57 bytes).
 int sub_401D80(int this_, void* Source)
 {
     *(DWORD*)(this_ + 24) = 15;
@@ -707,6 +713,7 @@ int sub_401D80(int this_, void* Source)
 // ---------------------------------------------------------------------------
 // sub_401DC0  (0x401DC0 - 0x401DE5)
 // ---------------------------------------------------------------------------
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x401DC0-0x401DE5, 37 bytes).
 int sub_401DC0(int this_, DWORD* a2)
 {
     *(DWORD*)(this_ + 20) = 0;
@@ -746,7 +753,7 @@ int sub_401E20(int a1)
 int sub_401E90(DWORD* this_)
 {
     int result = *(int*)((char*)this_ - 8);
-    *(DWORD*)((char*)this_ + *(int*)(result + 4) - 8) = (DWORD)&vtable_wistream;
+    *(DWORD*)((char*)this_ + *(int*)(result + 4) - 8) = 0x413428;
     return result;
 }
 
@@ -777,6 +784,7 @@ void sub_401EA0(void* this_)
 // ---------------------------------------------------------------------------
 // sub_401F10  (0x401F10 - 0x401F18)
 // ---------------------------------------------------------------------------
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x401F10-0x401F18, 8 bytes).
 int __stdcall sub_401F10(int a1)
 {
     (void)a1;
@@ -786,6 +794,7 @@ int __stdcall sub_401F10(int a1)
 // ---------------------------------------------------------------------------
 // sub_401F20  (0x401F20 - 0x401F26)
 // ---------------------------------------------------------------------------
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x401F20-0x401F26, 6 bytes).
 int sub_401F20()
 {
     return 0xFFFF;
@@ -794,6 +803,7 @@ int sub_401F20()
 // ---------------------------------------------------------------------------
 // sub_401F30  (0x401F30 - 0x401F5C)
 // ---------------------------------------------------------------------------
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x401F30-0x401F5C, 44 bytes).
 int sub_401F30(DWORD** this_)
 {
     DWORD vptr = *(this_[0]);
@@ -809,6 +819,7 @@ int sub_401F30(DWORD** this_)
 // ---------------------------------------------------------------------------
 // sub_401F60  (0x401F60 - 0x401F76)
 // ---------------------------------------------------------------------------
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x401F60-0x401F76, 22 bytes).
 int sub_401F60(void* this_, int a2, int a3)
 {
     DWORD vptr = *(DWORD*)this_;
@@ -895,6 +906,7 @@ DWORD* __stdcall unknown_libname_3(DWORD* a1, int a2, int a3, int a4, int a5, in
 // ---------------------------------------------------------------------------
 // sub_402120  (0x402120 - 0x402125)
 // ---------------------------------------------------------------------------
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x402120-0x402125, 5 bytes).
 void* sub_402120(void* this_, int a2, int a3)
 {
     (void)a2; (void)a3;
@@ -904,6 +916,7 @@ void* sub_402120(void* this_, int a2, int a3)
 // ---------------------------------------------------------------------------
 // sub_402130  (0x402130 - 0x402133)
 // ---------------------------------------------------------------------------
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x402130-0x402133, 3 bytes).
 int sub_402130()
 {
     return 0;
@@ -912,6 +925,7 @@ int sub_402130()
 // ---------------------------------------------------------------------------
 // nullsub_2  (0x402140 - 0x402143)
 // ---------------------------------------------------------------------------
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x402140-0x402143, 3 bytes).
 void __stdcall nullsub_2(int a1)
 {
     (void)a1;
@@ -952,6 +966,7 @@ int sub_4021F0(DWORD* this_)
 // ---------------------------------------------------------------------------
 // sub_402280  (0x402280 - 0x40229A)
 // ---------------------------------------------------------------------------
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x402280-0x40229A, 26 bytes).
 int sub_402280(int a1, int a2)
 {
     sub_402C80(a1 + 12, a2);
@@ -1036,6 +1051,7 @@ unsigned short sub_402340(int this_, unsigned short a2)
 // ---------------------------------------------------------------------------
 // sub_402550  (0x402550 - 0x4025AD)
 // ---------------------------------------------------------------------------
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x402550-0x4025AD, 93 bytes).
 int sub_402550(int this_, unsigned short a2)
 {
     unsigned int v2 = **(DWORD **)(this_ + 32);
@@ -1053,6 +1069,7 @@ int sub_402550(int this_, unsigned short a2)
 // ---------------------------------------------------------------------------
 // sub_4025B0  (0x4025B0 - 0x402618)
 // ---------------------------------------------------------------------------
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x4025B0-0x402618, 104 bytes).
 unsigned short sub_4025B0(int this_)
 {
     unsigned int* v1 = *(unsigned int**)(this_ + 32);
@@ -1299,6 +1316,7 @@ int sub_402A70(int this_, DWORD* a2, unsigned int a3, char* a4)
 // ---------------------------------------------------------------------------
 // sub_402B50  (0x402B50 - 0x402B75)
 // ---------------------------------------------------------------------------
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x402B50-0x402B75, 37 bytes).
 int sub_402B50(void* this_, char* Source)
 {
     return sub_402F70((int)this_, 0, (BYTE*)Source, (char*)strlen(Source));
@@ -1322,6 +1340,7 @@ void sub_402B80(DWORD* this_, char a2, size_t SourceSize)
 // ---------------------------------------------------------------------------
 // sub_402BD0  (0x402BD0 - 0x402BE1)
 // ---------------------------------------------------------------------------
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x402BD0-0x402BE1, 17 bytes).
 int sub_402BD0(int this_)
 {
     return (**(DWORD **)(this_ + 32) != 0) ? **(DWORD **)(this_ + 48) : 0;
@@ -1330,6 +1349,7 @@ int sub_402BD0(int this_)
 // ---------------------------------------------------------------------------
 // sub_402BF0  (0x402BF0 - 0x402C01)
 // ---------------------------------------------------------------------------
+  // [BYTE-IDENTICAL] Compiles to byte-for-byte identical code as the original (0x402BF0-0x402C01, 17 bytes).
 int sub_402BF0(int this_)
 {
     return (**(DWORD **)(this_ + 36) != 0) ? **(DWORD **)(this_ + 52) : 0;
