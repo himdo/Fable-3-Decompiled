@@ -1,1 +1,8 @@
-[]
+[
+  {
+    "name": "DisposeWorker",
+    "author": "himdo",
+    "srcPath": "Fable 3/engine/engine.cpp",
+    "matchProvenance": "BYTE-IDENTICAL"
+  }
+]
