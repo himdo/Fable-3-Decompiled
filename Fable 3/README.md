@@ -37,10 +37,13 @@ engine/                     game engine init + main run loop  [growing]
   engine.h
   engine.cpp                RunGame (0x615740) — implemented (run loop + thread)
                             CWorkerWin32Ctor (0x18F7040) — main-worker ctor
+                            SetWorker (0x18F6FC0) — install current worker + SEH block
+                            GetWorker (0x18F6A40) — current-worker getter
+                            ReleaseWorkerPair (0x55DB10) — release a worker pair
                             DisposeWorker (0x615880) — SEH dispose handler
                             CWorkerWin32_Dtor (0x55D8F0) — worker deleting destructor
                             CWorkerWin32_DtorBody (0x55D930) — worker dtor body
-                            (+ stub callees: sub_615380, sub_18F6FC0, ...)
+                            (+ stub callees: sub_615380, sub_18F6CA0, sub_18F6C50, sub_18F8600, ...)
 
 save/                       save-game loading  [growing]
   save.h
@@ -75,7 +78,8 @@ independent. The current state of the implemented functions:
 | `GetEngineTime` (0x18A88E0) | 99 | no | Placement-independent, but refs the `QueryPerformanceCounter` IAT slot (0x01AD50C8) and start globals (0x020B5FC0/0x020B5FB8) at original high VAs not present in the build. |
 | `SharedBufferFree` (0x403820) | 58 | no | Placement-independent, but refs the heap table (0x02075B24) at the original high VA. |
 | `ReleaseGlobalObject` (0x4017B0) | 71 | no | Placement-independent, but refs the heap table (0x02075B24), `lpAddend` (0x020B6008), and the `InterlockedDecrement` IAT slot (0x01AD52FC) at original high VAs. |
-| `FrameworkInit`, `FrameworkShutdown`, `ComputeExeDirectory`, `LHAlloc`, `SharedBufferAssign`, `OutOfMemory`, `RunGame`, `CWorkerWin32Ctor`, `CWorkerWin32_Dtor`, `CWorkerWin32_DtorBody`, `SetSaveGamePath` | — | no | Placement-dependent (relative calls to callees/CRT). |
+| `GetWorker` (0x18F6A40) | 6 | no | Placement-independent, but refs the high-VA global `dword_20FC8F0` (0x020FC8F0) not present in the build. |
+| `FrameworkInit`, `FrameworkShutdown`, `ComputeExeDirectory`, `LHAlloc`, `SharedBufferAssign`, `OutOfMemory`, `RunGame`, `CWorkerWin32Ctor`, `CWorkerWin32_Dtor`, `CWorkerWin32_DtorBody`, `SetSaveGamePath`, `SetWorker` (0x18F6FC0), `ReleaseWorkerPair` (0x55DB10) | — | no | Placement-dependent (relative calls to callees/CRT). |
 
 To byte-match the placement-independent functions that reference IAT/data
 globals, those globals must be placed at their original VAs (a PE
@@ -87,7 +91,7 @@ that it is worth doing.
 
 | Module    | Entry (IDA)          | What to add |
 |-----------|----------------------|-------------|
-| `engine/` | `RunGame` (0x615740), `CWorkerWin32Ctor` (0x18F7040), `DisposeWorker` (0x615880), `CWorkerWin32_Dtor`/`CWorkerWin32_DtorBody` (0x55D8F0/0x55D930) | (done) run loop + main-worker ctor + SEH dispose path (worker deleting destructor + dtor body: releases shared member, closes events, deletes CS, refcount); next: fill in the remaining stub callees |
+| `engine/` | `RunGame` (0x615740), `CWorkerWin32Ctor` (0x18F7040), `SetWorker` (0x18F6FC0), `GetWorker` (0x18F6A40), `ReleaseWorkerPair` (0x55DB10), `DisposeWorker` (0x615880), `CWorkerWin32_Dtor`/`CWorkerWin32_DtorBody` (0x55D8F0/0x55D930) | (done) run loop + main-worker ctor + current-worker pair (install/get/release with SEH refcount) + SEH dispose path (worker deleting destructor + dtor body); next: fill in the remaining stub callees (sub_18F6CA0, sub_18F6C50, sub_18F8600, sub_615380) |
 | `save/`   | `SetSaveGamePath` (0x1A019B0) | (done) store the save path refcounted into `dword_1DBD06C` + getter; next: the actual load logic |
 | `framework/` | `ComputeExeDirectory` (0x1A02870), `ReleaseGlobalObject` (0x4017B0) | (done) exe-directory compute + `ExeDirectory()` getter + global shared-object release; the framework init/shutdown pair is complete |
 | `common/` | `LHAlloc`, `LHFree`, `SharedBufferAssign`, `SharedBufferFree`, `OutOfMemory` | (done) heap alloc/free + `F3SharedBuffer` counted buffer + OOM report handler; next: cross-module globals `byte_1DBD01B`, `byte_1C86BD9` |

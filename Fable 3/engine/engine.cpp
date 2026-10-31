@@ -37,6 +37,18 @@ typedef struct F3SehBlock
     int arg;
 } F3SehBlock;
 
+// The 2-word "current worker" registration (dword_20FC8F0 / dword_20FC8F4):
+//   +0  worker    the current CWorkerWin32 (or 0)
+//   +4  sehBlock  the F3SehBlock that disposes the worker when released (or 0)
+typedef struct F3WorkerReg
+{
+    void *worker;
+    void *sehBlock;
+} F3WorkerReg;
+
+// dword_20FC8F0 / dword_20FC8F4: the current worker + its SEH cleanup block.
+static F3WorkerReg g_WorkerPair;
+
 // ============================================================
 //  CWorkerWin32  -- the main worker object (NSystem::CWorkerWin32, 664 bytes)
 //
@@ -217,13 +229,50 @@ static int __declspec(naked) DisposeWorker(int)
 }
 
 // ============================================================
-//  sub_18F6FC0  (0x18F6FC0)  -- register the SEH handler
-//  [STUB]
+//  ReleaseWorkerPair  (0x0055DB10 - 0x0055DB52)  -- release a worker pair
+//  [NOT byte-identical] placement-dependent (relative call to the heap free).
+//
+//  void ReleaseWorkerPair(void *pair)  (pair = &F3WorkerReg)
+//
+//  Decrement the SEH block's refcount; when it reaches zero invoke
+//  handler(arg) and free the block via the game heap. Then clear both words.
 // ============================================================
-static long sub_18F6FC0(int *a1)
+static void ReleaseWorkerPair(void *pair)
 {
-    (void)a1;
-    return 0;
+    F3WorkerReg *p = (F3WorkerReg *)pair;
+    F3SehBlock *sb = (F3SehBlock *)p->sehBlock;
+
+    if (sb != 0 && InterlockedDecrement(&sb->refcount) == 0)
+    {
+        sb->handler(sb->arg);
+        LHFree(sb);
+    }
+    p->worker = 0;
+    p->sehBlock = 0;
+}
+
+// ============================================================
+//  SetWorker  (0x18F6FC0)  -- install the current worker + SEH cleanup block
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  ReleaseWorkerPair and InterlockedIncrement).
+//
+//  void SetWorker(F3WorkerReg *reg)
+//
+//  If reg->sehBlock already matches the current global, no-op. Otherwise
+//  release the current pair (dropping the old SEH block's reference), store
+//  (reg->worker, reg->sehBlock) in the global pair, and take a reference on
+//  the new SEH block so it outlives RunGame.
+// ============================================================
+static void SetWorker(F3WorkerReg *reg)
+{
+    if (g_WorkerPair.sehBlock == reg->sehBlock)
+        return;
+
+    ReleaseWorkerPair(&g_WorkerPair);
+    g_WorkerPair.worker = reg->worker;
+    g_WorkerPair.sehBlock = reg->sehBlock;
+    if (reg->sehBlock != 0)
+        InterlockedIncrement(&((F3SehBlock *)reg->sehBlock)->refcount);
 }
 
 // ============================================================
@@ -236,20 +285,24 @@ static int sub_1A032C0(void *block)
 }
 
 // ============================================================
-//  sub_18F6A40  (0x18F6A40)  -- return the engine state word (dword_20FC8F0)
-//  [STUB] the global defaults to 0.
+//  GetWorker  (0x18F6A40 - 0x18F6A46)  -- return the current worker
+//  [NOT byte-identical] placement-independent but references the high-VA
+//  global dword_20FC8F0 (0x020FC8F0) not present in this build.
+//
+//  A tiny getter (mov eax, dword_20FC8F0; retn) used pervasively by the
+//  engine to reach the current CWorkerWin32.
 // ============================================================
-static int sub_18F6A40(void)
+void *GetWorker(void)
 {
-    return 0;
+    return g_WorkerPair.worker;
 }
 
 // ============================================================
 //  sub_18F6CA0 / sub_18F6C50  -- register a worker-thread callback
-//  [STUB]
+//  [STUB] __thiscall on the current worker (worker in ECX, callback on stack).
 // ============================================================
-static int sub_18F6CA0(F3CallbackFn cb) { (void)cb; return 0; }
-static int sub_18F6C50(F3CallbackFn cb) { (void)cb; return 0; }
+static int sub_18F6CA0(void *worker, F3CallbackFn cb) { (void)worker; (void)cb; return 0; }
+static int sub_18F6C50(void *worker, F3CallbackFn cb) { (void)worker; (void)cb; return 0; }
 
 // ============================================================
 //  sub_6152F0 / sub_615340  -- worker-thread callbacks
@@ -301,21 +354,25 @@ int RunGame(int hInstance, char *lpCmdLine, int nShowCmd)
         lpAddend = 0;
     }
 
-    // 3. Register the SEH handler (with the address of the worker pointer).
-    sub_18F6FC0((int *)&v9);
+    // 3. Install the current worker + SEH cleanup block (sets the global pair
+    //    and takes a reference so the worker outlives this call).
+    F3WorkerReg reg;
+    reg.worker = v9;
+    reg.sehBlock = lpAddend;
+    SetWorker(&reg);
 
     // 4. Release the local reference; on zero invoke the handler and free it.
+    //    (SetWorker took a reference, so this drops 2->1, leaving the global
+    //    pair as the owner of the worker.)
     if (lpAddend != 0 && InterlockedDecrement(&lpAddend->refcount) == 0)
     {
         lpAddend->handler(lpAddend->arg);
         sub_1A032C0(lpAddend);
     }
 
-    // 5. Register the worker-thread callbacks.
-    sub_18F6A40();
-    sub_18F6CA0(sub_6152F0);
-    sub_18F6A40();
-    sub_18F6C50(sub_615340);
+    // 5. Register the worker-thread callbacks (on the current worker).
+    sub_18F6CA0(GetWorker(), sub_6152F0);
+    sub_18F6C50(GetWorker(), sub_615340);
 
     // 6. Spawn the game thread (0x40000-byte stack).
     HANDLE hThread = (HANDLE)_beginthread(sub_615380, 0x40000u, lpCmdLine);
@@ -324,7 +381,7 @@ int RunGame(int hInstance, char *lpCmdLine, int nShowCmd)
     //    (WaitForSingleObject returns WAIT_TIMEOUT = 258 while it is alive).
     do
     {
-        int state = sub_18F6A40();
+        int state = (int)GetWorker();
         sub_18F8600(state);
     }
     while (WaitForSingleObject(hThread, 0) == 258);

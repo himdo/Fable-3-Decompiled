@@ -13,4 +13,8 @@
 // (The engine-internal callees are stubs for now.)
 int RunGame(int hInstance, char *lpCmdLine, int nShowCmd);
 
+// 0x18F6A40 - return the current worker (dword_20FC8F0). Used pervasively by
+// the engine to reach the current CWorkerWin32.
+void *GetWorker(void);
+
 #endif  // F3_ENGINE_H
