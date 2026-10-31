@@ -23,10 +23,16 @@
 static F3SharedBuffer *g_dword_1DBD06C = 0;
 
 // ============================================================
-//  SetSaveGamePath  (0x01A019B0 - 0x01A01A32)  -- set the save game to load
+//  SetSaveGamePath  (0x01A019B0 - 0x01A01A32)  -- assign (src) into a slot
 //  [NOT byte-identical] placement-dependent (relative calls to LHAlloc, SharedBufferAssign, SharedBufferFree).
+//
+//  void SetSaveGamePath(F3SharedBuffer **slot, const char *Source)
+//
+//  __thiscall in the original with this = the slot. Generic: WinMain uses it
+//  for the global save-game slot, GameThread for the CDebugTraceFable's string
+//  member. Stores Source into *slot (refcounted), releasing the old value.
 // ============================================================
-void SetSaveGamePath(char *Source)
+void SetSaveGamePath(F3SharedBuffer **slot, const char *Source)
 {
     F3SharedBuffer *newBlock = 0;
 
@@ -50,16 +56,24 @@ void SetSaveGamePath(char *Source)
     }
 
     // Release the previously stored block.
-    if (g_dword_1DBD06C != 0)
+    if (*slot != 0)
     {
-        if (InterlockedDecrement(&g_dword_1DBD06C->refcount) <= 0 && g_dword_1DBD06C != 0)
-            SharedBufferFree(g_dword_1DBD06C);   // refcount hit 0: free data + block
-        g_dword_1DBD06C = 0;
+        if (InterlockedDecrement(&(*slot)->refcount) <= 0 && *slot != 0)
+            SharedBufferFree(*slot);   // refcount hit 0: free data + block
+        *slot = 0;
     }
 
     // Store the new block.
     if (newBlock != 0)
-        g_dword_1DBD06C = newBlock;
+        *slot = newBlock;
+}
+
+// ============================================================
+//  SaveGameSlot  -- the global save slot (0x1DBD06C)
+// ============================================================
+F3SharedBuffer **SaveGameSlot(void)
+{
+    return &g_dword_1DBD06C;
 }
 
 // ============================================================

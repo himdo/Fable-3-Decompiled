@@ -13,12 +13,20 @@
 // The engine-internal callees below are stubs for now; they will be filled in
 // as the engine is decompiled.
 
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS   // original used _snwprintf
+#endif
+
 #include "engine.h"
 #include "common/common.h"
+#include "save/save.h"
+#include "framework/framework.h"
 
 #include <windows.h>
 #include <process.h>
 #include <string.h>
+#include <wchar.h>
+#include <stdio.h>
 
 // 0x1DBD00C — the process exit code, returned by the main run loop.
 static DWORD g_dword_1DBD00C = 0;
@@ -312,12 +320,250 @@ static int sub_6152F0(void) { return 0; }
 static int sub_615340(void) { return 0; }
 
 // ============================================================
-//  sub_615380  (0x615380)  -- the game thread entry point
-//  [STUB] returns immediately, so the run loop exits once the thread dies.
+//  GameThread  (0x00615380 - 0x00615740)  -- the game thread entry point
+//  [NOT byte-identical] placement-dependent (many relative calls to engine
+//  callees and Win32/CRT functions).
+//
+//  void GameThread(void *a1)
+//
+//  Called by _beginthread (RunGame) with a 0x40000-byte stack. It:
+//    1. Names the thread "GameThread", sets heap info (class 1), FrameworkInit.
+//    2. Creates a debug handler, a 48-byte object, and a CDebugTraceFable, each
+//       with an SEH cleanup block. The debug handler's SEH block is kept
+//       (released at the end by sub_401700); the other two release their local
+//       reference immediately (leaving the global as the owner).
+//    3. Clears the game buffer and loads a shared-memory blob named after the
+//       exe (-=[SMS_<exename>_SMS]=-). If the blob is missing, shows a message
+//       box and ExitProcess(1).
+//    4. Runs the game (sub_61C530, sub_61CB70) and sets the exit code
+//       (dword_1DBD00C), then cleans up (sub_61C670, sub_401700).
 // ============================================================
-static void sub_615380(void *a1)
+
+// 0x1DBD008: 1 when the shared-memory blob was loaded, 0 otherwise.
+static BYTE  g_byte_1DBD008 = 0;
+// 0x1DBD010 / 0x1DBD014: objects whose strings form the error message box
+// (body / title) shown when the shared-memory blob is missing.
+static DWORD g_dword_1DBD010 = 0;
+static DWORD g_dword_1DBD014 = 0;
+
+// Placeholder vtables for the two objects created on the game thread.
+static void *g_CFableWindowsDebugHandlerVtable[4] = { 0 };
+static void *g_CDebugTraceFableVtable[4]          = { 0 };
+
+// ---- SEH handlers for the three objects (called when their refcount hits 0) ----
+// sub_401D20 (0x401D20): tail call to the heap free -- frees the debug handler.
+static int sub_401D20(int arg) { LHFree((void *)arg); return 0; }
+// sub_615850 (0x615850): virtual dispatch (obj->vtable[0](obj, 1)), like DisposeWorker.
+static int sub_615850(int obj)
 {
-    (void)a1;
+    if (obj)
+    {
+        void **vtable = (void **)*(void ***)obj;   // *a1 = the vtable
+        int (*handler)(int, int) = (int (*)(int, int))vtable[0];   // **a1 = vtable[0]
+        return handler(obj, 1);
+    }
+    return 0;
+}
+// sub_615870 (0x615870): thunk to LHFree -- frees the CDebugTraceFable.
+static int sub_615870(int arg) { LHFree((void *)arg); return 0; }
+
+// ---- other engine callees (stubs for now) -----------------------------------
+static void  sub_18C5840(const char *name) { (void)name; }              // set thread name
+static void  sub_1A02DD0(F3WorkerReg *reg) { (void)reg; }               // register debug handler
+// NSystem::CManagerWin32 (48 bytes): vtable at +0, CRITICAL_SECTION at +8.
+// Placeholder slot[0] safely disposes the object (delete CS + free block).
+static int sub_CManagerWin32_Dtor(void *obj, int flag)
+{
+    (void)flag;
+    if (obj)
+    {
+        DeleteCriticalSection((CRITICAL_SECTION *)((char *)obj + 8));
+        LHFree(obj);
+    }
+    return 0;
+}
+static void *g_CManagerWin32Vtable[16] = { (void *)sub_CManagerWin32_Dtor };
+// sub_18F7160 (0x18F7160): NSystem::CManagerWin32 constructor.
+static void *sub_18F7160(void *obj)
+{
+    char *p = (char *)obj;
+    *(void **)p = g_CManagerWin32Vtable;   // vtable (base set first, then win32)
+    InitializeCriticalSection((CRITICAL_SECTION *)(p + 8));
+    *(int *)(p + 32) = 0;
+    *(int *)(p + 36) = 0;
+    p[40] = 0;
+    p[41] = 0;
+    p[44] = 0;
+    return p;
+}
+static long  sub_18F87E0(F3WorkerReg *reg) { (void)reg; return 0; }     // register 48-byte object
+// sub_1A00C30 (0x1A00C30): zero the save-path slot + bump the worker refcount.
+static void *sub_1A00C30(void *obj)
+{
+    *(void **)obj = 0;                 // this[0] = 0 (clear the save-path slot)
+    InterlockedIncrement(&g_Addend);   // &Addend (worker refcount)
+    return obj;
+}
+static void  sub_1A02E20(F3WorkerReg *reg) { (void)reg; }               // register CDebugTraceFable
+// The game buffer (0x6C4 bytes) that the shared-memory blob is loaded into.
+static char g_gameBuffer[0x6C4];
+static void *sub_18986E0(void) { return 0; }                            // engine init
+static void *sub_619AA0(void) { return g_gameBuffer; }                  // get the game buffer
+static const wchar_t *sub_19FF570(void *obj) { (void)obj; return L""; } // get a string
+static int   *sub_6195C0(int a1) { (void)a1; return 0; }                // get an object
+static int   sub_18F8750(void) { return 0; }                            // get the window context
+static void *sub_61C530(void *obj) { return obj; }                      // init the game (ArgList)
+static int   sub_61CB70(void *argList, int a2) { (void)argList; (void)a2; return 1; }  // run the game (success)
+static void  sub_61BE00(void *obj) { (void)obj; }                       // cleanup (part 1)
+static void  sub_61AE70(void *obj) { (void)obj; }                       // cleanup (part 2)
+static void  sub_61C670(void *obj) { (void)obj; }                       // cleanup (part 3)
+static long  sub_401700(F3WorkerReg *reg) { (void)reg; return 0; }      // free the debug handler
+
+// Release a locally-held SEH reference; on zero invoke the handler and free.
+static void F3ReleaseSehRef(void *sehBlock)
+{
+    if (sehBlock && InterlockedDecrement(&((F3SehBlock *)sehBlock)->refcount) == 0)
+    {
+        F3SehBlock *sb = (F3SehBlock *)sehBlock;
+        sb->handler(sb->arg);
+        LHFree(sb);
+    }
+}
+
+void GameThread(void *a1)
+{
+    int arg = (int)a1;
+
+    // 1. Thread setup + framework init.
+    HeapSetInformation(NULL, (HEAP_INFORMATION_CLASS)1, NULL, 0);
+    sub_18C5840("GameThread");   // set the thread name
+    FrameworkInit();
+
+    // 2. Debug handler (4-byte) + SEH block (sub_401D20). The SEH block is
+    //    kept (released at the end by sub_401700), not released here.
+    F3WorkerReg reg1;
+    reg1.worker = LHAlloc(4);
+    if (reg1.worker)
+        *(void **)reg1.worker = g_CFableWindowsDebugHandlerVtable;
+    reg1.sehBlock = 0;
+    if (reg1.worker && (reg1.sehBlock = LHAlloc(12)) != 0)
+    {
+        F3SehBlock *sb = (F3SehBlock *)reg1.sehBlock;
+        sb->refcount = 1;
+        sb->handler  = sub_401D20;
+        sb->arg      = (int)reg1.worker;
+    }
+    sub_1A02DD0(&reg1);
+
+    // 3. 48-byte object (sub_18F7160) + SEH block (sub_615850); release local.
+    F3WorkerReg reg2;
+    reg2.worker = LHAlloc(48);
+    reg2.worker = reg2.worker ? sub_18F7160(reg2.worker) : 0;
+    reg2.sehBlock = 0;
+    if (reg2.worker && (reg2.sehBlock = LHAlloc(12)) != 0)
+    {
+        F3SehBlock *sb = (F3SehBlock *)reg2.sehBlock;
+        sb->refcount = 1;
+        sb->handler  = sub_615850;
+        sb->arg      = (int)reg2.worker;
+    }
+    sub_18F87E0(&reg2);
+    F3ReleaseSehRef(reg2.sehBlock);
+
+    // 4. CDebugTraceFable (8-byte) + SEH block (sub_615870); release local.
+    F3WorkerReg reg3;
+    reg3.worker = LHAlloc(8);
+    if (reg3.worker)
+    {
+        *(void **)reg3.worker = g_CDebugTraceFableVtable;
+        sub_1A00C30((void *)((char *)reg3.worker + 4));
+        SetSaveGamePath((F3SharedBuffer **)(char *)reg3.worker + 1, "FTRACE");
+    }
+    reg3.sehBlock = 0;
+    if (reg3.worker && (reg3.sehBlock = LHAlloc(12)) != 0)
+    {
+        F3SehBlock *sb = (F3SehBlock *)reg3.sehBlock;
+        sb->refcount = 1;
+        sb->handler  = sub_615870;
+        sb->arg      = (int)reg3.worker;
+    }
+    sub_1A02E20(&reg3);
+    F3ReleaseSehRef(reg3.sehBlock);
+
+    // 5. Engine init + clear the game buffer.
+    sub_18986E0();
+    if (sub_619AA0() != 0)
+        memset(sub_619AA0(), 0, 0x6C4);
+
+    // 6. Load the shared-memory blob (named after the exe).
+    WCHAR Filename[0x800];
+    WCHAR Buffer[0x800];
+    memset(Filename, 0, sizeof(Filename));
+    memset(Buffer, 0, sizeof(Buffer));
+    g_byte_1DBD008 = 0;
+    if (sub_619AA0() != 0)
+    {
+        HMODULE hMod = GetModuleHandleA(NULL);
+        if (GetModuleFileNameW(hMod, Filename, 0x800) != 0)
+        {
+            const WCHAR *p = wcsrchr(Filename, L'\\');
+            if (p == 0)
+                p = wcsrchr(Filename, L'/');
+            if (p != 0)
+            {
+                _snwprintf(Buffer, 0x800, L"-=[SMS_%s_SMS]=-", p + 1);
+                HANDLE hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, Buffer);
+                if (hMap != 0)
+                {
+                    BYTE *view = (BYTE *)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+                    if (view != 0)
+                    {
+                        if (sub_619AA0() != 0)
+                            memcpy(sub_619AA0(), view, 0x6C4);
+                        if (UnmapViewOfFile(view))
+                            g_byte_1DBD008 = 1;
+                    }
+                    CloseHandle(hMap);
+                }
+            }
+        }
+    }
+
+    // 7. If the blob was not loaded, show a message box and exit.
+    if (g_byte_1DBD008 == 0)
+    {
+        int v19 = sub_18F8750();
+        const WCHAR *title = (const WCHAR *)sub_19FF570(sub_6195C0(g_dword_1DBD010));
+        const WCHAR *body  = (const WCHAR *)sub_19FF570(sub_6195C0(g_dword_1DBD014));
+        HWND hwnd = 0;
+        if (v19)
+        {
+            void **vtable = (void **)*(void ***)v19;
+            int (__thiscall *getWindow)(int) =
+                (int (__thiscall *)(int))vtable[8];   // vtable slot at offset 32
+            hwnd = (HWND)getWindow(v19);
+        }
+        MessageBoxW(hwnd, body, title, MB_ICONERROR);   // 0x10
+        ExitProcess(1);
+    }
+
+    // 8. Run the game.
+    char ArgList[356];
+    sub_61C530(ArgList);
+    if (sub_61CB70(ArgList, arg) != 0)
+    {
+        sub_61BE00(ArgList);
+        sub_61AE70(ArgList);
+        g_dword_1DBD00C = 0;
+    }
+    else
+    {
+        g_dword_1DBD00C = 1;
+    }
+    sub_61C670(ArgList);
+
+    // 9. Free the debug handler.
+    sub_401700(&reg1);
 }
 
 // ============================================================
@@ -375,7 +621,7 @@ int RunGame(int hInstance, char *lpCmdLine, int nShowCmd)
     sub_18F6C50(GetWorker(), sub_615340);
 
     // 6. Spawn the game thread (0x40000-byte stack).
-    HANDLE hThread = (HANDLE)_beginthread(sub_615380, 0x40000u, lpCmdLine);
+    HANDLE hThread = (HANDLE)_beginthread(GameThread, 0x40000u, lpCmdLine);
 
     // 7. Pump the engine while the game thread is still running
     //    (WaitForSingleObject returns WAIT_TIMEOUT = 258 while it is alive).

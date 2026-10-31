@@ -15,6 +15,7 @@
 # ---- Accidental Windows `nul` redirect artifact ----
 # Created by a stray `... > nul` run under a POSIX shell.
 nul
+**test_out/
 
 # ---- OS junk ----
 Thumbs.db
