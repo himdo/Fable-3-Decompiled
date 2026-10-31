@@ -76,14 +76,22 @@ goto :compile
 :compile
 pushd "%OUTREL%" || exit /b 1
 
-echo.
-echo === cl, x86: main.cpp ===
-cl %CLFLAGS% ..\..\main.cpp
-if errorlevel 1 (echo COMPILE FAILED & popd & popd & exit /b 1)
+:: Application sources: the entry point plus one file per module folder.
+:: Add a new module by listing its .cpp in SRCS (paths are relative to the
+:: project root; each .obj is produced in the Release/Win32 output dir and
+:: then linked below by name).
+set "SRCS=..\..\main.cpp ..\..\framework\framework.cpp ..\..\engine\engine.cpp ..\..\save\save.cpp"
+
+for %%F in (%SRCS%) do (
+    echo.
+    echo === cl, x86: %%F ===
+    cl %CLFLAGS% "%%F"
+    if errorlevel 1 (echo COMPILE FAILED & popd & popd & exit /b 1)
+)
 
 echo.
 echo === link, x86 ===
-link %LNKFLAGS% /out:Fable3.exe /pdb:Fable3.pdb main.obj %RRES%
+link %LNKFLAGS% /out:Fable3.exe /pdb:Fable3.pdb main.obj framework.obj engine.obj save.obj %RRES%
 if errorlevel 1 (echo LINK FAILED & popd & popd & exit /b 1)
 
 if exist ..\..\patch_rsrc.py (
