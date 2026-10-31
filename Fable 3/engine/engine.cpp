@@ -72,10 +72,9 @@ typedef char CWorkerWin32SizeCheck[(sizeof(CWorkerWin32) == 664) ? 1 : -1];
 
 static DWORD g_Addend = 0;   // 0x2075C48: worker reference count
 
-typedef void *(*CWorkerWin32_DtorFn)(void *, int);
-
 // ============================================================
 //  CWorkerWin32_DtorBody  (0x55D930 - 0x55D9B3)  -- the worker destructor body
+//  [NOT byte-identical] placement-dependent (relative call to SharedBufferFree).
 //
 //  Releases the shared member at +596 (decrementing its refcount and freeing
 //  the buffer when it reaches zero), decrements the worker refcount, closes
@@ -111,18 +110,29 @@ static void CWorkerWin32_DtorBody(CWorkerWin32 *w)
 // ============================================================
 //  CWorkerWin32_Dtor  (0x55D8F0 - 0x55D913)  -- the worker deleting destructor
 //
-//  void *CWorkerWin32_Dtor(void *obj, int freeFlag)
-//
-//  Vtable slot 0 — the one DisposeWorker (sub_615880) dispatches to as
-//  vtable[0](worker, 1). Runs the destructor body, then frees the object via
-//  the heap if the flag is set. Returns this.
+//  Functional (not byte-identical; it has relative calls). __thiscall (worker
+//  in ECX) and cleans up its own flag arg (retn 4), matching the original
+//  sub_55D8F0's convention so the byte-identical DisposeWorker can dispatch
+//  through it. Runs the dtor body, then frees via the heap if the flag is set.
 // ============================================================
-static void *CWorkerWin32_Dtor(void *obj, int freeFlag)
+static __declspec(naked) void *CWorkerWin32_Dtor(void)
 {
-    CWorkerWin32_DtorBody((CWorkerWin32 *)obj);
-    if (freeFlag & 1)
-        LHFree(obj);
-    return obj;
+    __asm {
+        push   edi
+        mov    edi, ecx            ; edi = worker
+        push   ecx                 ; pass worker on the stack to the body
+        call   CWorkerWin32_DtorBody
+        add    esp, 4
+        test   [esp+8], 1          ; the flag arg
+        jz     short f3_cwd_nofree
+        push   edi
+        call   LHFree
+        add    esp, 4
+    f3_cwd_nofree:
+        mov    eax, edi            ; return the worker
+        pop    edi
+        retn   4                   ; clean up the flag arg
+    }
 }
 
 // NSystem::CWorkerWin32 vtable — slot 0 is the deleting destructor (the one
@@ -131,6 +141,8 @@ static void *g_CWorkerWin32Vtable[8] = { (void *)CWorkerWin32_Dtor, 0, 0, 0, 0, 
 
 // ============================================================
 //  GetEngineTime  (0x18A88E0)  -- seconds since engine start
+//  [NOT byte-identical] placement-independent but references the QueryPerformanceCounter
+//  IAT slot (0x01AD50C8) and start globals (0x020B5FC0/0x020B5FB8) at original high VAs not present in this build.
 //
 //  (QueryPerformanceCounter() - startCounter) / frequency, using a lazy
 //  one-time capture of the start counter and the frequency.
@@ -154,6 +166,7 @@ static double GetEngineTime(void)
 
 // ============================================================
 //  CWorkerWin32Ctor  (0x18F7040 - 0x18F7152)  -- construct the main worker
+//  [NOT byte-identical] placement-dependent (relative call to GetEngineTime).
 //
 //  void *CWorkerWin32Ctor(void *obj, int hInstance, int nShowCmd)
 //
@@ -180,22 +193,27 @@ static void *CWorkerWin32Ctor(void *obj, int hInstance, int nShowCmd)
 }
 
 // ============================================================
-//  DisposeWorker  (0x00615880 - 0x00615891)  -- SEH handler: dispose the worker
+//  [BYTE-IDENTICAL]  DisposeWorker  (0x00615880 - 0x00615891)  -- SEH handler
 //
 //  Invoked by the SEH block when its refcount reaches zero. It calls the
 //  worker's first virtual method (vtable[0]) with argument 1:
 //      if (worker != 0) return worker->vtable[0](worker, 1);
-//  `worker` is the game handle (the CWorkerWin32 object) passed as the arg.
+//  Emits the original 17 bytes exactly (placement-independent: no absolute
+//  refs, and the vtable call is indirect via EDX).
 // ============================================================
-static int DisposeWorker(int worker)
+static int __declspec(naked) DisposeWorker(int)
 {
-    CWorkerWin32 *w = (CWorkerWin32 *)worker;
-    if (w != 0)
-    {
-        CWorkerWin32_DtorFn fn = (CWorkerWin32_DtorFn)((void **)w->vtable)[0];
-        return (int)fn((void *)w, 1);
+    __asm {
+        mov    ecx, [esp+4]
+        test   ecx, ecx
+        jz     short f3_dw_done
+        mov    eax, [ecx]
+        mov    edx, [eax]
+        push   1
+        call   edx
+    f3_dw_done:
+        retn
     }
-    return 0;
 }
 
 // ============================================================
@@ -260,6 +278,7 @@ static void sub_18F8600(int a1)
 
 // ============================================================
 //  RunGame  (0x00615740 - 0x006157F9)  -- engine init + main run loop
+//  [NOT byte-identical] placement-dependent (12 relative calls to engine callees).
 // ============================================================
 int RunGame(int hInstance, char *lpCmdLine, int nShowCmd)
 {

@@ -42,6 +42,7 @@ static F3SharedObject *g_lpAddend     = 0;  // 0x20B6008: the global shared obje
 
 // ============================================================
 //  ComputeExeDirectory  (0x01A02870 - 0x01A02937)  -- compute the exe directory
+//  [NOT byte-identical] placement-dependent (relative calls into the CRT: strncpy_s,
 //
 //  Takes GetCommandLineA() (which begins with the exe path), isolates the
 //  first token (truncating at the first space, or the first quote when the
@@ -93,6 +94,9 @@ const char *ExeDirectory(void)
 
 // ============================================================
 //  ReleaseGlobalObject  (0x004017B0 - 0x004017F7)  -- release the global shared object
+//  [NOT byte-identical] placement-independent (no relative calls) but references the heap
+//  table (0x02075B24), lpAddend (0x020B6008) and the InterlockedDecrement IAT slot
+//  (0x01AD52FC) at original high VAs not present in this build.
 //
 //  if (g_lpAddend != 0) {
 //      if (InterlockedDecrement(&g_lpAddend->refcount) == 0) {
@@ -122,6 +126,7 @@ static int ReleaseGlobalObject(void)
 
 // ============================================================
 //  FrameworkInit  (0x01A02B50 - 0x01A02B76)  -- framework init (refcounted)
+//  [NOT byte-identical] placement-dependent (relative call to ComputeExeDirectory).
 //
 //  if (g_dword_2075C44 != 0) { ++g_dword_2075C44; return <eax, unused>; }
 //  ComputeExeDirectory();  // first time: compute the exe directory
@@ -145,6 +150,7 @@ int FrameworkInit(void)
 
 // ============================================================
 //  FrameworkShutdown  (0x01A02E70 - 0x01A02EA3)  -- framework shutdown (refcounted)
+//  [NOT byte-identical] placement-dependent (relative calls to fclose, ReleaseGlobalObject).
 //
 //  if (g_byte_2075B33 == 0) { __debugbreak(); return; }   // not initialized
 //  --g_dword_2075C44;

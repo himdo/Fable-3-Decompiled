@@ -40,6 +40,7 @@ static DWORD g_dword_1DADD10 = 0;  // 0x1DADD10: verbose / OOM-report flag
 
 // ============================================================
 //  OutOfMemory  (0x01A034F0 - 0x01A0356C)  -- report an out-of-memory condition
+//  [NOT byte-identical] placement-dependent (relative calls to swprintf_s, OutputDebugStringW, DebugBreak).
 //
 //  void OutOfMemory(const wchar_t *context, unsigned int size)
 //
@@ -78,6 +79,7 @@ static void OutOfMemory(const wchar_t *context, unsigned int size)
 
 // ============================================================
 //  LHAlloc  (0x1A035C0 - 0x1A03627)  -- game heap allocator
+//  [NOT byte-identical] placement-dependent (relative call to OutOfMemory).
 // ============================================================
 void *LHAlloc(unsigned int size)
 {
@@ -106,6 +108,7 @@ void LHFree(void *p)
 
 // ============================================================
 //  SharedBufferAssign  (0x403FE0 - 0x404053)  -- assign (src, len) into the buffer
+//  [NOT byte-identical] placement-dependent (relative call to memcpy_s).
 // ============================================================
 void SharedBufferAssign(F3SharedBuffer *this_, const char *src, unsigned int len)
 {
@@ -133,6 +136,8 @@ void SharedBufferAssign(F3SharedBuffer *this_, const char *src, unsigned int len
 
 // ============================================================
 //  SharedBufferFree  (0x403820 - 0x40385A)  -- release the counted buffer
+//  [NOT byte-identical] placement-independent but references the heap table (0x02075B24)
+//  at the original high VA, which is not present in this build.
 // ============================================================
 void SharedBufferFree(F3SharedBuffer *this_)
 {

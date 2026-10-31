@@ -24,6 +24,7 @@ static F3SharedBuffer *g_dword_1DBD06C = 0;
 
 // ============================================================
 //  SetSaveGamePath  (0x01A019B0 - 0x01A01A32)  -- set the save game to load
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc, SharedBufferAssign, SharedBufferFree).
 // ============================================================
 void SetSaveGamePath(char *Source)
 {
