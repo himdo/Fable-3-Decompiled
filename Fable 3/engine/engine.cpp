@@ -2,7 +2,7 @@
 //
 // RunGame is the main game function. It:
 //   - allocates the 664-byte engine object (LHAlloc(664))
-//   - calls sub_18F7040(hInstance, nShowCmd) to start the real engine
+//   - constructs the 664-byte main worker object (CWorkerWin32Ctor)
 //   - builds a 12-byte SEH handler block (refcount / handler / arg)
 //   - registers the handler (sub_18F6FC0) then releases the local reference
 //   - registers two worker-thread callbacks (sub_6152F0, sub_615340)
@@ -18,6 +18,7 @@
 
 #include <windows.h>
 #include <process.h>
+#include <string.h>
 
 // 0x1DBD00C — the process exit code, returned by the main run loop.
 static DWORD g_dword_1DBD00C = 0;
@@ -37,15 +38,93 @@ typedef struct F3SehBlock
 } F3SehBlock;
 
 // ============================================================
-//  sub_18F7040  (0x18F7040)  -- start the real engine
-//  [STUB] Returns a dummy non-null handle (a DWORD in the original) so the
-//  downstream setup runs.
+//  CWorkerWin32  -- the main worker object (NSystem::CWorkerWin32, 664 bytes)
+//
+//  Layout (offsets match the original so events / hInstance / nShowCmd / timing
+//  sit where the rest of the engine expects them):
+//    +0    vtable
+//    +4    critical section (24 bytes on x86)
+//    +156  event1   +288 event2   +420 event3   +552 event4  (auto-reset)
+//    +560  hInstance   +564 nShowCmd
+//    +656  timing (double, seconds since engine start)
 // ============================================================
-static int sub_18F7040(int hInstance, int nShowCmd)
+typedef struct CWorkerWin32
 {
-    (void)hInstance;
-    (void)nShowCmd;
-    return 1;
+    void *           vtable;        // +0
+    CRITICAL_SECTION cs;            // +4  (24 bytes on x86)
+    char             _pad1[128];    // +28  .. +156
+    HANDLE           event1;        // +156
+    char             _pad2[128];    // +160 .. +288
+    HANDLE           event2;        // +288
+    char             _pad3[128];    // +292 .. +420
+    HANDLE           event3;        // +420
+    char             _pad4[128];    // +424 .. +552
+    HANDLE           event4;        // +552
+    int              _pad5;         // +556
+    int              hInstance;     // +560
+    int              nShowCmd;      // +564
+    char             _pad6[88];     // +568 .. +656
+    double           timing;        // +656 .. +664
+} CWorkerWin32;
+
+// Compile-time check: the object must be exactly 664 bytes (LHAlloc(664)).
+typedef char CWorkerWin32SizeCheck[(sizeof(CWorkerWin32) == 664) ? 1 : -1];
+
+static DWORD g_Addend = 0;   // 0x2075C48: worker reference count
+
+// NSystem::CWorkerWin32 vtable placeholder — the worker's virtual methods are
+// not implemented, so this is a marker. No code in the current build calls
+// through it.
+static void *g_CWorkerWin32Vtable[8] = { 0 };
+
+// ============================================================
+//  GetEngineTime  (0x18A88E0)  -- seconds since engine start
+//
+//  (QueryPerformanceCounter() - startCounter) / frequency, using a lazy
+//  one-time capture of the start counter and the frequency.
+// ============================================================
+static double GetEngineTime(void)
+{
+    static LARGE_INTEGER startCounter;
+    static double startFreq = 0.0;
+    LARGE_INTEGER now;
+
+    if (startFreq == 0.0)
+    {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        startFreq = (double)f.QuadPart;
+        QueryPerformanceCounter(&startCounter);
+    }
+    QueryPerformanceCounter(&now);
+    return (double)(unsigned __int64)(now.QuadPart - startCounter.QuadPart) / startFreq;
+}
+
+// ============================================================
+//  CWorkerWin32Ctor  (0x18F7040 - 0x18F7152)  -- construct the main worker
+//
+//  void *CWorkerWin32Ctor(void *obj, int hInstance, int nShowCmd)
+//
+//  Zeroes the 664-byte object, sets the vtable, initializes the critical
+//  section, creates four auto-reset events, stores hInstance/nShowCmd, seeds
+//  the timing field, and bumps the worker refcount. Returns this.
+// ============================================================
+static void *CWorkerWin32Ctor(void *obj, int hInstance, int nShowCmd)
+{
+    CWorkerWin32 *w = (CWorkerWin32 *)obj;
+    memset(w, 0, sizeof(CWorkerWin32));
+
+    w->vtable   = g_CWorkerWin32Vtable;
+    InitializeCriticalSection(&w->cs);
+    w->event1   = CreateEventA(0, FALSE, FALSE, 0);
+    w->event2   = CreateEventA(0, FALSE, FALSE, 0);
+    w->event3   = CreateEventA(0, FALSE, FALSE, 0);
+    w->event4   = CreateEventA(0, FALSE, FALSE, 0);
+    w->hInstance = hInstance;
+    w->nShowCmd  = nShowCmd;
+    w->timing    = GetEngineTime();
+    InterlockedIncrement(&g_Addend);
+    return obj;
 }
 
 // ============================================================
@@ -123,29 +202,27 @@ static void sub_18F8600(int a1)
 // ============================================================
 int RunGame(int hInstance, char *lpCmdLine, int nShowCmd)
 {
-    int          v9;        // game init result / handle
-    F3SehBlock  *lpAddend;  // the SEH handler block (or 0)
+    void       *v9;         // the worker object (game handle)
+    F3SehBlock *lpAddend;   // the SEH handler block (or 0)
 
-    // 1. Allocate the 664-byte engine object and start the real engine.
-    if (LHAlloc(664) != 0)
-        v9 = sub_18F7040(hInstance, nShowCmd);
-    else
-        v9 = 0;
+    // 1. Allocate the 664-byte worker object and construct it in place.
+    void *block = LHAlloc(664);
+    v9 = (block != 0) ? CWorkerWin32Ctor(block, hInstance, nShowCmd) : 0;
 
     // 2. Build the 12-byte SEH handler block (refcount=1, handler, arg).
     if (v9 != 0 && (lpAddend = (F3SehBlock *)LHAlloc(12)) != 0)
     {
         lpAddend->refcount = 1;
         lpAddend->handler  = sub_615880;
-        lpAddend->arg      = v9;
+        lpAddend->arg      = (int)v9;
     }
     else
     {
         lpAddend = 0;
     }
 
-    // 3. Register the SEH handler.
-    sub_18F6FC0(&v9);
+    // 3. Register the SEH handler (with the address of the worker pointer).
+    sub_18F6FC0((int *)&v9);
 
     // 4. Release the local reference; on zero invoke the handler and free it.
     if (lpAddend != 0 && InterlockedDecrement(&lpAddend->refcount) == 0)

@@ -2,6 +2,7 @@
 
 #include "common.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -37,12 +38,42 @@ static F3HeapTable g_heapTable = { 0, 0, f3_heap_alloc, 0, f3_heap_free };
 static BYTE  g_byte_2075B30  = 0;  // 0x2075B30: heap info initialized
 static DWORD g_dword_1DADD10 = 0;  // 0x1DADD10: verbose / OOM-report flag
 
-// sub_1A034F0 (0x1A034F0) - out-of-memory report handler. [STUB] — only runs
-// when an allocation fails AND the verbose flag is set, so it is a no-op for
-// normal (functional) operation.
-static void sub_1A034F0(unsigned int size)
+// ============================================================
+//  OutOfMemory  (0x01A034F0 - 0x01A0356C)  -- report an out-of-memory condition
+//
+//  void OutOfMemory(const wchar_t *context, unsigned int size)
+//
+//  Locks a private critical section, calls the optional pre-callback
+//  (dword_2075B20), formats and writes to the debugger:
+//      "Out Of Memory allocating <size> in <context>\n"
+//  then calls the optional post-callback (dword_2075B2C) with (0, 0) and breaks.
+//
+//  Only runs when an allocation fails AND the verbose flag (0x1DADD10) is set.
+// ============================================================
+static CRITICAL_SECTION g_OomCs;
+struct OomCsInit
 {
-    (void)size;
+    OomCsInit()  { InitializeCriticalSection(&g_OomCs); }
+    ~OomCsInit() { DeleteCriticalSection(&g_OomCs); }
+};
+static OomCsInit g_OomCsInit;
+
+static void (*g_dword_2075B20)(void)          = 0;   // 0x2075B20: optional pre-callback
+static void (*g_dword_2075B2C)(void *, void *) = 0;   // 0x2075B2C: optional post-callback
+
+static void OutOfMemory(const wchar_t *context, unsigned int size)
+{
+    WCHAR buf[512];
+
+    EnterCriticalSection(&g_OomCs);
+    if (g_dword_2075B20 != 0)
+        g_dword_2075B20();
+    swprintf_s(buf, 0x1FF, L"Out Of Memory allocating %u in %s\n", size, context);
+    OutputDebugStringW(buf);
+    if (g_dword_2075B2C != 0)
+        g_dword_2075B2C(0, 0);
+    DebugBreak();
+    LeaveCriticalSection(&g_OomCs);
 }
 
 // ============================================================
@@ -60,7 +91,7 @@ void *LHAlloc(unsigned int size)
 
     void *p = g_heapTable.alloc(size);
     if (p == 0 && (g_dword_1DADD10 & 1))
-        sub_1A034F0(size);
+        OutOfMemory(L"LHBaseMemory::Alloc", size);
     return p;
 }
 

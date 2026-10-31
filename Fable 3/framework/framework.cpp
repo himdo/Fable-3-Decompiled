@@ -6,6 +6,7 @@
 // FrameworkShutdown (declared in framework.h).
 
 #include "framework.h"
+#include "common/common.h"
 
 #include <windows.h>
 #include <stdio.h>
@@ -21,6 +22,23 @@ static FILE *g_Stream        = 0;  // "Stream": global file stream (opened by th
 // at first init). A 0x107-byte buffer; the game's base path for locating data
 // files and save games.
 char g_ExeDirectory[0x107];
+
+// The 12-byte refcounted control block the global shared object points to:
+//   +0  refcount    reference count (Interlocked)
+//   +4  destructor  invoked as destructor(arg) when the count reaches zero
+//   +8  arg         the argument handed to the destructor
+typedef struct F3SharedObject
+{
+    volatile long refcount;
+    void (*destructor)(int);
+    int arg;
+} F3SharedObject;
+
+// 0x20B6004 + 0x20B6008 — the global shared object pair. `g_lpAddend` points to
+// a refcounted control block (see F3SharedObject); when its refcount reaches
+// zero the destructor is invoked and the block is freed (ReleaseGlobalObject).
+static DWORD          g_dword_20B6004 = 0;  // 0x20B6004
+static F3SharedObject *g_lpAddend     = 0;  // 0x20B6008: the global shared object
 
 // ============================================================
 //  ComputeExeDirectory  (0x01A02870 - 0x01A02937)  -- compute the exe directory
@@ -74,21 +92,32 @@ const char *ExeDirectory(void)
 }
 
 // ============================================================
-//  sub_4017B0  (0x004017B0 - 0x004017F7)  -- release the global shared pointer
+//  ReleaseGlobalObject  (0x004017B0 - 0x004017F7)  -- release the global shared object
 //
-//  if (lpAddend != 0) {
-//      if (InterlockedDecrement(lpAddend) == 0) {
-//          lpAddend[1](lpAddend[2]);              // call the object's destructor
-//          (*(dword_2075B24 + 16))(lpAddend);      // free the control block
+//  if (g_lpAddend != 0) {
+//      if (InterlockedDecrement(&g_lpAddend->refcount) == 0) {
+//          g_lpAddend->destructor(g_lpAddend->arg);   // invoke the destructor
+//          LHFree(g_lpAddend);                          // free the control block
 //      }
 //  }
-//  lpAddend = 0;  dword_20B6004 = 0;
-//  With the current stubs lpAddend is never set, so this is a no-op.
-//  [STUB]
+//  g_lpAddend = 0;  g_dword_20B6004 = 0;
+//  Returns the final refcount (0 when there was nothing to release).
 // ============================================================
-static int sub_4017B0(void)
+static int ReleaseGlobalObject(void)
 {
-    return 0;
+    long result = 0;
+    if (g_lpAddend != 0)
+    {
+        result = InterlockedDecrement(&g_lpAddend->refcount);
+        if (result == 0)
+        {
+            g_lpAddend->destructor(g_lpAddend->arg);
+            LHFree(g_lpAddend);
+        }
+    }
+    g_lpAddend = 0;
+    g_dword_20B6004 = 0;
+    return (int)result;
 }
 
 // ============================================================
@@ -121,7 +150,7 @@ int FrameworkInit(void)
 //  --g_dword_2075C44;
 //  if (g_dword_2075C44 == 0) {
 //      if (g_Stream) fclose(g_Stream);
-//      sub_4017B0();          // release the framework's global shared pointer
+//      ReleaseGlobalObject();   // release the framework's global shared object
 //      g_byte_2075B33 = 0;
 //  }
 // ============================================================
@@ -140,7 +169,7 @@ int FrameworkShutdown(void)
 
     if (g_Stream != 0)
         fclose(g_Stream);
-    result = sub_4017B0();
+    result = ReleaseGlobalObject();
     g_byte_2075B33 = 0;
     return result;
 }

@@ -22,7 +22,7 @@ framework/                  refcounted framework init / shutdown
   framework.cpp             FrameworkInit  (0x1A02B50)
                             FrameworkShutdown (0x1A02E70)
                             ComputeExeDirectory (0x1A02870) + ExeDirectory()
-                            (+ private stub sub_4017B0)
+                            ReleaseGlobalObject (0x4017B0)
 
 common/                     engine-wide memory / buffer helpers
   common.h
@@ -59,10 +59,10 @@ save/                       save-game loading  [growing]
 
 | Module    | Entry (IDA)          | What to add |
 |-----------|----------------------|-------------|
-| `engine/` | `RunGame` (0x615740) | (done) run loop: 664-byte engine alloc, SEH block + handler, worker-thread callbacks, `_beginthread` game thread, WaitForSingleObject pump; next: fill in the stub callees |
+| `engine/` | `RunGame` (0x615740), `CWorkerWin32Ctor` (0x18F7040) | (done) run loop + `CWorkerWin32` main-worker ctor (vtable, crit section, 4 auto-reset events, timing, refcount); next: fill in the remaining stub callees |
 | `save/`   | `SetSaveGamePath` (0x1A019B0) | (done) store the save path refcounted into `dword_1DBD06C` + getter; next: the actual load logic |
-| `framework/` | `ComputeExeDirectory` (0x1A02870) | (done) exe-directory compute + `ExeDirectory()` getter; next: `sub_4017B0` (shared-ptr release) |
-| `common/` | `LHAlloc`, `LHFree`, `SharedBufferAssign`, `SharedBufferFree` | (done) heap alloc/free + `F3SharedBuffer` counted buffer; next: cross-module globals `byte_1DBD01B`, `byte_1C86BD9` |
+| `framework/` | `ComputeExeDirectory` (0x1A02870), `ReleaseGlobalObject` (0x4017B0) | (done) exe-directory compute + `ExeDirectory()` getter + global shared-object release; the framework init/shutdown pair is complete |
+| `common/` | `LHAlloc`, `LHFree`, `SharedBufferAssign`, `SharedBufferFree`, `OutOfMemory` | (done) heap alloc/free + `F3SharedBuffer` counted buffer + OOM report handler; next: cross-module globals `byte_1DBD01B`, `byte_1C86BD9` |
 | (future)  | render / audio / input / network | as their code is decompiled |
 
 ## Original entry chain (for reference)
