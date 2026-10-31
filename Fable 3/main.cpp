@@ -47,7 +47,7 @@ static BYTE g_byte_1C86BD9 = 0;  // 0x1C86BD9: set 0 when -loadsavegame is given
 //     starts (ERROR_ALREADY_EXISTS), focus the existing "Fable 3" window and
 //     return -1.
 //  2. FrameworkInit, parse -loadsavegame <path>, then run the engine
-//     (sub_615740), FrameworkShutdown, release the mutex, return the
+//     (RunGame), FrameworkShutdown, release the mutex, return the
 //     engine's exit code.
 // ============================================================
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
@@ -87,7 +87,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     LocalFree(argv);
 
     // --- run the game ---
-    int result = sub_615740((int)hInstance, lpCmdLine, nShowCmd);
+    int result = RunGame((int)hInstance, lpCmdLine, nShowCmd);
     FrameworkShutdown();   // framework shutdown (refcounted)
     if (hMutex != NULL)
         ReleaseMutex(hMutex);

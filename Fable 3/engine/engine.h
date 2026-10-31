@@ -9,7 +9,8 @@
 // 0x615740 - engine init + main run loop. Allocates the 664-byte engine
 // object, starts it (sub_18F7040), spawns the game thread
 // (_beginthread(sub_615380, 0x40000, ...)), pumps messages in a
-// WaitForSingleObject loop, and returns the engine exit code. [STUB]
-int sub_615740(int hInstance, char *lpCmdLine, int nShowCmd);
+// WaitForSingleObject loop, and returns the engine exit code.
+// (The engine-internal callees are stubs for now.)
+int RunGame(int hInstance, char *lpCmdLine, int nShowCmd);
 
 #endif  // F3_ENGINE_H

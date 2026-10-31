@@ -65,6 +65,15 @@ void *LHAlloc(unsigned int size)
 }
 
 // ============================================================
+//  LHFree  -- the game heap free (counterpart to LHAlloc)
+// ============================================================
+void LHFree(void *p)
+{
+    if (p != 0)
+        g_heapTable.free(p);
+}
+
+// ============================================================
 //  SharedBufferAssign  (0x403FE0 - 0x404053)  -- assign (src, len) into the buffer
 // ============================================================
 void SharedBufferAssign(F3SharedBuffer *this_, const char *src, unsigned int len)

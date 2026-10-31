@@ -13,4 +13,9 @@ int  FrameworkInit(void);
 // releases the framework's global shared pointer).
 int  FrameworkShutdown(void);
 
+// The executable's directory path (computed from the command line at first
+// init; empty until FrameworkInit has run). Used to locate data files and
+// save games.
+const char *ExeDirectory(void);
+
 #endif  // F3_FRAMEWORK_H

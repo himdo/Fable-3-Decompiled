@@ -21,16 +21,19 @@ framework/                  refcounted framework init / shutdown
   framework.h
   framework.cpp             FrameworkInit  (0x1A02B50)
                             FrameworkShutdown (0x1A02E70)
-                            (+ private stubs sub_1A02870, sub_4017B0)
+                            ComputeExeDirectory (0x1A02870) + ExeDirectory()
+                            (+ private stub sub_4017B0)
 
 common/                     engine-wide memory / buffer helpers
   common.h
-  common.cpp                LHAlloc (heap alloc), SharedBufferAssign (buffer assign),
+  common.cpp                LHAlloc (heap alloc), LHFree (heap free),
+                            SharedBufferAssign (buffer assign),
                             SharedBufferFree (buffer free), F3SharedBuffer struct
 
 engine/                     game engine init + main run loop  [growing]
   engine.h
-  engine.cpp                sub_615740 (0x615740)  [STUB]
+  engine.cpp                RunGame (0x615740) — implemented (run loop + thread)
+                            (+ stub callees: sub_18F7040, sub_615880, sub_615380, ...)
 
 save/                       save-game loading  [growing]
   save.h
@@ -56,10 +59,10 @@ save/                       save-game loading  [growing]
 
 | Module    | Entry (IDA)          | What to add |
 |-----------|----------------------|-------------|
-| `engine/` | `sub_615740` (0x615740) | engine object alloc, game init (sub_18F7040), SEH (sub_615880), game thread (sub_615380), message pump (sub_18F6A40 / sub_18F8600) |
+| `engine/` | `RunGame` (0x615740) | (done) run loop: 664-byte engine alloc, SEH block + handler, worker-thread callbacks, `_beginthread` game thread, WaitForSingleObject pump; next: fill in the stub callees |
 | `save/`   | `SetSaveGamePath` (0x1A019B0) | (done) store the save path refcounted into `dword_1DBD06C` + getter; next: the actual load logic |
-| `framework/` | `sub_1A02870`, `sub_4017B0` | exe-directory compute, global shared-pointer release |
-| `common/` | `LHAlloc`, `SharedBufferAssign`, `SharedBufferFree` | (done) heap allocator + `F3SharedBuffer` counted buffer; next: cross-module globals `byte_1DBD01B`, `byte_1C86BD9`, `dword_1DBD00C` (exit code) |
+| `framework/` | `ComputeExeDirectory` (0x1A02870) | (done) exe-directory compute + `ExeDirectory()` getter; next: `sub_4017B0` (shared-ptr release) |
+| `common/` | `LHAlloc`, `LHFree`, `SharedBufferAssign`, `SharedBufferFree` | (done) heap alloc/free + `F3SharedBuffer` counted buffer; next: cross-module globals `byte_1DBD01B`, `byte_1C86BD9` |
 | (future)  | render / audio / input / network | as their code is decompiled |
 
 ## Original entry chain (for reference)
@@ -72,4 +75,4 @@ entry 0x1523B39:   call ___security_init_cookie; jmp ___tmainCRTStartup
 
 `WinMain`: single-instance mutex `Local\FableIII` (focus the existing window
 on a second launch) → `FrameworkInit` → parse `-loadsavegame <path>` →
-`sub_615740` (run the game) → `FrameworkShutdown` → return the exit code.
+`RunGame` (run the game) → `FrameworkShutdown` → return the exit code.
