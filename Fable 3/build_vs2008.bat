@@ -32,7 +32,8 @@ set "LIB=%V90%\VC\LIB;%SDK%\Lib"
 set "PATH=%V90BIN%;%PATH%"
 
 rem ---- compiler flags: Release x86, static CRT, LTCG, C++ ----
-set "CLFLAGS=/nologo /c /O2 /Ob2 /Oi /DNDEBUG /DWIN32 /D_WINDOWS /W3 /EHsc /GS /MT /GL /Z7 /Fds"
+rem /I ..\..  adds the project root so modules include each other root-relative
+set "CLFLAGS=/nologo /c /I ..\.. /O2 /Ob2 /Oi /DNDEBUG /DWIN32 /D_WINDOWS /W3 /EHsc /GS /MT /GL /Z7 /Fds"
 rem ---- linker flags: LTCG, GUI, x86, base 0x400000 ----
 set "LNKFLAGS=/nologo /LTCG /subsystem:windows /machine:x86 /base:0x400000 /DYNAMICBASE /NXCOMPAT"
 
@@ -80,7 +81,7 @@ pushd "%OUTREL%" || exit /b 1
 :: Add a new module by listing its .cpp in SRCS (paths are relative to the
 :: project root; each .obj is produced in the Release/Win32 output dir and
 :: then linked below by name).
-set "SRCS=..\..\main.cpp ..\..\framework\framework.cpp ..\..\engine\engine.cpp ..\..\save\save.cpp"
+set "SRCS=..\..\main.cpp ..\..\framework\framework.cpp ..\..\common\common.cpp ..\..\engine\engine.cpp ..\..\save\save.cpp"
 
 for %%F in (%SRCS%) do (
     echo.
@@ -91,7 +92,7 @@ for %%F in (%SRCS%) do (
 
 echo.
 echo === link, x86 ===
-link %LNKFLAGS% /out:Fable3.exe /pdb:Fable3.pdb main.obj framework.obj engine.obj save.obj %RRES%
+link %LNKFLAGS% /out:Fable3.exe /pdb:Fable3.pdb main.obj framework.obj common.obj engine.obj save.obj %RRES%
 if errorlevel 1 (echo LINK FAILED & popd & popd & exit /b 1)
 
 if exist ..\..\patch_rsrc.py (

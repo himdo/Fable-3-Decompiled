@@ -1,7 +1,7 @@
 // Fable 3 — engine module (game engine init + main run loop).
 //
 // sub_615740 is the main game function. Its full decompile:
-//   - allocates the 664-byte engine object (sub_1A035C0(664))
+//   - allocates the 664-byte engine object (LHAlloc(664))
 //   - calls sub_18F7040(hInstance, nShowCmd) to start the real engine
 //   - sets up a 12-byte SEH handler (handler = sub_615880)
 //   - registers thread callbacks (sub_6152F0, sub_615340)

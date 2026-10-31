@@ -79,7 +79,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         {
             char dest[256];
             wcstombs(dest, argv[i + 1], 0xFF);   // wide -> narrow (up to 255 chars)
-            sub_1A019B0(dest);                    // tell the engine which save to load
+            SetSaveGamePath(dest);                // tell the engine which save to load
             g_byte_1DBD01B = 1;
             g_byte_1C86BD9 = 0;
         }
