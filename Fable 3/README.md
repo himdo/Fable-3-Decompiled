@@ -33,7 +33,11 @@ common/                     engine-wide memory / buffer helpers
 engine/                     game engine init + main run loop  [growing]
   engine.h
   engine.cpp                RunGame (0x615740) — implemented (run loop + thread)
-                            (+ stub callees: sub_18F7040, sub_615880, sub_615380, ...)
+                            CWorkerWin32Ctor (0x18F7040) — main-worker ctor
+                            DisposeWorker (0x615880) — SEH dispose handler
+                            CWorkerWin32_Dtor (0x55D8F0) — worker deleting destructor
+                            CWorkerWin32_DtorBody (0x55D930) — worker dtor body
+                            (+ stub callees: sub_615380, sub_18F6FC0, ...)
 
 save/                       save-game loading  [growing]
   save.h
@@ -59,7 +63,7 @@ save/                       save-game loading  [growing]
 
 | Module    | Entry (IDA)          | What to add |
 |-----------|----------------------|-------------|
-| `engine/` | `RunGame` (0x615740), `CWorkerWin32Ctor` (0x18F7040) | (done) run loop + `CWorkerWin32` main-worker ctor (vtable, crit section, 4 auto-reset events, timing, refcount); next: fill in the remaining stub callees |
+| `engine/` | `RunGame` (0x615740), `CWorkerWin32Ctor` (0x18F7040), `DisposeWorker` (0x615880), `CWorkerWin32_Dtor`/`CWorkerWin32_DtorBody` (0x55D8F0/0x55D930) | (done) run loop + main-worker ctor + SEH dispose path (worker deleting destructor + dtor body: releases shared member, closes events, deletes CS, refcount); next: fill in the remaining stub callees |
 | `save/`   | `SetSaveGamePath` (0x1A019B0) | (done) store the save path refcounted into `dword_1DBD06C` + getter; next: the actual load logic |
 | `framework/` | `ComputeExeDirectory` (0x1A02870), `ReleaseGlobalObject` (0x4017B0) | (done) exe-directory compute + `ExeDirectory()` getter + global shared-object release; the framework init/shutdown pair is complete |
 | `common/` | `LHAlloc`, `LHFree`, `SharedBufferAssign`, `SharedBufferFree`, `OutOfMemory` | (done) heap alloc/free + `F3SharedBuffer` counted buffer + OOM report handler; next: cross-module globals `byte_1DBD01B`, `byte_1C86BD9` |

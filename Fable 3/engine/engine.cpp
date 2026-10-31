@@ -72,10 +72,62 @@ typedef char CWorkerWin32SizeCheck[(sizeof(CWorkerWin32) == 664) ? 1 : -1];
 
 static DWORD g_Addend = 0;   // 0x2075C48: worker reference count
 
-// NSystem::CWorkerWin32 vtable placeholder — the worker's virtual methods are
-// not implemented, so this is a marker. No code in the current build calls
-// through it.
-static void *g_CWorkerWin32Vtable[8] = { 0 };
+typedef void *(*CWorkerWin32_DtorFn)(void *, int);
+
+// ============================================================
+//  CWorkerWin32_DtorBody  (0x55D930 - 0x55D9B3)  -- the worker destructor body
+//
+//  Releases the shared member at +596 (decrementing its refcount and freeing
+//  the buffer when it reaches zero), decrements the worker refcount, closes
+//  the four auto-reset events, deletes the critical section, and resets the
+//  vtable (to the base-class vftable in the original).
+// ============================================================
+static void CWorkerWin32_DtorBody(CWorkerWin32 *w)
+{
+    char *base = (char *)w;
+
+    void *block = *(void **)(base + 596);
+    if (block != 0)
+    {
+        if (InterlockedDecrement((volatile long *)((char *)block + 12)) <= 0)
+        {
+            void *b2 = *(void **)(base + 596);
+            if (b2 != 0)
+                SharedBufferFree((F3SharedBuffer *)b2);
+        }
+        *(void **)(base + 596) = 0;
+    }
+
+    InterlockedDecrement(&g_Addend);
+    *(void **)(base + 596) = 0;   // redundant clear (matches the original)
+    CloseHandle(*(HANDLE *)(base + 552));   // event4
+    CloseHandle(*(HANDLE *)(base + 420));   // event3
+    CloseHandle(*(HANDLE *)(base + 288));   // event2
+    CloseHandle(*(HANDLE *)(base + 156));   // event1
+    DeleteCriticalSection((LPCRITICAL_SECTION)(base + 4));   // the critical section
+    *(void **)base = 0;   // reset vtable (base-class vftable in the original)
+}
+
+// ============================================================
+//  CWorkerWin32_Dtor  (0x55D8F0 - 0x55D913)  -- the worker deleting destructor
+//
+//  void *CWorkerWin32_Dtor(void *obj, int freeFlag)
+//
+//  Vtable slot 0 — the one DisposeWorker (sub_615880) dispatches to as
+//  vtable[0](worker, 1). Runs the destructor body, then frees the object via
+//  the heap if the flag is set. Returns this.
+// ============================================================
+static void *CWorkerWin32_Dtor(void *obj, int freeFlag)
+{
+    CWorkerWin32_DtorBody((CWorkerWin32 *)obj);
+    if (freeFlag & 1)
+        LHFree(obj);
+    return obj;
+}
+
+// NSystem::CWorkerWin32 vtable — slot 0 is the deleting destructor (the one
+// the dispose handler calls); the remaining slots are not implemented.
+static void *g_CWorkerWin32Vtable[8] = { (void *)CWorkerWin32_Dtor, 0, 0, 0, 0, 0, 0, 0 };
 
 // ============================================================
 //  GetEngineTime  (0x18A88E0)  -- seconds since engine start
@@ -128,12 +180,21 @@ static void *CWorkerWin32Ctor(void *obj, int hInstance, int nShowCmd)
 }
 
 // ============================================================
-//  sub_615880  (0x615880)  -- SEH handler / engine dispose
-//  [STUB]
+//  DisposeWorker  (0x00615880 - 0x00615891)  -- SEH handler: dispose the worker
+//
+//  Invoked by the SEH block when its refcount reaches zero. It calls the
+//  worker's first virtual method (vtable[0]) with argument 1:
+//      if (worker != 0) return worker->vtable[0](worker, 1);
+//  `worker` is the game handle (the CWorkerWin32 object) passed as the arg.
 // ============================================================
-static int sub_615880(int a1)
+static int DisposeWorker(int worker)
 {
-    (void)a1;
+    CWorkerWin32 *w = (CWorkerWin32 *)worker;
+    if (w != 0)
+    {
+        CWorkerWin32_DtorFn fn = (CWorkerWin32_DtorFn)((void **)w->vtable)[0];
+        return (int)fn((void *)w, 1);
+    }
     return 0;
 }
 
@@ -213,7 +274,7 @@ int RunGame(int hInstance, char *lpCmdLine, int nShowCmd)
     if (v9 != 0 && (lpAddend = (F3SehBlock *)LHAlloc(12)) != 0)
     {
         lpAddend->refcount = 1;
-        lpAddend->handler  = sub_615880;
+        lpAddend->handler  = DisposeWorker;
         lpAddend->arg      = (int)v9;
     }
     else
