@@ -17,6 +17,10 @@ int RunGame(int hInstance, char *lpCmdLine, int nShowCmd);
 // the engine to reach the current CWorkerWin32.
 void *GetWorker(void);
 
+// 0x18F8750 - return the current manager (dword_20FC8C4). Used by the engine
+// to reach the current CManagerWin32.
+void *GetManager(void);
+
 // 0x615380 - the game thread entry point (called by _beginthread in RunGame
 // with a 0x40000-byte stack). Sets up the thread, creates the worker objects
 // (each with an SEH cleanup block), loads the shared-memory blob, runs the

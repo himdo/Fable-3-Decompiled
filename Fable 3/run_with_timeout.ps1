@@ -12,7 +12,10 @@ for ($i=0; $i -lt $Rest.Count; $i++) {
     else { $args += $Rest[$i] }
 }
 $psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = $Exe
+# Resolve a relative $Exe against the current location (PowerShell's `cd`
+# does not change the .NET CurrentDirectory that ProcessStartInfo uses).
+$psi.FileName = (Resolve-Path $Exe).Path
+$psi.WorkingDirectory = (Get-Location).Path
 foreach ($a in $args) { $psi.ArgumentList.Add($a) }
 $psi.UseShellExecute = $false
 $psi.RedirectStandardOutput = $true

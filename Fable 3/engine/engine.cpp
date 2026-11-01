@@ -45,17 +45,21 @@ typedef struct F3SehBlock
     int arg;
 } F3SehBlock;
 
-// The 2-word "current worker" registration (dword_20FC8F0 / dword_20FC8F4):
-//   +0  worker    the current CWorkerWin32 (or 0)
-//   +4  sehBlock  the F3SehBlock that disposes the worker when released (or 0)
-typedef struct F3WorkerReg
+// The 2-word "current object + SEH block" registration. Used for the worker
+// pair (dword_20FC8F0 / dword_20FC8F4) and the manager pair
+// (dword_20FC8C4 / dword_20FC8C8):
+//   +0  object    the current CWorkerWin32 / CManagerWin32 (or 0)
+//   +4  sehBlock  the F3SehBlock that disposes the object when released (or 0)
+typedef struct F3ObjReg
 {
-    void *worker;
+    void *object;
     void *sehBlock;
-} F3WorkerReg;
+} F3ObjReg;
 
 // dword_20FC8F0 / dword_20FC8F4: the current worker + its SEH cleanup block.
-static F3WorkerReg g_WorkerPair;
+static F3ObjReg g_WorkerPair;
+// dword_20FC8C4 / dword_20FC8C8: the current manager + its SEH cleanup block.
+static F3ObjReg g_ManagerPair;
 
 // ============================================================
 //  CWorkerWin32  -- the main worker object (NSystem::CWorkerWin32, 664 bytes)
@@ -240,14 +244,14 @@ static int __declspec(naked) DisposeWorker(int)
 //  ReleaseWorkerPair  (0x0055DB10 - 0x0055DB52)  -- release a worker pair
 //  [NOT byte-identical] placement-dependent (relative call to the heap free).
 //
-//  void ReleaseWorkerPair(void *pair)  (pair = &F3WorkerReg)
+//  void ReleaseWorkerPair(void *pair)  (pair = &F3ObjReg)
 //
 //  Decrement the SEH block's refcount; when it reaches zero invoke
 //  handler(arg) and free the block via the game heap. Then clear both words.
 // ============================================================
 static void ReleaseWorkerPair(void *pair)
 {
-    F3WorkerReg *p = (F3WorkerReg *)pair;
+    F3ObjReg *p = (F3ObjReg *)pair;
     F3SehBlock *sb = (F3SehBlock *)p->sehBlock;
 
     if (sb != 0 && InterlockedDecrement(&sb->refcount) == 0)
@@ -255,7 +259,7 @@ static void ReleaseWorkerPair(void *pair)
         sb->handler(sb->arg);
         LHFree(sb);
     }
-    p->worker = 0;
+    p->object = 0;
     p->sehBlock = 0;
 }
 
@@ -264,20 +268,20 @@ static void ReleaseWorkerPair(void *pair)
 //  [NOT byte-identical] placement-dependent (relative calls to
 //  ReleaseWorkerPair and InterlockedIncrement).
 //
-//  void SetWorker(F3WorkerReg *reg)
+//  void SetWorker(F3ObjReg *reg)
 //
 //  If reg->sehBlock already matches the current global, no-op. Otherwise
 //  release the current pair (dropping the old SEH block's reference), store
-//  (reg->worker, reg->sehBlock) in the global pair, and take a reference on
+//  (reg->object, reg->sehBlock) in the global pair, and take a reference on
 //  the new SEH block so it outlives RunGame.
 // ============================================================
-static void SetWorker(F3WorkerReg *reg)
+static void SetWorker(F3ObjReg *reg)
 {
     if (g_WorkerPair.sehBlock == reg->sehBlock)
         return;
 
     ReleaseWorkerPair(&g_WorkerPair);
-    g_WorkerPair.worker = reg->worker;
+    g_WorkerPair.object = reg->object;
     g_WorkerPair.sehBlock = reg->sehBlock;
     if (reg->sehBlock != 0)
         InterlockedIncrement(&((F3SehBlock *)reg->sehBlock)->refcount);
@@ -302,7 +306,77 @@ static int sub_1A032C0(void *block)
 // ============================================================
 void *GetWorker(void)
 {
-    return g_WorkerPair.worker;
+    return g_WorkerPair.object;
+}
+
+// ============================================================
+//  ReleaseManagerPair  (0x0055D7C0 - 0x0055D818)  -- release the manager pair
+//  [NOT byte-identical] placement-dependent (relative call to the heap free).
+//
+//  long ReleaseManagerPair(void *pair)  (pair = &F3ObjReg)
+//
+//  The manager-pair analog of ReleaseWorkerPair (sub_55DB10). Decrement the
+//  SEH block's refcount; when it reaches zero invoke handler(arg) and free
+//  the block via the game heap. Then clear both words. Returns the release
+//  result (the refcount, or the block pointer when there is no SEH block).
+// ============================================================
+static long ReleaseManagerPair(void *pair)
+{
+    F3ObjReg *p = (F3ObjReg *)pair;
+    F3SehBlock *sb = (F3SehBlock *)p->sehBlock;
+    long result = (long)sb;
+    if (sb != 0)
+    {
+        result = InterlockedDecrement(&sb->refcount);
+        if (result == 0)
+        {
+            sb->handler(sb->arg);
+            LHFree(sb);
+        }
+    }
+    p->object = 0;
+    p->sehBlock = 0;
+    return result;
+}
+
+// ============================================================
+//  SetManager  (0x18F87E0 - 0x18F8817)  -- install the current manager + SEH
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  ReleaseManagerPair and InterlockedIncrement).
+//
+//  long SetManager(F3ObjReg *reg)
+//
+//  The manager-pair analog of SetWorker (sub_18F6FC0). Registers the 48-byte
+//  CManagerWin32 object (reg->object) + its SEH block (reg->sehBlock) into the
+//  global manager pair (dword_20FC8C4/8C8). If reg->sehBlock already matches
+//  the current global, no-op. Otherwise release the current pair, store the
+//  new pair, and take a reference on the new SEH block. Returns the SEH
+//  block's new refcount, or reg on no-op / no block.
+// ============================================================
+static long SetManager(F3ObjReg *reg)
+{
+    long result = (long)reg;
+    if (g_ManagerPair.sehBlock == reg->sehBlock)
+        return result;
+    result = ReleaseManagerPair(&g_ManagerPair);
+    g_ManagerPair.object   = reg->object;
+    g_ManagerPair.sehBlock = reg->sehBlock;
+    if (reg->sehBlock != 0)
+        result = InterlockedIncrement(&((F3SehBlock *)reg->sehBlock)->refcount);
+    return result;
+}
+
+// ============================================================
+//  GetManager  (0x18F8750 - 0x18F8756)  -- return the current manager
+//  [NOT byte-identical] placement-independent but references the high-VA
+//  global dword_20FC8C4 (0x020FC8C4) not present in this build.
+//
+//  A tiny getter (mov eax, dword_20FC8C4; retn) used by the engine to reach
+//  the current CManagerWin32.
+// ============================================================
+void *GetManager(void)
+{
+    return g_ManagerPair.object;
 }
 
 // ============================================================
@@ -353,36 +427,96 @@ static void *g_CDebugTraceFableVtable[4]          = { 0 };
 // ---- SEH handlers for the three objects (called when their refcount hits 0) ----
 // sub_401D20 (0x401D20): tail call to the heap free -- frees the debug handler.
 static int sub_401D20(int arg) { LHFree((void *)arg); return 0; }
-// sub_615850 (0x615850): virtual dispatch (obj->vtable[0](obj, 1)), like DisposeWorker.
-static int sub_615850(int obj)
+// ============================================================
+//  [BYTE-IDENTICAL]  DisposeManager  (0x00615850 - 0x00615860)  -- SEH handler
+//
+//  Invoked by the SEH block (for the 48-byte NSystem::CManagerWin32 object
+//  created by sub_18F7160) when its refcount reaches zero. It calls the
+//  object's first virtual method (vtable[0], the scalar-deleting destructor)
+//  with argument 1:
+//      if (obj != 0) return obj->vtable[0](obj, 1);
+//  Byte-identical to DisposeWorker (0x615880); only the target object differs.
+//  Emits the original 17 bytes exactly (placement-independent: no absolute
+//  refs, and the vtable call is indirect via EDX).
+// ============================================================
+static int __declspec(naked) DisposeManager(int)
 {
-    if (obj)
-    {
-        void **vtable = (void **)*(void ***)obj;   // *a1 = the vtable
-        int (*handler)(int, int) = (int (*)(int, int))vtable[0];   // **a1 = vtable[0]
-        return handler(obj, 1);
+    __asm {
+        mov    ecx, [esp+4]
+        test   ecx, ecx
+        jz     short f3_dm_done
+        mov    eax, [ecx]
+        mov    edx, [eax]
+        push   1
+        call   edx
+    f3_dm_done:
+        retn
     }
-    return 0;
 }
 // sub_615870 (0x615870): thunk to LHFree -- frees the CDebugTraceFable.
 static int sub_615870(int arg) { LHFree((void *)arg); return 0; }
 
 // ---- other engine callees (stubs for now) -----------------------------------
 static void  sub_18C5840(const char *name) { (void)name; }              // set thread name
-static void  sub_1A02DD0(F3WorkerReg *reg) { (void)reg; }               // register debug handler
-// NSystem::CManagerWin32 (48 bytes): vtable at +0, CRITICAL_SECTION at +8.
-// Placeholder slot[0] safely disposes the object (delete CS + free block).
-static int sub_CManagerWin32_Dtor(void *obj, int flag)
+static void  sub_1A02DD0(F3ObjReg *reg) { (void)reg; }               // register debug handler
+// ============================================================
+//  CManagerWin32_DtorBody  (0x55D5F0 - 0x55D63E)  -- the destructor body
+//  [NOT byte-identical] placement-dependent (relative call to the heap free).
+//
+//  Releases the refcounted block at this+36 (decrementing its refcount at +0;
+//  on zero calls the block's destructor (block+4) with arg (block+8) and frees
+//  the block via the heap), clears this+32/this+36, deletes the critical
+//  section at this+8, and resets the vtable to the base-class vftable.
+// ============================================================
+static void CManagerWin32_DtorBody(void *obj)
 {
-    (void)flag;
-    if (obj)
+    char *base = (char *)obj;
+
+    void *block = *(void **)(base + 36);
+    if (block != 0 && InterlockedDecrement((volatile long *)block) == 0)
     {
-        DeleteCriticalSection((CRITICAL_SECTION *)((char *)obj + 8));
-        LHFree(obj);
+        void  (*destructor)(int) = *(void (**)(int))((char *)block + 4);
+        int   arg               = *(int *)((char *)block + 8);
+        destructor(arg);
+        LHFree(block);
     }
-    return 0;
+    *(int *)(base + 32) = 0;
+    *(int *)(base + 36) = 0;
+    DeleteCriticalSection((LPCRITICAL_SECTION)(base + 8));
+    *(void **)base = 0;   // reset vtable (base-class vftable in the original)
 }
-static void *g_CManagerWin32Vtable[16] = { (void *)sub_CManagerWin32_Dtor };
+
+// ============================================================
+//  CManagerWin32_Dtor  (0x55D8B0 - 0x55D8D6)  -- the deleting destructor
+//
+//  Functional (not byte-identical; it has relative calls). __thiscall (obj in
+//  ECX) and cleans up its own flag arg (retn 4), matching the original
+//  sub_55D8B0's convention so the byte-identical DisposeManager can dispatch
+//  through it. Runs the dtor body, then frees via the heap if the flag is set.
+// ============================================================
+static __declspec(naked) void *CManagerWin32_Dtor(void)
+{
+    __asm {
+        push   edi
+        mov    edi, ecx            ; edi = obj
+        push   ecx                 ; pass obj on the stack to the body
+        call   CManagerWin32_DtorBody
+        add    esp, 4
+        test   [esp+8], 1          ; the flag arg
+        jz     short f3_cmd_nofree
+        push   edi
+        call   LHFree
+        add    esp, 4
+    f3_cmd_nofree:
+        mov    eax, edi            ; return obj
+        pop    edi
+        retn   4                   ; clean up the flag arg
+    }
+}
+
+// NSystem::CManagerWin32 (48 bytes): vtable at +0, CRITICAL_SECTION at +8,
+// refcounted block at +36. Slot 0 is the deleting destructor.
+static void *g_CManagerWin32Vtable[16] = { (void *)CManagerWin32_Dtor };
 // sub_18F7160 (0x18F7160): NSystem::CManagerWin32 constructor.
 static void *sub_18F7160(void *obj)
 {
@@ -396,7 +530,6 @@ static void *sub_18F7160(void *obj)
     p[44] = 0;
     return p;
 }
-static long  sub_18F87E0(F3WorkerReg *reg) { (void)reg; return 0; }     // register 48-byte object
 // sub_1A00C30 (0x1A00C30): zero the save-path slot + bump the worker refcount.
 static void *sub_1A00C30(void *obj)
 {
@@ -404,20 +537,19 @@ static void *sub_1A00C30(void *obj)
     InterlockedIncrement(&g_Addend);   // &Addend (worker refcount)
     return obj;
 }
-static void  sub_1A02E20(F3WorkerReg *reg) { (void)reg; }               // register CDebugTraceFable
+static void  sub_1A02E20(F3ObjReg *reg) { (void)reg; }               // register CDebugTraceFable
 // The game buffer (0x6C4 bytes) that the shared-memory blob is loaded into.
 static char g_gameBuffer[0x6C4];
 static void *sub_18986E0(void) { return 0; }                            // engine init
 static void *sub_619AA0(void) { return g_gameBuffer; }                  // get the game buffer
 static const wchar_t *sub_19FF570(void *obj) { (void)obj; return L""; } // get a string
 static int   *sub_6195C0(int a1) { (void)a1; return 0; }                // get an object
-static int   sub_18F8750(void) { return 0; }                            // get the window context
 static void *sub_61C530(void *obj) { return obj; }                      // init the game (ArgList)
 static int   sub_61CB70(void *argList, int a2) { (void)argList; (void)a2; return 1; }  // run the game (success)
 static void  sub_61BE00(void *obj) { (void)obj; }                       // cleanup (part 1)
 static void  sub_61AE70(void *obj) { (void)obj; }                       // cleanup (part 2)
 static void  sub_61C670(void *obj) { (void)obj; }                       // cleanup (part 3)
-static long  sub_401700(F3WorkerReg *reg) { (void)reg; return 0; }      // free the debug handler
+static long  sub_401700(F3ObjReg *reg) { (void)reg; return 0; }      // free the debug handler
 
 // Release a locally-held SEH reference; on zero invoke the handler and free.
 static void F3ReleaseSehRef(void *sehBlock)
@@ -441,51 +573,51 @@ void GameThread(void *a1)
 
     // 2. Debug handler (4-byte) + SEH block (sub_401D20). The SEH block is
     //    kept (released at the end by sub_401700), not released here.
-    F3WorkerReg reg1;
-    reg1.worker = LHAlloc(4);
-    if (reg1.worker)
-        *(void **)reg1.worker = g_CFableWindowsDebugHandlerVtable;
+    F3ObjReg reg1;
+    reg1.object = LHAlloc(4);
+    if (reg1.object)
+        *(void **)reg1.object = g_CFableWindowsDebugHandlerVtable;
     reg1.sehBlock = 0;
-    if (reg1.worker && (reg1.sehBlock = LHAlloc(12)) != 0)
+    if (reg1.object && (reg1.sehBlock = LHAlloc(12)) != 0)
     {
         F3SehBlock *sb = (F3SehBlock *)reg1.sehBlock;
         sb->refcount = 1;
         sb->handler  = sub_401D20;
-        sb->arg      = (int)reg1.worker;
+        sb->arg      = (int)reg1.object;
     }
     sub_1A02DD0(&reg1);
 
-    // 3. 48-byte object (sub_18F7160) + SEH block (sub_615850); release local.
-    F3WorkerReg reg2;
-    reg2.worker = LHAlloc(48);
-    reg2.worker = reg2.worker ? sub_18F7160(reg2.worker) : 0;
+    // 3. 48-byte object (sub_18F7160) + SEH block (DisposeManager); release local.
+    F3ObjReg reg2;
+    reg2.object = LHAlloc(48);
+    reg2.object = reg2.object ? sub_18F7160(reg2.object) : 0;
     reg2.sehBlock = 0;
-    if (reg2.worker && (reg2.sehBlock = LHAlloc(12)) != 0)
+    if (reg2.object && (reg2.sehBlock = LHAlloc(12)) != 0)
     {
         F3SehBlock *sb = (F3SehBlock *)reg2.sehBlock;
         sb->refcount = 1;
-        sb->handler  = sub_615850;
-        sb->arg      = (int)reg2.worker;
+        sb->handler  = DisposeManager;
+        sb->arg      = (int)reg2.object;
     }
-    sub_18F87E0(&reg2);
+    SetManager(&reg2);
     F3ReleaseSehRef(reg2.sehBlock);
 
     // 4. CDebugTraceFable (8-byte) + SEH block (sub_615870); release local.
-    F3WorkerReg reg3;
-    reg3.worker = LHAlloc(8);
-    if (reg3.worker)
+    F3ObjReg reg3;
+    reg3.object = LHAlloc(8);
+    if (reg3.object)
     {
-        *(void **)reg3.worker = g_CDebugTraceFableVtable;
-        sub_1A00C30((void *)((char *)reg3.worker + 4));
-        SetSaveGamePath((F3SharedBuffer **)(char *)reg3.worker + 1, "FTRACE");
+        *(void **)reg3.object = g_CDebugTraceFableVtable;
+        sub_1A00C30((void *)((char *)reg3.object + 4));
+        SetSaveGamePath((F3SharedBuffer **)(char *)reg3.object + 1, "FTRACE");
     }
     reg3.sehBlock = 0;
-    if (reg3.worker && (reg3.sehBlock = LHAlloc(12)) != 0)
+    if (reg3.object && (reg3.sehBlock = LHAlloc(12)) != 0)
     {
         F3SehBlock *sb = (F3SehBlock *)reg3.sehBlock;
         sb->refcount = 1;
         sb->handler  = sub_615870;
-        sb->arg      = (int)reg3.worker;
+        sb->arg      = (int)reg3.object;
     }
     sub_1A02E20(&reg3);
     F3ReleaseSehRef(reg3.sehBlock);
@@ -532,7 +664,7 @@ void GameThread(void *a1)
     // 7. If the blob was not loaded, show a message box and exit.
     if (g_byte_1DBD008 == 0)
     {
-        int v19 = sub_18F8750();
+        int v19 = (int)GetManager();
         const WCHAR *title = (const WCHAR *)sub_19FF570(sub_6195C0(g_dword_1DBD010));
         const WCHAR *body  = (const WCHAR *)sub_19FF570(sub_6195C0(g_dword_1DBD014));
         HWND hwnd = 0;
@@ -602,8 +734,8 @@ int RunGame(int hInstance, char *lpCmdLine, int nShowCmd)
 
     // 3. Install the current worker + SEH cleanup block (sets the global pair
     //    and takes a reference so the worker outlives this call).
-    F3WorkerReg reg;
-    reg.worker = v9;
+    F3ObjReg reg;
+    reg.object = v9;
     reg.sehBlock = lpAddend;
     SetWorker(&reg);
 

@@ -40,9 +40,15 @@ engine/                     game engine init + main run loop  [growing]
                             SetWorker (0x18F6FC0) — install current worker + SEH block
                             GetWorker (0x18F6A40) — current-worker getter
                             ReleaseWorkerPair (0x55DB10) — release a worker pair
-                            DisposeWorker (0x615880) — SEH dispose handler
+                            SetManager (0x18F87E0) — install current manager + SEH block
+                            GetManager (0x18F8750) — current-manager getter
+                            ReleaseManagerPair (0x55D7C0) — release a manager pair
+                            DisposeWorker (0x615880) — SEH dispose handler (worker)
+                            DisposeManager (0x615850) — SEH dispose handler (CManagerWin32)
                             CWorkerWin32_Dtor (0x55D8F0) — worker deleting destructor
                             CWorkerWin32_DtorBody (0x55D930) — worker dtor body
+                            CManagerWin32_Dtor (0x55D8B0) — CManagerWin32 deleting destructor
+                            CManagerWin32_DtorBody (0x55D5F0) — CManagerWin32 dtor body
                             (+ stub callees: sub_615380, sub_18F6CA0, sub_18F6C50, sub_18F8600, ...)
 
 save/                       save-game loading  [growing]
@@ -75,11 +81,13 @@ independent. The current state of the implemented functions:
 | Function | Bytes | Byte-identical? | Why |
 |----------|------|-----------------|-----|
 | `DisposeWorker` (0x615880) | 17 | **YES** | Pure stack/register ops, no absolute refs or relative calls. `__declspec(naked)` inline asm. |
+| `DisposeManager` (0x615850) | 17 | **YES** | Byte-identical to `DisposeWorker` (same 17 bytes); disposes the 48-byte `CManagerWin32` via `vtable[0](obj,1)`. `__declspec(naked)` inline asm. |
 | `GetEngineTime` (0x18A88E0) | 99 | no | Placement-independent, but refs the `QueryPerformanceCounter` IAT slot (0x01AD50C8) and start globals (0x020B5FC0/0x020B5FB8) at original high VAs not present in the build. |
 | `SharedBufferFree` (0x403820) | 58 | no | Placement-independent, but refs the heap table (0x02075B24) at the original high VA. |
 | `ReleaseGlobalObject` (0x4017B0) | 71 | no | Placement-independent, but refs the heap table (0x02075B24), `lpAddend` (0x020B6008), and the `InterlockedDecrement` IAT slot (0x01AD52FC) at original high VAs. |
 | `GetWorker` (0x18F6A40) | 6 | no | Placement-independent, but refs the high-VA global `dword_20FC8F0` (0x020FC8F0) not present in the build. |
-| `FrameworkInit`, `FrameworkShutdown`, `ComputeExeDirectory`, `LHAlloc`, `SharedBufferAssign`, `OutOfMemory`, `RunGame`, `CWorkerWin32Ctor`, `CWorkerWin32_Dtor`, `CWorkerWin32_DtorBody`, `SetSaveGamePath`, `SetWorker` (0x18F6FC0), `ReleaseWorkerPair` (0x55DB10) | — | no | Placement-dependent (relative calls to callees/CRT). |
+| `GetManager` (0x18F8750) | 6 | no | Placement-independent, but refs the high-VA global `dword_20FC8C4` (0x020FC8C4) not present in the build. |
+| `FrameworkInit`, `FrameworkShutdown`, `ComputeExeDirectory`, `LHAlloc`, `SharedBufferAssign`, `OutOfMemory`, `RunGame`, `CWorkerWin32Ctor`, `CWorkerWin32_Dtor`, `CWorkerWin32_DtorBody`, `CManagerWin32_Dtor` (0x55D8B0), `CManagerWin32_DtorBody` (0x55D5F0), `SetSaveGamePath`, `SetWorker` (0x18F6FC0), `ReleaseWorkerPair` (0x55DB10), `SetManager` (0x18F87E0), `ReleaseManagerPair` (0x55D7C0) | — | no | Placement-dependent (relative calls to callees/CRT). |
 
 To byte-match the placement-independent functions that reference IAT/data
 globals, those globals must be placed at their original VAs (a PE
@@ -91,7 +99,7 @@ that it is worth doing.
 
 | Module    | Entry (IDA)          | What to add |
 |-----------|----------------------|-------------|
-| `engine/` | `RunGame` (0x615740), `CWorkerWin32Ctor` (0x18F7040), `SetWorker` (0x18F6FC0), `GetWorker` (0x18F6A40), `ReleaseWorkerPair` (0x55DB10), `DisposeWorker` (0x615880), `CWorkerWin32_Dtor`/`CWorkerWin32_DtorBody` (0x55D8F0/0x55D930) | (done) run loop + main-worker ctor + current-worker pair (install/get/release with SEH refcount) + SEH dispose path (worker deleting destructor + dtor body); next: fill in the remaining stub callees (sub_18F6CA0, sub_18F6C50, sub_18F8600, sub_615380) |
+| `engine/` | `RunGame` (0x615740), `CWorkerWin32Ctor` (0x18F7040), `SetWorker`/`GetWorker`/`ReleaseWorkerPair` (0x18F6FC0/0x18F6A40/0x55DB10), `SetManager`/`GetManager`/`ReleaseManagerPair` (0x18F87E0/0x18F8750/0x55D7C0), `DisposeWorker` (0x615880), `DisposeManager` (0x615850), `CWorkerWin32_Dtor`/`CWorkerWin32_DtorBody` (0x55D8F0/0x55D930), `CManagerWin32_Dtor`/`CManagerWin32_DtorBody` (0x55D8B0/0x55D5F0) | (done) run loop + main-worker ctor + worker & manager pairs (install/get/release with SEH refcount) + SEH dispose path (worker + CManagerWin32 deleting destructors + dtor bodies); next: fill in the remaining stub callees (sub_18F6CA0, sub_18F6C50, sub_18F8600, sub_615380) |
 | `save/`   | `SetSaveGamePath` (0x1A019B0) | (done) store the save path refcounted into `dword_1DBD06C` + getter; next: the actual load logic |
 | `framework/` | `ComputeExeDirectory` (0x1A02870), `ReleaseGlobalObject` (0x4017B0) | (done) exe-directory compute + `ExeDirectory()` getter + global shared-object release; the framework init/shutdown pair is complete |
 | `common/` | `LHAlloc`, `LHFree`, `SharedBufferAssign`, `SharedBufferFree`, `OutOfMemory` | (done) heap alloc/free + `F3SharedBuffer` counted buffer + OOM report handler; next: cross-module globals `byte_1DBD01B`, `byte_1C86BD9` |
