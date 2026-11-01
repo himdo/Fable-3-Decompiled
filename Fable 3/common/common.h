@@ -29,8 +29,10 @@ typedef struct F3SharedBuffer
 // failure (and with the verbose flag set) reports "LHBaseMemory::Alloc".
 void *LHAlloc(unsigned int size);
 
-// LHFree - the game heap free (counterpart to LHAlloc). Routes through the
-// allocator table's free slot.
+// LHFree (0x1A032C0) - the game heap free (counterpart to LHAlloc).
+// 11-byte thunk: ecx = dword_2075B24 (allocator table pointer), then
+// jmp [ecx+10h] with p as the first stack argument. Unconditional (the
+// underlying free(NULL) is a no-op).
 void LHFree(void *p);
 
 // SharedBufferAssign (0x403FE0) - assign (src, len) into the counted buffer at this_:

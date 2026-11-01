@@ -301,15 +301,6 @@ static void SetWorker(F3ObjReg *reg)
 }
 
 // ============================================================
-//  sub_1A032C0  (0x1A032C0)  -- free the SEH block (game heap free)
-// ============================================================
-static int sub_1A032C0(void *block)
-{
-    LHFree(block);
-    return 0;
-}
-
-// ============================================================
 //  GetWorker  (0x18F6A40 - 0x18F6A46)  -- return the current worker
 //  [NOT byte-identical] placement-independent but references the high-VA
 //  global dword_20FC8F0 (0x020FC8F0) not present in this build.
@@ -422,7 +413,7 @@ static int sub_615340(void) { return 0; }
 //    3. Clears the game buffer and loads a shared-memory blob named after the
 //       exe (-=[SMS_<exename>_SMS]=-). If the blob is missing, shows a message
 //       box and ExitProcess(1).
-//    4. Runs the game (sub_61C530, sub_61CB70) and sets the exit code
+//    4. Runs the game (CGameEngineCtor, sub_61CB70) and sets the exit code
 //       (dword_1DBD00C), then cleans up (sub_61C670, sub_401700).
 // ============================================================
 
@@ -635,10 +626,319 @@ static void *HeapStressTest(void)
     }
     return g_head;
 }
+// ============================================================
+//  CGameVersion  -- the version sub-object (92 bytes)
+//
+//  Embedded at +0xEC of CGameEngine. Holds three self-linked node
+//  lists: each list slot at +0x08 / +0x24 / +0x40 gets a 4-byte heap
+//  node that back-references the slot, a 12-byte self-linked sentinel
+//  block stored as the list head (+0x14), and a zero count (+0x18).
+//  The lists therefore sit at +0x1C/+0x20, +0x38/+0x3C, +0x54/+0x58.
+// ============================================================
+typedef struct CGameVersion
+{
+    void *   vtable;       // +0x00  single-slot vftable (0x1AF4F00)
+    char     flag;         // +0x04  zeroed by CGameVersionReset
+    char     _pad1[3];     // +0x05 .. +0x08
+    void *   node1;        // +0x08  4-byte heap node -> this+8
+    char     _pad2[16];    // +0x0C .. +0x1C
+    void *   list1Head;    // +0x1C  12-byte self-linked sentinel block
+    void *   list1Count;   // +0x20  node count
+    void *   node2;        // +0x24  4-byte heap node -> this+0x24
+    char     _pad3[16];    // +0x28 .. +0x38
+    void *   list2Head;    // +0x38
+    void *   list2Count;   // +0x3C
+    void *   node3;        // +0x40  4-byte heap node -> this+0x40
+    char     _pad4[16];    // +0x44 .. +0x54
+    void *   list3Head;    // +0x54
+    void *   list3Count;   // +0x58
+} CGameVersion;
+
+// Compile-time check: the sub-object must be exactly 92 bytes.
+typedef char CGameVersionSizeCheck[(sizeof(CGameVersion) == 92) ? 1 : -1];
+
+// CGameVersion vftable (0x1AF4F00): the original's single slot points to
+// sub_72EDB0, which is not implemented yet (never invoked by the code paths
+// built so far), so the slot is a placeholder.
+static void *g_CGameVersionVtable[1] = { 0 };
+
+// ============================================================
+//  CGameVersionReset  (0x72DC80 - 0x72DD06)  -- reset the version lists
+//  [NOT byte-identical] placement-dependent (relative calls to LHFree).
+//
+//  void *CGameVersionReset(void *obj)
+//
+//  Zeroes the +4 flag byte, then resets each of the three node lists to
+//  empty: re-links the sentinel (head.next = head.prev = head), zeroes the
+//  count, and LHFrees every list node (the sentinel itself is kept). The
+//  return value (the third list's sentinel) is discarded by the sole caller.
+// ============================================================
+static void *CGameVersionReset(void *obj)
+{
+    char *base = (char *)obj;
+    int   heads[3] = { 0x1C, 0x38, 0x54 };
+
+    base[4] = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        void *head = *(void **)(base + heads[i]);
+        void *node = *(void **)head;
+        *(void **)head               = head;
+        *(void **)((char *)head + 4) = head;
+        *(void **)(base + heads[i] + 4) = 0;
+        while (node != head)
+        {
+            void *next = *(void **)node;
+            LHFree(node);
+            node = next;
+        }
+    }
+    return *(void **)(base + 0x54);
+}
+
+// ============================================================
+//  CGameVersionCtor  (0x72DD10 - 0x72DDDA)  -- construct a CGameVersion
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc).
+//
+//  void *CGameVersionCtor(void *obj)
+//
+//  Stores the vtable, then for each list slot (+0x08, +0x24, +0x40):
+//  allocates a 4-byte heap node that back-references the slot, allocates a
+//  12-byte self-linked sentinel block, stores it as the list head and zeroes
+//  the count. Finally runs CGameVersionReset. Returns this.
+// ============================================================
+static void *CGameVersionCtor(void *obj)
+{
+    char *base = (char *)obj;
+    int   slots[3] = { 0x08, 0x24, 0x40 };
+
+    *(void **)base = g_CGameVersionVtable;
+    for (int i = 0; i < 3; i++)
+    {
+        void *node = LHAlloc(4);
+        if (node)
+            *(void **)node = base + slots[i];
+        *(void **)(base + slots[i]) = node;
+
+        void *head = LHAlloc(12);
+        if (head)
+            *(void **)head = head;
+        if ((char *)head + 4 != (void *)0)
+            *(void **)((char *)head + 4) = head;
+        *(void **)(base + slots[i] + 0x14) = head;
+        *(void **)(base + slots[i] + 0x18) = 0;
+    }
+
+    CGameVersionReset(obj);
+    return obj;
+}
+
+// ============================================================
+//  CGameEngineSubCtor  (0x623360 - 0x6233D4)  -- construct the +0xC8 sub-object
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc).
+//
+//  void *CGameEngineSubCtor(void *obj, void *a2, void *a3)
+//
+//  The two stack arguments are unused by the callee (the original cleans
+//  them with `retn 8`; the caller passes the address of a 1-byte stack
+//  local for both). Allocates a 4-byte heap node back-referencing the
+//  sub-object (stored at +0), plus a 44-byte block whose first three words
+//  self-link into an empty list and whose bytes +0x28/+0x29 are set to 1
+//  (flag bytes); the block pointer is stored at +0x18 with the +0x1C count
+//  zeroed. Returns this (the caller discards it).
+// ============================================================
+static void *CGameEngineSubCtor(void *obj, void *a2, void *a3)
+{
+    char *sub;
+    char *block;
+
+    (void)a2;
+    (void)a3;
+    sub = (char *)obj;
+
+    void *node = LHAlloc(4);
+    if (node)
+        *(void **)node = obj;
+    *(void **)sub = node;
+
+    block = (char *)LHAlloc(44);
+    if (block != (void *)0)
+        *(void **)block = 0;
+    if (block + 4 != (void *)0)
+        *(void **)(block + 4) = 0;
+    if (block + 8 != (void *)0)
+        *(void **)(block + 8) = 0;
+    block[41] = 0;
+    block[40] = 1;
+    *(void **)(sub + 0x18) = block;
+    block[41] = 1;
+    *(void **)(block + 4) = block;
+    *(void **)block       = block;
+    *(void **)(block + 8) = block;
+    *(void **)(sub + 0x1C) = 0;
+    return obj;
+}
+
+// ============================================================
+//  CGameEngine  -- the 356-byte game engine object
+//
+//  Lives in a 356-byte stack buffer inside GameThread (ArgList in IDA).
+//  Constructed by CGameEngineCtor, run by sub_61CB70, torn down by
+//  sub_61C670. The current instance is published into the global
+//  dword_1DBD9DC (read back by the getter sub_619A90). Layout:
+//    +0x00  heapNode    4-byte heap node back-referencing the object
+//    +0x14  node list   first / count / last / sentinel
+//    +0x30  sub-object  node + members, critical section at +0x48
+//    +0x48  cs1         CRITICAL_SECTION (24 bytes)
+//    +0x60  cs2         CRITICAL_SECTION (24 bytes)
+//    +0x78  ..          object-pointer members zeroed by the ctor
+//    +0xC8  sub-object  CGameEngineSubCtor (node at +0xC8, 44-byte block at +0xE0)
+//    +0xEC  version     CGameVersion sub-object (92 bytes)
+//    +0x148 cs3         CRITICAL_SECTION (24 bytes)
+//    +0x160 trailing byte
+// ============================================================
+typedef struct CGameEngine
+{
+    void *           heapNode;      // +0x00
+    char             _pad1[16];     // +0x04 .. +0x14
+    void *           listFirst;     // +0x14
+    void *           listCount;     // +0x18
+    void *           listLast;      // +0x1C
+    void *           listSentinel;  // +0x20
+    char             _pad2[12];     // +0x24 .. +0x30 (bytes +0x24/+0x25 zeroed by the ctor)
+    void *           sub0x30Node;   // +0x30  4-byte heap node -> this+0x30
+    char             _pad3[8];      // +0x34 .. +0x3C
+    void *           sub0x30A;      // +0x3C
+    void *           sub0x30B;      // +0x40
+    void *           sub0x30C;      // +0x44
+    CRITICAL_SECTION cs1;           // +0x48 .. +0x5F
+    CRITICAL_SECTION cs2;           // +0x60 .. +0x77
+    void *           member0x78;    // +0x78
+    void *           member0x7C;    // +0x7C
+    void *           member0x80;    // +0x80
+    char             member0x84;    // +0x84
+    char             _pad4[3];      // +0x85 .. +0x88
+    void *           member0x88;    // +0x88
+    void *           member0x8C;    // +0x8C
+    void *           member0x90;    // +0x90
+    void *           member0x94;    // +0x94
+    void *           member0x98;    // +0x98
+    void *           member0x9C;    // +0x9C
+    void *           member0xA0;    // +0xA0
+    void *           member0xA4;    // +0xA4
+    void *           member0xA8;    // +0xA8
+    void *           member0xAC;    // +0xAC
+    void *           member0xB0;    // +0xB0
+    void *           member0xB4;    // +0xB4
+    void *           member0xB8;    // +0xB8
+    void *           member0xBC;    // +0xBC
+    void *           member0xC0;    // +0xC0
+    char             member0xC4;    // +0xC4
+    char             _pad5[3];      // +0xC5 .. +0xC8
+    void *           sub0xC8Node;   // +0xC8
+    char             _pad6[12];     // +0xCC .. +0xD8
+    char             _pad7[8];      // +0xD8 .. +0xE0
+    void *           sub0xE0Block;  // +0xE0  the 44-byte block
+    void *           sub0xE4Count;  // +0xE4
+    void *           member0xE8;    // +0xE8
+    CGameVersion     version;       // +0xEC .. +0x147
+    CRITICAL_SECTION cs3;           // +0x148 .. +0x15F
+    char             member0x160;   // +0x160
+    char             _pad8[3];      // +0x161 .. +0x164
+} CGameEngine;
+
+// Compile-time check: the object must be exactly 356 bytes (the ArgList buffer).
+typedef char CGameEngineSizeCheck[(sizeof(CGameEngine) == 356) ? 1 : -1];
+
+// 0x1DBD9DC: the current game engine object (set by CGameEngineCtor, cleared by the dtor).
+static void *g_GameEngine = 0;
+
+// ============================================================
+//  CGameEngineCtor  (0x61C530 - 0x61C66C)  -- construct the game engine
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc,
+//  the CS init thunk, CGameEngineSubCtor, CGameVersionCtor) and it writes
+//  the high-VA global dword_1DBD9DC.
+//
+//  void *CGameEngineCtor(void *obj)
+//
+//  Initializes the 356-byte CGameEngine in place: the back-referencing
+//  heap node (+0x00), the self-linked node list (+0x14, sentinel at +0x20,
+//  last = the node), the +0x30 sub-object, the critical sections at +0x48
+//  and +0x60, the zeroed object-pointer members (+0x78..+0xC4), the +0xC8
+//  sub-object (CGameEngineSubCtor), the CGameVersion at +0xEC, the third
+//  critical section at +0x148, and the trailing byte. Publishes the object
+//  into dword_1DBD9DC. Returns this.
+// ============================================================
+static void *CGameEngineCtor(void *obj)
+{
+    CGameEngine *g    = (CGameEngine *)obj;
+    char        *base = (char *)obj;
+    char         tmp;    // the original passes its address (twice) to CGameEngineSubCtor
+
+    g->heapNode = LHAlloc(4);
+    if (g->heapNode)
+        *(void **)g->heapNode = obj;
+
+    void *head = LHAlloc(12);
+    if (head)
+        *(void **)head = head;
+    if ((char *)head + 4 != (void *)0)
+        *(void **)((char *)head + 4) = head;
+    g->listFirst    = head;
+    g->listCount    = 0;
+    g->listLast     = 0;
+    g->listSentinel = head;
+    g->listLast     = g->heapNode;
+
+    base[0x24] = 0;
+    base[0x25] = 0;
+
+    g->sub0x30Node = LHAlloc(4);
+    if (g->sub0x30Node)
+        *(void **)g->sub0x30Node = base + 0x30;
+    g->sub0x30A = 0;
+    g->sub0x30B = 0;
+    g->sub0x30C = 0;
+
+    InitializeCriticalSection(&g->cs1);
+    InitializeCriticalSection(&g->cs2);
+
+    g->member0x78 = 0;
+    g->member0x7C = 0;
+    g->member0x80 = 0;
+    g->member0x84 = 0;
+    g->member0x88 = 0;
+    g->member0x8C = 0;
+    g->member0x90 = 0;
+    g->member0x94 = 0;
+    g->member0x98 = 0;
+    g->member0x9C = 0;
+    g->member0xA0 = 0;
+    g->member0xA4 = 0;
+    g->member0xA8 = 0;
+    g->member0xAC = 0;
+    g->member0xB0 = 0;
+    g->member0xB4 = 0;
+    g->member0xB8 = 0;
+
+    g->member0xBC = 0;
+    g->member0xC0 = 0;
+    g->member0xC4 = 0;
+
+    CGameEngineSubCtor(base + 0xC8, &tmp, &tmp);
+
+    g->member0xE8 = 0;
+    CGameVersionCtor(&g->version);
+
+    InitializeCriticalSection(&g->cs3);
+    g->member0x160 = 0;
+
+    g_GameEngine = obj;   // dword_1DBD9DC
+    return obj;
+}
 static void *sub_619AA0(void) { return g_gameBuffer; }                  // get the game buffer
 static const wchar_t *sub_19FF570(void *obj) { (void)obj; return L""; } // get a string
 static int   *sub_6195C0(int a1) { (void)a1; return 0; }                // get an object
-static void *sub_61C530(void *obj) { return obj; }                      // init the game (ArgList)
 static int   sub_61CB70(void *argList, int a2) { (void)argList; (void)a2; return 1; }  // run the game (success)
 static void  sub_61BE00(void *obj) { (void)obj; }                       // cleanup (part 1)
 static void  sub_61AE70(void *obj) { (void)obj; }                       // cleanup (part 2)
@@ -775,7 +1075,7 @@ void GameThread(void *a1)
 
     // 8. Run the game.
     char ArgList[356];
-    sub_61C530(ArgList);
+    CGameEngineCtor(ArgList);
     if (sub_61CB70(ArgList, arg) != 0)
     {
         sub_61BE00(ArgList);
@@ -839,7 +1139,7 @@ int RunGame(int hInstance, char *lpCmdLine, int nShowCmd)
     if (lpAddend != 0 && InterlockedDecrement(&lpAddend->refcount) == 0)
     {
         lpAddend->handler(lpAddend->arg);
-        sub_1A032C0(lpAddend);
+        LHFree(lpAddend);
     }
 
     // 5. Register the worker-thread callbacks (on the current worker).

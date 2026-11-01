@@ -14,14 +14,15 @@
 #endif
 
 // ---- custom heap allocator table (dword_2075B24) --------------------------
-// Function-pointer table the engine uses for all heap traffic. Only the two
-// slots the current code touches are backed by real (malloc/free) routines;
-// the rest are left null. Layout (x86, 4-byte slots):
+// Function-pointer table the engine uses for all heap traffic (the object
+// pointer is stored in the global at 0x02075B24). Only the two slots the
+// current code touches are backed by real (malloc/free) routines; the rest
+// are left null. Layout (x86, 4-byte slots):
 //   +0  (unused here)
 //   +4  (unused here)
 //   +8  allocate(size)      <- LHAlloc calls this
 //   +12 (unused here)
-//   +16 free(ptr)           <- SharedBufferAssign / SharedBufferFree call this
+//   +16 free(ptr)           <- LHFree / SharedBufferAssign / SharedBufferFree
 static void *f3_heap_alloc(unsigned int size) { return malloc(size); }
 static void  f3_heap_free(void *p) { free(p); }
 typedef struct F3HeapTable
@@ -98,12 +99,21 @@ void *LHAlloc(unsigned int size)
 }
 
 // ============================================================
-//  LHFree  -- the game heap free (counterpart to LHAlloc)
+//  LHFree  (0x1A032C0 - 0x1A032CB)  -- the game heap free (counterpart to
+//  LHAlloc)
+//  [NOT byte-identical] placement-independent, but refs the heap-table
+//  pointer global (0x02075B24) at the original high VA not present in this
+//  build.
+//
+//  void LHFree(void *p)
+//
+//  11-byte thiscall thunk: `mov ecx, dword_2075B24; mov edx, [ecx+10h];
+//  jmp edx` -- calls the allocator table's free member with p as the first
+//  stack argument. Unconditional; the underlying free(NULL) is a no-op.
 // ============================================================
 void LHFree(void *p)
 {
-    if (p != 0)
-        g_heapTable.free(p);
+    g_heapTable.free(p);
 }
 
 // ============================================================
