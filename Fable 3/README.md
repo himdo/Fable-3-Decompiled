@@ -49,7 +49,11 @@ engine/                     game engine init + main run loop  [growing]
                             CWorkerWin32_DtorBody (0x55D930) — worker dtor body
                             CManagerWin32_Dtor (0x55D8B0) — CManagerWin32 deleting destructor
                             CManagerWin32_DtorBody (0x55D5F0) — CManagerWin32 dtor body
-                            (+ stub callees: sub_615380, sub_18F6CA0, sub_18F6C50, sub_18F8600, ...)
+                            GameThread (0x615380) — game thread entry point (implemented)
+                            SetDebugTrace (0x1A02E20) — register CDebugTraceFable (CS-protected)
+                            ReleaseObjectPair (0x403220) — release a global object pair
+                            HeapStressTest (0x18986E0) — engine heap sanity check (1000 alloc/free)
+                            (+ stub callees: sub_18F6CA0, sub_18F6C50, sub_18F8600, sub_6195C0, ...)
 
 save/                       save-game loading  [growing]
   save.h
@@ -87,7 +91,7 @@ independent. The current state of the implemented functions:
 | `ReleaseGlobalObject` (0x4017B0) | 71 | no | Placement-independent, but refs the heap table (0x02075B24), `lpAddend` (0x020B6008), and the `InterlockedDecrement` IAT slot (0x01AD52FC) at original high VAs. |
 | `GetWorker` (0x18F6A40) | 6 | no | Placement-independent, but refs the high-VA global `dword_20FC8F0` (0x020FC8F0) not present in the build. |
 | `GetManager` (0x18F8750) | 6 | no | Placement-independent, but refs the high-VA global `dword_20FC8C4` (0x020FC8C4) not present in the build. |
-| `FrameworkInit`, `FrameworkShutdown`, `ComputeExeDirectory`, `LHAlloc`, `SharedBufferAssign`, `OutOfMemory`, `RunGame`, `CWorkerWin32Ctor`, `CWorkerWin32_Dtor`, `CWorkerWin32_DtorBody`, `CManagerWin32_Dtor` (0x55D8B0), `CManagerWin32_DtorBody` (0x55D5F0), `SetSaveGamePath`, `SetWorker` (0x18F6FC0), `ReleaseWorkerPair` (0x55DB10), `SetManager` (0x18F87E0), `ReleaseManagerPair` (0x55D7C0) | — | no | Placement-dependent (relative calls to callees/CRT). |
+| `FrameworkInit`, `FrameworkShutdown`, `ComputeExeDirectory`, `LHAlloc`, `SharedBufferAssign`, `OutOfMemory`, `RunGame`, `GameThread` (0x615380), `CWorkerWin32Ctor`, `CWorkerWin32_Dtor`, `CWorkerWin32_DtorBody`, `CManagerWin32_Dtor` (0x55D8B0), `CManagerWin32_DtorBody` (0x55D5F0), `SetSaveGamePath`, `SetWorker` (0x18F6FC0), `ReleaseWorkerPair` (0x55DB10), `SetManager` (0x18F87E0), `ReleaseManagerPair` (0x55D7C0), `SetDebugTrace` (0x1A02E20), `ReleaseObjectPair` (0x403220), `HeapStressTest` (0x18986E0) | — | no | Placement-dependent (relative calls to callees/CRT). |
 
 To byte-match the placement-independent functions that reference IAT/data
 globals, those globals must be placed at their original VAs (a PE
@@ -99,7 +103,7 @@ that it is worth doing.
 
 | Module    | Entry (IDA)          | What to add |
 |-----------|----------------------|-------------|
-| `engine/` | `RunGame` (0x615740), `CWorkerWin32Ctor` (0x18F7040), `SetWorker`/`GetWorker`/`ReleaseWorkerPair` (0x18F6FC0/0x18F6A40/0x55DB10), `SetManager`/`GetManager`/`ReleaseManagerPair` (0x18F87E0/0x18F8750/0x55D7C0), `DisposeWorker` (0x615880), `DisposeManager` (0x615850), `CWorkerWin32_Dtor`/`CWorkerWin32_DtorBody` (0x55D8F0/0x55D930), `CManagerWin32_Dtor`/`CManagerWin32_DtorBody` (0x55D8B0/0x55D5F0) | (done) run loop + main-worker ctor + worker & manager pairs (install/get/release with SEH refcount) + SEH dispose path (worker + CManagerWin32 deleting destructors + dtor bodies); next: fill in the remaining stub callees (sub_18F6CA0, sub_18F6C50, sub_18F8600, sub_615380) |
+| `engine/` | `RunGame` (0x615740), `GameThread` (0x615380), `CWorkerWin32Ctor` (0x18F7040), `SetWorker`/`GetWorker`/`ReleaseWorkerPair` (0x18F6FC0/0x18F6A40/0x55DB10), `SetManager`/`GetManager`/`ReleaseManagerPair` (0x18F87E0/0x18F8750/0x55D7C0), `SetDebugTrace` (0x1A02E20), `ReleaseObjectPair` (0x403220), `HeapStressTest` (0x18986E0), `DisposeWorker` (0x615880), `DisposeManager` (0x615850), `CWorkerWin32_Dtor`/`CWorkerWin32_DtorBody` (0x55D8F0/0x55D930), `CManagerWin32_Dtor`/`CManagerWin32_DtorBody` (0x55D8B0/0x55D5F0) | (done) run loop + game thread + main-worker ctor + worker & manager pairs + CDebugTraceFable registration (CS-protected) + heap sanity check + SEH dispose path; next: fill in the remaining stub callees (sub_18F6CA0, sub_18F6C50, sub_18F8600, sub_6195C0, ...) |
 | `save/`   | `SetSaveGamePath` (0x1A019B0) | (done) store the save path refcounted into `dword_1DBD06C` + getter; next: the actual load logic |
 | `framework/` | `ComputeExeDirectory` (0x1A02870), `ReleaseGlobalObject` (0x4017B0) | (done) exe-directory compute + `ExeDirectory()` getter + global shared-object release; the framework init/shutdown pair is complete |
 | `common/` | `LHAlloc`, `LHFree`, `SharedBufferAssign`, `SharedBufferFree`, `OutOfMemory` | (done) heap alloc/free + `F3SharedBuffer` counted buffer + OOM report handler; next: cross-module globals `byte_1DBD01B`, `byte_1C86BD9` |

@@ -60,6 +60,19 @@ typedef struct F3ObjReg
 static F3ObjReg g_WorkerPair;
 // dword_20FC8C4 / dword_20FC8C8: the current manager + its SEH cleanup block.
 static F3ObjReg g_ManagerPair;
+// dword_20B600C / dword_20B6010: the CDebugTraceFable object + its SEH block.
+static F3ObjReg g_DebugTracePair;
+
+// stru_20B6014: the critical section shared by the "register / release object"
+// helpers (sub_1A02DD0, sub_1A02DA0, SetDebugTrace/sub_1A02E20, sub_1A030A0, ...) that all
+// lock the same mutex before touching their global object pair.
+static CRITICAL_SECTION g_ObjectRegistryCS;
+struct ObjectRegistryCsInit
+{
+    ObjectRegistryCsInit()  { InitializeCriticalSection(&g_ObjectRegistryCS); }
+    ~ObjectRegistryCsInit() { DeleteCriticalSection(&g_ObjectRegistryCS); }
+};
+static ObjectRegistryCsInit g_ObjectRegistryCsInit;
 
 // ============================================================
 //  CWorkerWin32  -- the main worker object (NSystem::CWorkerWin32, 664 bytes)
@@ -537,10 +550,91 @@ static void *sub_1A00C30(void *obj)
     InterlockedIncrement(&g_Addend);   // &Addend (worker refcount)
     return obj;
 }
-static void  sub_1A02E20(F3ObjReg *reg) { (void)reg; }               // register CDebugTraceFable
+// ============================================================
+//  ReleaseObjectPair  (0x00403220 - 0x00403262)  -- release a global object pair
+//  [NOT byte-identical] placement-dependent (relative call to the heap free).
+//
+//  void ReleaseObjectPair(void *pair)  (pair = &F3ObjReg)
+//
+//  General-purpose release used by the critical-section-protected "register
+//  object" helpers. Decrement the SEH block's refcount; when it reaches zero
+//  invoke handler(arg) and free the block via the game heap. Then clear both
+//  words. Structurally identical to ReleaseWorkerPair / ReleaseManagerPair.
+// ============================================================
+static void ReleaseObjectPair(void *pair)
+{
+    F3ObjReg *p    = (F3ObjReg *)pair;
+    F3SehBlock *sb = (F3SehBlock *)p->sehBlock;
+
+    if (sb != 0 && InterlockedDecrement(&sb->refcount) == 0)
+    {
+        sb->handler(sb->arg);
+        LHFree(sb);
+    }
+    p->object   = 0;
+    p->sehBlock = 0;
+}
+
+// ============================================================
+//  SetDebugTrace  (0x1A02E20 - 0x1A02E6C)  -- register the CDebugTraceFable
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  ReleaseObjectPair, InterlockedIncrement and the critical-section helpers).
+//
+//  void SetDebugTrace(F3ObjReg *reg)
+//
+//  Critical-section-protected setter for the CDebugTraceFable global pair. If
+//  the incoming SEH block differs from the current one, release the old pair,
+//  store the new (object, SEH block), and take a reference on the new SEH block
+//  so the global pair owns it. (Sole caller: GameThread.)
+// ============================================================
+static void SetDebugTrace(F3ObjReg *reg)
+{
+    EnterCriticalSection(&g_ObjectRegistryCS);
+    if (g_DebugTracePair.sehBlock != reg->sehBlock)
+    {
+        ReleaseObjectPair(&g_DebugTracePair);
+        g_DebugTracePair.object   = reg->object;
+        g_DebugTracePair.sehBlock = reg->sehBlock;
+        if (reg->sehBlock != 0)
+            InterlockedIncrement(&((F3SehBlock *)reg->sehBlock)->refcount);
+    }
+    LeaveCriticalSection(&g_ObjectRegistryCS);
+}
 // The game buffer (0x6C4 bytes) that the shared-memory blob is loaded into.
 static char g_gameBuffer[0x6C4];
-static void *sub_18986E0(void) { return 0; }                            // engine init
+// ============================================================
+//  HeapStressTest  (0x18986E0 - 0x189888C)  -- engine heap sanity check
+//  [NOT byte-identical] placement-dependent (relative call to LHAlloc,
+//  indirect heap frees, /GS stack cookie, 0x3E8-iteration loops).
+//
+//  void *HeapStressTest(void)
+//
+//  The engine's heap self-test: allocate 1000 (0x3E8) 16-byte blocks and free
+//  them all again, stressing the allocator. The original builds an intrusive
+//  doubly-linked list over the blocks (list head embedded at offset 4 of each
+//  block, first block held in the global dword_20B5FC8) and tears it down by
+//  removing the head and tail block each iteration, freeing the head before the
+//  tail -- which yields the exact allocation/free sequence reproduced here.
+//  The return value is discarded by the sole caller (GameThread).
+// ============================================================
+static void *HeapStressTest(void)
+{
+    static void *g_head = 0;        // dword_20B5FC8: first allocated block
+    void        *blocks[0x3E8];     // the 1000 blocks (the list is internal)
+
+    for (int i = 0; i < 0x3E8; i++)
+        blocks[i] = LHAlloc(16);
+    g_head = blocks[0];
+
+    // Remove head + tail each iteration (head freed before tail): the free
+    // order is N1, N1000, N2, N999, ..., N500, N501.
+    for (int k = 1; k <= 0x1F4; k++)   // 0x1F4 = 500 iterations
+    {
+        LHFree(blocks[k - 1]);         // head block (Nk)
+        LHFree(blocks[0x3E8 - k]);     // tail block (N(1001-k))
+    }
+    return g_head;
+}
 static void *sub_619AA0(void) { return g_gameBuffer; }                  // get the game buffer
 static const wchar_t *sub_19FF570(void *obj) { (void)obj; return L""; } // get a string
 static int   *sub_6195C0(int a1) { (void)a1; return 0; }                // get an object
@@ -619,11 +713,11 @@ void GameThread(void *a1)
         sb->handler  = sub_615870;
         sb->arg      = (int)reg3.object;
     }
-    sub_1A02E20(&reg3);
+    SetDebugTrace(&reg3);
     F3ReleaseSehRef(reg3.sehBlock);
 
-    // 5. Engine init + clear the game buffer.
-    sub_18986E0();
+    // 5. Heap sanity check + clear the game buffer.
+    HeapStressTest();
     if (sub_619AA0() != 0)
         memset(sub_619AA0(), 0, 0x6C4);
 
