@@ -20,8 +20,8 @@ long SetManager(F3ObjReg *reg);
 // by the SEH block when its refcount reaches zero; calls vtable[0](obj, 1).
 int DisposeManager(int arg);
 
-// sub_18F7160 (0x18F7160) - NSystem::CManagerWin32 constructor (48-byte
+// CManagerWin32Ctor (0x18F7160) - NSystem::CManagerWin32 constructor (48-byte
 // object): vtable, critical section at +8, zeroed members at +32..+44.
-void *sub_18F7160(void *obj);
+void *CManagerWin32Ctor(void *obj);
 
 #endif  // F3_MANAGER_H

@@ -11,7 +11,7 @@
 #include "common/common.h"        // LHAlloc / LHFree
 #include "save/save.h"            // SetSaveGamePath
 #include "object_registry.h"      // F3ObjReg / SetDebugTrace / F3ReleaseSehRef
-#include "manager.h"              // SetManager / DisposeManager / sub_18F7160
+#include "manager.h"              // SetManager / DisposeManager / CManagerWin32Ctor
 #include "gameengine.h"           // CGameEngineCtor
 #include "gamemain.h"             // RunFrontEnd
 
@@ -173,10 +173,10 @@ void GameThread(void *a1)
     }
     SetDebugHandler(&reg1);   // register the CFableWindowsDebugHandler (0x1A02DD0)
 
-    // 3. 48-byte object (sub_18F7160) + SEH block (DisposeManager); release local.
+    // 3. 48-byte object (CManagerWin32Ctor) + SEH block (DisposeManager); release local.
     F3ObjReg reg2;
     reg2.object = LHAlloc(48);
-    reg2.object = reg2.object ? sub_18F7160(reg2.object) : 0;
+    reg2.object = reg2.object ? CManagerWin32Ctor(reg2.object) : 0;
     reg2.sehBlock = 0;
     if (reg2.object && (reg2.sehBlock = LHAlloc(12)) != 0)
     {

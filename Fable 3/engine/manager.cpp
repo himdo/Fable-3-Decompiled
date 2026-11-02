@@ -97,18 +97,28 @@ static void *g_CManagerWin32Vtable[16] = {
 };
 
 // ============================================================
-//  sub_18F7160  (0x18F7160)  -- NSystem::CManagerWin32 constructor
+//  CManagerWin32Ctor  (0x18F7160 - 0x18F718E)  -- NSystem::CManagerWin32
+//  constructor
+//  [NOT byte-identical] placement-independent, but refs the two class
+//  vftables (CManagerBase 0x01BE7340 / CManagerWin32 0x01BE737C) and the
+//  InitializeCriticalSection IAT slot (0x01AD531C) at original high VAs not
+//  present in this build.
+//
+//  Construct the 48-byte CManagerWin32: set the vtable (the base CManagerBase
+//  vftable first, then the derived CManagerWin32 vftable), initialize the
+//  CRITICAL_SECTION at +8, and zero the members at +0x20/+0x24 (dwords) and
+//  +0x28/+0x29/+0x2C (bytes; +0x2A/+0x2B left untouched). Returns obj (this).
 // ============================================================
-void *sub_18F7160(void *obj)
+void *CManagerWin32Ctor(void *obj)
 {
     char *p = (char *)obj;
     *(void **)p = g_CManagerWin32Vtable;   // vtable (base set first, then win32)
     InitializeCriticalSection((CRITICAL_SECTION *)(p + 8));
-    *(int *)(p + 32) = 0;
-    *(int *)(p + 36) = 0;
-    p[40] = 0;
-    p[41] = 0;
-    p[44] = 0;
+    *(int *)(p + 32) = 0;   // +0x20
+    *(int *)(p + 36) = 0;   // +0x24
+    p[40] = 0;              // +0x28
+    p[41] = 0;              // +0x29
+    p[44] = 0;              // +0x2C
     return p;
 }
 
@@ -116,7 +126,7 @@ void *sub_18F7160(void *obj)
 //  [BYTE-IDENTICAL]  DisposeManager  (0x00615850 - 0x00615860)  -- SEH handler
 //
 //  Invoked by the SEH block (for the 48-byte NSystem::CManagerWin32 object
-//  created by sub_18F7160) when its refcount reaches zero. It calls the
+//  created by CManagerWin32Ctor) when its refcount reaches zero. It calls the
 //  object's first virtual method (vtable[0], the scalar-deleting destructor)
 //  with argument 1:
 //      if (obj != 0) return obj->vtable[0](obj, 1);

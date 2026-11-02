@@ -265,22 +265,158 @@ static void sub_18F82E0(CWorkerWin32 *obj) { (void)obj; }
 static void sub_18F8530(CWorkerWin32 *obj) { (void)obj; }
 
 // ============================================================
-//  [STUB]  sub_18F17B0  (0x18F17B0 - 0x18F1804)  -- shut the device down
-//  (the "shutdown state 3" step of PumpWorker)
-//
-//  __thiscall (worker in ECX). If byte_2075DDB (device-active flag) is set:
-//  sub_17D6510(worker) (device teardown), sub_17D1E60(), clear the flag.
-//  Then dword_1E2ED70 = dword_1E2ED6C = -1, sub_18F0E00(), sub_18F0C10(),
-//  sub_18F1760(), and if the device object dword_1E2EEF8 is set, invokes its
-//  second virtual method (vtable[1]) and clears it.
+//  Device-shutdown state (0x1E2E / 0x2075)  -- touched by ShutdownDevice
+//  (0x18F17B0). The original keeps these at the VAs noted; here they live as
+//  static globals in this module.
 // ============================================================
-static void sub_18F17B0(CWorkerWin32 *obj) { (void)obj; }
+static unsigned char g_byte_2075DDB = 0;   // 0x2075DDB  device-active flag
+static long          g_dword_1E2ED70 = 0;  // 0x1E2ED70  reset to -1 on shutdown
+static long          g_dword_1E2ED6C = 0;  // 0x1E2ED6C  reset to -1 on shutdown
+static DWORD         g_dword_1E2EEF8 = 0;  // 0x1E2EEF8  device object (vtable-backed)
+
+// ============================================================
+//  nvapi.dll interface subsystem state (0x1E2C / 0x1D94)  -- the init
+//  (sub_17D1D10) loads nvapi.dll, takes nvapi_QueryInterface, and resolves the
+//  before/after hooks; the unload (sub_17D1E60) clears the table and frees the
+//  library. The original keeps these at the VAs noted; here they live as
+//  static globals in this module. dword_1D94644 / byte_1D94648 are one
+//  12-byte slot (resolved entry + flag) of the 178-entry resolved-interface
+//  table at 0x1D941F4.
+// ============================================================
+static int (__cdecl *g_dword_1E2C708)(DWORD) = 0;               // 0x1E2C708  nvapi_QueryInterface resolver
+static int (__cdecl *g_dword_1E2C70C)(DWORD, int *) = 0;        // 0x1E2C70C  before-call hook
+static int (__cdecl *g_dword_1E2C710)(DWORD, int, int, int) = 0; // 0x1E2C710  after-call hook
+static int (__cdecl *g_dword_1D94644)(void) = 0;                // 0x1D94644  resolved entry for interface 0x2EC50C2B
+static unsigned char  g_byte_1D94648 = 0;                       // 0x1D94648  slot-resolved flag
+
+// ============================================================
+//  NvApiTeardownFlush  (0x17D6510 - 0x17D65BF)  -- device teardown flush
+//  (NVAPI interface 0x2EC50C2B)
+//  [NOT byte-identical] placement-independent body, but refs the nvapi.dll
+//  interface globals (dword_1E2C708 / dword_1E2C70C / dword_1E2C710) and the
+//  interface-table slot (dword_1D94644 / byte_1D94648) at their original
+//  high VAs.
+//
+//  int NvApiTeardownFlush(void)   -- no args
+//
+//  Lazily resolves NVAPI interface 0x2EC50C2B through the nvapi_QueryInterface
+//  resolver (dword_1E2C708) when the slot is empty and unresolved, caching the
+//  entry in the slot and setting the flag (even if the resolver returns NULL).
+//  Returns -3 if no entry is available. Otherwise runs the resolved entry,
+//  bracketed by the before-hook dword_1E2C70C(0x2EC50C2B, &pre) and the
+//  after-hook dword_1E2C710(0x2EC50C2B, pre, 0, result), and returns the
+//  entry's result. Called on the device-teardown path (ShutdownDevice) just
+//  before the nvapi.dll library is released (sub_17D1E60).
+// ============================================================
+static int NvApiTeardownFlush(void)
+{
+    int pre = 0;
+    int result;
+
+    if (g_dword_1E2C708 != 0 && g_dword_1D94644 == 0 && g_byte_1D94648 == 0)
+    {
+        g_dword_1D94644 = (int (__cdecl *)(void))g_dword_1E2C708(0x2EC50C2B);
+        g_byte_1D94648 = 1;
+    }
+    if (g_dword_1D94644 == 0)
+        return -3;
+    if (g_dword_1E2C70C != 0)
+        g_dword_1E2C70C(0x2EC50C2B, &pre);
+    result = g_dword_1D94644();
+    if (g_dword_1E2C710 != 0)
+        g_dword_1E2C710(0x2EC50C2B, pre, 0, result);
+    return result;
+}
+
+// ============================================================
+//  [STUB]  sub_17D1E60  (0x17D1E60 - 0x17D1F31)  -- release the device library
+//
+//  Resolves the teardown entry point via dword_1E2C708(-0x2DD5052A), runs it,
+//  then clears the 178-entry device table (dword_1D941F4 / byte_1D941F8),
+//  FreeLibrary(hLibModule), and clears the before/after hooks
+//  (dword_1E2C70C / dword_1E2C710). Returns 0 on success.
+// ============================================================
+static void sub_17D1E60(void) { }
+
+// ============================================================
+//  [STUB]  sub_18F0E00  (0x18F0E00 - 0x18F0E9B)  -- device teardown (per-slot)
+//
+//  Walks the 8-slot per-device table (dword_20FCA6C) at the current slot index
+//  (dword_2075F10); for each occupied slot issues a vtable call on the device
+//  object (dword_1E2EEF4) and releases the per-slot object (vtable[2]). Falls
+//  through to sub_18F0850() at the end.
+// ============================================================
+static void sub_18F0E00(void) { }
+
+// ============================================================
+//  [STUB]  sub_18F0C10  (0x18F0C10 - 0x18F0C6C)  -- device teardown (per-slot base)
+//
+//  Releases the base per-slot device (a vtable call on dword_1E2EEF4 plus the
+//  object at unk_20FCAE8 / slot index dword_2075F10), then calls sub_18F0710().
+// ============================================================
+static void sub_18F0C10(void) { }
+
+// ============================================================
+//  [STUB]  sub_18F1760  (0x18F1760 - 0x18F17A1)  -- device teardown (final)
+//
+//  If the device object (dword_1E2EEF4) is set: flush the pending flag
+//  (sub_5639E0 + clear dword_2075F00), run sub_18F1220(), invoke the device
+//  object's vtable[2] and clear the object pointer.
+// ============================================================
+static void sub_18F1760(void) { }
+
+// ============================================================
+//  ShutdownDevice  (0x18F17B0 - 0x18F1804)  -- shut the device down
+//  (the "shutdown state 3" step of PumpWorker)
+//  [NOT byte-identical] placement-dependent (relative calls to NvApiTeardownFlush /
+//  sub_17D1E60 / sub_18F0E00 / sub_18F0C10 / sub_18F1760) and refs the device
+//  globals byte_2075DDB, dword_1E2ED70, dword_1E2ED6C, dword_1E2EEF8 at their
+//  original high VAs.
+//
+//  int ShutdownDevice(CWorkerWin32 *obj)   -- __thiscall (worker in ECX)
+//
+//  If byte_2075DDB (device-active flag) is set: NvApiTeardownFlush() (device
+//  teardown flush), sub_17D1E60() (release the device library), clear the
+//  flag. Then dword_1E2ED70 = dword_1E2ED6C = -1, sub_18F0E00(),
+//  sub_18F0C10(), sub_18F1760() (per-slot / final device teardown), and if the
+//  device object dword_1E2EEF8 is set, invokes its third virtual method
+//  (vtable[2], stdcall with the object on the stack) and clears it. Returns
+//  the vtable[2] result (or 0).
+// ============================================================
+static int ShutdownDevice(CWorkerWin32 *obj)
+{
+    int result;
+
+    if (g_byte_2075DDB != 0)
+    {
+        NvApiTeardownFlush();
+        sub_17D1E60();
+        g_byte_2075DDB = 0;
+    }
+
+    g_dword_1E2ED70 = -1;
+    g_dword_1E2ED6C = -1;
+    sub_18F0E00();
+    sub_18F0C10();
+    sub_18F1760();
+
+    result = (int)g_dword_1E2EEF8;
+    if (g_dword_1E2EEF8 != 0)
+    {
+        void **vtable = *(void ***)g_dword_1E2EEF8;
+        typedef int (__stdcall *F3DeviceShutdownFn)(DWORD);
+        F3DeviceShutdownFn fn = (F3DeviceShutdownFn)vtable[2];
+        result = fn(g_dword_1E2EEF8);
+    }
+    g_dword_1E2EEF8 = 0;
+    return result;
+}
 
 // ============================================================
 //  PumpWorker  (0x18F8600 - 0x18F86A9)  -- one step of the worker's state
 //  machine, called on every iteration of RunGame's main pump loop
 //  [NOT byte-identical] placement-dependent (relative calls to sub_18F82E0 /
-//  sub_18F8530 / sub_18F17B0) and refs the EnterCriticalSection /
+//  sub_18F8530 / ShutdownDevice) and refs the EnterCriticalSection /
 //  LeaveCriticalSection / SetEvent / WaitForSingleObjectEx / WaitMessage IAT
 //  slots at their original high VAs.
 //
@@ -291,7 +427,7 @@ static void sub_18F17B0(CWorkerWin32 *obj) { (void)obj; }
 //             WaitForSingleObjectEx(event2, INFINITE, false), re-enter the CS
 //    state 2  leave the CS, WaitMessage() (sleep until a message arrives),
 //             re-enter the CS, drain the message queue (sub_18F8530), leave
-//    state 3  shut the device down (sub_18F17B0), reset the state to 0, leave
+//    state 3  shut the device down (ShutdownDevice), reset the state to 0, leave
 //    state 0  leave the CS (idle no-op)
 // ============================================================
 void PumpWorker(CWorkerWin32 *obj)
@@ -317,7 +453,7 @@ void PumpWorker(CWorkerWin32 *obj)
         LeaveCriticalSection(cs);
         return;
     case 3:
-        sub_18F17B0(obj);
+        ShutdownDevice(obj);
         obj->workerState = 0;
         LeaveCriticalSection(cs);
         return;
