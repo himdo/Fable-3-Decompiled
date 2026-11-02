@@ -5,7 +5,7 @@
 //   - constructs the 664-byte main worker object (CWorkerWin32Ctor)
 //   - builds a 12-byte SEH handler block (refcount / handler / arg)
 //   - registers the handler (sub_18F6FC0) then releases the local reference
-//   - registers two worker-thread callbacks (sub_6152F0, sub_615340)
+//   - registers two worker-thread callbacks (OnCreateDevice, OnResetDevice)
 //   - spawns the game thread (_beginthread(sub_615380, 0x40000, lpCmdLine))
 //   - pumps (sub_18F6A40 / sub_18F8600) while the thread is running
 //   - returns the global dword_1DBD00C as the process exit code
@@ -33,6 +33,10 @@ static DWORD g_dword_1DBD00C = 0;
 
 // A callback the engine invokes on its worker threads.
 typedef int (*F3CallbackFn)(void);
+
+// A __thiscall "set worker callback" method (worker in ECX, callback on the
+// stack, callee cleans the arg via ret 4) used to install a worker callback.
+typedef F3CallbackFn (__thiscall *F3ThiscallSetFn)(void *, F3CallbackFn);
 
 // The 12-byte SEH / exception-handler control block:
 //   +0  refcount  reference count (Interlocked)
@@ -100,7 +104,11 @@ typedef struct CWorkerWin32
     int              _pad5;         // +556
     int              hInstance;     // +560
     int              nShowCmd;      // +564
-    char             _pad6[88];     // +568 .. +656
+    char             _pad6a[32];    // +568 .. +600
+    F3CallbackFn     onCreateDevice; // +600 (0x258) on-create-device callback
+    char             _pad6b1[16];   // +604 .. +620
+    F3CallbackFn     onResetDevice; // +620 (0x26C) on-reset-device callback
+    char             _pad6b2[32];   // +624 .. +656
     double           timing;        // +656 .. +664
 } CWorkerWin32;
 
@@ -384,18 +392,134 @@ void *GetManager(void)
 }
 
 // ============================================================
-//  sub_18F6CA0 / sub_18F6C50  -- register a worker-thread callback
-//  [STUB] __thiscall on the current worker (worker in ECX, callback on stack).
+//  SetOnCreateDevice  (0x18F6CA0 - 0x18F6CAD)  -- set the worker's
+//  on-create-device callback (the worker field at +0x258)
+//
+//  [BYTE-IDENTICAL]  A __thiscall + retn 4 hybrid: the worker is in ECX and
+//  the callback is a stack arg the callee cleans (ret 4). It stores the
+//  callback in the worker's onCreateDevice field and returns it. The caller
+//  must dispatch it as a __thiscall function (see the F3ThiscallSetFn cast
+//  in RunGame) so that it cleans the arg itself.
+//
+//  F3CallbackFn SetOnCreateDevice(CWorkerWin32 *worker, F3CallbackFn cb)
 // ============================================================
-static int sub_18F6CA0(void *worker, F3CallbackFn cb) { (void)worker; (void)cb; return 0; }
-static int sub_18F6C50(void *worker, F3CallbackFn cb) { (void)worker; (void)cb; return 0; }
+static __declspec(naked) F3CallbackFn SetOnCreateDevice(void *worker, F3CallbackFn cb)
+{
+    __asm {
+        mov    eax, [esp+4]      ; eax = cb
+        mov    [ecx+258h], eax   ; worker->onCreateDevice = cb
+        ret    4                 ; return cb, clean up the stack arg
+    }
+}
 
 // ============================================================
-//  sub_6152F0 / sub_615340  -- worker-thread callbacks
-//  [STUB]
+//  SetOnResetDevice  (0x18F6C50 - 0x18F6C5D)  -- set the worker's
+//  on-reset-device callback (the worker field at +0x26C)
+//
+//  [BYTE-IDENTICAL]  A __thiscall + retn 4 hybrid, the sibling of
+//  SetOnCreateDevice (0x18F6CA0): the worker is in ECX and the callback is
+//  a stack arg the callee cleans (ret 4). It stores the callback in the
+//  worker's onResetDevice field and returns it. The caller must dispatch
+//  it as a __thiscall function (see the F3ThiscallSetFn cast in RunGame).
+//
+//  F3CallbackFn SetOnResetDevice(CWorkerWin32 *worker, F3CallbackFn cb)
 // ============================================================
-static int sub_6152F0(void) { return 0; }
-static int sub_615340(void) { return 0; }
+static __declspec(naked) F3CallbackFn SetOnResetDevice(void *worker, F3CallbackFn cb)
+{
+    __asm {
+        mov    eax, [esp+4]      ; eax = cb
+        mov    [ecx+26Ch], eax   ; worker->onResetDevice = cb
+        ret    4                 ; return cb, clean up the stack arg
+    }
+}
+
+// ============================================================
+//  XLO (Xbox Live On) device callbacks
+//
+//  RunGame registers two no-arg callbacks on the current worker
+//  (CWorkerWin32): OnCreateDevice (field +0x258, via SetOnCreateDevice) and
+//  OnResetDevice (field +0x26C, via SetOnResetDevice). The XLO layer
+//  invokes them when a device is created / reset; each forwards to the
+//  corresponding XDK XLiveOn* import, passing the current device object
+//  (dword_1E2EEF4) and a copy of the game's 56-byte device-caps block
+//  (dword_1E2ED80, reached in the original through the sub_18F01A0 getter).
+// ============================================================
+
+// 0x1E2EEF4: the current XLO device object (a vtable-backed pointer; the
+// on-create-device callback passes its value straight to XLiveOnCreateDevice).
+static DWORD g_dword_1E2EEF4 = 0;
+
+// 0x1E2ED80: the 56-byte (14 DWORD) XLO device-caps block. The callbacks copy
+// this into a local buffer before handing it to the XDK.
+static DWORD g_dword_1E2ED80[14];
+
+typedef struct F3XloDeviceCaps { DWORD field[14]; } F3XloDeviceCaps;
+typedef char F3XloDeviceCapsSizeCheck[(sizeof(F3XloDeviceCaps) == 56) ? 1 : -1];
+
+// XLiveOnCreateDevice -- XDK (Xbox 360) import (IAT thunk 0x17D1A54 ->
+// __imp_XLiveOnCreateDevice). Not present in a PC build, so stub it. Returns
+// the created-device result (DWORD). First arg is the device object value
+// (dword_1E2EEF4); second is the 56-byte caps block.
+static DWORD XLiveOnCreateDevice(DWORD device, F3XloDeviceCaps *caps)
+{
+    (void)device; (void)caps;
+    return 0;
+}
+
+// XLiveOnResetDevice -- XDK (Xbox 360) import (IAT thunk 0x17D1A5A ->
+// __imp_XLiveOnResetDevice). Not present in a PC build, so stub it.
+// Takes the 56-byte device-caps block.
+static DWORD XLiveOnResetDevice(F3XloDeviceCaps *caps)
+{
+    (void)caps;
+    return 0;
+}
+
+// ============================================================
+//  OnCreateDevice  (0x006152F0 - 0x00615336)  -- the worker's
+//  on-create-device callback
+//
+//  [NOT byte-identical] placement-dependent (relative calls to the
+//  sub_18F01A0 caps getter, the XLiveOnCreateDevice IAT thunk, and
+//  __security_check_cookie) and reads the original security-cookie + data
+//  globals at their high VAs.
+//
+//  int OnCreateDevice(void)
+//
+//  Invoked by the XLO layer when a device is created. It:
+//    1. Reads the current device object (dword_1E2EEF4).
+//    2. Copies the 56-byte device-caps block (dword_1E2ED80, via the
+//       sub_18F01A0 getter) onto the stack.
+//    3. Returns XLiveOnCreateDevice(device, caps).
+// ============================================================
+static int OnCreateDevice(void)
+{
+    F3XloDeviceCaps caps;
+    memcpy(&caps, g_dword_1E2ED80, sizeof(caps));   // == sub_18F01A0()
+    return (int)XLiveOnCreateDevice(g_dword_1E2EEF4, &caps);
+}
+
+// ============================================================
+//  OnResetDevice  (0x00615340 - 0x0061537D)  -- the worker's
+//  on-reset-device callback
+//
+//  [NOT byte-identical] placement-dependent (relative calls to the
+//  sub_18F01A0 caps getter, the XLiveOnResetDevice IAT thunk, and
+//  __security_check_cookie) and reads the original security-cookie at
+//  its high VA.
+//
+//  int OnResetDevice(void)
+//
+//  Invoked by the XLO layer when a device is reset. It copies the
+//  56-byte device-caps block (dword_1E2ED80, via the sub_18F01A0
+//  getter) onto the stack and returns XLiveOnResetDevice(caps).
+// ============================================================
+static int OnResetDevice(void)
+{
+    F3XloDeviceCaps caps;
+    memcpy(&caps, g_dword_1E2ED80, sizeof(caps));   // == sub_18F01A0()
+    return (int)XLiveOnResetDevice(&caps);
+}
 
 // ============================================================
 //  GameThread  (0x00615380 - 0x00615740)  -- the game thread entry point
@@ -429,8 +553,23 @@ static void *g_CFableWindowsDebugHandlerVtable[4] = { 0 };
 static void *g_CDebugTraceFableVtable[4]          = { 0 };
 
 // ---- SEH handlers for the three objects (called when their refcount hits 0) ----
-// sub_401D20 (0x401D20): tail call to the heap free -- frees the debug handler.
-static int sub_401D20(int arg) { LHFree((void *)arg); return 0; }
+// ============================================================
+//  LHFreeHandler  (0x00401D20 - 0x00401D2B)  -- SEH cleanup handler that
+//  frees its object on the game heap
+//  [NOT byte-identical] placement-independent, but refs the heap table
+//  (0x02075B24) at the original high VA not present in this build.
+//
+//  int LHFreeHandler(int obj)
+//
+//  Byte-identical to LHFree (0x1A032C0): the 11-byte thunk
+//  `mov ecx, dword_2075B24; mov edx, [ecx+10h]; jmp edx` that tail-calls
+//  the heap table's free slot. Stored as the `handler` of a 12-byte SEH
+//  block ({ refcount, handler, arg }); when the block's refcount hits 0
+//  the engine calls handler(arg), freeing `arg` via the game heap.
+//  Referenced by GameThread (0x615380, CFableWindowsDebugHandler pair)
+//  and by sub_42DE70 (generic object + SEH-block registration).
+// ============================================================
+static int LHFreeHandler(int arg) { LHFree((void *)arg); return 0; }
 // ============================================================
 //  [BYTE-IDENTICAL]  DisposeManager  (0x00615850 - 0x00615860)  -- SEH handler
 //
@@ -965,7 +1104,7 @@ void GameThread(void *a1)
     sub_18C5840("GameThread");   // set the thread name
     FrameworkInit();
 
-    // 2. Debug handler (4-byte) + SEH block (sub_401D20). The SEH block is
+    // 2. Debug handler (4-byte) + SEH block (LHFreeHandler). The SEH block is
     //    kept (released at the end by sub_401700), not released here.
     F3ObjReg reg1;
     reg1.object = LHAlloc(4);
@@ -976,7 +1115,7 @@ void GameThread(void *a1)
     {
         F3SehBlock *sb = (F3SehBlock *)reg1.sehBlock;
         sb->refcount = 1;
-        sb->handler  = sub_401D20;
+        sb->handler  = LHFreeHandler;
         sb->arg      = (int)reg1.object;
     }
     sub_1A02DD0(&reg1);
@@ -1143,8 +1282,10 @@ int RunGame(int hInstance, char *lpCmdLine, int nShowCmd)
     }
 
     // 5. Register the worker-thread callbacks (on the current worker).
-    sub_18F6CA0(GetWorker(), sub_6152F0);
-    sub_18F6C50(GetWorker(), sub_615340);
+    //    Both setters are __thiscall + retn 4 hybrids, so dispatch them
+    //    through a __thiscall function pointer (the callee cleans the arg).
+    ((F3ThiscallSetFn)SetOnCreateDevice)(GetWorker(), OnCreateDevice);
+    ((F3ThiscallSetFn)SetOnResetDevice)(GetWorker(), OnResetDevice);
 
     // 6. Spawn the game thread (0x40000-byte stack).
     HANDLE hThread = (HANDLE)_beginthread(GameThread, 0x40000u, lpCmdLine);

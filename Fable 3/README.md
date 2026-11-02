@@ -59,7 +59,12 @@ engine/                     game engine init + main run loop  [growing]
                             CGameEngineSubCtor (0x623360) — ctor of the engine's +0xC8 sub-object
                             CGameVersionCtor (0x72DD10) — construct the 92-byte CGameVersion sub-object
                             CGameVersionReset (0x72DC80) — reset CGameVersion's node lists
-                            (+ stub callees: sub_18F6CA0, sub_18F6C50, sub_18F8600, sub_6195C0, ...)
+                            SetOnCreateDevice (0x18F6CA0) — set the worker's on-create-device callback [BYTE-IDENTICAL]
+                            OnCreateDevice (0x6152F0) — worker on-create-device callback (XLO)
+                            SetOnResetDevice (0x18F6C50) — set the worker's on-reset-device callback [BYTE-IDENTICAL]
+                            OnResetDevice (0x615340) — worker on-reset-device callback (XLO)
+                            LHFreeHandler (0x401D20) — SEH cleanup handler: frees its object via the game heap
+                            (+ stub callees: sub_18F8600, sub_6195C0, ...)
 
 save/                       save-game loading  [growing]
   save.h
@@ -92,8 +97,13 @@ independent. The current state of the implemented functions:
 |----------|------|-----------------|-----|
 | `DisposeWorker` (0x615880) | 17 | **YES** | Pure stack/register ops, no absolute refs or relative calls. `__declspec(naked)` inline asm. |
 | `DisposeManager` (0x615850) | 17 | **YES** | Byte-identical to `DisposeWorker` (same 17 bytes); disposes the 48-byte `CManagerWin32` via `vtable[0](obj,1)`. `__declspec(naked)` inline asm. |
+| `SetOnCreateDevice` (0x18F6CA0) | 13 | **YES** | `__thiscall` + `retn 4` hybrid (worker in ECX, callback on the stack, callee cleans via `ret 4`). Pure register/stack ops, no absolute refs or relative calls. `__declspec(naked)` inline asm; the caller dispatches it through a `__thiscall` function pointer (`F3ThiscallSetFn`). |
+| `OnCreateDevice` (0x6152F0) | 70 | no | Placement-dependent (relative calls to the `sub_18F01A0` caps getter, the `XLiveOnCreateDevice` IAT thunk, `__security_check_cookie`) and reads the original security-cookie + data globals (`dword_1E2EEF4`, `dword_1E2ED80`) at high VAs. The XDK `XLiveOnCreateDevice` import is stubbed for the PC build. |
+| `SetOnResetDevice` (0x18F6C50) | 13 | **YES** | `__thiscall` + `retn 4` hybrid, the sibling of `SetOnCreateDevice` (worker in ECX, callback on the stack, callee cleans via `ret 4`). Stores the callback in the worker's `onResetDevice` field (+0x26C). `__declspec(naked)` inline asm; the caller dispatches it through a `__thiscall` function pointer (`F3ThiscallSetFn`). |
+| `OnResetDevice` (0x615340) | 61 | no | Placement-dependent (relative calls to the `sub_18F01A0` caps getter, the `XLiveOnResetDevice` IAT thunk, `__security_check_cookie`) and reads the original security-cookie at its high VA. Copies the 56-byte device-caps block (`dword_1E2ED80`) onto the stack and forwards it to the stubbed XDK `XLiveOnResetDevice` import. |
 | `GetEngineTime` (0x18A88E0) | 99 | no | Placement-independent, but refs the `QueryPerformanceCounter` IAT slot (0x01AD50C8) and start globals (0x020B5FC0/0x020B5FB8) at original high VAs not present in the build. |
 | `LHFree` (0x1A032C0) | 11 | no | Placement-independent, but refs the heap-table pointer global (0x02075B24) at the original high VA. |
+| `LHFreeHandler` (0x401D20) | 11 | no | Byte-identical to `LHFree`; placement-independent, but refs the heap table (0x02075B24) at the original high VA. |
 | `SharedBufferFree` (0x403820) | 58 | no | Placement-independent, but refs the heap table (0x02075B24) at the original high VA. |
 | `ReleaseGlobalObject` (0x4017B0) | 71 | no | Placement-independent, but refs the heap table (0x02075B24), `lpAddend` (0x020B6008), and the `InterlockedDecrement` IAT slot (0x01AD52FC) at original high VAs. |
 | `GetWorker` (0x18F6A40) | 6 | no | Placement-independent, but refs the high-VA global `dword_20FC8F0` (0x020FC8F0) not present in the build. |
@@ -110,7 +120,7 @@ that it is worth doing.
 
 | Module    | Entry (IDA)          | What to add |
 |-----------|----------------------|-------------|
-| `engine/` | `RunGame` (0x615740), `GameThread` (0x615380), `CWorkerWin32Ctor` (0x18F7040), `SetWorker`/`GetWorker`/`ReleaseWorkerPair` (0x18F6FC0/0x18F6A40/0x55DB10), `SetManager`/`GetManager`/`ReleaseManagerPair` (0x18F87E0/0x18F8750/0x55D7C0), `SetDebugTrace` (0x1A02E20), `ReleaseObjectPair` (0x403220), `HeapStressTest` (0x18986E0), `DisposeWorker` (0x615880), `DisposeManager` (0x615850), `CWorkerWin32_Dtor`/`CWorkerWin32_DtorBody` (0x55D8F0/0x55D930), `CManagerWin32_Dtor`/`CManagerWin32_DtorBody` (0x55D8B0/0x55D5F0), `CGameEngineCtor` (0x61C530), `CGameEngineSubCtor` (0x623360), `CGameVersionCtor` (0x72DD10), `CGameVersionReset` (0x72DC80) | (done) run loop + game thread + main-worker ctor + worker & manager pairs + CDebugTraceFable registration (CS-protected) + heap sanity check + SEH dispose path + 356-byte game-engine ctor (with CGameVersion sub-object); next: fill in the remaining stub callees (sub_18F6CA0, sub_18F6C50, sub_18F8600, sub_6195C0, sub_61CB70, ...) |
+| `engine/` | `RunGame` (0x615740), `GameThread` (0x615380), `CWorkerWin32Ctor` (0x18F7040), `SetWorker`/`GetWorker`/`ReleaseWorkerPair` (0x18F6FC0/0x18F6A40/0x55DB10), `SetManager`/`GetManager`/`ReleaseManagerPair` (0x18F87E0/0x18F8750/0x55D7C0), `SetDebugTrace` (0x1A02E20), `ReleaseObjectPair` (0x403220), `HeapStressTest` (0x18986E0), `DisposeWorker` (0x615880), `DisposeManager` (0x615850), `CWorkerWin32_Dtor`/`CWorkerWin32_DtorBody` (0x55D8F0/0x55D930), `CManagerWin32_Dtor`/`CManagerWin32_DtorBody` (0x55D8B0/0x55D5F0), `CGameEngineCtor` (0x61C530), `CGameEngineSubCtor` (0x623360), `CGameVersionCtor` (0x72DD10), `CGameVersionReset` (0x72DC80), `SetOnCreateDevice` (0x18F6CA0), `OnCreateDevice` (0x6152F0), `SetOnResetDevice` (0x18F6C50), `OnResetDevice` (0x615340), `LHFreeHandler` (0x401D20) | (done) run loop + game thread + main-worker ctor + worker & manager pairs + CDebugTraceFable registration (CS-protected) + heap sanity check + SEH dispose path + 356-byte game-engine ctor (with CGameVersion sub-object) + worker on-create-device callback setter (byte-identical) + both XLO device callbacks (on-create and on-reset, setters byte-identical); next: fill in the remaining stub callees (sub_18F8600, sub_6195C0, sub_61CB70, ...) |
 | `save/`   | `SetSaveGamePath` (0x1A019B0) | (done) store the save path refcounted into `dword_1DBD06C` + getter; next: the actual load logic |
 | `framework/` | `ComputeExeDirectory` (0x1A02870), `ReleaseGlobalObject` (0x4017B0) | (done) exe-directory compute + `ExeDirectory()` getter + global shared-object release; the framework init/shutdown pair is complete |
 | `common/` | `LHAlloc` (0x1A035C0), `LHFree` (0x1A032C0), `SharedBufferAssign` (0x403FE0), `SharedBufferFree` (0x403820), `OutOfMemory` (0x1A034F0) | (done) heap alloc/free + `F3SharedBuffer` counted buffer + OOM report handler; next: cross-module globals `byte_1DBD01B`, `byte_1C86BD9` |
