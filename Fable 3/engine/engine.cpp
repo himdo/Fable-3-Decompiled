@@ -7,7 +7,7 @@
 //   - registers the handler (sub_18F6FC0) then releases the local reference
 //   - registers two worker-thread callbacks (OnCreateDevice, OnResetDevice)
 //   - spawns the game thread (_beginthread(sub_615380, 0x40000, lpCmdLine))
-//   - pumps (sub_18F6A40 / sub_18F8600) while the thread is running
+//   - pumps (GetWorker / PumpWorker) while the thread is running
 //   - returns the global dword_1DBD00C as the process exit code
 //
 // The rest of the engine lives in focused modules alongside this file:
@@ -33,15 +33,6 @@
 // 0x1DBD00C — the process exit code, returned by the main run loop.
 // (Set by GameThread, see gamethread.cpp.)
 DWORD g_dword_1DBD00C = 0;
-
-// ============================================================
-//  sub_18F8600  (0x18F8600)  -- per-frame engine pump
-//  [STUB]
-// ============================================================
-static void sub_18F8600(int a1)
-{
-    (void)a1;
-}
 
 // ============================================================
 //  RunGame  (0x00615740 - 0x006157F9)  -- engine init + main run loop
@@ -97,8 +88,7 @@ int RunGame(int hInstance, char *lpCmdLine, int nShowCmd)
     //    (WaitForSingleObject returns WAIT_TIMEOUT = 258 while it is alive).
     do
     {
-        int state = (int)GetWorker();
-        sub_18F8600(state);
+        PumpWorker((CWorkerWin32 *)GetWorker());
     }
     while (WaitForSingleObject(hThread, 0) == 258);
 

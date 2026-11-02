@@ -70,7 +70,6 @@ static int __declspec(naked) JmpLHFree(int)
 }
 
 // ---- other engine callees (stubs for now) -----------------------------------
-static void  sub_1A02DD0(F3ObjReg *reg) { (void)reg; }               // register debug handler
 // sub_1A00C30 (0x1A00C30): zero the save-path slot + bump the worker refcount.
 static void *sub_1A00C30(void *obj)
 {
@@ -163,7 +162,7 @@ void GameThread(void *a1)
         sb->handler  = LHFreeHandler;
         sb->arg      = (int)reg1.object;
     }
-    sub_1A02DD0(&reg1);
+    SetDebugHandler(&reg1);   // register the CFableWindowsDebugHandler (0x1A02DD0)
 
     // 3. 48-byte object (sub_18F7160) + SEH block (DisposeManager); release local.
     F3ObjReg reg2;

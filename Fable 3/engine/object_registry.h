@@ -56,6 +56,26 @@ void ReleaseObjectPair(void *pair);
 // (Sole caller: GameThread.)
 void SetDebugTrace(F3ObjReg *reg);
 
+// SetDebugHandler (0x1A02DD0 - 0x1A02E1C) -- register the
+// NDebug::NDebugManager::CFableWindowsDebugHandler
+// [NOT byte-identical] placement-dependent (relative call to
+// ReleaseObjectPair, plus the InterlockedIncrement / critical-section IAT slots
+// and the high-VA dword_20B6004 / lpAddend globals).
+//
+// void SetDebugHandler(F3ObjReg *reg)
+//
+// Critical-section-protected setter for the CFableWindowsDebugHandler global
+// pair (dword_20B6004 / lpAddend, 0x20B6008). If the incoming SEH block differs
+// from the current one, release the old pair, store the new (object, SEH block),
+// and take a reference on the new SEH block so the global pair owns it.
+// (Callers: GameThread 0x615412, sub_19D4FC0 0x19D517E.)
+void SetDebugHandler(F3ObjReg *reg);
+
+// GetDebugHandlerPair -- return the CFableWindowsDebugHandler global pair
+// (dword_20B6004 / lpAddend). Exposed so framework.cpp's ReleaseGlobalObject
+// releases the same pair it tears down at FrameworkShutdown.
+F3ObjReg *GetDebugHandlerPair(void);
+
 // Release a locally-held SEH reference; on zero invoke the handler and free.
 void F3ReleaseSehRef(void *sehBlock);
 

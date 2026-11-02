@@ -236,6 +236,98 @@ __declspec(naked) F3CallbackFn SetOnCreateDevice(void *worker, F3CallbackFn cb)
 }
 
 // ============================================================
+//  [STUB]  sub_18F82E0  (0x18F82E0 - 0x18F852D)  -- create / restore the
+//  worker window (the "window state 1" step of PumpWorker)
+//
+//  __thiscall (worker in ECX). Ensures the worker window is up (sub_18F7AE0
+//  creates it into worker->hwnd, +568), restores/resizes it (sub_18F28C0 /
+//  sub_18F2B30 with the cached size at +576/+580/+584, window style via
+//  SetWindowLongA GWLP_WNDPROC/GWLP_HINSTANCE + SetWindowPos), and on failure
+//  shows an error MessageBoxW (manager GetManager window, 0x10) and posts
+//  WM_CLOSE (0x10) to the window. Then sub_18F7E60(visible), ShowWindow(hwnd,
+//  nShowCmd), UpdateWindow, and finally invokes the worker's +600 callback
+//  (onCreateDevice) and sets the visible/ready bytes at +648/+649.
+// ============================================================
+static void sub_18F82E0(CWorkerWin32 *obj) { (void)obj; }
+
+// ============================================================
+//  [STUB]  sub_18F8530  (0x18F8530 - 0x18F85FB)  -- drain the worker's
+//  pending message queue (the "message state 2" step of PumpWorker)
+//
+//  Nonstandard caller convention: the worker pointer arrives in EDI (the
+//  decompiler recovers it as a1@<edi>). Loops while PeekMessageA(&msg,
+//  worker->hwnd (+568), 0, 0, PM_REMOVE) is true: leaves the CS, runs the
+//  +624 message-filter callback on the message (if it returns 0 or is
+//  absent), TranslateMessage + DispatchMessageA, and if worker->+641 is
+//  set, re-enters the CS and calls sub_18F8060 (the window resize handler)
+//  under it. Runs with the worker CS already held by PumpWorker.
+// ============================================================
+static void sub_18F8530(CWorkerWin32 *obj) { (void)obj; }
+
+// ============================================================
+//  [STUB]  sub_18F17B0  (0x18F17B0 - 0x18F1804)  -- shut the device down
+//  (the "shutdown state 3" step of PumpWorker)
+//
+//  __thiscall (worker in ECX). If byte_2075DDB (device-active flag) is set:
+//  sub_17D6510(worker) (device teardown), sub_17D1E60(), clear the flag.
+//  Then dword_1E2ED70 = dword_1E2ED6C = -1, sub_18F0E00(), sub_18F0C10(),
+//  sub_18F1760(), and if the device object dword_1E2EEF8 is set, invokes its
+//  second virtual method (vtable[1]) and clears it.
+// ============================================================
+static void sub_18F17B0(CWorkerWin32 *obj) { (void)obj; }
+
+// ============================================================
+//  PumpWorker  (0x18F8600 - 0x18F86A9)  -- one step of the worker's state
+//  machine, called on every iteration of RunGame's main pump loop
+//  [NOT byte-identical] placement-dependent (relative calls to sub_18F82E0 /
+//  sub_18F8530 / sub_18F17B0) and refs the EnterCriticalSection /
+//  LeaveCriticalSection / SetEvent / WaitForSingleObjectEx / WaitMessage IAT
+//  slots at their original high VAs.
+//
+//  __thiscall-style (worker in ECX, no stack args). Reads the pump state
+//  word at +556 (workerState) under the worker's critical section (+4):
+//    state 1  create/restore the worker window (sub_18F82E0), set the state
+//             to 2, signal event1 (+156), leave the CS, block on
+//             WaitForSingleObjectEx(event2, INFINITE, false), re-enter the CS
+//    state 2  leave the CS, WaitMessage() (sleep until a message arrives),
+//             re-enter the CS, drain the message queue (sub_18F8530), leave
+//    state 3  shut the device down (sub_18F17B0), reset the state to 0, leave
+//    state 0  leave the CS (idle no-op)
+// ============================================================
+void PumpWorker(CWorkerWin32 *obj)
+{
+    LPCRITICAL_SECTION cs = (LPCRITICAL_SECTION)&obj->cs;
+
+    EnterCriticalSection(cs);
+    switch (obj->workerState)
+    {
+    case 1:
+        sub_18F82E0(obj);
+        obj->workerState = 2;
+        SetEvent(obj->event1);
+        LeaveCriticalSection(cs);
+        WaitForSingleObjectEx(obj->event2, INFINITE, FALSE);
+        EnterCriticalSection(cs);
+        break;
+    case 2:
+        LeaveCriticalSection(cs);
+        WaitMessage();
+        EnterCriticalSection(cs);
+        sub_18F8530(obj);
+        LeaveCriticalSection(cs);
+        return;
+    case 3:
+        sub_18F17B0(obj);
+        obj->workerState = 0;
+        LeaveCriticalSection(cs);
+        return;
+    default:
+        break;
+    }
+    LeaveCriticalSection(cs);
+}
+
+// ============================================================
 //  SetOnResetDevice  (0x18F6C50 - 0x18F6C5D)  -- set the worker's
 //  on-reset-device callback (the worker field at +0x26C)
 //

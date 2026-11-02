@@ -41,7 +41,7 @@ typedef struct CWorkerWin32
     HANDLE           event3;        // +420
     char             _pad4[128];    // +424 .. +552
     HANDLE           event4;        // +552
-    int              _pad5;         // +556
+    int              workerState;   // +556 pump state (0 idle / 1 window / 2 message / 3 shutdown)
     int              hInstance;     // +560
     int              nShowCmd;      // +564
     char             _pad6a[32];    // +568 .. +600
@@ -76,6 +76,10 @@ void SetWorker(F3ObjReg *reg);
 // 0x18F6CA0 - set the worker's on-create-device callback [BYTE-IDENTICAL].
 // __thiscall + retn 4 hybrid: dispatch through F3ThiscallSetFn.
 F3CallbackFn SetOnCreateDevice(void *worker, F3CallbackFn cb);
+
+// 0x18F8600 - one step of the worker's state machine, called on every
+// iteration of RunGame's main pump loop. See worker.cpp.
+void PumpWorker(CWorkerWin32 *obj);
 
 // 0x18F6C50 - set the worker's on-reset-device callback [BYTE-IDENTICAL].
 // __thiscall + retn 4 hybrid: dispatch through F3ThiscallSetFn.

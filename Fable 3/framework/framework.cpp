@@ -7,6 +7,7 @@
 
 #include "framework.h"
 #include "common/common.h"
+#include "engine/object_registry.h"   // GetDebugHandlerPair / F3ObjReg / F3SehBlock
 
 #include <windows.h>
 #include <stdio.h>
@@ -23,22 +24,13 @@ static FILE *g_Stream        = 0;  // "Stream": global file stream (opened by th
 // files and save games.
 char g_ExeDirectory[0x107];
 
-// The 12-byte refcounted control block the global shared object points to:
-//   +0  refcount    reference count (Interlocked)
-//   +4  destructor  invoked as destructor(arg) when the count reaches zero
-//   +8  arg         the argument handed to the destructor
-typedef struct F3SharedObject
-{
-    volatile long refcount;
-    void (*destructor)(int);
-    int arg;
-} F3SharedObject;
-
-// 0x20B6004 + 0x20B6008 — the global shared object pair. `g_lpAddend` points to
-// a refcounted control block (see F3SharedObject); when its refcount reaches
-// zero the destructor is invoked and the block is freed (ReleaseGlobalObject).
-static DWORD          g_dword_20B6004 = 0;  // 0x20B6004
-static F3SharedObject *g_lpAddend     = 0;  // 0x20B6008: the global shared object
+// The global shared object pair (0x20B6004 + 0x20B6008) is the
+// NDebug::NDebugManager::CFableWindowsDebugHandler object + its SEH control
+// block, owned by engine/object_registry.cpp (GetDebugHandlerPair). It is
+// installed by SetDebugHandler (object_registry.cpp) and released here during
+// FrameworkShutdown. The 12-byte control block is an F3SehBlock { refcount,
+// handler, arg }: when its refcount reaches zero the handler is invoked and the
+// block is freed via the game heap (ReleaseGlobalObject below).
 
 // ============================================================
 //  ComputeExeDirectory  (0x01A02870 - 0x01A02937)  -- compute the exe directory
@@ -98,29 +90,34 @@ const char *ExeDirectory(void)
 //  table (0x02075B24), lpAddend (0x020B6008) and the InterlockedDecrement IAT slot
 //  (0x01AD52FC) at original high VAs not present in this build.
 //
-//  if (g_lpAddend != 0) {
-//      if (InterlockedDecrement(&g_lpAddend->refcount) == 0) {
-//          g_lpAddend->destructor(g_lpAddend->arg);   // invoke the destructor
-//          LHFree(g_lpAddend);                          // free the control block
+//  if (lpAddend != 0) {
+//      if (InterlockedDecrement(&lpAddend->refcount) == 0) {
+//          lpAddend->destructor(lpAddend->arg);       // invoke the destructor
+//          LHFree(lpAddend);                            // free the control block
 //      }
 //  }
-//  g_lpAddend = 0;  g_dword_20B6004 = 0;
+//  lpAddend = 0;  dword_20B6004 = 0;
 //  Returns the final refcount (0 when there was nothing to release).
+//
+//  Operates on the CFableWindowsDebugHandler global pair (dword_20B6004 /
+//  lpAddend), shared with object_registry.cpp via GetDebugHandlerPair().
 // ============================================================
 static int ReleaseGlobalObject(void)
 {
+    F3ObjReg   *pair = GetDebugHandlerPair();   // 0x20B6004 / lpAddend (0x20B6008)
+    F3SehBlock *sb   = (F3SehBlock *)pair->sehBlock;
     long result = 0;
-    if (g_lpAddend != 0)
+    if (sb != 0)
     {
-        result = InterlockedDecrement(&g_lpAddend->refcount);
+        result = InterlockedDecrement(&sb->refcount);
         if (result == 0)
         {
-            g_lpAddend->destructor(g_lpAddend->arg);
-            LHFree(g_lpAddend);
+            sb->handler(sb->arg);
+            LHFree(sb);
         }
     }
-    g_lpAddend = 0;
-    g_dword_20B6004 = 0;
+    pair->object   = 0;
+    pair->sehBlock = 0;
     return (int)result;
 }
 
