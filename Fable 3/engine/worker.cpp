@@ -277,17 +277,25 @@ static DWORD         g_dword_1E2EEF8 = 0;  // 0x1E2EEF8  device object (vtable-b
 // ============================================================
 //  nvapi.dll interface subsystem state (0x1E2C / 0x1D94)  -- the init
 //  (sub_17D1D10) loads nvapi.dll, takes nvapi_QueryInterface, and resolves the
-//  before/after hooks; the unload (sub_17D1E60) clears the table and frees the
-//  library. The original keeps these at the VAs noted; here they live as
-//  static globals in this module. dword_1D94644 / byte_1D94648 are one
-//  12-byte slot (resolved entry + flag) of the 178-entry resolved-interface
-//  table at 0x1D941F4.
+//  before/after hooks; the unload (NvApiTeardownUnload) clears the table and
+//  frees the library. The original keeps these at the VAs noted; here they
+//  live as static globals in this module.
 // ============================================================
+static HMODULE g_hLibModule = 0;                                // 0x1E2C704  nvapi.dll module handle (hLibModule)
 static int (__cdecl *g_dword_1E2C708)(DWORD) = 0;               // 0x1E2C708  nvapi_QueryInterface resolver
 static int (__cdecl *g_dword_1E2C70C)(DWORD, int *) = 0;        // 0x1E2C70C  before-call hook
 static int (__cdecl *g_dword_1E2C710)(DWORD, int, int, int) = 0; // 0x1E2C710  after-call hook
-static int (__cdecl *g_dword_1D94644)(void) = 0;                // 0x1D94644  resolved entry for interface 0x2EC50C2B
-static unsigned char  g_byte_1D94648 = 0;                       // 0x1D94648  slot-resolved flag
+
+//  178-entry resolved-interface table (0x1D941F4 - 0x1D94A08), 12 bytes per
+//  slot: resolved entry pointer at +0, resolved flag byte at +4. Slot 112 is
+//  dword_1D94644 / byte_1D94648 (NVAPI interface 0x2EC50C2B).
+struct F3NvApiSlot
+{
+    int (__cdecl *entry)(void);   // +0  resolved interface entry
+    unsigned char resolved;       // +4  slot-resolved flag
+    char pad[7];                  // +5  untouched by the game
+};
+static F3NvApiSlot g_dword_1D941F4[178];                         // 0x1D941F4  resolved-interface table
 
 // ============================================================
 //  NvApiTeardownFlush  (0x17D6510 - 0x17D65BF)  -- device teardown flush
@@ -306,37 +314,73 @@ static unsigned char  g_byte_1D94648 = 0;                       // 0x1D94648  sl
 //  bracketed by the before-hook dword_1E2C70C(0x2EC50C2B, &pre) and the
 //  after-hook dword_1E2C710(0x2EC50C2B, pre, 0, result), and returns the
 //  entry's result. Called on the device-teardown path (ShutdownDevice) just
-//  before the nvapi.dll library is released (sub_17D1E60).
+//  before the nvapi.dll library is released (NvApiTeardownUnload).
 // ============================================================
 static int NvApiTeardownFlush(void)
 {
     int pre = 0;
     int result;
+    F3NvApiSlot *slot = &g_dword_1D941F4[112];   // 0x1D94644 / 0x1D94648, interface 0x2EC50C2B
 
-    if (g_dword_1E2C708 != 0 && g_dword_1D94644 == 0 && g_byte_1D94648 == 0)
+    if (g_dword_1E2C708 != 0 && slot->entry == 0 && slot->resolved == 0)
     {
-        g_dword_1D94644 = (int (__cdecl *)(void))g_dword_1E2C708(0x2EC50C2B);
-        g_byte_1D94648 = 1;
+        slot->entry = (int (__cdecl *)(void))g_dword_1E2C708(0x2EC50C2B);
+        slot->resolved = 1;
     }
-    if (g_dword_1D94644 == 0)
+    if (slot->entry == 0)
         return -3;
     if (g_dword_1E2C70C != 0)
         g_dword_1E2C70C(0x2EC50C2B, &pre);
-    result = g_dword_1D94644();
+    result = slot->entry();
     if (g_dword_1E2C710 != 0)
         g_dword_1E2C710(0x2EC50C2B, pre, 0, result);
     return result;
 }
 
 // ============================================================
-//  [STUB]  sub_17D1E60  (0x17D1E60 - 0x17D1F31)  -- release the device library
+//  NvApiTeardownUnload  (0x17D1E60 - 0x17D1F31)  -- release the device library
+//  [NOT byte-identical] placement-dependent (long jumps to the common exit)
+//  and refs hLibModule (0x01E2C704), the nvapi globals (dword_1E2C708 /
+//  dword_1E2C70C / dword_1E2C710), the interface table (0x01D941F4), and the
+//  FreeLibrary IAT slot (0x01AD5154) at their original high VAs.
 //
-//  Resolves the teardown entry point via dword_1E2C708(-0x2DD5052A), runs it,
-//  then clears the 178-entry device table (dword_1D941F4 / byte_1D941F8),
-//  FreeLibrary(hLibModule), and clears the before/after hooks
+//  int NvApiTeardownUnload(void)   -- no args
+//
+//  Resolves the teardown entry (interface 0xD22BDD7E) through the
+//  nvapi_QueryInterface resolver and runs it; returns -4 if the library or
+//  resolver is gone, -3 if the entry will not resolve, and -1 if the entry
+//  reports failure. On success clears the resolver, zeroes every slot of the
+//  178-entry resolved-interface table (entry pointer + flag byte),
+//  FreeLibrary(hLibModule), and clears hLibModule plus the before/after hooks
 //  (dword_1E2C70C / dword_1E2C710). Returns 0 on success.
 // ============================================================
-static void sub_17D1E60(void) { }
+static int NvApiTeardownUnload(void)
+{
+    int i;
+    int (__cdecl *teardown)(void);
+
+    if (g_hLibModule == 0 || g_dword_1E2C708 == 0)
+        return -4;
+
+    teardown = (int (__cdecl *)(void))g_dword_1E2C708(0xD22BDD7E);
+    if (teardown == 0)
+        return -3;
+    if (teardown() != 0)
+        return -1;
+
+    g_dword_1E2C708 = 0;
+    for (i = 0; i < 178; ++i)
+    {
+        g_dword_1D941F4[i].entry = 0;
+        g_dword_1D941F4[i].resolved = 0;
+    }
+
+    FreeLibrary(g_hLibModule);
+    g_hLibModule = 0;
+    g_dword_1E2C70C = 0;
+    g_dword_1E2C710 = 0;
+    return 0;
+}
 
 // ============================================================
 //  [STUB]  sub_18F0E00  (0x18F0E00 - 0x18F0E9B)  -- device teardown (per-slot)
@@ -369,14 +413,14 @@ static void sub_18F1760(void) { }
 //  ShutdownDevice  (0x18F17B0 - 0x18F1804)  -- shut the device down
 //  (the "shutdown state 3" step of PumpWorker)
 //  [NOT byte-identical] placement-dependent (relative calls to NvApiTeardownFlush /
-//  sub_17D1E60 / sub_18F0E00 / sub_18F0C10 / sub_18F1760) and refs the device
+//  NvApiTeardownUnload / sub_18F0E00 / sub_18F0C10 / sub_18F1760) and refs the device
 //  globals byte_2075DDB, dword_1E2ED70, dword_1E2ED6C, dword_1E2EEF8 at their
 //  original high VAs.
 //
 //  int ShutdownDevice(CWorkerWin32 *obj)   -- __thiscall (worker in ECX)
 //
 //  If byte_2075DDB (device-active flag) is set: NvApiTeardownFlush() (device
-//  teardown flush), sub_17D1E60() (release the device library), clear the
+//  teardown flush), NvApiTeardownUnload() (release the device library), clear the
 //  flag. Then dword_1E2ED70 = dword_1E2ED6C = -1, sub_18F0E00(),
 //  sub_18F0C10(), sub_18F1760() (per-slot / final device teardown), and if the
 //  device object dword_1E2EEF8 is set, invokes its third virtual method
@@ -390,7 +434,7 @@ static int ShutdownDevice(CWorkerWin32 *obj)
     if (g_byte_2075DDB != 0)
     {
         NvApiTeardownFlush();
-        sub_17D1E60();
+        NvApiTeardownUnload();
         g_byte_2075DDB = 0;
     }
 
