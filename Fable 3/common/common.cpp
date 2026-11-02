@@ -39,6 +39,11 @@ static F3HeapTable g_heapTable = { 0, 0, f3_heap_alloc, 0, f3_heap_free };
 static BYTE  g_byte_2075B30  = 0;  // 0x2075B30: heap info initialized
 static DWORD g_dword_1DADD10 = 0;  // 0x1DADD10: verbose / OOM-report flag
 
+// 0x2075C48: global live-slot counter (the IDA name is "Addend"). Bumped by
+// InitSharedSlot and the worker ctor, dropped by ReleaseSharedSlot and the
+// worker dtor body. (Was worker.cpp; moved here with its slot ctor/dtor.)
+DWORD g_Addend = 0;
+
 // ============================================================
 //  OutOfMemory  (0x01A034F0 - 0x01A0356C)  -- report an out-of-memory condition
 //  [NOT byte-identical] placement-dependent (relative calls to swprintf_s, OutputDebugStringW, DebugBreak).
@@ -159,4 +164,31 @@ void SharedBufferFree(F3SharedBuffer *this_)
     this_->capacity &= 0x80000000u;
     this_->length   = 0;
     g_heapTable.free(this_);
+}
+
+// ============================================================
+//  InitSharedSlot  (0x1A00C30 - 0x1A00C48)  -- construct a (null) shared slot
+//  [NOT byte-identical] placement-independent (no relative calls / long jumps),
+//  but refs the high-VA global g_Addend (0x02075C48) and the
+//  InterlockedIncrement IAT slot (0x01AD52F8) at original high VAs not present
+//  in this build.
+//
+//  F3SharedBuffer ** __thiscall InitSharedSlot(F3SharedBuffer **obj)
+//
+//  The shared-slot constructor: null the slot (it holds no buffer yet) and
+//  register the slot in the global live-slot count (g_Addend), then return the
+//  slot. Called from ~1588 sites in the original to initialize the single-word
+//  F3SharedBuffer * slots embedded in classes (e.g. CDebugTraceFable's string
+//  member at +4, the global save-path slot) and on the stack. Its matching
+//  destructor is ReleaseSharedSlot (sub_1A01320), which releases the buffer and
+//  drops the counter. __thiscall in the original: the slot pointer (obj) is in
+//  ECX and returned in EAX, with no stack arguments (plain `retn`); declared
+//  here as a plain free function to match the project convention for
+//  non-byte-identical thiscall methods.
+// ============================================================
+F3SharedBuffer ** InitSharedSlot(F3SharedBuffer **obj)
+{
+    *obj = 0;
+    InterlockedIncrement(&g_Addend);
+    return obj;
 }

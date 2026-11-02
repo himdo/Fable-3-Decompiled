@@ -44,4 +44,17 @@ void SharedBufferAssign(F3SharedBuffer *this_, const char *src, unsigned int len
 // length, set the capacity flag, then free the control block itself.
 void SharedBufferFree(F3SharedBuffer *this_);
 
+// 0x2075C48 - global live-object count for the shared slots below (the IDA
+// name is "Addend"): InitSharedSlot bumps it, ReleaseSharedSlot drops it; the
+// worker ctor / dtor body do as well.
+extern DWORD g_Addend;
+
+// InitSharedSlot (0x1A00C30) - construct a (null) shared slot and register it
+// in the live-slot count. __thiscall in the original: the slot pointer is in
+// ECX and is returned in EAX (no stack args). Declared here as a plain free
+// function (the `obj` parameter is the slot pointer, the thiscall `this`),
+// matching the project convention for non-byte-identical thiscall methods.
+// The matching destructor is ReleaseSharedSlot (0x1A01320).
+F3SharedBuffer ** InitSharedSlot(F3SharedBuffer **obj);
+
 #endif  // F3_COMMON_H

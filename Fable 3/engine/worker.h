@@ -55,10 +55,6 @@ typedef struct CWorkerWin32
 // Compile-time check: the object must be exactly 664 bytes (LHAlloc(664)).
 typedef char CWorkerWin32SizeCheck[(sizeof(CWorkerWin32) == 664) ? 1 : -1];
 
-// 0x2075C48: worker reference count (bumped by CWorkerWin32Ctor / sub_1A00C30,
-// dropped by the worker dtor body).
-extern DWORD g_Addend;
-
 // CWorkerWin32Ctor (0x18F7040) -- construct the main worker (see worker.cpp).
 void *CWorkerWin32Ctor(void *obj, int hInstance, int nShowCmd);
 

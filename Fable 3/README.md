@@ -33,12 +33,15 @@ common/                     engine-wide memory / buffer helpers
                             LHFree (0x1A032C0, heap free),
                             SharedBufferAssign (0x403FE0, buffer assign),
                             SharedBufferFree (0x403820, buffer free),
+                            InitSharedSlot (0x1A00C30) — shared-slot ctor (+ g_Addend counter)
                             F3SharedBuffer struct
 
 engine/                     game engine init + main run loop  [growing]
   engine.h                  public engine API (RunGame + the module headers below)
   engine.cpp                RunGame (0x615740) — implemented (run loop + thread)
   worker.h / worker.cpp     CWorkerWin32Ctor (0x18F7040) — main-worker ctor
+                            (+ the live-slot counter g_Addend (0x2075C48) now lives in common/,
+                             with InitSharedSlot / ReleaseSharedSlot, its primary users)
                             GetEngineTime (0x18A88E0) — seconds since engine start
                             CWorkerWin32_Dtor (0x55D8F0) / _DtorBody (0x55D930) — dtor
                             DisposeWorker (0x615880) — SEH dispose handler [BYTE-IDENTICAL]
@@ -114,10 +117,11 @@ independent. The current state of the implemented functions:
 | `SetThreadName` (0x18C5840) | 131 | no | Placement-dependent: refs the compiler-generated SEH scope table (`stru_1C7F160`) + EH4 scope handler (0x152ECE0), the original /GS security cookie, and the `RaiseException` IAT slot (0x01AD51B0) at their original high VAs. |
 | `SharedBufferFree` (0x403820) | 58 | no | Placement-independent, but refs the heap table (0x02075B24) at the original high VA. |
 | `ReleaseGlobalObject` (0x4017B0) | 71 | no | Placement-independent, but refs the heap table (0x02075B24), `lpAddend` (0x020B6008), and the `InterlockedDecrement` IAT slot (0x01AD52FC) at original high VAs. |
+| `InitSharedSlot` (0x1A00C30) | 24 | no | Placement-independent (no relative calls / long jumps), but refs the live-slot counter `g_Addend` (0x02075C48) and the `InterlockedIncrement` IAT slot (0x01AD52F8) at original high VAs. |
 | `GetWorker` (0x18F6A40) | 6 | no | Placement-independent, but refs the high-VA global `dword_20FC8F0` (0x020FC8F0) not present in the build. |
 | `GetManager` (0x18F8750) | 6 | no | Placement-independent, but refs the high-VA global `dword_20FC8C4` (0x020FC8C4) not present in the build. |
 | `PumpWorker` (0x18F8600) | 169 | no | Placement-dependent (relative calls to `sub_18F82E0` / `sub_18F8530` / `sub_18F17B0`) and refs the `EnterCriticalSection` / `LeaveCriticalSection` / `SetEvent` / `WaitForSingleObjectEx` / `WaitMessage` IAT slots at their original high VAs. |
-| `FrameworkInit`, `FrameworkShutdown`, `ComputeExeDirectory`, `LHAlloc`, `SharedBufferAssign`, `OutOfMemory`, `RunGame`, `GameThread` (0x615380), `CWorkerWin32Ctor`, `CWorkerWin32_Dtor`, `CWorkerWin32_DtorBody`, `CManagerWin32_Dtor` (0x55D8B0), `CManagerWin32_DtorBody` (0x55D5F0), `SetSaveGamePath`, `SetWorker` (0x18F6FC0), `ReleaseWorkerPair` (0x55DB10), `SetManager` (0x18F87E0), `ReleaseManagerPair` (0x55D7C0), `SetDebugTrace` (0x1A02E20), `SetDebugHandler` (0x1A02DD0), `ReleaseObjectPair` (0x403220), `HeapStressTest` (0x18986E0), `CGameEngineCtor` (0x61C530), `CGameEngineSubCtor` (0x623360), `CGameVersionCtor` (0x72DD10), `CGameVersionReset` (0x72DC80) | — | no | Placement-dependent (relative calls to callees/CRT). `CGameEngineCtor` also writes the high-VA global `dword_1DBD9DC`. |
+| `FrameworkInit`, `FrameworkShutdown`, `ComputeExeDirectory`, `LHAlloc`, `SharedBufferAssign`, `InitSharedSlot` (0x1A00C30), `OutOfMemory`, `RunGame`, `GameThread` (0x615380), `CWorkerWin32Ctor`, `CWorkerWin32_Dtor`, `CWorkerWin32_DtorBody`, `CManagerWin32_Dtor` (0x55D8B0), `CManagerWin32_DtorBody` (0x55D5F0), `SetSaveGamePath`, `SetWorker` (0x18F6FC0), `ReleaseWorkerPair` (0x55DB10), `SetManager` (0x18F87E0), `ReleaseManagerPair` (0x55D7C0), `SetDebugTrace` (0x1A02E20), `SetDebugHandler` (0x1A02DD0), `ReleaseObjectPair` (0x403220), `HeapStressTest` (0x18986E0), `CGameEngineCtor` (0x61C530), `CGameEngineSubCtor` (0x623360), `CGameVersionCtor` (0x72DD10), `CGameVersionReset` (0x72DC80) | — | no | Placement-dependent (relative calls to callees/CRT). `CGameEngineCtor` also writes the high-VA global `dword_1DBD9DC`. |
 
 To byte-match the placement-independent functions that reference IAT/data
 globals, those globals must be placed at their original VAs (a PE

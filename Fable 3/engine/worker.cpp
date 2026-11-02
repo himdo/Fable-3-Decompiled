@@ -4,8 +4,8 @@
 #include "worker.h"
 #include "common/common.h"
 
-// 0x2075C48: worker reference count
-DWORD g_Addend = 0;
+// g_Addend (0x2075C48, the live-slot counter) now lives in common/common.cpp
+// alongside InitSharedSlot / ReleaseSharedSlot, its primary users.
 
 // dword_20FC8F0 / dword_20FC8F4: the current worker + its SEH cleanup block.
 static F3ObjReg g_WorkerPair;

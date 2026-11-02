@@ -70,13 +70,6 @@ static int __declspec(naked) JmpLHFree(int)
 }
 
 // ---- other engine callees (stubs for now) -----------------------------------
-// sub_1A00C30 (0x1A00C30): zero the save-path slot + bump the worker refcount.
-static void *sub_1A00C30(void *obj)
-{
-    *(void **)obj = 0;                 // this[0] = 0 (clear the save-path slot)
-    InterlockedIncrement(&g_Addend);   // &Addend (worker refcount, see worker.h)
-    return obj;
-}
 static void *sub_619AA0(void) { return g_gameBuffer; }                  // get the game buffer
 static const wchar_t *sub_19FF570(void *obj) { (void)obj; return L""; } // get a string
 static int   *sub_6195C0(int a1) { (void)a1; return 0; }                // get an object
@@ -185,7 +178,7 @@ void GameThread(void *a1)
     if (reg3.object)
     {
         *(void **)reg3.object = g_CDebugTraceFableVtable;
-        sub_1A00C30((void *)((char *)reg3.object + 4));
+        InitSharedSlot((F3SharedBuffer **)((char *)reg3.object + 4));   // construct the +4 string slot
         SetSaveGamePath((F3SharedBuffer **)(char *)reg3.object + 1, "FTRACE");
     }
     reg3.sehBlock = 0;
