@@ -19,7 +19,7 @@
 #include "gamethread.h"
 
 // 0x1DBD00C — the process exit code, returned by the main run loop. Set by
-// GameThread once the game run (sub_61CB70) finishes.
+// GameThread once the game run (RunFrontEnd, 0x61CB70) finishes.
 extern DWORD g_dword_1DBD00C;
 
 // 0x615740 - engine init + main run loop. Allocates the 664-byte worker

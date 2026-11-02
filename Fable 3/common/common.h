@@ -57,14 +57,27 @@ extern DWORD g_Addend;
 // The matching destructor is ReleaseSharedSlot (0x1A01320).
 F3SharedBuffer ** InitSharedSlot(F3SharedBuffer **obj);
 
+// ReleaseSharedSlot (0x1A01320) - the shared-slot destructor (counterpart to
+// InitSharedSlot). Decrements the control block's refcount, frees the block
+// via SharedBufferFree on zero, nulls the slot, and drops the global
+// live-slot count (g_Addend). Returns the new g_Addend value.
+long ReleaseSharedSlot(F3SharedBuffer **slot);
+
 // GetLocalizedString (0x19FF570) - thiscall accessor for a per-LCID
 // localized-string entry. obj points to a word holding the current-locale
 // string pointer (a `const WCHAR **`); returns *that pointer (the wide string)
 // when it is non-null, otherwise the empty default string (the original "Path"
 // global at 0x01BDFD28). The entries come from the locale tables selected by
-// sub_6195C0 (GetLocaleEntry). Declared as a plain free function (obj is the
-// thiscall `this`) per the project convention for non-byte-identical thiscall
-// methods.
+// GetLocaleEntry (0x6195C0). Pick the current locale's localized-string
+// table entry for a given key. `key` is searched against the 9-entry key
+// table (dword_1DBD2F4); on a match at index i, the current user locale
+// (GetUserDefaultLCID) selects one of 13 per-LCID string tables and the
+// function returns a pointer into that table at entry i (an `int *` / `DWORD *`).
+// If the key is not present it returns the default entry table (dword_20B6078).
+// The returned entry is a `const WCHAR **` consumed by GetLocalizedString
+// (0x19FF570).
+int *GetLocaleEntry(int key);
+
 const WCHAR *GetLocalizedString(const WCHAR ***obj);
 
 #endif  // F3_COMMON_H

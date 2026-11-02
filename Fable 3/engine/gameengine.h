@@ -1,8 +1,8 @@
 // Fable 3 — CGameEngine module (the 356-byte game engine object).
 //
 // The engine object lives in a 356-byte stack buffer inside GameThread
-// (ArgList in IDA). It is constructed by CGameEngineCtor, run by sub_61CB70,
-// and torn down by sub_61C670. The current instance is published into the
+// (ArgList in IDA). It is constructed by CGameEngineCtor, run by RunFrontEnd
+// (0x61CB70), and torn down by sub_61C670. The current instance is published into the
 // global dword_1DBD9DC (read back by the getter sub_619A90).
 #ifndef F3_GAMEENGINE_H
 #define F3_GAMEENGINE_H

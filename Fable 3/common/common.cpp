@@ -193,6 +193,34 @@ F3SharedBuffer ** InitSharedSlot(F3SharedBuffer **obj)
     return obj;
 }
 
+// ============================================================
+//  ReleaseSharedSlot  (0x1A01320 - 0x1A0135D)  -- destroy a (shared) slot
+//  [NOT byte-identical] placement-dependent (relative calls to the
+//  InterlockedDecrement IAT slot and to SharedBufferFree).
+//
+//  long ReleaseSharedSlot(F3SharedBuffer **slot)
+//
+//  The shared-slot destructor (the counterpart to InitSharedSlot, 0x1A00C30).
+//  `slot` points at the single-word F3SharedBuffer * slot. When the slot holds
+//  a control block it decrements the block's refcount (at +12); on zero it
+//  frees the block via SharedBufferFree (0x403820) and nulls the slot. It then
+//  drops the global live-slot count (g_Addend) and returns that new count.
+//  __thiscall in the original (slot in ECX, plain `retn`); declared as a plain
+//  free function to match the project convention.
+// ============================================================
+long ReleaseSharedSlot(F3SharedBuffer **slot)
+{
+    if (*slot != 0)
+    {
+        if (InterlockedDecrement(&(*slot)->refcount) <= 0 && *slot != 0)
+            SharedBufferFree(*slot);
+        *slot = 0;
+    }
+    long result = InterlockedDecrement(&g_Addend);
+    *slot = 0;
+    return result;
+}
+
 // 0x01BDFD28: the default wide string returned when a localized-string entry
 // is null. In the original it is the (empty) wide string IDA names "Path";
 // it lives in .rdata at a high VA not present in this build, so a local empty
@@ -230,4 +258,284 @@ const WCHAR *GetLocalizedString(const WCHAR ***obj)
     if (p != 0)
         return *p;
     return g_defaultLocalizedString;
+}
+
+// ============================================================
+//  Per-LCID localized-string tables (0x01DBD120.., .data)
+//
+//  GetLocaleEntry (0x6195C0) maps (key, current user LCID) -> a pointer into
+//  one of thirteen 9-entry per-locale string tables. Each table entry is a
+//  `const WCHAR **` (the current locale's wide-string pointer) consumed by
+//  GetLocalizedString (0x19FF570). The key table (dword_1DBD2F4, 9 dwords) is
+//  searched to find the entry index; all values are 0xFFFFFFFF in the binary
+//  (the tables are filled in at runtime by the save/load path).
+//
+//  Original layout (each table is 0x24 bytes = 9 dwords):
+//    0x1DBD120  default (English-US fallback)   0x1DBD1B0  Spanish
+//    0x1DBD144  English                         0x1DBD1D4  Italian
+//    0x1DBD168  German                          0x1DBD1F8  Dutch
+//    0x1DBD18C  French                          0x1DBD21C  Norwegian
+//                                              0x1DBD240  Swedish
+//    0x1DBD264  Turkish                         0x1DBD288  Polish
+//    0x1DBD2AC  Finnish                         0x1DBD2D0  Russian
+//    0x1DBD2F4  key table (dword_1DBD2F4)
+//  The not-found default table is at 0x20B6078 (dword_20B6078).
+// ============================================================
+#define F3_LOCALE_TABLE_INIT \
+    0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, \
+    0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF
+
+static DWORD g_localeTable_1DBD120[9] = { F3_LOCALE_TABLE_INIT };  // default / English-US fallback
+static DWORD g_localeTable_1DBD144[9] = { F3_LOCALE_TABLE_INIT };  // English
+static DWORD g_localeTable_1DBD168[9] = { F3_LOCALE_TABLE_INIT };  // German
+static DWORD g_localeTable_1DBD18C[9] = { F3_LOCALE_TABLE_INIT };  // French
+static DWORD g_localeTable_1DBD1B0[9] = { F3_LOCALE_TABLE_INIT };  // Spanish
+static DWORD g_localeTable_1DBD1D4[9] = { F3_LOCALE_TABLE_INIT };  // Italian
+static DWORD g_localeTable_1DBD1F8[9] = { F3_LOCALE_TABLE_INIT };  // Dutch
+static DWORD g_localeTable_1DBD21C[9] = { F3_LOCALE_TABLE_INIT };  // Norwegian
+static DWORD g_localeTable_1DBD240[9] = { F3_LOCALE_TABLE_INIT };  // Swedish
+static DWORD g_localeTable_1DBD264[9] = { F3_LOCALE_TABLE_INIT };  // Turkish
+static DWORD g_localeTable_1DBD288[9] = { F3_LOCALE_TABLE_INIT };  // Polish
+static DWORD g_localeTable_1DBD2AC[9] = { F3_LOCALE_TABLE_INIT };  // Finnish
+static DWORD g_localeTable_1DBD2D0[9] = { F3_LOCALE_TABLE_INIT };  // Russian
+static DWORD g_localeKeys[9]          = { F3_LOCALE_TABLE_INIT };  // 0x1DBD2F4: key table
+static DWORD g_localeDefault[9]       = { F3_LOCALE_TABLE_INIT };  // 0x20B6078: not-found default
+
+#undef F3_LOCALE_TABLE_INIT
+
+// ============================================================
+//  GetLocaleEntry  (0x006195C0 - 0x00619850)  -- per-LCID localized-string
+//  entry lookup
+//  [NOT byte-identical] refs the .data locale/key tables (0x01DBD120..0x01DBD2F4)
+//  and the not-found default table (0x020B6078) at their original high VAs
+//  (not present in this build), plus an indirect IAT call to
+//  GetUserDefaultLCID (0x01AD...) and MSVC switch jump tables.
+//
+//  int * GetLocaleEntry(int key)
+//
+//  Search the 9-entry key table (dword_1DBD2F4) for `key`; if absent, return
+//  the default entry table (dword_20B6078). Otherwise pick one of 13 per-LCID
+//  string tables by the current user locale (GetUserDefaultLCID) and return a
+//  pointer into that table at the matched entry (table + index). The returned
+//  entry is a `const WCHAR **` consumed by GetLocalizedString (0x19FF570).
+//
+//  The LCID -> table decision tree below is a faithful transcription of the
+//  original cmp/switch ladder (verified against the disassembly). `table` is
+//  initialized to the default table so every LCID resolves to a valid entry.
+// ============================================================
+int *GetLocaleEntry(int key)
+{
+    int i = 0;
+    while (key != g_localeKeys[i])
+    {
+        if ((unsigned int)++i >= 9)
+            return (int *)g_localeDefault;    // 0x20B6078
+    }
+
+    DWORD           lcid   = GetUserDefaultLCID();
+    const DWORD    *table  = g_localeTable_1DBD120;   // default fallback
+
+    if (lcid <= 0x804)
+    {
+        if (lcid != 2052)                                  // 0x0804
+        {
+            switch (lcid)
+            {
+            case 0x404:  table = g_localeTable_1DBD144; break;
+            case 0x405:  table = g_localeTable_1DBD168; break;
+            case 0x407:  table = g_localeTable_1DBD1B0; break;
+            case 0x40A:  table = g_localeTable_1DBD2AC; break;
+            case 0x40C:  table = g_localeTable_1DBD18C; break;
+            case 0x40E:  table = g_localeTable_1DBD1D4; break;
+            case 0x410:  table = g_localeTable_1DBD1F8; break;
+            case 0x411:  table = g_localeTable_1DBD21C; break;
+            case 0x412:  table = g_localeTable_1DBD240; break;
+            case 0x415:  table = g_localeTable_1DBD264; break;
+            case 0x419:  table = g_localeTable_1DBD288; break;
+            default:     table = g_localeTable_1DBD120; break;
+            }
+        }
+        else
+            table = g_localeTable_1DBD144;                 // 0x0804 -> English
+    }
+    else if (lcid > 0x200C)
+    {
+        if (lcid > 0x380C)
+        {
+            if (lcid > 0x4C0A)
+            {
+                if (lcid <= 0x580A)
+                {
+                    if (lcid != 22538 && lcid != 20490 && lcid != 21514)   // 0x580A/0x500A/0x540A
+                        table = g_localeTable_1DBD120;
+                    else
+                        table = g_localeTable_1DBD2D0;
+                }
+                else    // lcid > 0x580A
+                    table = (lcid == 58380) ? g_localeTable_1DBD18C   // 0xE40C
+                                            : g_localeTable_1DBD120;
+            }
+            else        // 0x380C < lcid <= 0x4C0A
+            {
+                if (lcid == 19466)                                 // 0x4C0A
+                    table = g_localeTable_1DBD2D0;
+                else if (lcid > 0x400A)
+                {
+                    if (lcid != 17418 && lcid != 18442)            // 0x440A/0x480A
+                        table = g_localeTable_1DBD120;
+                    else
+                        table = g_localeTable_1DBD2D0;
+                }
+                else        // 0x380C < lcid <= 0x400A
+                {
+                    if (lcid == 16394 || lcid - 15370 == 0)        // 0x400A / 0x3C0A
+                        table = g_localeTable_1DBD2D0;
+                    else
+                        table = (lcid - 15370 == 2) ? g_localeTable_1DBD18C  // 0x3C0C
+                                                    : g_localeTable_1DBD120;
+                }
+            }
+        }
+        else        // 0x200C < lcid <= 0x380C
+        {
+            if (lcid == 14348)                                     // 0x380C
+                table = g_localeTable_1DBD18C;
+            else if (lcid > 0x2C0C)
+            {
+                if (lcid > 0x340A)
+                {
+                    if (lcid == 13324)                             // 0x340C
+                        table = g_localeTable_1DBD18C;
+                    else if (lcid != 14346)                        // 0x380A
+                        table = g_localeTable_1DBD120;
+                    else
+                        table = g_localeTable_1DBD2D0;
+                }
+                else        // 0x2C0C < lcid <= 0x340A
+                {
+                    if (lcid == 13322 || lcid - 12298 == 0)        // 0x340A / 0x300A
+                        table = g_localeTable_1DBD2D0;
+                    else
+                        table = (lcid - 12298 == 2) ? g_localeTable_1DBD18C  // 0x300C
+                                                    : g_localeTable_1DBD120;
+                }
+            }
+            else        // 0x200C < lcid <= 0x2C0C
+            {
+                if (lcid == 11276)                                 // 0x2C0C
+                    table = g_localeTable_1DBD18C;
+                else if (lcid > 0x280A)
+                {
+                    if (lcid == 10252)                             // 0x280C
+                        table = g_localeTable_1DBD18C;
+                    else if (lcid != 11274)                        // 0x2C0A
+                        table = g_localeTable_1DBD120;
+                    else
+                        table = g_localeTable_1DBD2D0;
+                }
+                else        // 0x200C < lcid <= 0x280A
+                {
+                    if (lcid == 10250 || lcid - 9226 == 0)         // 0x280A / 0x240A
+                        table = g_localeTable_1DBD2D0;
+                    else
+                        table = (lcid - 9226 == 2) ? g_localeTable_1DBD18C   // 0x240C
+                                                   : g_localeTable_1DBD120;
+                }
+            }
+        }
+    }
+    else        // 0x804 < lcid <= 0x200C
+    {
+        if (lcid == 8204)                                          // 0x200C
+            table = g_localeTable_1DBD18C;
+        else if (lcid > 0x100A)
+        {
+            if (lcid > 0x180A)
+            {
+                if (lcid > 0x1C0C)
+                {
+                    if (lcid != 8202)                              // 0x200A
+                        table = g_localeTable_1DBD120;
+                    else
+                        table = g_localeTable_1DBD2D0;
+                }
+                else        // 0x180A < lcid <= 0x1C0C
+                {
+                    if (lcid == 7180 || lcid == 6156)              // 0x1C0C/0x180C
+                        table = g_localeTable_1DBD18C;
+                    else if (lcid != 7178)                         // 0x1C0A
+                        table = g_localeTable_1DBD120;
+                    else
+                        table = g_localeTable_1DBD2D0;
+                }
+            }
+            else if (lcid != 6154)                                 // 0x180A
+            {
+                if (lcid <= 0x1407)
+                {
+                    switch (lcid)
+                    {
+                    case 0x1407: table = g_localeTable_1DBD1B0; break;
+                    case 0x100C: table = g_localeTable_1DBD18C; break;
+                    case 0x1404: table = g_localeTable_1DBD144; break;
+                    default:     table = g_localeTable_1DBD120; break;
+                    }
+                }
+                else        // 0x1407 < lcid < 0x180A
+                {
+                    if (lcid == 5130)                              // 0x140A
+                        table = g_localeTable_1DBD2D0;
+                    else
+                        table = (lcid - 5130 == 2) ? g_localeTable_1DBD18C   // 0x140C
+                                                   : g_localeTable_1DBD120;
+                }
+            }
+            else            // lcid == 0x180A
+                table = g_localeTable_1DBD2D0;
+        }
+        else if (lcid == 4106)                                     // 0x100A
+            table = g_localeTable_1DBD2D0;
+        else if (lcid > 0xC04)
+        {
+            if (lcid <= 0xC0C)
+            {
+                if (lcid != 3084)                                  // 0xC0C
+                {
+                    if (lcid == 3079)                              // 0xC07
+                        table = g_localeTable_1DBD1B0;
+                    else if (lcid - 3079 == 3)                     // 0xC0A
+                        table = g_localeTable_1DBD2AC;
+                    else
+                        table = g_localeTable_1DBD120;
+                }
+                else
+                    table = g_localeTable_1DBD18C;                 // 0xC0C
+            }
+            else        // 0xC0C < lcid <= 0x100A
+            {
+                if (lcid == 4100)                                  // 0x1004
+                    table = g_localeTable_1DBD144;
+                else if (lcid - 4100 == 3)                         // 0x1007
+                    table = g_localeTable_1DBD1B0;
+                else
+                    table = g_localeTable_1DBD120;
+            }
+        }
+        else if (lcid == 3076)                                     // 0xC04
+            table = g_localeTable_1DBD144;
+        else        // 0x804 < lcid < 0xC04
+        {
+            switch (lcid)
+            {
+            case 0x807: table = g_localeTable_1DBD1B0; break;
+            case 0x80A: table = g_localeTable_1DBD2D0; break;
+            case 0x80C: table = g_localeTable_1DBD18C; break;
+            case 0x810: table = g_localeTable_1DBD1F8; break;
+            case 0x819: table = g_localeTable_1DBD288; break;
+            default:    table = g_localeTable_1DBD120; break;
+            }
+        }
+    }
+
+    return (int *)(table + i);
 }

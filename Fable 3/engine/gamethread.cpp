@@ -13,6 +13,7 @@
 #include "object_registry.h"      // F3ObjReg / SetDebugTrace / F3ReleaseSehRef
 #include "manager.h"              // SetManager / DisposeManager / sub_18F7160
 #include "gameengine.h"           // CGameEngineCtor
+#include "gamemain.h"             // RunFrontEnd
 
 #include <windows.h>
 #include <string.h>
@@ -89,8 +90,6 @@ void *GetGameBuffer(void)
     return g_gameBuffer;   // originally 0x1DBD318
 }
 
-static int   *sub_6195C0(int a1) { (void)a1; return 0; }                // get a per-LCID localized-string entry
-static int   sub_61CB70(void *argList, int a2) { (void)argList; (void)a2; return 1; }  // run the game (success)
 static void  sub_61BE00(void *obj) { (void)obj; }                       // cleanup (part 1)
 static void  sub_61AE70(void *obj) { (void)obj; }                       // cleanup (part 2)
 static void  sub_61C670(void *obj) { (void)obj; }                       // cleanup (part 3)
@@ -146,7 +145,7 @@ static void *HeapStressTest(void)
 //    3. Clears the game buffer and loads a shared-memory blob named after the
 //       exe (-=[SMS_<exename>_SMS]=-). If the blob is missing, shows a message
 //       box and ExitProcess(1).
-//    4. Runs the game (CGameEngineCtor, sub_61CB70) and sets the exit code
+//    4. Runs the game (CGameEngineCtor, RunFrontEnd) and sets the exit code
 //       (dword_1DBD00C), then cleans up (sub_61C670, sub_401700).
 // ============================================================
 void GameThread(void *a1)
@@ -252,8 +251,8 @@ void GameThread(void *a1)
     if (g_byte_1DBD008 == 0)
     {
         int v19 = (int)GetManager();
-        const WCHAR *title = GetLocalizedString((const WCHAR ***)sub_6195C0(g_dword_1DBD010));
-        const WCHAR *body  = GetLocalizedString((const WCHAR ***)sub_6195C0(g_dword_1DBD014));
+        const WCHAR *title = GetLocalizedString((const WCHAR ***)GetLocaleEntry(g_dword_1DBD010));
+        const WCHAR *body  = GetLocalizedString((const WCHAR ***)GetLocaleEntry(g_dword_1DBD014));
         HWND hwnd = 0;
         if (v19)
         {
@@ -266,10 +265,13 @@ void GameThread(void *a1)
         ExitProcess(1);
     }
 
-    // 8. Run the game.
+    // 8. Run the game. Zero the buffer so the freshly-constructed engine has
+    //    well-defined (null) object slots; CGameEngineCtor re-initializes the
+    //    rest in place.
     char ArgList[356];
+    memset(ArgList, 0, sizeof(ArgList));
     CGameEngineCtor(ArgList);
-    if (sub_61CB70(ArgList, arg) != 0)
+    if (RunFrontEnd(ArgList, arg) != 0)
     {
         sub_61BE00(ArgList);
         sub_61AE70(ArgList);

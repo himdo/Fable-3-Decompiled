@@ -64,7 +64,37 @@ static __declspec(naked) void *CManagerWin32_Dtor(void)
 
 // NSystem::CManagerWin32 (48 bytes): vtable at +0, CRITICAL_SECTION at +8,
 // refcounted block at +36. Slot 0 is the deleting destructor.
-static void *g_CManagerWin32Vtable[16] = { (void *)CManagerWin32_Dtor };
+//
+// The remaining slots below are the virtual methods the frontend (RunFrontEnd,
+// 0x61CB70) dispatches through. They are stubbed here so the vtable indirection
+// resolves; real per-method behavior is out of scope until each is decompiled.
+//
+//  slot 1  (0x04)  "run the game" -- the big start-up dispatch. Returns 1 so the
+//              frontend proceeds down the success path.
+//  slot 8  (0x20)  GetWindow -- the manager's HWND (0 = none, the desktop).
+//  slot 10 (0x28)  a flag setter called as (this, byte).
+//  slot 12 (0x30)  a setter called as (this, 1) on the sign-in paths.
+static int CManagerWin32_RunGame(void *obj, int a1, int a2, int a3, int a4,
+                                 int a5, int a6, int a7, int a8)
+{
+    (void)obj; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    (void)a6; (void)a7; (void)a8;
+    return 1;
+}
+static void *CManagerWin32_GetWindow(void *obj) { (void)obj; return 0; }
+static void  CManagerWin32_SetFlag(void *obj, int flag) { (void)obj; (void)flag; }
+
+static void *g_CManagerWin32Vtable[16] = {
+    (void *)CManagerWin32_Dtor,        // 0
+    (void *)CManagerWin32_RunGame,     // 1
+    0, 0, 0, 0, 0, 0,                  // 2..7
+    (void *)CManagerWin32_GetWindow,   // 8
+    0,                                 // 9
+    (void *)CManagerWin32_SetFlag,     // 10
+    0,                                 // 11
+    (void *)CManagerWin32_SetFlag,     // 12
+    0, 0, 0                            // 13..15
+};
 
 // ============================================================
 //  sub_18F7160  (0x18F7160)  -- NSystem::CManagerWin32 constructor
