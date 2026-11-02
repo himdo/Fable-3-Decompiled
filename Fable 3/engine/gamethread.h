@@ -8,4 +8,8 @@
 // game, and sets the process exit code.
 void GameThread(void *a1);
 
+// 0x619AA0 - getter for the 0x6C4-byte game buffer (original address
+// 0x1DBD318) that holds the shared-memory blob loaded by GameThread.
+void *GetGameBuffer(void);
+
 #endif  // F3_GAMETHREAD_H

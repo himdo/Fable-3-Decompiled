@@ -57,4 +57,14 @@ extern DWORD g_Addend;
 // The matching destructor is ReleaseSharedSlot (0x1A01320).
 F3SharedBuffer ** InitSharedSlot(F3SharedBuffer **obj);
 
+// GetLocalizedString (0x19FF570) - thiscall accessor for a per-LCID
+// localized-string entry. obj points to a word holding the current-locale
+// string pointer (a `const WCHAR **`); returns *that pointer (the wide string)
+// when it is non-null, otherwise the empty default string (the original "Path"
+// global at 0x01BDFD28). The entries come from the locale tables selected by
+// sub_6195C0 (GetLocaleEntry). Declared as a plain free function (obj is the
+// thiscall `this`) per the project convention for non-byte-identical thiscall
+// methods.
+const WCHAR *GetLocalizedString(const WCHAR ***obj);
+
 #endif  // F3_COMMON_H

@@ -34,6 +34,7 @@ common/                     engine-wide memory / buffer helpers
                             SharedBufferAssign (0x403FE0, buffer assign),
                             SharedBufferFree (0x403820, buffer free),
                             InitSharedSlot (0x1A00C30) — shared-slot ctor (+ g_Addend counter)
+                            GetLocalizedString (0x19FF570) — per-LCID localized-string getter
                             F3SharedBuffer struct
 
 engine/                     game engine init + main run loop  [growing]
@@ -68,6 +69,8 @@ engine/                     game engine init + main run loop  [growing]
                             CGameVersionReset (0x72DC80) — reset CGameVersion's node lists
   gamethread.h / gamethread.cpp
                             GameThread (0x615380) — game thread entry point (implemented)
+                            GetGameBuffer (0x619AA0) — getter for the 0x6C4-byte
+                            game buffer (0x1DBD318) holding the shared-memory blob
                             HeapStressTest (0x18986E0) — engine heap sanity check
                             LHFreeHandler (0x401D20) — SEH cleanup handler (LHFree)
                             JmpLHFree (0x615870) — `jmp LHFree` thunk SEH handler
@@ -120,6 +123,8 @@ independent. The current state of the implemented functions:
 | `InitSharedSlot` (0x1A00C30) | 24 | no | Placement-independent (no relative calls / long jumps), but refs the live-slot counter `g_Addend` (0x02075C48) and the `InterlockedIncrement` IAT slot (0x01AD52F8) at original high VAs. |
 | `GetWorker` (0x18F6A40) | 6 | no | Placement-independent, but refs the high-VA global `dword_20FC8F0` (0x020FC8F0) not present in the build. |
 | `GetManager` (0x18F8750) | 6 | no | Placement-independent, but refs the high-VA global `dword_20FC8C4` (0x020FC8C4) not present in the build. |
+| `GetGameBuffer` (0x619AA0) | 6 | no | Placement-independent (no calls / relative jumps), but refs the game buffer (0x01DBD318) at its original high VA not present in the build. |
+| `GetLocalizedString` (0x19FF570) | 15 | no | Placement-independent (no calls / relative jumps), but refs the default "Path" wide-string global (0x01BDFD28) at its original high VA not present in the build. |
 | `PumpWorker` (0x18F8600) | 169 | no | Placement-dependent (relative calls to `sub_18F82E0` / `sub_18F8530` / `sub_18F17B0`) and refs the `EnterCriticalSection` / `LeaveCriticalSection` / `SetEvent` / `WaitForSingleObjectEx` / `WaitMessage` IAT slots at their original high VAs. |
 | `FrameworkInit`, `FrameworkShutdown`, `ComputeExeDirectory`, `LHAlloc`, `SharedBufferAssign`, `InitSharedSlot` (0x1A00C30), `OutOfMemory`, `RunGame`, `GameThread` (0x615380), `CWorkerWin32Ctor`, `CWorkerWin32_Dtor`, `CWorkerWin32_DtorBody`, `CManagerWin32_Dtor` (0x55D8B0), `CManagerWin32_DtorBody` (0x55D5F0), `SetSaveGamePath`, `SetWorker` (0x18F6FC0), `ReleaseWorkerPair` (0x55DB10), `SetManager` (0x18F87E0), `ReleaseManagerPair` (0x55D7C0), `SetDebugTrace` (0x1A02E20), `SetDebugHandler` (0x1A02DD0), `ReleaseObjectPair` (0x403220), `HeapStressTest` (0x18986E0), `CGameEngineCtor` (0x61C530), `CGameEngineSubCtor` (0x623360), `CGameVersionCtor` (0x72DD10), `CGameVersionReset` (0x72DC80) | — | no | Placement-dependent (relative calls to callees/CRT). `CGameEngineCtor` also writes the high-VA global `dword_1DBD9DC`. |
 
@@ -133,10 +138,10 @@ that it is worth doing.
 
 | Module    | Entry (IDA)          | What to add |
 |-----------|----------------------|-------------|
-| `engine/` | `RunGame` (0x615740), `GameThread` (0x615380), `CWorkerWin32Ctor` (0x18F7040), `SetWorker`/`GetWorker`/`ReleaseWorkerPair` (0x18F6FC0/0x18F6A40/0x55DB10), `SetManager`/`GetManager`/`ReleaseManagerPair` (0x18F87E0/0x18F8750/0x55D7C0), `SetDebugTrace` (0x1A02E20), `SetDebugHandler` (0x1A02DD0), `ReleaseObjectPair` (0x403220), `HeapStressTest` (0x18986E0), `DisposeWorker` (0x615880), `DisposeManager` (0x615850), `CWorkerWin32_Dtor`/`CWorkerWin32_DtorBody` (0x55D8F0/0x55D930), `CManagerWin32_Dtor`/`CManagerWin32_DtorBody` (0x55D8B0/0x55D5F0), `CGameEngineCtor` (0x61C530), `CGameEngineSubCtor` (0x623360), `CGameVersionCtor` (0x72DD10), `CGameVersionReset` (0x72DC80), `SetOnCreateDevice` (0x18F6CA0), `OnCreateDevice` (0x6152F0), `SetOnResetDevice` (0x18F6C50), `OnResetDevice` (0x615340), `LHFreeHandler` (0x401D20), `JmpLHFree` (0x615870), `SetThreadName` (0x18C5840), `PumpWorker` (0x18F8600) | (done) run loop + game thread + main-worker ctor + worker & manager pairs + CDebugTraceFable + CFableWindowsDebugHandler registration (CS-protected) + heap sanity check + SEH dispose path + 356-byte game-engine ctor (with CGameVersion sub-object) + worker on-create-device callback setter (byte-identical) + both XLO device callbacks (on-create and on-reset, setters byte-identical) + CDebugTraceFable SEH handler thunk (JmpLHFree) + worker pump step (PumpWorker; window / message / device-shutdown callees stubbed); next: fill in the remaining stub callees (sub_18F82E0, sub_18F8530, sub_18F17B0, sub_6195C0, sub_61CB70, ...) |
+| `engine/` | `RunGame` (0x615740), `GameThread` (0x615380), `CWorkerWin32Ctor` (0x18F7040), `SetWorker`/`GetWorker`/`ReleaseWorkerPair` (0x18F6FC0/0x18F6A40/0x55DB10), `SetManager`/`GetManager`/`ReleaseManagerPair` (0x18F87E0/0x18F8750/0x55D7C0), `SetDebugTrace` (0x1A02E20), `SetDebugHandler` (0x1A02DD0), `ReleaseObjectPair` (0x403220), `HeapStressTest` (0x18986E0), `DisposeWorker` (0x615880), `DisposeManager` (0x615850), `CWorkerWin32_Dtor`/`CWorkerWin32_DtorBody` (0x55D8F0/0x55D930), `CManagerWin32_Dtor`/`CManagerWin32_DtorBody` (0x55D8B0/0x55D5F0), `CGameEngineCtor` (0x61C530), `CGameEngineSubCtor` (0x623360), `CGameVersionCtor` (0x72DD10), `CGameVersionReset` (0x72DC80), `SetOnCreateDevice` (0x18F6CA0), `OnCreateDevice` (0x6152F0), `SetOnResetDevice` (0x18F6C50), `OnResetDevice` (0x615340), `LHFreeHandler` (0x401D20), `JmpLHFree` (0x615870), `SetThreadName` (0x18C5840), `PumpWorker` (0x18F8600), `GetGameBuffer` (0x619AA0) | (done) run loop + game thread + main-worker ctor + worker & manager pairs + CDebugTraceFable + CFableWindowsDebugHandler registration (CS-protected) + heap sanity check + SEH dispose path + 356-byte game-engine ctor (with CGameVersion sub-object) + worker on-create-device callback setter (byte-identical) + both XLO device callbacks (on-create and on-reset, setters byte-identical) + CDebugTraceFable SEH handler thunk (JmpLHFree) + worker pump step (PumpWorker; window / message / device-shutdown callees stubbed); next: fill in the remaining stub callees (sub_18F82E0, sub_18F8530, sub_18F17B0, sub_6195C0, sub_61CB70, ...) |
 | `save/`   | `SetSaveGamePath` (0x1A019B0) | (done) store the save path refcounted into `dword_1DBD06C` + getter; next: the actual load logic |
 | `framework/` | `ComputeExeDirectory` (0x1A02870), `ReleaseGlobalObject` (0x4017B0) | (done) exe-directory compute + `ExeDirectory()` getter + global shared-object release; the framework init/shutdown pair is complete |
-| `common/` | `LHAlloc` (0x1A035C0), `LHFree` (0x1A032C0), `SharedBufferAssign` (0x403FE0), `SharedBufferFree` (0x403820), `OutOfMemory` (0x1A034F0) | (done) heap alloc/free + `F3SharedBuffer` counted buffer + OOM report handler; next: cross-module globals `byte_1DBD01B`, `byte_1C86BD9` |
+| `common/` | `LHAlloc` (0x1A035C0), `LHFree` (0x1A032C0), `SharedBufferAssign` (0x403FE0), `SharedBufferFree` (0x403820), `OutOfMemory` (0x1A034F0), `GetLocalizedString` (0x19FF570) | (done) heap alloc/free + `F3SharedBuffer` counted buffer + OOM report handler + per-LCID localized-string getter; next: cross-module globals `byte_1DBD01B`, `byte_1C86BD9` |
 | (future)  | render / audio / input / network | as their code is decompiled |
 
 ## Original entry chain (for reference)

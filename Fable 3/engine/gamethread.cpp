@@ -31,6 +31,7 @@ static void *g_CFableWindowsDebugHandlerVtable[4] = { 0 };
 static void *g_CDebugTraceFableVtable[4]          = { 0 };
 
 // The game buffer (0x6C4 bytes) that the shared-memory blob is loaded into.
+// Its original address is 0x1DBD318 (a high-VA data global).
 static char g_gameBuffer[0x6C4];
 
 // ---- SEH handlers for the three objects (called when their refcount hits 0) ----
@@ -70,9 +71,25 @@ static int __declspec(naked) JmpLHFree(int)
 }
 
 // ---- other engine callees (stubs for now) -----------------------------------
-static void *sub_619AA0(void) { return g_gameBuffer; }                  // get the game buffer
-static const wchar_t *sub_19FF570(void *obj) { (void)obj; return L""; } // get a string
-static int   *sub_6195C0(int a1) { (void)a1; return 0; }                // get an object
+// ============================================================
+//  GetGameBuffer  (0x00619AA0 - 0x00619AA6)  -- getter for the game buffer
+//  [NOT byte-identical] placement-independent (no calls / relative jumps),
+//  but refs the game buffer at its original high VA (0x01DBD318), not present
+//  in this build.
+//
+//  void *GetGameBuffer(void)
+//
+//  A 6-byte getter: `mov eax, offset <game buffer>; retn`. GameThread zeroes
+//  the buffer and fills it from the shared-memory blob (-=[SMS_<exename>_SMS]=-);
+//  the engine read paths (sub_6488A0, sub_9F2770, sub_9F31F0, sub_9F38A0,
+//  sub_9F4B50) read fields out of it (e.g. +68, +108, +680, +1728).
+// ============================================================
+void *GetGameBuffer(void)
+{
+    return g_gameBuffer;   // originally 0x1DBD318
+}
+
+static int   *sub_6195C0(int a1) { (void)a1; return 0; }                // get a per-LCID localized-string entry
 static int   sub_61CB70(void *argList, int a2) { (void)argList; (void)a2; return 1; }  // run the game (success)
 static void  sub_61BE00(void *obj) { (void)obj; }                       // cleanup (part 1)
 static void  sub_61AE70(void *obj) { (void)obj; }                       // cleanup (part 2)
@@ -194,8 +211,8 @@ void GameThread(void *a1)
 
     // 5. Heap sanity check + clear the game buffer.
     HeapStressTest();
-    if (sub_619AA0() != 0)
-        memset(sub_619AA0(), 0, 0x6C4);
+    if (GetGameBuffer() != 0)
+        memset(GetGameBuffer(), 0, 0x6C4);
 
     // 6. Load the shared-memory blob (named after the exe).
     WCHAR Filename[0x800];
@@ -203,7 +220,7 @@ void GameThread(void *a1)
     memset(Filename, 0, sizeof(Filename));
     memset(Buffer, 0, sizeof(Buffer));
     g_byte_1DBD008 = 0;
-    if (sub_619AA0() != 0)
+    if (GetGameBuffer() != 0)
     {
         HMODULE hMod = GetModuleHandleA(NULL);
         if (GetModuleFileNameW(hMod, Filename, 0x800) != 0)
@@ -220,8 +237,8 @@ void GameThread(void *a1)
                     BYTE *view = (BYTE *)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
                     if (view != 0)
                     {
-                        if (sub_619AA0() != 0)
-                            memcpy(sub_619AA0(), view, 0x6C4);
+                        if (GetGameBuffer() != 0)
+                            memcpy(GetGameBuffer(), view, 0x6C4);
                         if (UnmapViewOfFile(view))
                             g_byte_1DBD008 = 1;
                     }
@@ -235,8 +252,8 @@ void GameThread(void *a1)
     if (g_byte_1DBD008 == 0)
     {
         int v19 = (int)GetManager();
-        const WCHAR *title = (const WCHAR *)sub_19FF570(sub_6195C0(g_dword_1DBD010));
-        const WCHAR *body  = (const WCHAR *)sub_19FF570(sub_6195C0(g_dword_1DBD014));
+        const WCHAR *title = GetLocalizedString((const WCHAR ***)sub_6195C0(g_dword_1DBD010));
+        const WCHAR *body  = GetLocalizedString((const WCHAR ***)sub_6195C0(g_dword_1DBD014));
         HWND hwnd = 0;
         if (v19)
         {

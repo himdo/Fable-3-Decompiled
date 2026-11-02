@@ -192,3 +192,42 @@ F3SharedBuffer ** InitSharedSlot(F3SharedBuffer **obj)
     InterlockedIncrement(&g_Addend);
     return obj;
 }
+
+// 0x01BDFD28: the default wide string returned when a localized-string entry
+// is null. In the original it is the (empty) wide string IDA names "Path";
+// it lives in .rdata at a high VA not present in this build, so a local empty
+// string stands in for it (the value only matters on the null-entry fallback).
+static const WCHAR g_defaultLocalizedString[] = L"";
+
+// ============================================================
+//  GetLocalizedString  (0x019FF570 - 0x019FF57F)  -- localized-string getter
+//  [NOT byte-identical] placement-independent (no calls / relative jumps),
+//  but refs the default "Path" wide-string global (0x01BDFD28) at its original
+//  high VA, which is not present in this build.
+//
+//  const WCHAR * GetLocalizedString(const WCHAR ***obj)
+//
+//  thiscall accessor for a per-LCID localized-string entry (obj is the this
+//  pointer, no stack args, plain `retn`). obj points to a word holding the
+//  current-locale string pointer P (a `const WCHAR **`). If P is non-null it
+//  returns *P (the wide string); otherwise it returns the default (the empty
+//  wide string, the original "Path" global at 0x01BDFD28). The entries are the
+//  per-LCID string tables selected by GetLocaleEntry (sub_6195C0).
+//
+//  Original body (15 bytes, 8B 01 85 C0 75 06 B8 28 FD BD 01 C3 8B 00 C3):
+//      mov eax, [ecx]        ; eax = P        = *obj
+//      test eax, eax
+//      jnz  L_ret            ; if P != 0
+//      mov eax, offset Path  ; else return the default (0x01BDFD28)
+//      retn
+//  L_ret:
+//      mov eax, [eax]        ; eax = *P       = the wide string
+//      retn
+// ============================================================
+const WCHAR *GetLocalizedString(const WCHAR ***obj)
+{
+    const WCHAR **p = *obj;
+    if (p != 0)
+        return *p;
+    return g_defaultLocalizedString;
+}
