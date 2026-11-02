@@ -1,0 +1,4 @@
+# IDA is required for `dump` / `compare-exe`.
+# Requires a local IDA Pro/Free installation (located via
+# %APPDATA%\Hex-Rays\IDA Pro\ida-config.json -> Paths.ida-install-dir).
+ida-domain>=0.5.1
