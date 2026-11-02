@@ -36,35 +36,38 @@ common/                     engine-wide memory / buffer helpers
                             F3SharedBuffer struct
 
 engine/                     game engine init + main run loop  [growing]
-  engine.h
+  engine.h                  public engine API (RunGame + the module headers below)
   engine.cpp                RunGame (0x615740) — implemented (run loop + thread)
-                            CWorkerWin32Ctor (0x18F7040) — main-worker ctor
-                            SetWorker (0x18F6FC0) — install current worker + SEH block
-                            GetWorker (0x18F6A40) — current-worker getter
-                            ReleaseWorkerPair (0x55DB10) — release a worker pair
-                            SetManager (0x18F87E0) — install current manager + SEH block
-                            GetManager (0x18F8750) — current-manager getter
-                            ReleaseManagerPair (0x55D7C0) — release a manager pair
-                            DisposeWorker (0x615880) — SEH dispose handler (worker)
-                            DisposeManager (0x615850) — SEH dispose handler (CManagerWin32)
-                            CWorkerWin32_Dtor (0x55D8F0) — worker deleting destructor
-                            CWorkerWin32_DtorBody (0x55D930) — worker dtor body
-                            CManagerWin32_Dtor (0x55D8B0) — CManagerWin32 deleting destructor
-                            CManagerWin32_DtorBody (0x55D5F0) — CManagerWin32 dtor body
-                            GameThread (0x615380) — game thread entry point (implemented)
-                            SetDebugTrace (0x1A02E20) — register CDebugTraceFable (CS-protected)
+                            (+ stub callees: sub_18F8600 per-frame pump)
+  worker.h / worker.cpp     CWorkerWin32Ctor (0x18F7040) — main-worker ctor
+                            GetEngineTime (0x18A88E0) — seconds since engine start
+                            CWorkerWin32_Dtor (0x55D8F0) / _DtorBody (0x55D930) — dtor
+                            DisposeWorker (0x615880) — SEH dispose handler [BYTE-IDENTICAL]
+                            GetWorker (0x18F6A40) / SetWorker (0x18F6FC0) / ReleaseWorkerPair (0x55DB10)
+                            SetOnCreateDevice (0x18F6CA0) / SetOnResetDevice (0x18F6C50) [BYTE-IDENTICAL]
+  manager.h / manager.cpp   CManagerWin32_Dtor (0x55D8B0) / _DtorBody (0x55D5F0) — dtor
+                            sub_18F7160 — CManagerWin32 ctor (48-byte object)
+                            DisposeManager (0x615850) — SEH dispose handler [BYTE-IDENTICAL]
+                            GetManager (0x18F8750) / SetManager (0x18F87E0) / ReleaseManagerPair (0x55D7C0)
+  object_registry.h/.cpp    F3SehBlock / F3ObjReg types + registry critical section
                             ReleaseObjectPair (0x403220) — release a global object pair
-                            HeapStressTest (0x18986E0) — engine heap sanity check (1000 alloc/free)
+                            SetDebugTrace (0x1A02E20) — register CDebugTraceFable (CS-protected)
+  xlo_device.h / xlo_device.cpp
+                            OnCreateDevice (0x6152F0) / OnResetDevice (0x615340) — XLO
+                            device callbacks (+ stubbed XLiveOn* XDK imports)
+  gameengine.h / gameengine.cpp
                             CGameEngineCtor (0x61C530) — construct the 356-byte game engine
                             CGameEngineSubCtor (0x623360) — ctor of the engine's +0xC8 sub-object
-                            CGameVersionCtor (0x72DD10) — construct the 92-byte CGameVersion sub-object
+                            CGameVersionCtor (0x72DD10) — 92-byte CGameVersion sub-object
                             CGameVersionReset (0x72DC80) — reset CGameVersion's node lists
-                            SetOnCreateDevice (0x18F6CA0) — set the worker's on-create-device callback [BYTE-IDENTICAL]
-                            OnCreateDevice (0x6152F0) — worker on-create-device callback (XLO)
-                            SetOnResetDevice (0x18F6C50) — set the worker's on-reset-device callback [BYTE-IDENTICAL]
-                            OnResetDevice (0x615340) — worker on-reset-device callback (XLO)
-                            LHFreeHandler (0x401D20) — SEH cleanup handler: frees its object via the game heap
-                            (+ stub callees: sub_18F8600, sub_6195C0, ...)
+  gamethread.h / gamethread.cpp
+                            GameThread (0x615380) — game thread entry point (implemented)
+                            HeapStressTest (0x18986E0) — engine heap sanity check
+                            LHFreeHandler (0x401D20) — SEH cleanup handler (LHFree)
+                            JmpLHFree (0x615870) — `jmp LHFree` thunk SEH handler
+                            (+ GameThread's stub callees: sub_6195C0, sub_61CB70, ...)
+  thread.cpp                SetThreadName (0x18C5840) — announce the thread name via a
+                            first-chance SEH raise
 
 save/                       save-game loading  [growing]
   save.h
@@ -104,6 +107,8 @@ independent. The current state of the implemented functions:
 | `GetEngineTime` (0x18A88E0) | 99 | no | Placement-independent, but refs the `QueryPerformanceCounter` IAT slot (0x01AD50C8) and start globals (0x020B5FC0/0x020B5FB8) at original high VAs not present in the build. |
 | `LHFree` (0x1A032C0) | 11 | no | Placement-independent, but refs the heap-table pointer global (0x02075B24) at the original high VA. |
 | `LHFreeHandler` (0x401D20) | 11 | no | Byte-identical to `LHFree`; placement-independent, but refs the heap table (0x02075B24) at the original high VA. |
+| `JmpLHFree` (0x615870) | 5 | no | Placement-dependent: the near `jmp LHFree` is rebased to the build's `LHFree` (the original displacement targeted 0x1A032C0). `__declspec(naked)` inline asm; the SEH release code pushes the object pointer and calls the handler, so the tail jump passes it straight into `LHFree`'s (cdecl) parameter. |
+| `SetThreadName` (0x18C5840) | 131 | no | Placement-dependent: refs the compiler-generated SEH scope table (`stru_1C7F160`) + EH4 scope handler (0x152ECE0), the original /GS security cookie, and the `RaiseException` IAT slot (0x01AD51B0) at their original high VAs. |
 | `SharedBufferFree` (0x403820) | 58 | no | Placement-independent, but refs the heap table (0x02075B24) at the original high VA. |
 | `ReleaseGlobalObject` (0x4017B0) | 71 | no | Placement-independent, but refs the heap table (0x02075B24), `lpAddend` (0x020B6008), and the `InterlockedDecrement` IAT slot (0x01AD52FC) at original high VAs. |
 | `GetWorker` (0x18F6A40) | 6 | no | Placement-independent, but refs the high-VA global `dword_20FC8F0` (0x020FC8F0) not present in the build. |
@@ -120,7 +125,7 @@ that it is worth doing.
 
 | Module    | Entry (IDA)          | What to add |
 |-----------|----------------------|-------------|
-| `engine/` | `RunGame` (0x615740), `GameThread` (0x615380), `CWorkerWin32Ctor` (0x18F7040), `SetWorker`/`GetWorker`/`ReleaseWorkerPair` (0x18F6FC0/0x18F6A40/0x55DB10), `SetManager`/`GetManager`/`ReleaseManagerPair` (0x18F87E0/0x18F8750/0x55D7C0), `SetDebugTrace` (0x1A02E20), `ReleaseObjectPair` (0x403220), `HeapStressTest` (0x18986E0), `DisposeWorker` (0x615880), `DisposeManager` (0x615850), `CWorkerWin32_Dtor`/`CWorkerWin32_DtorBody` (0x55D8F0/0x55D930), `CManagerWin32_Dtor`/`CManagerWin32_DtorBody` (0x55D8B0/0x55D5F0), `CGameEngineCtor` (0x61C530), `CGameEngineSubCtor` (0x623360), `CGameVersionCtor` (0x72DD10), `CGameVersionReset` (0x72DC80), `SetOnCreateDevice` (0x18F6CA0), `OnCreateDevice` (0x6152F0), `SetOnResetDevice` (0x18F6C50), `OnResetDevice` (0x615340), `LHFreeHandler` (0x401D20) | (done) run loop + game thread + main-worker ctor + worker & manager pairs + CDebugTraceFable registration (CS-protected) + heap sanity check + SEH dispose path + 356-byte game-engine ctor (with CGameVersion sub-object) + worker on-create-device callback setter (byte-identical) + both XLO device callbacks (on-create and on-reset, setters byte-identical); next: fill in the remaining stub callees (sub_18F8600, sub_6195C0, sub_61CB70, ...) |
+| `engine/` | `RunGame` (0x615740), `GameThread` (0x615380), `CWorkerWin32Ctor` (0x18F7040), `SetWorker`/`GetWorker`/`ReleaseWorkerPair` (0x18F6FC0/0x18F6A40/0x55DB10), `SetManager`/`GetManager`/`ReleaseManagerPair` (0x18F87E0/0x18F8750/0x55D7C0), `SetDebugTrace` (0x1A02E20), `ReleaseObjectPair` (0x403220), `HeapStressTest` (0x18986E0), `DisposeWorker` (0x615880), `DisposeManager` (0x615850), `CWorkerWin32_Dtor`/`CWorkerWin32_DtorBody` (0x55D8F0/0x55D930), `CManagerWin32_Dtor`/`CManagerWin32_DtorBody` (0x55D8B0/0x55D5F0), `CGameEngineCtor` (0x61C530), `CGameEngineSubCtor` (0x623360), `CGameVersionCtor` (0x72DD10), `CGameVersionReset` (0x72DC80), `SetOnCreateDevice` (0x18F6CA0), `OnCreateDevice` (0x6152F0), `SetOnResetDevice` (0x18F6C50), `OnResetDevice` (0x615340), `LHFreeHandler` (0x401D20), `JmpLHFree` (0x615870), `SetThreadName` (0x18C5840) | (done) run loop + game thread + main-worker ctor + worker & manager pairs + CDebugTraceFable registration (CS-protected) + heap sanity check + SEH dispose path + 356-byte game-engine ctor (with CGameVersion sub-object) + worker on-create-device callback setter (byte-identical) + both XLO device callbacks (on-create and on-reset, setters byte-identical) + CDebugTraceFable SEH handler thunk (JmpLHFree); next: fill in the remaining stub callees (sub_18F8600, sub_6195C0, sub_61CB70, ...) |
 | `save/`   | `SetSaveGamePath` (0x1A019B0) | (done) store the save path refcounted into `dword_1DBD06C` + getter; next: the actual load logic |
 | `framework/` | `ComputeExeDirectory` (0x1A02870), `ReleaseGlobalObject` (0x4017B0) | (done) exe-directory compute + `ExeDirectory()` getter + global shared-object release; the framework init/shutdown pair is complete |
 | `common/` | `LHAlloc` (0x1A035C0), `LHFree` (0x1A032C0), `SharedBufferAssign` (0x403FE0), `SharedBufferFree` (0x403820), `OutOfMemory` (0x1A034F0) | (done) heap alloc/free + `F3SharedBuffer` counted buffer + OOM report handler; next: cross-module globals `byte_1DBD01B`, `byte_1C86BD9` |
