@@ -342,12 +342,101 @@ static BYTE  g_byte_1D9E19C  = 0;
 // WM_SIZE path).
 static int ResizeWorkerWindow(CWorkerWin32 *obj);
 
-// 0x18F2850 -- display readiness check. The original enters a global CS and
-// invokes a display vtable method (sub_18F2310 path); here we conservatively
-// report "not ready" so WorkerFlushFrame keeps its pending flag set without
-// invoking the render callback (onResetDevice at worker +0x26C), which may not
-// be installed yet. [simplified]
-static char IsDisplayReady(void) { return 0; }
+// 0x1E2EEF4: the current XLO device object (a vtable-backed pointer; defined
+// here ahead of IsDisplayReady, grouped conceptually with the device-global
+// block further down).
+static void *g_dword_1E2EEF4 = 0;
+
+// 0x1E2ED80: the 56-byte (14 DWORD) XLO device-caps block (xlo_device.cpp
+// carries an independent mirror of this global for the XLO import paths).
+static DWORD g_dword_1E2ED80[14];
+
+// 0x20FC948: the device critical section guarding the XLO device state
+// (dword_1E2EEF4 / dword_1E2ED80 / dword_1E2ED74). In the image it is
+// all-0xFF poison, as with stru_20FCA50; the game's device-subsystem init
+// calls InitializeCriticalSection on it before any Enter. Reproduce that with
+// a one-time lazy init (a raw poison CS faults on Enter).
+static CRITICAL_SECTION g_stru_20FC948;
+static int g_stru_20FC948Init = 0;
+static void F3EnterDisplayCs(void)
+{
+    if (!g_stru_20FC948Init)
+    {
+        InitializeCriticalSection(&g_stru_20FC948);
+        g_stru_20FC948Init = 1;
+    }
+    EnterCriticalSection(&g_stru_20FC948);
+}
+
+// ============================================================
+//  [STUB]  ResetXloDevice  (0x18F2310 - 0x18F2850)  -- reset/recreate the XLO
+//  device from a fresh 56-byte caps block
+//
+//  int ResetXloDevice(const DWORD *caps56)   -- 1 = reset succeeded, 0 = failed
+//
+//  Original semantics (nested under the device CS stru_20FC948 already held
+//  by the caller): if the device object (dword_1E2EEF4) reports status
+//  0x88760868 (already reset) return 0. Otherwise, unless the device has
+//  been built once (byte_2075F04), release the per-device resources first
+//  (the LHAlloc-allocated container, the 0x20FCA0C/0x20FC9CC object-list
+//  callback walks, ReleaseDeviceObjects + sub_566CB0). Then recreate the
+//  device through its vtable[16] (offset 0x40) with the new caps, record the
+//  caps into dword_1E2ED80 and the mode class into dword_1E2ED74 (selected
+//  from the last caps dword: bit 0x80000001/low bit -> 1, bit 2 -> 2, bit 4
+//  -> 3, bit 8 -> 4), run sub_18F1310, re-notify the 0x20FCA0C list (vtable[2])
+//  and the 0x20FC9EC list, clear byte_2075F04, and return 1. The full
+//  device-rebuild subsystem (object-list management, sub_18E65F0,
+//  sub_18F1310, sub_56xxxx helpers) is out of scope. Returns 0 (reset failed)
+//  so IsDisplayReady stays conservative.
+// ============================================================
+static int ResetXloDevice(const DWORD *caps56)
+{
+    (void)caps56;
+    return 0;
+}
+
+//  IsDisplayReady  (0x18F2850 - 0x18F28B5)  -- is the XLO display ready to
+//  present a frame?
+//  [NOT byte-identical] placement-dependent (relative call to
+//  ResetXloDevice) and refs the high-VA globals stru_20FC948 (0x020FC948),
+//  dword_1E2EEF4 (0x01E2EEF4), dword_1E2ED80 (0x01E2ED80) plus the
+//  EnterCriticalSection / LeaveCriticalSection IAT slots.
+//
+//  char IsDisplayReady(void)   -- 1 = ready, 0 = not ready
+//
+//  Under the device CS (stru_20FC948): query the device object
+//  (dword_1E2EEF4) through its vtable[3] (offset 0x0C), passing the device
+//  pointer as the (single, stdcall) argument. If the status is 0x88760869
+//  (device lost), attempt a device reset (ResetXloDevice, 0x18F2310) with the
+//  56-byte caps block at dword_1E2ED80; a failed reset reports "not ready".
+//  Any other nonzero status also reports "not ready". Otherwise the display
+//  is ready. The original faults on a null device slot; the guard below
+//  reports "not ready" instead so this build is safe pre-device-init.
+static char IsDisplayReady(void)
+{
+    if (g_dword_1E2EEF4 == 0)
+        return 0;
+
+    F3EnterDisplayCs();
+    void *devObj = g_dword_1E2EEF4;
+    void **vt    = *(void ***)devObj;
+    int status   = (*(int (**)(void *, void *))(vt[3]))(devObj, devObj);
+    if (status == 0x88760869)
+    {
+        if (ResetXloDevice(g_dword_1E2ED80) == 0)
+        {
+            LeaveCriticalSection(&g_stru_20FC948);
+            return 0;
+        }
+    }
+    else if (status != 0)
+    {
+        LeaveCriticalSection(&g_stru_20FC948);
+        return 0;
+    }
+    LeaveCriticalSection(&g_stru_20FC948);
+    return 1;
+}
 
 // 0x188EDF0 -- input-manager "set active" (obj in the caller's ECX/esi, a
 // state byte on the stack). Sets obj[72]=state and, when the state changes to
@@ -932,7 +1021,7 @@ static F3DisplayMode *InitDisplayMode(F3DisplayMode *dm)
 //  Original semantics (under the device critical section stru_20FC948): 0 =
 //  the requested mode is / became current, 1 = the mode was changed, 2 = the
 //  restore-to-current failed. Deep display-mode subsystem (sub_18F1510 /
-//  sub_18F2310 / sub_18EFF00 / sub_18F21A0 / sub_18F05D0 / sub_18F1B30); out
+//  ResetXloDevice (0x18F2310) / sub_18EFF00 / sub_18F21A0 / sub_18F05D0 / sub_18F1B30); out
 //  of scope here. Returns 0 (mode already current) so callers take the
 //  success path.
 // ============================================================
@@ -1343,8 +1432,8 @@ static int NvApiDestroyObject(void *obj)
 // 0x2075F10: the current per-device slot index (which XLO device slot).
 static DWORD g_dword_2075F10 = 0;
 
-// 0x1E2EEF4: the current XLO device object (a vtable-backed pointer).
-static void *g_dword_1E2EEF4 = 0;
+// 0x1E2EEF4 (the current XLO device object) is defined earlier, ahead of
+// IsDisplayReady.
 
 // 0x2075F00: the pending device flush-request object -- a 20-byte struct
 // (three floats, a wrapped NVAPI resource at +12, three flag bytes at
