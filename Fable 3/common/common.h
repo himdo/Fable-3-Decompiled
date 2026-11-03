@@ -44,6 +44,12 @@ void SharedBufferAssign(F3SharedBuffer *this_, const char *src, unsigned int len
 // length, set the capacity flag, then free the control block itself.
 void SharedBufferFree(F3SharedBuffer *this_);
 
+// SharedBufferCreate (0x1A01360) - allocate a fresh 16-byte counted buffer and
+// fill it from (src, size): zero data/length/capacity, SharedBufferAssign the
+// payload (size bytes, or the null-terminated length when size == -1), set the
+// refcount to 1, and return the block (0 on OOM).
+F3SharedBuffer *SharedBufferCreate(const char *src, int size);
+
 // 0x2075C48 - global live-object count for the shared slots below (the IDA
 // name is "Addend"): InitSharedSlot bumps it, ReleaseSharedSlot drops it; the
 // worker ctor / dtor body do as well.
@@ -62,6 +68,14 @@ F3SharedBuffer ** InitSharedSlot(F3SharedBuffer **obj);
 // via SharedBufferFree on zero, nulls the slot, and drops the global
 // live-slot count (g_Addend). Returns the new g_Addend value.
 long ReleaseSharedSlot(F3SharedBuffer **slot);
+
+// SetSharedSlot (0x1A01CC0) - the general shared-slot setter (the generic core of
+// SetSaveGamePath). thiscall in the original (slot in ECX, src + size on the
+// stack, callee cleans via retn 8); declared as a plain free function here.
+// Nulls the slot, bumps the live-slot count (g_Addend), builds a fresh counted
+// buffer from (src, size) via SharedBufferCreate when src is non-empty, releases
+// any old block the slot still holds, stores the new block, and returns the slot.
+F3SharedBuffer **SetSharedSlot(F3SharedBuffer **obj, const char *src, int size);
 
 // GetLocalizedString (0x19FF570) - thiscall accessor for a per-LCID
 // localized-string entry. obj points to a word holding the current-locale

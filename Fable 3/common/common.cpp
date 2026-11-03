@@ -167,6 +167,46 @@ void SharedBufferFree(F3SharedBuffer *this_)
 }
 
 // ============================================================
+//  SharedBufferCreate  (0x1A01360 - 0x1A013D3)  -- allocate + fill a counted buffer
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc and
+//  SharedBufferAssign).
+//
+//  F3SharedBuffer * SharedBufferCreate(const char *src, int size)
+//
+//  Allocate a fresh 16-byte F3SharedBuffer control block (LHAlloc(16)) and fill
+//  it from the source byte buffer: zero data / length / capacity, then run
+//  SharedBufferAssign(src, len) where len is `size` or, when size == -1
+//  (0xFFFFFFFF), the length of the null-terminated src (0 when *src is 0). The
+//  new block's refcount is set to 1 and the block is returned (0 on OOM).
+//  userpurge in the original (src in EDI, size on the stack); SetSharedSlot
+//  (0x1A01CC0) is its primary caller (the original has 6 call sites).
+// ============================================================
+F3SharedBuffer *SharedBufferCreate(const char *src, int size)
+{
+    F3SharedBuffer *blk = (F3SharedBuffer *)LHAlloc(16);
+    if (blk == 0)
+        return 0;
+
+    blk->data     = 0;
+    blk->length   = 0;
+    blk->capacity = 0;
+
+    unsigned int len;
+    if (size == -1)
+    {
+        len = 0;
+        if (src != 0 && *src != 0)
+            do { ++len; } while (src[len] != 0);
+    }
+    else
+        len = (unsigned int)size;
+
+    SharedBufferAssign(blk, src, len);
+    blk->refcount = 1;
+    return blk;
+}
+
+// ============================================================
 //  InitSharedSlot  (0x1A00C30 - 0x1A00C48)  -- construct a (null) shared slot
 //  [NOT byte-identical] placement-independent (no relative calls / long jumps),
 //  but refs the high-VA global g_Addend (0x02075C48) and the
@@ -219,6 +259,49 @@ long ReleaseSharedSlot(F3SharedBuffer **slot)
     long result = InterlockedDecrement(&g_Addend);
     *slot = 0;
     return result;
+}
+
+// ============================================================
+//  SetSharedSlot  (0x1A01CC0 - 0x1A01D26)  -- assign (src, size) into a shared slot
+//  [NOT byte-identical] placement-dependent (relative calls to SharedBufferCreate
+//  and SharedBufferFree), plus the InterlockedIncrement / InterlockedDecrement IAT
+//  slots and the high-VA live-slot counter g_Addend (0x02075C48).
+//
+//  F3SharedBuffer ** SetSharedSlot(F3SharedBuffer **obj, const char *src, int size)
+//
+//  The engine's general shared-slot setter: thiscall in the original (the slot
+//  pointer is in ECX, src and size are the two stack args, the callee cleans via
+//  `retn 8`), with ~18,460 call sites across the engine. It nulls the slot, bumps
+//  the global live-slot count (g_Addend), then -- when src is a non-empty buffer --
+//  builds a fresh counted buffer from (src, size) via SharedBufferCreate (0x1A01360).
+//  It releases any block the slot still holds (InterlockedDecrement its refcount at
+//  +12; SharedBufferFree on zero) and re-nulls it; the slot was already nulled above,
+//  so this branch is a no-op unless the builder touches it. It stores the new block
+//  if one was built and returns the slot pointer (this). Declared as a plain free
+//  function (first param `obj` = the thiscall slot) to match the project convention.
+//  The sibling SetSaveGamePath (0x1A019B0) is the save-path specialization (no size
+//  arg, no counter bump, void return).
+// ============================================================
+F3SharedBuffer **SetSharedSlot(F3SharedBuffer **obj, const char *src, int size)
+{
+    F3SharedBuffer *v4 = 0;
+
+    *obj = 0;
+    InterlockedIncrement(&g_Addend);
+
+    if (src != 0 && *src != 0)
+        v4 = SharedBufferCreate(src, size);
+
+    if (*obj != 0)
+    {
+        if (InterlockedDecrement(&(*obj)->refcount) <= 0 && *obj != 0)
+            SharedBufferFree(*obj);
+        *obj = 0;
+    }
+
+    if (v4 != 0)
+        *obj = v4;
+    return obj;
 }
 
 // 0x01BDFD28: the default wide string returned when a localized-string entry
