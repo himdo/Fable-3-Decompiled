@@ -311,13 +311,482 @@ static int g_dword_2122F18 = 0;
 static const char g_DefaultClassName[] = "";
 
 // ============================================================
-//  [STUB]  sub_18F7460  (0x18F7460)  -- window-message dispatch
+//  sub_18F7460 (DispatchWorkerMessage)  -- window-message dispatch
 //
-//  3-arg stdcall (hWnd, msg, wParam). Dispatches a main-window message while
-//  the worker is in message-pump state; also called on the resize path
-//  (sub_18F8060 / HandleDisplayModeChange). Returns 0 (unhandled).
+//  The real main-window message handler, invoked by WorkerWndProc while the
+//  worker is in message-pump state (2). The original is a 3-arg stdcall that
+//  also reads lParam from ECX (retn 0Ch); here it is written as a clean
+//  4-argument WNDPROC. It enters the worker critical section (worker +4),
+//  dispatches on Msg, and either forwards to DefWindowProcA (unhandled) or
+//  returns 0 (handled). The WM_CLOSE (0x10) path saves settings and calls
+//  ExitProcess(0), so it never returns.
+//
+//  Globals referenced (high-VA, kept under their original IDA names):
+//    0x20FC8CC  hInstance     -- the process HINSTANCE
+//    0x20FC8D0  dword_20FC8D0 -- default cursor fallback (wParam==0 of 0x8003)
+//    0x20FC8D4  hCursor       -- the current worker cursor (HCURSOR)
+//    0x2122F1C  byte_2122F1C  -- cursor-shown tracking flag
 // ============================================================
-static LRESULT __stdcall sub_18F7460(HWND, UINT, WPARAM) { return 0; }
+static int     g_hInstance     = 0;   // 0x20FC8CC
+static int     g_dword_20FC8D0 = 0;   // 0x20FC8D0
+static HCURSOR g_hCursor       = 0;   // 0x20FC8D4
+static char    g_byte_2122F1C  = 0;   // 0x2122F1C
+
+// 0x1D9E18C / 0x1D9E194 / 0x1D9E19C: the system-parameter restore values used
+// by SaveSettingsBeforeExit (sub_18F71E0).
+static DWORD g_dword_1D9E18C = 0;
+static DWORD g_dword_1D9E194 = 0;
+static BYTE  g_byte_1D9E19C  = 0;
+
+// Forward declaration for a helper defined later in this file (used by the
+// WM_SIZE path).
+static int ResizeWorkerWindow(CWorkerWin32 *obj);
+
+// 0x18F2850 -- display readiness check. The original enters a global CS and
+// invokes a display vtable method (sub_18F2310 path); here we conservatively
+// report "not ready" so WorkerFlushFrame keeps its pending flag set without
+// invoking the render callback (onResetDevice at worker +0x26C), which may not
+// be installed yet. [simplified]
+static char IsDisplayReady(void) { return 0; }
+
+// 0x188EDF0 -- input-manager "set active" (obj in the caller's ECX/esi, a
+// state byte on the stack). Sets obj[72]=state and, when the state changes to
+// 0 (deactivate), walks the observer list at obj[12..16) invoking each
+// observer's vtable[4].
+static void SetInputActive(void *obj, unsigned char state)
+{
+    if (obj == 0)
+        return;
+    char *o = (char *)obj;
+    EnterCriticalSection((LPCRITICAL_SECTION)(o + 76));
+    int changed = (o[72] != (char)state);
+    o[72] = (char)state;
+    if (changed && state == 0)
+    {
+        void **i = (void **)(*(int *)(o + 12));   // list start
+        void **end = (void **)(*(int *)(o + 16)); // list end
+        while (i != end)
+        {
+            void *obs = *i;
+            void *vt = *(void **)obs;
+            if (vt)
+                (*(void (**)(void *))((char *)vt + 16))(obs);   // vtable[4](obs)
+            i = (void **)((char *)i + 8);
+        }
+    }
+    LeaveCriticalSection((LPCRITICAL_SECTION)(o + 76));
+}
+
+// 0x188EC90 -- find the active input device. Walks the device list at
+// obj[12..16); returns the first device whose vtable[1] returns 3, else 0.
+static void *FindActiveInputDevice(void *obj)
+{
+    if (obj == 0)
+        return 0;
+    DWORD *self = (DWORD *)obj;
+    void **i = (void **)(self[3]);   // offset 12 = list start
+    void **end = (void **)(self[4]); // offset 16 = list end
+    if (i == end)
+        return 0;
+    for (;;)
+    {
+        void *obs = *i;
+        void *vt = *(void **)obs;
+        int res = (vt != 0) ? (*(int (**)(void *))((char *)vt + 4))(obs) : 0; // vtable[1]
+        if (res == 3)
+            return obs;
+        i = (void **)((char *)i + 8);
+        if (i == end)
+            return 0;
+    }
+}
+
+// 0x188D710 -- handle a raw-input report (obj, HRAWINPUT). The original calls
+// GetRawInputData and feeds the gamepad axis/button state into the input
+// subsystem (sub_412AB0 / sub_412B00 / sub_417C50 / sub_5CCC90 / ...), which
+// is out of scope here. [remaining stub]
+static UINT HandleRawInput(void *obj, void *hRawInput)
+{
+    (void)obj;
+    (void)hRawInput;
+    return 0;
+}
+
+// 0x188F140 -- record an input event (obj, WORD code, BYTE state). The
+// original takes obj's CS and calls sub_5C9F50(&code, obj+24). The event
+// recorder is out of scope here. [remaining stub]
+static void RecordInputEvent(void *obj, unsigned short code, char state)
+{
+    (void)code;
+    (void)state;
+    if (obj == 0)
+        return;
+    char *o = (char *)obj;
+    EnterCriticalSection((LPCRITICAL_SECTION)(o + 76));
+    LeaveCriticalSection((LPCRITICAL_SECTION)(o + 76));
+}
+
+// 0x18F7000 -- set the worker's activation/cursor state (and mirror it to the
+// input manager). Original is __usercall (state in EAX, worker in ECX).
+static int SetWorkerState(void *worker, int state)
+{
+    char *w = (char *)worker;
+    if (w[0x23C] != (BYTE)state)
+    {
+        w[0x23C] = (BYTE)state;
+        w[0x287] = 1;
+        void *mgr = GetManager();
+        if (mgr != 0)
+            SetInputActive(*(void **)((char *)mgr + 0x20), (BYTE)state);
+    }
+    return state;
+}
+
+// 0x18F7190 -- flush a pending worker frame (worker in the caller's ESI). If
+// the render-pending flag (worker[0x280]) is set and the display is ready,
+// invoke the render callback (worker +0x26C), set the frame event (worker
+// +0x1A4), clear the pending flag, and propagate the reflow flag (worker
+// +0x283 -> worker +0x285). Otherwise keep the pending flag set.
+static void WorkerFlushFrame(void *worker)
+{
+    char *w = (char *)worker;
+    if (w[0x280] != 0)
+    {
+        if (IsDisplayReady() != 0)
+        {
+            (*(int (**)(void))(w + 0x26C))();   // onResetDevice callback
+            SetEvent(*(HANDLE *)(w + 0x1A4));   // event3
+            w[0x280] = 0;
+            if (w[0x283] != 0)
+                w[0x285] = 1;
+        }
+        else
+        {
+            w[0x280] = 1;
+        }
+    }
+}
+
+// 0x18F71E0 -- save settings before exit. Restores the three system
+// parameters the game overrode; the original also re-saves
+// AccessibilitySettings.xml through shared buffers (out of scope). Returns the
+// save status.
+static LONG SaveSettingsBeforeExit(void)
+{
+    SystemParametersInfoA(0x3B, 8, &g_dword_1D9E18C, 0);
+    SystemParametersInfoA(0x35, 8, &g_dword_1D9E194, 0);
+    SystemParametersInfoA(0x33, 0x18, (PVOID)(unsigned long)g_byte_1D9E19C, 0);
+    return 0;
+}
+
+// 0x67C930 -- fill a shared-buffer slot (used on the WM_CLOSE path to obtain
+// the "abnormal_shutdown.tmp" path). Matches the gamemain.cpp no-op stub.
+static void sub_67C930(void *obj)
+{
+    (void)obj;
+}
+
+// 0x18B0420 -- delete the file resolved from a shared-buffer slot. The
+// original resolves the path via sub_18AFB90 and DeleteFileA's it, releasing
+// the refcount; the path resolution is out of scope. [remaining stub]
+static int DeleteSharedFile(void *slot)
+{
+    (void)slot;
+    return 0;
+}
+
+// 0xBE37E0 -- release the LFX module (the loaded module at 0x1DD3218).
+// Looks up "LFX_Release" and calls it, clearing the handle.
+static int ReleaseLfxModule(void)
+{
+    static HMODULE g_hModule = 0;   // 0x1DD3218
+    int result = (int)g_hModule;
+    if (g_hModule != 0)
+    {
+        FARPROC proc = GetProcAddress(g_hModule, "LFX_Release");
+        result = 1;
+        if (proc != 0)
+        {
+            result = ((int (*)(void))proc)();
+            g_hModule = 0;
+        }
+    }
+    return result;
+}
+
+// 0x18F7460 -- DispatchWorkerMessage (see header comment above).
+static LRESULT DispatchWorkerMessage(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam)
+{
+    CWorkerWin32 *worker = (CWorkerWin32 *)g_dword_2122F18;
+    if (worker == 0)
+        return DefWindowProcA(hWnd, Msg, wParam, lParam);
+
+    char *w = (char *)worker;
+    CRITICAL_SECTION *cs = &worker->cs;   // worker +4
+
+    EnterCriticalSection(cs);
+
+    if (Msg <= 0x1C)
+    {
+        if (Msg != 0x1C)
+        {
+            switch (Msg)
+            {
+            case 5:   // WM_SIZE
+                if (wParam == 1)   // SIZE_MINIMIZED -- show the cursor if hidden
+                {
+                    if (w[0x286] == 0)
+                    {
+                        w[0x286] = 1;
+                        w[0x284] = 1;
+                        SetWorkerState(worker, 0);
+                    }
+                }
+                else if (wParam == 0 || wParam == 2)   // SIZE_RESTORED / SIZE_MAXIMIZED -- hide the cursor if shown
+                {
+                    if (w[0x286] != 0)
+                    {
+                        w[0x286] = 0;
+                        w[0x285] = 1;
+                        SetWorkerState(worker, 1);
+                        g_byte_2122F1C = 0;
+                        WorkerFlushFrame(worker);
+                    }
+                }
+                if (w[0x24C] != 0)
+                {
+                    LeaveCriticalSection(cs);
+                    return DefWindowProcA(hWnd, Msg, wParam, lParam);
+                }
+                ResizeWorkerWindow(worker);
+                LeaveCriticalSection(cs);
+                return DefWindowProcA(hWnd, Msg, wParam, lParam);
+            case 6:   // WM_ACTIVATE
+            {
+                int bl = ((WORD)wParam != 0);
+                SetWorkerState(worker, bl);
+                if (bl != 0 && g_byte_2122F1C != 0)
+                {
+                    g_byte_2122F1C = 0;
+                    if (w[0x286] == 0)
+                        w[0x285] = 1;
+                }
+                LeaveCriticalSection(cs);
+                return DefWindowProcA(hWnd, Msg, wParam, lParam);
+            }
+            case 7:   // WM_SETFOCUS
+            case 8:   // WM_KILLFOCUS
+                SetWorkerState(worker, 1);
+                LeaveCriticalSection(cs);
+                return DefWindowProcA(hWnd, Msg, wParam, lParam);
+            case 0xF:   // WM_PAINT
+                w[0x289] = 1;   // ready
+                if (g_byte_2122F1C != 0)
+                {
+                    g_byte_2122F1C = 0;
+                    if (w[0x286] == 0)
+                        w[0x285] = 1;
+                }
+                LeaveCriticalSection(cs);
+                return DefWindowProcA(hWnd, Msg, wParam, lParam);
+            case 0x10:   // WM_CLOSE -- hard process exit
+                SaveSettingsBeforeExit();
+                if (wParam == 0)
+                {
+                    F3SharedBuffer *slot = 0;
+                    sub_67C930(&slot);
+                    DeleteSharedFile(slot);
+                    ReleaseSharedSlot(&slot);
+                }
+                ReleaseLfxModule();
+                ExitProcess(0);
+                break;
+            default:
+                LeaveCriticalSection(cs);
+                return DefWindowProcA(hWnd, Msg, wParam, lParam);
+            }
+        }
+        else   // Msg == 0x1C (WM_ACTIVATEAPP)
+        {
+            char bl = (wParam != 0);
+            if (w[0x23C] != bl)
+            {
+                w[0x23C] = bl;
+                w[0x287] = 1;
+                void *mgr = GetManager();
+                if (mgr != 0)
+                    SetInputActive(*(void **)((char *)mgr + 0x20), (BYTE)bl);
+            }
+            if (bl != 0)
+                WorkerFlushFrame(worker);
+            LeaveCriticalSection(cs);
+            return DefWindowProcA(hWnd, Msg, wParam, lParam);
+        }
+    }
+    else if (Msg <= 0x113)
+    {
+        if (Msg == 0x113)   // custom: refresh / repaint request
+        {
+            if (wParam == 0x1000 && w[0x23C] != 0)
+            {
+                WorkerFlushFrame(worker);
+                if (w[0x288] != 0)   // shown
+                {
+                    if (w[0x289] != 0)   // ready
+                    {
+                        InvalidateRect(*(HWND *)(w + 0x238), 0, 0);
+                        w[0x289] = 0;
+                    }
+                    else
+                    {
+                        g_byte_2122F1C = 1;
+                        w[0x288] = 0;
+                        w[0x284] = 1;
+                        SetWorkerState(worker, 0);
+                    }
+                }
+            }
+            LeaveCriticalSection(cs);
+            return DefWindowProcA(hWnd, Msg, wParam, lParam);
+        }
+        switch (Msg)
+        {
+        case 0x20:   // WM_SETCURSOR
+            SetCursor(g_hCursor);
+            LeaveCriticalSection(cs);
+            return 0;
+        case 0xFF:   // WM_INPUT (raw input)
+            if (wParam == 0)
+            {
+                void *mgr = GetManager();
+                void *device = (mgr != 0)
+                    ? FindActiveInputDevice(*(void **)((char *)mgr + 0x20))
+                    : 0;
+                if (device != 0)
+                {
+                    void *vt = *(void **)device;
+                    if (vt && (*(int (**)(void *))((char *)vt + 7 * 4))(device) == 1)
+                        HandleRawInput(device, (void *)lParam);
+                }
+            }
+            LeaveCriticalSection(cs);
+            return DefWindowProcA(hWnd, Msg, wParam, lParam);
+        case 0x102:   // WM_KEYUP
+        {
+            void *mgr = GetManager();
+            void *obj = (mgr != 0) ? *(void **)((char *)mgr + 0x20) : 0;
+            char state = (lParam >= 0) ? 1 : 0;
+            RecordInputEvent(obj, (WORD)wParam, state);
+            LeaveCriticalSection(cs);
+            return DefWindowProcA(hWnd, Msg, wParam, lParam);
+        }
+        case 0x104:   // custom
+        case 0x105:   // custom
+            if (wParam == 0x12)
+            {
+                LeaveCriticalSection(cs);
+                return 0;
+            }
+            LeaveCriticalSection(cs);
+            return DefWindowProcA(hWnd, Msg, wParam, lParam);
+        case 0x112:   // custom (scan-code / gamepad range)
+        {
+            int v = (int)wParam & 0xFFF0;
+            if (v == 0xF120)
+            {
+                if (w[0x286] != 0)
+                {
+                    w[0x286] = 0;
+                    w[0x285] = 1;
+                    SetWorkerState(worker, 1);
+                    g_byte_2122F1C = 0;
+                    WorkerFlushFrame(worker);
+                }
+                LeaveCriticalSection(cs);
+                return DefWindowProcA(hWnd, Msg, wParam, lParam);
+            }
+            else if (v == 0xF020)
+            {
+                if (w[0x286] == 0)
+                {
+                    w[0x286] = 1;
+                    w[0x284] = 1;
+                    SetWorkerState(worker, 0);
+                }
+                LeaveCriticalSection(cs);
+                return DefWindowProcA(hWnd, Msg, wParam, lParam);
+            }
+            else if (v == 0xF100 || v == 0xF140 || v == 0xF170)
+            {
+                LeaveCriticalSection(cs);
+                return 0;
+            }
+            LeaveCriticalSection(cs);
+            return DefWindowProcA(hWnd, Msg, wParam, lParam);
+        }
+        default:
+            LeaveCriticalSection(cs);
+            return DefWindowProcA(hWnd, Msg, wParam, lParam);
+        }
+    }
+    else
+    {
+        // Msg > 0x113
+        if (Msg > 0x8002)
+        {
+            if (Msg == 0x8003)   // custom: set cursor
+            {
+                HCURSOR cur = (HCURSOR)g_hInstance;
+                if (wParam == 0)
+                    cur = (HCURSOR)g_dword_20FC8D0;
+                g_hCursor = cur;
+                if (cur == 0)
+                {
+                    cur = LoadCursorA(0, (LPCSTR)0x7F00);
+                    g_hCursor = cur;
+                }
+                SetCursor(g_hCursor);
+                LeaveCriticalSection(cs);
+                return 0;
+            }
+            LeaveCriticalSection(cs);
+            return DefWindowProcA(hWnd, Msg, wParam, lParam);
+        }
+        else
+        {
+            // 0x114 < Msg <= 0x8002
+            if (Msg == 0x8002)   // custom: show / hide cursor loop
+            {
+                if (wParam != 0)
+                {
+                    while (ShowCursor(1) < 0) { }
+                }
+                else
+                {
+                    while (ShowCursor(0) >= 0) { }
+                }
+                LeaveCriticalSection(cs);
+                return 0;
+            }
+            else if (Msg == 0x281)   // custom: forward with lParam cleared
+            {
+                LeaveCriticalSection(cs);
+                return DefWindowProcA(hWnd, Msg, wParam, 0);
+            }
+            else if (Msg == 0x8000)   // custom: render request
+            {
+                w[0x284] = 1;
+                w[0x283] = 1;
+                w[0x280] = 1;
+                WorkerFlushFrame(worker);
+                LeaveCriticalSection(cs);
+                return 0;
+            }
+            LeaveCriticalSection(cs);
+            return DefWindowProcA(hWnd, Msg, wParam, lParam);
+        }
+    }
+}
 
 // ============================================================
 //  WorkerWndProc  (0x18F7A70 - 0x18F7AD4)  -- the main window's wndproc
@@ -332,8 +801,8 @@ static LRESULT __stdcall sub_18F7460(HWND, UINT, WPARAM) { return 0; }
 //  0x7FFFFFFF to [lParam+0x20] and [lParam+0x24] (the MINMAXINFO
 //  ptMaxTrackSize x/y) and return 0 -- the original allows the window to
 //  grow without a max track size. Otherwise, while the stored target is
-//  alive and its pump state (+0x22C) is 2, forward (hWnd, msg, wParam) to
-//  sub_18F7460; else DefWindowProcA.
+//  alive and its pump state (+0x22C) is 2, forward (hWnd, msg, wParam, lParam)
+//  to DispatchWorkerMessage (sub_18F7460); else DefWindowProcA.
 // ============================================================
 static LRESULT CALLBACK WorkerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -350,7 +819,7 @@ static LRESULT CALLBACK WorkerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
     }
 
     if (g_dword_2122F18 != 0 && *(int *)((char *)g_dword_2122F18 + 0x22C) == 2)
-        return sub_18F7460(hWnd, msg, wParam);
+        return DispatchWorkerMessage(hWnd, msg, wParam, lParam);
 
     return DefWindowProcA(hWnd, msg, wParam, lParam);
 }
