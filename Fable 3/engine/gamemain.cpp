@@ -115,8 +115,6 @@ static int SteamAPI_Init(void)
 //  They are "remaining stubs": real per-function behavior is out of scope
 //  until each is decompiled on its own.
 // ============================================================
-static void  sub_72F7B0(void *obj) { (void)obj; }
-static void  sub_775D10(void *str, char c) { (void)str; (void)c; }
 static int   sub_775DA0(void *str, char c) { (void)str; (void)c; return 0; }
 
 static int   g_sub61A000Buf[2] = { 0, 0 };
@@ -189,6 +187,41 @@ typedef struct F3XmlStream
 static void *g_CXMLStreamVtable[8]      = { 0 };
 static void *g_CXMLReadStreamVtable[32] = { 0 };
 
+// sub_17DC6D0 (defined below): the real vtable[1] slot (enter a section)
+static char FindXmlSection(F3XmlStream *obj, const char *name);
+
+// ============================================================
+//  LHXML report handler (off_1D94CA0)
+//
+//  The LHXML module forwards parser / reader errors to a single global
+//  report handler (off_1D94CA0, type int (__cdecl *)(char *message)); the
+//  report builder sub_17E4FA0 formats the message (vprintf + vsprintf_s into
+//  a growing buffer) and calls it. The saved video-options loader installs a
+//  silent no-op handler (nullsub_33) for the duration of the file read.
+// ============================================================
+typedef int (__cdecl *F3XmlReportHandler)(char *message);
+static F3XmlReportHandler g_dword_1D94CA0 = 0;   // 0x1D94CA0: the report handler
+
+// sub_17E4F80 (0x17E4F80 - 0x17E4F86): the current report handler
+static F3XmlReportHandler GetXmlReportHandler(void)
+{
+    return g_dword_1D94CA0;
+}
+
+// sub_17E4F90 (0x17E4F90 - 0x17E4F9A): install + return the report handler
+static F3XmlReportHandler SetXmlReportHandler(F3XmlReportHandler handler)
+{
+    g_dword_1D94CA0 = handler;
+    return handler;
+}
+
+// nullsub_33 (0x775A50): the silent report handler (a bare `ret`)
+static int XmlReportNoop(char *message)
+{
+    (void)message;
+    return 0;
+}
+
 // 0x1E2D7A0: the LHXML buffer-pool allocation counter.
 static DWORD g_dword_1E2D7A0 = 0;
 
@@ -242,6 +275,8 @@ static void CXMLReadStreamCtor(F3XmlStream *obj)
     obj->sectionInfo = 0;
     obj->sectionFound = 0;
     obj->vtable = (void *)g_CXMLReadStreamVtable;   // the derived vtable
+    if (g_CXMLReadStreamVtable[1] == 0)
+        g_CXMLReadStreamVtable[1] = (void *)FindXmlSection;   // vt[1]: enter a section
 }
 
 // sub_17DBD00 (0x17DBD00 - 0x17DBDB8): open + parse the XML file into the stream
@@ -392,6 +427,206 @@ static F3SharedBuffer **RefSharedSlot(F3SharedBuffer **dst, F3SharedBuffer **src
         }
     }
     return dst;
+}
+
+// ============================================================
+//  Shared-slot string-build cluster (the "settings file path" helpers that
+//  RunFrontEnd and the settings subsystem drive). The game keeps the
+//  settings-directory path in one global shared slot and builds concrete file
+//  paths by taking a fresh ref of it and appending a literal filename.
+//
+//  g_dword_1DBE2F0 is the settings-directory shared-slot global (the IDA name
+//  is "dword_1DBE2F0"): .bss (starts null), populated by the settings
+//  subsystem before the paths below are built. It is also the base slot used
+//  by sub_67C910 / sub_67C930 / the AccessibilitySettings.xml builders.
+// ============================================================
+static F3SharedBuffer *g_dword_1DBE2F0 = 0;   // 0x1DBE2F0: settings-directory path slot
+
+// sub_4040C0 (0x4040C0 - 0x40413B): index of the highest set bit (floor log2).
+static int TopBitIndex(unsigned int x)
+{
+    if (x == 0)
+        return -1;
+    if (x >= 0x80000000u)
+        return 31;
+    int r = 0;
+    while (x >= 2) { x >>= 1; ++r; }
+    return r;
+}
+
+// sub_403DB0 (0x403DB0 - 0x403E50) -- grow the buffer so it can hold `needed`
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc /
+//  sub_4040C0 / memcpy_s / memset) and refs the high-VA heap table (0x02075B24).
+//
+//  If the block's usable capacity (the low 31 bits of F3SharedBuffer::capacity)
+//  is already >= (needed+4) aligned, do nothing. Otherwise allocate a fresh
+//  aligned buffer, zero the trailing padding, copy the current payload, free
+//  the old payload through the heap table, and store the new pointer + the new
+//  capacity (preserving the capacity field's sign bit, the "auto-grow" flag).
+static void EnsureBufferCapacity(F3SharedBuffer *blk, unsigned int needed)
+{
+    unsigned int aligned = (needed + 4) & 0xFFFFFFFCu;
+    if (aligned <= (blk->capacity & 0x7FFFFFFFu))
+        return;
+
+    unsigned int newsz;
+    if ((blk->capacity & 0x80000000u) == 0)
+        newsz = aligned;                                  // exact-fit capacity
+    else
+    {
+        unsigned int v = aligned * 2u - 1u;               // 2*aligned - 1 (32-bit wrap)
+        newsz = (v == 0) ? 0u : (1u << TopBitIndex(v));   // next power of two
+    }
+
+    char *newdata = (char *)LHAlloc(newsz);
+    unsigned int len  = blk->length;
+    unsigned int tail = len + 1;
+    unsigned int pad  = ((tail + 4) & 0xFFFFFFFCu) - tail;
+    if (pad)
+        memset(newdata + tail, 0, pad);
+    memcpy(newdata, blk->data, len);
+    newdata[len] = 0;
+    if (blk->data != 0)
+    {
+        LHFree(blk->data);
+        blk->data = 0;
+    }
+    blk->data = newdata;
+    blk->capacity = (blk->capacity & 0x80000000u) | (newsz & 0x7FFFFFFFu);
+}
+
+// sub_403D10 (0x403D10 - 0x403D63) -- append (src, len) to the end of the buffer
+//  [NOT byte-identical] placement-dependent (relative calls to sub_403DB0 /
+//  memcpy_s / memset).
+//
+//  Grow the buffer to fit length+len, copy src's len bytes after the current
+//  payload, null-terminate, bump the length, and zero the trailing padding.
+static void SharedBufferAppend(F3SharedBuffer *blk, const char *src, unsigned int len)
+{
+    EnsureBufferCapacity(blk, blk->length + len);
+    char *dest = blk->data + blk->length;
+    memcpy(dest, src, len);
+    dest[len] = 0;
+    blk->length += len;
+    blk->data[blk->length] = 0;
+    unsigned int tail = blk->length + 1;
+    unsigned int pad  = ((tail + 4) & 0xFFFFFFFCu) - tail;
+    if (pad)
+        memset(blk->data + tail, 0, pad);
+}
+
+// sub_1A01500 (0x1A01500 - 0x1A015BE) -- copy-on-write detach a shared slot
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc /
+//  SharedBufferAssign / SharedBufferFree + the Interlocked IAT slots).
+//
+//  Make the slot own a PRIVATE copy of its block. A unique owner (refcount 1
+//  before the check) is already private: the check-increment is undone and the
+//  block is left in place. A shared block (refcount >= 2) is copied into a
+//  fresh 16-byte control block, the old ref is dropped (freeing the old block
+//  on zero), and the slot then points at the private copy.
+static void DetachSharedSlot(F3SharedBuffer **slot)
+{
+    F3SharedBuffer *blk = *slot;
+    if (blk == 0)
+        return;
+
+    if (InterlockedIncrement(&blk->refcount) <= 2)
+    {
+        InterlockedDecrement(&blk->refcount);              // unique: undo the check
+        return;
+    }
+
+    InterlockedDecrement(&blk->refcount);                  // shared: undo the check
+
+    F3SharedBuffer *copy = 0;
+    F3SharedBuffer *nb = (F3SharedBuffer *)LHAlloc(16);
+    if (nb != 0)
+    {
+        nb->data = 0;
+        nb->length = 0;
+        nb->capacity = 0;
+        unsigned int len = 0;
+        if (blk->data != 0 && *blk->data != 0)
+            do { ++len; } while (blk->data[len] != 0);
+        SharedBufferAssign(nb, blk->data, len);
+        nb->refcount = 1;
+        copy = nb;
+    }
+
+    if (*slot != 0)
+    {
+        if (InterlockedDecrement(&(*slot)->refcount) <= 0 && *slot != 0)
+            SharedBufferFree(*slot);
+        *slot = 0;
+    }
+    *slot = copy;
+}
+
+// sub_1A01880 (0x1A01880 - 0x1A01934) -- append (or create) a string on a slot
+//  [NOT byte-identical] placement-dependent (relative calls to DetachSharedSlot
+//  / LHAlloc / SharedBufferAssign / SharedBufferFree + the Interlocked IAT).
+//
+//  Append src to the slot's current string: when the slot already holds a
+//  block, DetachSharedSlot makes a private copy and SharedBufferAppend appends
+//  src. When the slot is empty, a fresh counted buffer is created from src
+//  (SharedBufferCreate, 0x1A01360) and any old block the slot holds is
+//  released. The live-slot count (g_Addend) is the caller's responsibility
+//  (InitSharedSlot / RefSharedSlot own it).
+static void AppendSharedSlot(F3SharedBuffer **slot, const char *src)
+{
+    if (*slot != 0)
+    {
+        DetachSharedSlot(slot);
+        unsigned int len = 0;
+        if (src != 0 && *src != 0)
+            do { ++len; } while (src[len] != 0);
+        SharedBufferAppend(*slot, src, len);
+        return;
+    }
+
+    F3SharedBuffer *nb = 0;
+    if (src != 0 && *src != 0)
+        nb = SharedBufferCreate(src, -1);
+
+    if (*slot != 0)
+    {
+        if (InterlockedDecrement(&(*slot)->refcount) <= 0 && *slot != 0)
+            SharedBufferFree(*slot);
+        *slot = 0;
+    }
+    if (nb != 0)
+        *slot = nb;
+}
+
+// sub_1A02230 (0x1A02230 - 0x1A02251) -- build a path as (base slot + literal)
+//  [NOT byte-identical] placement-dependent (relative calls to RefSharedSlot /
+//  AppendSharedSlot).
+//
+//  Ref the base slot into dst (RefSharedSlot, 0x1A012C0), then append the
+//  literal filename (AppendSharedSlot, 0x1A01880), so dst = base + name as a
+//  shared string. Returns dst. dst / base are the addresses of the slot words
+//  (typed F3SharedBuffer **); the original passes them as plain int*.
+static F3SharedBuffer **MakeSettingsFilePath(F3SharedBuffer **dst, F3SharedBuffer **base,
+                                             const char *name)
+{
+    RefSharedSlot(dst, base);
+    AppendSharedSlot(dst, name);
+    return dst;
+}
+
+//  MakeVideoOptionsPath  (0x72F7B0 - 0x72F7CC)  -- settings dir + "VideoOptions.xml"
+//  [NOT byte-identical] placement-dependent (relative call to MakeSettingsFilePath
+//  + the high-VA string literal and the settings-directory global at 0x1DBE2F0).
+//
+//  Build the video-options settings-file path: ref the settings-directory
+//  shared slot (g_dword_1DBE2F0) into obj and append the "VideoOptions.xml"
+//  filename, then return obj. One of several identical builders in the
+//  settings cluster (sub_67C910 "Controls\\", sub_67C930 "abnormal_shutdown.tmp",
+//  the AccessibilitySettings.xml builders). obj is a fresh caller slot (the
+//  RunFrontEnd v70 local); the caller ignores the returned pointer.
+static F3SharedBuffer **MakeVideoOptionsPath(F3SharedBuffer **obj)
+{
+    return MakeSettingsFilePath(obj, &g_dword_1DBE2F0, "VideoOptions.xml");
 }
 
 // sub_487560 (0x487560 - 0x4875AE): fresh 24-byte copy node from the source
@@ -545,10 +780,10 @@ typedef struct F3CXMLReadStreamVT
     void *                                    vt2;
     void (*nextSibling)(void *stream);                      // +0x0C
     void (*readPath)(void *stream, void *out);              // +0x10
-    void *                                    vt5;
+    void (*readBool)(void *stream, BYTE *out);              // +0x14
     void *                                    vt6;
     void (*readFloat)(void *stream, float *out);            // +0x1C
-    void *                                    vt8;
+    void (*readInt2)(void *stream, int *out);               // +0x20
     void (*readInt)(void *stream, int *out);                // +0x24
     void *                                    vt10[10];
     void *(*currentNode)(void *stream);                     // +0x50
@@ -726,6 +961,185 @@ static void *LoadVideoOptions(void *obj)
     CopyDetailOptionMap((F3OptionMap *)obj + 2, &maps[2]);      // sub_7770D0
     CXMLReadStreamDtor(&xml);                                   // sub_17DC2B0
     DestroyOptionMaps(&maps[0]);                                // sub_40E1F0
+    return obj;
+}
+
+// ============================================================
+//  Saved video-options values (LoadVideoOptionsValues, 0x775D10)
+//
+//  The user's saved video settings live in VideoOptions.xml (the path slot
+//  MakeVideoOptionsPath built above). LoadVideoOptionsValues fills a 52-byte
+//  options record with the defaults (InitVideoOptionsDefaults, 0x19E1380),
+//  opens the file in a 24-byte stack CXMLReadStream, and reads the
+//  "VideoOptions" element's fields in (ReadVideoOptionsValues, 0x775A60):
+//  Version, AdapterOrdinal, ScreenResolutionX / Y, Fullscreen, VSync, the
+//  eight TextureDetail .. DrawDistance values, and Calibrated. A silent
+//  report handler (nullsub_33) is installed for the duration of the read.
+// ============================================================
+
+// The 52-byte saved video-options record (RunFrontEnd's v103..v106 local).
+typedef struct F3VideoOptions
+{
+    DWORD  adapterOrdinal;     // +0x00
+    DWORD  screenResolutionX;  // +0x04
+    DWORD  screenResolutionY;  // +0x08
+    BYTE   fullscreen;         // +0x0C
+    BYTE   pad[3];
+    DWORD  detail[8];          // +0x10..+0x2F: Texture / Model / Water / Shadow /
+                               //      Effects / Environment / Tree / DrawDistance
+    BYTE   vsync;              // +0x30
+    BYTE   calibrated;         // +0x31
+    BYTE   pad2[2];
+} F3VideoOptions;              // 52 bytes
+
+//  InitVideoOptionsDefaults  (0x19E1380 - 0x19E13BF)  -- the 1280x720 defaults
+//  [NOT byte-identical] the original is a bare store sequence (no calls);
+//  the C++ form writes the same words / bytes to the same offsets, in order.
+static F3VideoOptions *InitVideoOptionsDefaults(F3VideoOptions *obj)
+{
+    obj->adapterOrdinal    = 0;
+    obj->screenResolutionX = 1280;
+    obj->screenResolutionY = 720;
+    obj->calibrated        = 0;
+    obj->fullscreen        = 1;
+    obj->vsync             = 1;
+    for (int i = 0; i < 8; ++i)
+        obj->detail[i] = 2;
+    return obj;
+}
+
+// sub_19E1920 (0x19E1920 - 0x19E1964): set the slot to the i-th detail name
+static void SetDetailOptionSlotName(F3SharedBuffer **slot, int index)
+{
+    static const char *detailNames[8] = {
+        "TextureDetail", "ModelDetail", "WaterDetail", "ShadowDetail",
+        "EffectsDetail", "EnvironmentDetail", "TreeDetail", "DrawDistance"
+    };
+    SetSharedSlot(slot, detailNames[index], -1);
+}
+
+//  ReadVideoOptionsValues  (0x775A60 - 0x775D04)  -- read the "VideoOptions"
+//  element's fields into the record
+//  [NOT byte-identical] placement-dependent (relative calls to the shared-
+//  slot helpers + the vtable dispatches; the /GS cookie refs high-VA data).
+//
+//  void ReadVideoOptionsValues(F3XmlStream *stream, F3VideoOptions *opts)
+//
+//  Enter the "VideoOptions" element; for each named child element found, read
+//  its value into the matching record field and advance to the next sibling.
+//  The 4-byte key slot is reused for every element (SetSharedSlot takes a ref
+//  on each set; each ReleaseSharedSlot drops it). In this build the LHXML
+//  parse is a remaining stub, so enterElement never finds the element and
+//  the record keeps its defaults (exactly the original's behavior for a
+//  missing / empty file).
+static void ReadVideoOptionsValues(F3XmlStream *stream, F3VideoOptions *opts)
+{
+    const F3CXMLReadStreamVT *vt = (const F3CXMLReadStreamVT *)stream->vtable;
+    if (vt->enterElement(stream, "VideoOptions") == 0)
+        return;
+
+    F3SharedBuffer *slot = 0;      // the one 4-byte slot, reused for every element
+    int version = 3;               // the Version child (read into a local, unused)
+
+    SetSharedSlot(&slot, "Version", -1);
+    if (vt->enterElement(stream, GetSlotString(&slot)) != 0)
+    {
+        vt->readInt2(stream, &version);          // vt[8]
+        vt->nextSibling(stream);                 // vt[3]
+    }
+    ReleaseSharedSlot(&slot);
+
+    SetSharedSlot(&slot, "AdapterOrdinal", -1);
+    if (vt->enterElement(stream, GetSlotString(&slot)) != 0)
+    {
+        vt->readInt2(stream, (int *)&opts->adapterOrdinal);   // vt[8]
+        vt->nextSibling(stream);
+    }
+    ReleaseSharedSlot(&slot);
+
+    SetSharedSlot(&slot, "ScreenResolutionX", -1);
+    if (vt->enterElement(stream, GetSlotString(&slot)) != 0)
+    {
+        vt->readInt(stream, (int *)&opts->screenResolutionX); // vt[9]
+        vt->nextSibling(stream);
+    }
+    ReleaseSharedSlot(&slot);
+
+    SetSharedSlot(&slot, "ScreenResolutionY", -1);
+    if (vt->enterElement(stream, GetSlotString(&slot)) != 0)
+    {
+        vt->readInt(stream, (int *)&opts->screenResolutionY); // vt[9]
+        vt->nextSibling(stream);
+    }
+    ReleaseSharedSlot(&slot);
+
+    SetSharedSlot(&slot, "Fullscreen", -1);
+    if (vt->enterElement(stream, GetSlotString(&slot)) != 0)
+    {
+        vt->readBool(stream, &opts->fullscreen);  // vt[5]
+        vt->nextSibling(stream);
+    }
+    ReleaseSharedSlot(&slot);
+
+    SetSharedSlot(&slot, "VSync", -1);
+    if (vt->enterElement(stream, GetSlotString(&slot)) != 0)
+    {
+        vt->readBool(stream, &opts->vsync);       // vt[5]
+        vt->nextSibling(stream);
+    }
+    ReleaseSharedSlot(&slot);
+
+    for (int i = 0; i < 8; ++i)
+    {
+        SetDetailOptionSlotName(&slot, i);        // sub_19E1920
+        if (vt->enterElement(stream, GetSlotString(&slot)) != 0)
+        {
+            vt->readInt(stream, (int *)&opts->detail[i]);        // vt[9]
+            vt->nextSibling(stream);
+        }
+        ReleaseSharedSlot(&slot);
+    }
+
+    SetSharedSlot(&slot, "Calibrated", -1);
+    if (vt->enterElement(stream, GetSlotString(&slot)) != 0)
+    {
+        vt->readBool(stream, &opts->calibrated);  // vt[5]
+        vt->nextSibling(stream);
+    }
+    ReleaseSharedSlot(&slot);
+    vt->nextSibling(stream);                      // leave the "VideoOptions" element
+}
+
+//  LoadVideoOptionsValues  (0x775D10 - 0x775D9B)  -- load the saved values
+//  [NOT byte-identical] placement-dependent (relative calls to the report-
+//  handler get / set, the defaults init, the CXMLReadStream ctor / dtor, the
+//  LHXML open, the values reader, and ReleaseSharedSlot; the /GS cookie and
+//  the high-VA XmlReportNoop literal).
+//
+//  void *LoadVideoOptionsValues(void *obj, F3SharedBuffer **pathSlot)
+//
+//  Fill the 52-byte saved video-options record (obj) from the settings
+//  VideoOptions.xml (the path in pathSlot): install the silent report
+//  handler (sub_17E4F90(nullsub_33), the saved one from sub_17E4F80), write
+//  the 1280x720 defaults (sub_19E1380), open the file in a 24-byte stack
+//  CXMLReadStream (sub_17DC290 / sub_17DBD00), read the "VideoOptions"
+//  element's values in (sub_775A60), restore the report handler, destroy the
+//  stream (sub_17DC2B0), and release the path slot. The record pointer (obj)
+//  is returned. Callers: RunFrontEnd (the v103..v106 frontend local).
+static void *LoadVideoOptionsValues(void *obj, F3SharedBuffer **pathSlot)
+{
+    F3XmlReportHandler saved = GetXmlReportHandler();     // sub_17E4F80
+    SetXmlReportHandler(XmlReportNoop);                   // sub_17E4F90(nullsub_33)
+    InitVideoOptionsDefaults((F3VideoOptions *)obj);      // sub_19E1380
+
+    F3XmlStream xml;                                      // the 24-byte CXMLReadStream
+    CXMLReadStreamCtor(&xml);                             // sub_17DC290
+    if (OpenXmlFile(&xml, GetSlotString(pathSlot)) != 0)  // sub_17DBD00
+        ReadVideoOptionsValues(&xml, (F3VideoOptions *)obj);   // sub_775A60
+    SetXmlReportHandler(saved);                           // sub_17E4F90
+
+    CXMLReadStreamDtor(&xml);                             // sub_17DC2B0
+    ReleaseSharedSlot(pathSlot);
     return obj;
 }
 
@@ -1580,8 +1994,8 @@ char RunFrontEnd(void *obj, int arg)
     // ---- locals (the original's stack frame) ----
     F3SharedBuffer *steamSlot = 0;          // the "Data/ThisIsSteam" string slot
     char            v108[100];              // LoadVideoOptions object (the 96-byte option-map triple)
-    DWORD           v70[5];                 // sub_72F7B0 object
-    DWORD           str103[4];              // the 16-byte string (v103..v106)
+    DWORD           v70[5];                 // the video-options file-path shared slot (MakeVideoOptionsPath)
+    DWORD           str103[13];             // the 52-byte saved video-options record (v103..v106)
     DWORD           v107 = 0;               // the separate command-line word
     int             v84;                    // sub_61A000 slot
     F3SharedBuffer *v88 = 0;                // sub_67C930 / SharedFileExists slot
@@ -1626,8 +2040,8 @@ char RunFrontEnd(void *obj, int arg)
 
     // 4. Build the small frontend strings.
     LoadVideoOptions(v108);   // 0x775EE0: build the video-options maps
-    sub_72F7B0(v70);
-    sub_775D10(str103, (char)v70[0]);
+    MakeVideoOptionsPath((F3SharedBuffer **)v70);   // 0x72F7B0: settings dir + "VideoOptions.xml"
+    LoadVideoOptionsValues(str103, (F3SharedBuffer **)v70);
 
     // 5. Parse the command-line / locale words.
     int *parsed = sub_61A000(&v84);
@@ -1684,7 +2098,7 @@ char RunFrontEnd(void *obj, int arg)
                 str103[1] = (DWORD)p2[0];
                 str103[2] = (DWORD)p2[1];
                 base[0x160] = 1;
-                sub_72F7B0(v70);
+                MakeVideoOptionsPath((F3SharedBuffer **)v70);   // 0x72F7B0
                 sub_775DA0(str103, (char)v70[0]);
             }
             sub_18E6D40();
