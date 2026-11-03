@@ -9,6 +9,7 @@
 #include "gamemain.h"
 #include "common/common.h"        // LHAlloc / LHFree / InitSharedSlot / ReleaseSharedSlot
 #include "manager.h"              // GetManager
+#include "netinit.h"              // InitNetworking
 #include "worker.h"               // GetWorker
 
 #include <windows.h>
@@ -80,8 +81,6 @@ static int   SteamAPI_Init(void) { return 0; }
 //  They are "remaining stubs": real per-function behavior is out of scope
 //  until each is decompiled on its own.
 // ============================================================
-static void  sub_18A89A0(void) {}
-static void  sub_6A7210(void) {}
 static int   sub_1A01CC0(void *obj, const char *path, int size)
 { (void)obj; (void)path; (void)size; return 0; }
 static int   sub_18B0F30(void *obj) { (void)obj; return 0; }   // false -> no error box
@@ -242,8 +241,8 @@ char RunFrontEnd(void *obj, int arg)
     char            result = 0;             // default: cancel / failure -> 0
 
     // 1. Framework / engine bootstrap.
-    sub_18A89A0();
-    sub_6A7210();
+    InitEngineTime();   // 0x18A89A0: capture the engine-start QPC counter / frequency
+    InitNetworking();   // 0x6A7210: XLive init, pre-translate hook, CNetLiveSystem + CNetManager
 
     // 2. Ensure the XNA notification listener exists (obj+0xE8).
     if (dw[0xEA / 4] == 0)

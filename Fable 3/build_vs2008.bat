@@ -81,7 +81,7 @@ pushd "%OUTREL%" || exit /b 1
 :: Add a new module by listing its .cpp in SRCS (paths are relative to the
 :: project root; each .obj is produced in the Release/Win32 output dir and
 :: then linked below by name).
-set "SRCS=..\..\main.cpp ..\..\framework\framework.cpp ..\..\common\common.cpp ..\..\engine\engine.cpp ..\..\engine\worker.cpp ..\..\engine\manager.cpp ..\..\engine\object_registry.cpp ..\..\engine\xlo_device.cpp ..\..\engine\gameengine.cpp ..\..\engine\gamethread.cpp ..\..\engine\gamemain.cpp ..\..\engine\thread.cpp ..\..\save\save.cpp"
+set "SRCS=..\..\main.cpp ..\..\framework\framework.cpp ..\..\common\common.cpp ..\..\engine\engine.cpp ..\..\engine\worker.cpp ..\..\engine\manager.cpp ..\..\engine\object_registry.cpp ..\..\engine\xlo_device.cpp ..\..\engine\gameengine.cpp ..\..\engine\gamethread.cpp ..\..\engine\gamemain.cpp ..\..\engine\netinit.cpp ..\..\engine\thread.cpp ..\..\save\save.cpp"
 
 for %%F in (%SRCS%) do (
     echo.
@@ -92,7 +92,7 @@ for %%F in (%SRCS%) do (
 
 echo.
 echo === link, x86 ===
-link %LNKFLAGS% /out:Fable3.exe /pdb:Fable3.pdb main.obj framework.obj common.obj engine.obj worker.obj manager.obj object_registry.obj xlo_device.obj gameengine.obj gamethread.obj gamemain.obj thread.obj save.obj %RRES%
+link %LNKFLAGS% /out:Fable3.exe /pdb:Fable3.pdb main.obj framework.obj common.obj engine.obj worker.obj manager.obj object_registry.obj xlo_device.obj gameengine.obj gamethread.obj gamemain.obj netinit.obj thread.obj save.obj ws2_32.lib %RRES%
 if errorlevel 1 (echo LINK FAILED & popd & popd & exit /b 1)
 
 if exist ..\..\patch_rsrc.py (

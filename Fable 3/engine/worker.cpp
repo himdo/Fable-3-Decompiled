@@ -79,28 +79,65 @@ static __declspec(naked) void *CWorkerWin32_Dtor(void)
 static void *g_CWorkerWin32Vtable[8] = { (void *)CWorkerWin32_Dtor, 0, 0, 0, 0, 0, 0, 0 };
 
 // ============================================================
+//  Engine-time globals (original IDs kept)
+//
+//  qword_20B5FC0: the QPC counter captured at engine start (64-bit).
+//  dbl_20B5FB8:   the QPC frequency as a double.
+//  byte_2123048:  non-zero once InitEngineTime has captured them.
+//  Written by InitEngineTime (0x18A89A0), read by GetEngineTime (0x18A88E0).
+// ============================================================
+static LARGE_INTEGER g_qword_20B5FC0;   // 0x20B5FC0 engine-start QPC counter
+static double g_dbl_20B5FB8 = 0.0;      // 0x20B5FB8 QPC frequency (double)
+static BYTE   g_byte_2123048 = 0;       // 0x2123048 engine-time initialized flag
+
+// ============================================================
 //  GetEngineTime  (0x18A88E0)  -- seconds since engine start
 //  [NOT byte-identical] placement-independent but references the QueryPerformanceCounter
 //  IAT slot (0x01AD50C8) and start globals (0x020B5FC0/0x020B5FB8) at original high VAs not present in this build.
 //
-//  (QueryPerformanceCounter() - startCounter) / frequency, using a lazy
-//  one-time capture of the start counter and the frequency.
+//  (QueryPerformanceCounter() - qword_20B5FC0) / dbl_20B5FB8. The original
+//  reads the globals captured by InitEngineTime; if that has not run yet we
+//  lazily capture them here so the first call still returns valid seconds.
 // ============================================================
 static double GetEngineTime(void)
 {
-    static LARGE_INTEGER startCounter;
-    static double startFreq = 0.0;
     LARGE_INTEGER now;
 
-    if (startFreq == 0.0)
+    if (g_dbl_20B5FB8 == 0.0)
     {
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
-        startFreq = (double)f.QuadPart;
-        QueryPerformanceCounter(&startCounter);
+        g_dbl_20B5FB8 = (double)(unsigned __int64)f.QuadPart;
+        QueryPerformanceCounter(&g_qword_20B5FC0);
     }
     QueryPerformanceCounter(&now);
-    return (double)(unsigned __int64)(now.QuadPart - startCounter.QuadPart) / startFreq;
+    return (double)(unsigned __int64)(now.QuadPart - g_qword_20B5FC0.QuadPart) / g_dbl_20B5FB8;
+}
+
+// ============================================================
+//  InitEngineTime  (0x18A89A0 - 0x18A8A2F)  -- one-time engine-time init
+//  [NOT byte-identical] refs high-VA globals (qword_20B5FC0 / dbl_20B5FB8 /
+//  byte_2123048) and the QueryPerformanceCounter / QueryPerformanceFrequency
+//  IAT slots (0x01AD50C8 / 0x01AD5098) at their original addresses.
+//
+//  On the first call captures the QPC counter into qword_20B5FC0 and the QPC
+//  frequency (converted to a positive double from the full 64-bit value) into
+//  dbl_20B5FB8, sets the byte_2123048 flag, and returns the captured counter's
+//  high 32 bits & 0x7FFFFFFF. Later calls return 0. Both callers (RunFrontEnd
+//  and the LHCOM request-manager ctor sub_18A45D0) discard the return value.
+// ============================================================
+int InitEngineTime(void)
+{
+    if (g_byte_2123048 == 0)
+    {
+        LARGE_INTEGER freq;
+        QueryPerformanceCounter(&g_qword_20B5FC0);
+        QueryPerformanceFrequency(&freq);
+        g_byte_2123048 = 1;
+        g_dbl_20B5FB8 = (double)(unsigned __int64)freq.QuadPart;
+        return (int)(g_qword_20B5FC0.HighPart & 0x7FFFFFFF);
+    }
+    return 0;
 }
 
 // ============================================================
@@ -1968,4 +2005,28 @@ __declspec(naked) F3CallbackFn SetOnResetDevice(void *worker, F3CallbackFn cb)
         mov    [ecx+26Ch], eax   ; worker->onResetDevice = cb
         ret    4                 ; return cb, clean up the stack arg
     }
+}
+
+// ============================================================
+//  SetPreTranslate  (0x18F6F20 - 0x18F6F44)  -- set the worker's
+//  pre-translate hook (the field at +0x270)
+//
+//  [NOT byte-identical] refs the EnterCriticalSection / LeaveCriticalSection
+//  IAT slots.
+//
+//  A __thiscall + retn 4 hybrid, the sibling of SetOnCreateDevice: the
+//  worker is in ECX and the callback is a stack arg the callee cleans
+//  (ret 4). It stores the callback under the worker's critical section
+//  (the original holds the CS across the store) and returns it. Installed
+//  with XLivePreTranslateMessage by InitNetworking (0x6A7210).
+//
+//  F3PreTranslateFn SetPreTranslate(CWorkerWin32 *worker, F3PreTranslateFn cb)
+// ============================================================
+F3PreTranslateFn SetPreTranslate(void *worker, F3PreTranslateFn cb)
+{
+    CWorkerWin32 *w = (CWorkerWin32 *)worker;
+    EnterCriticalSection(&w->cs);
+    w->preTranslate = cb;
+    LeaveCriticalSection(&w->cs);
+    return cb;
 }

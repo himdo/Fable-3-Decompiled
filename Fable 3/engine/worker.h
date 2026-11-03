@@ -18,10 +18,10 @@ typedef int (*F3CallbackFn)(void);
 // stack, callee cleans the arg via ret 4) used to install a worker callback.
 typedef F3CallbackFn (__thiscall *F3ThiscallSetFn)(void *, F3CallbackFn);
 
-// Pre-translate message hook installed by sub_18F6F20 (the original installs
-// XLivePreTranslateMessage). Runs under the worker CS before each queued
-// message is translated / dispatched; a non-zero return means the message
-// was handled (skip TranslateMessage / DispatchMessageA).
+// Pre-translate message hook installed by SetPreTranslate (0x18F6F20; the
+// original installs XLivePreTranslateMessage). Runs under the worker CS
+// before each queued message is translated / dispatched; a non-zero return
+// means the message was handled (skip TranslateMessage / DispatchMessageA).
 typedef int (WINAPI *F3PreTranslateFn)(LPMSG msg);
 
 // ============================================================
@@ -61,7 +61,7 @@ typedef struct CWorkerWin32
     F3CallbackFn     onCreateDevice; // +600 (0x258) on-create-device callback
     char             _pad6b1[16];   // +604 .. +620
     F3CallbackFn     onResetDevice; // +620 (0x26C) on-reset-device callback
-    F3PreTranslateFn preTranslate;  // +624 (0x270) pre-translate hook (XLive; setter sub_18F6F20)
+    F3PreTranslateFn preTranslate;  // +624 (0x270) pre-translate hook (XLive; setter SetPreTranslate)
     char             _pad7a1[13];   // +628 .. +641
     char             displayModePending; // +641 (0x281) display-mode change pending (set by sub_18F6BA0)
     char             _pad7a2[6];    // +642 .. +648
@@ -76,6 +76,12 @@ typedef char CWorkerWin32SizeCheck[(sizeof(CWorkerWin32) == 664) ? 1 : -1];
 
 // CWorkerWin32Ctor (0x18F7040) -- construct the main worker (see worker.cpp).
 void *CWorkerWin32Ctor(void *obj, int hInstance, int nShowCmd);
+
+// 0x18A89A0 - one-time engine-time init: captures the QPC start counter and
+// frequency (globals 0x020B5FC0 / 0x020B5FB8) that GetEngineTime's pump code
+// reads. Returns the start counter's high 32 bits & 0x7FFFFFFF on the first
+// call, 0 afterwards; both original callers discard the return value.
+int InitEngineTime(void);
 
 // 0x18F6A40 - return the current worker (dword_20FC8F0). Used pervasively by
 // the engine to reach the current CWorkerWin32.
@@ -99,5 +105,9 @@ void PumpWorker(CWorkerWin32 *obj);
 // 0x18F6C50 - set the worker's on-reset-device callback [BYTE-IDENTICAL].
 // __thiscall + retn 4 hybrid: dispatch through F3ThiscallSetFn.
 F3CallbackFn SetOnResetDevice(void *worker, F3CallbackFn cb);
+
+// 0x18F6F20 - set the worker's pre-translate hook (the XLive one, +0x270).
+// __thiscall + retn 4 hybrid; stored under the worker critical section.
+F3PreTranslateFn SetPreTranslate(void *worker, F3PreTranslateFn cb);
 
 #endif  // F3_WORKER_H
