@@ -18,6 +18,12 @@ typedef int (*F3CallbackFn)(void);
 // stack, callee cleans the arg via ret 4) used to install a worker callback.
 typedef F3CallbackFn (__thiscall *F3ThiscallSetFn)(void *, F3CallbackFn);
 
+// Pre-translate message hook installed by sub_18F6F20 (the original installs
+// XLivePreTranslateMessage). Runs under the worker CS before each queued
+// message is translated / dispatched; a non-zero return means the message
+// was handled (skip TranslateMessage / DispatchMessageA).
+typedef int (WINAPI *F3PreTranslateFn)(LPMSG msg);
+
 // ============================================================
 //  CWorkerWin32  -- the main worker object (NSystem::CWorkerWin32, 664 bytes)
 //
@@ -44,11 +50,24 @@ typedef struct CWorkerWin32
     int              workerState;   // +556 pump state (0 idle / 1 window / 2 message / 3 shutdown)
     int              hInstance;     // +560
     int              nShowCmd;      // +564
-    char             _pad6a[32];    // +568 .. +600
+    HWND             hwnd;          // +568 (0x238) main window handle (CreateWorkerWindow)
+    int              f_023C;        // +572 (0x23C)
+    int              f_0240;        // +576 (0x240) display-mode field (F3DisplayMode +0)
+    int              windowWidth;   // +580 (0x244) requested client width
+    int              windowHeight;  // +584 (0x248) requested client height
+    int              windowFlags;   // +588 (0x24C) byte0 = fullscreen, byte1 (0x24D) = refresh byte
+    int              f_0250;        // +592 (0x250) display-mode field (F3DisplayMode +36)
+    void *           sharedBlock;   // +596 (0x254) refcounted shared block (window class name at +0)
     F3CallbackFn     onCreateDevice; // +600 (0x258) on-create-device callback
     char             _pad6b1[16];   // +604 .. +620
     F3CallbackFn     onResetDevice; // +620 (0x26C) on-reset-device callback
-    char             _pad6b2[32];   // +624 .. +656
+    F3PreTranslateFn preTranslate;  // +624 (0x270) pre-translate hook (XLive; setter sub_18F6F20)
+    char             _pad7a1[13];   // +628 .. +641
+    char             displayModePending; // +641 (0x281) display-mode change pending (set by sub_18F6BA0)
+    char             _pad7a2[6];    // +642 .. +648
+    char             shown;         // +648 (0x288) set by EnsureWorkerWindow
+    char             ready;         // +649 (0x289) set by EnsureWorkerWindow
+    char             _pad7b[6];     // +650 .. +656
     double           timing;        // +656 .. +664
 } CWorkerWin32;
 

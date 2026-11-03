@@ -32,6 +32,7 @@
 #pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "gdi32.lib")
 
 // ---- globals referenced by WinMain ----
 // Cross-module flags set when -loadsavegame is given; the save engine reads
