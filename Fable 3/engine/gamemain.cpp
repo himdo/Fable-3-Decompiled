@@ -17,6 +17,7 @@
 #include <process.h>              // _beginthread / _getdrive / _chdrive
 #include <wchar.h>                // _wgetcwd
 #include <string.h>
+#include <mbstring.h>             // _mbscmp
 #include <direct.h>               // _chdir / _mkdir
 
 // ============================================================
@@ -74,7 +75,37 @@ static int   XShowMessageBoxUI(int a, int b, int c, int d, void *e,
                                int f, int g, void *h, void *i)
 { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i; return 6; }
 static int   XCancelOverlapped(void *p) { (void)p; return 0; }
-static int   SteamAPI_Init(void) { return 0; }
+
+//  SteamAPI_Init  (0x17DA5EA - 0x17DA5F0)  -- steam_api.dll import thunk
+//
+//  In the original this is a 6-byte MSVC import thunk, not an in-image body:
+//      FF 25 C8 55 AD 01   ; jmp ds:__imp_SteamAPI_Init   (steam_api.dll)
+//  The real implementation lives in steam_api.dll (the bundled Steamworks
+//  proxy) and returns bool (1 = Steam client initialized, 0 = not). RunFrontEnd
+//  calls it only after confirming "Data/ThisIsSteam" is present and, on a
+//  nonzero return, sets byte_1DBDC4A (the "SteamAPI initialized" flag).
+//
+//  This self-contained build does not link steam_api.dll, so the import is
+//  resolved dynamically: when the DLL is present the real call is forwarded
+//  (matching the thunk's target); when it is not (standalone test / no Steam)
+//  the init is reported as failed (0), leaving byte_1DBDC4A clear so the
+//  frontend takes the "no Steam" path. The sibling steam_api imports
+//  (SteamFriends 0x17DA5F0, SteamUtils 0x17DA5F6) are not referenced by any
+//  implemented caller yet.
+//
+//  [NOT byte-identical] -- it is a steam_api.dll import thunk with no
+//  in-image body; the self-contained build has no steam_api IAT slot to jump
+//  to, so the original `jmp ds:__imp_SteamAPI_Init` cannot be reproduced.
+static int SteamAPI_Init(void)
+{
+    typedef int (__cdecl *SteamAPI_Init_f)(void);   // bool SteamAPI_Init(void)
+    static HMODULE hSteam = (HMODULE)LoadLibraryA("steam_api.dll");
+    static SteamAPI_Init_f pInit =
+        hSteam ? (SteamAPI_Init_f)GetProcAddress(hSteam, "SteamAPI_Init") : 0;
+    if (!pInit)                                    // steam_api.dll unavailable
+        return 0;                                  // -> Steam init failed
+    return pInit() ? 1 : 0;
+}
 
 // ============================================================
 //  Unimplemented engine callees (stubs)
@@ -84,7 +115,6 @@ static int   SteamAPI_Init(void) { return 0; }
 //  They are "remaining stubs": real per-function behavior is out of scope
 //  until each is decompiled on its own.
 // ============================================================
-static void  sub_775EE0(void *obj) { (void)obj; }
 static void  sub_72F7B0(void *obj) { (void)obj; }
 static void  sub_775D10(void *str, char c) { (void)str; (void)c; }
 static int   sub_775DA0(void *str, char c) { (void)str; (void)c; return 0; }
@@ -99,6 +129,605 @@ static void  sub_18C4840(void *obj) { (void)obj; }
 
 static int   sub_1A02560(void *obj, void *str) { (void)obj; (void)str; return 0; }
 static void  sub_19FFA70(void *str) { (void)str; }
+
+// ============================================================
+//  Video-options option-map cluster (LoadVideoOptions, 0x775EE0, and the
+//  32-byte option-map objects, the LHXML stream helpers, and the map
+//  copy / destroy machinery it drives)
+//
+//  The frontend builds a 96-byte triple of 32-byte "option map" objects
+//  (the Int / Float / Detail settings; each is a red-black tree of 24-byte
+//  nodes) from VideoOptionsConfig.xml: three local maps are constructed on
+//  the stack, the "ConfigSettings" section's IntSettings / FloatSettings /
+//  DetailSettings child elements are read into them, and the locals are then
+//  heap-copied into the caller's object (Int at +0x00, Float at +0x20,
+//  Detail at +0x40). The LHXML parse engine itself is a remaining stub, so
+//  no section is ever found and the maps stay empty (exactly the original's
+//  behavior when the file is missing); the map layout, the heap traffic, and
+//  the copy / destroy paths below are all reproduced.
+// ============================================================
+
+// The 24-byte option-map tree node (the red-black tree backing each map).
+typedef struct F3OptionNode
+{
+    F3OptionNode *  link0;    // +0x00
+    F3OptionNode *  link1;    // +0x04
+    F3OptionNode *  link2;    // +0x08
+    F3SharedBuffer *key;      // +0x0C: the 16-byte key block (a ref)
+    DWORD           keyLen;   // +0x10
+    BYTE            color;    // +0x14 (byte 20)
+    BYTE            leaf;     // +0x15 (byte 21)
+    BYTE            pad22;    // +0x16
+    BYTE            pad23;    // +0x17
+} F3OptionNode;               // 24 bytes
+
+// The 32-byte option-map object; three sit side by side in the 96-byte
+// video-options triple (Int at +0x00, Float at +0x20, Detail at +0x40).
+typedef struct F3OptionMap
+{
+    DWORD *       wrapper;    // +0x00: the 4-byte heap block { &obj }
+    DWORD         pad[5];     // +0x04..+0x17: untouched by the ctor / copy
+    F3OptionNode *root;       // +0x18: the sentinel node
+    DWORD         count;      // +0x1C: the element count
+} F3OptionMap;                // 32 bytes
+
+// The 24-byte LHXML::CXMLReadStream stack object (sub_17DC290 / sub_17DC2B0).
+typedef struct F3XmlStream
+{
+    void *   vtable;      // +0x00
+    DWORD    flags;       // +0x04: 0x8000 (the base ctor)
+    DWORD *  fileBuf;     // +0x08: the 8-byte {0, 4096-byte buffer} block
+    DWORD    section;     // +0x0C: the current section node
+    DWORD    sectionInfo; // +0x10
+    BYTE     sectionFound;// +0x14 (byte 20)
+    BYTE     pad[3];      // +0x15..+0x17
+} F3XmlStream;             // 24 bytes
+
+// Placeholder LHXML vtables: the stack stream's slots are never dispatched
+// in this build (the parse below is a remaining stub, so no section is ever
+// found and the option readers are unreachable).
+static void *g_CXMLStreamVtable[8]      = { 0 };
+static void *g_CXMLReadStreamVtable[32] = { 0 };
+
+// 0x1E2D7A0: the LHXML buffer-pool allocation counter.
+static DWORD g_dword_1E2D7A0 = 0;
+
+// sub_17E63B0 / sub_17E63C0: the LHXML game-heap alloc / free thunks.
+static void *XmlHeapAlloc(unsigned int size) { InterlockedIncrement(&g_dword_1E2D7A0); return LHAlloc(size); }
+static void  XmlHeapFree(void *p) { if (p != 0) { LHFree(p); InterlockedDecrement(&g_dword_1E2D7A0); } }
+
+// sub_17E6620 (0x17E6620 - 0x17E66A8): fresh 8-byte {0, 4096-byte buffer} file block
+static DWORD *InitXmlFileBlock(DWORD *block)
+{
+    *block = 0;
+    DWORD *buf = (DWORD *)XmlHeapAlloc(4096);
+    if (buf != 0)
+    {
+        buf[0] = 4096;      // capacity
+        buf[1] = 0;         // length
+        buf[2] = -1;
+        buf[3] = 0;
+        buf[4] = 0;
+        buf[5] = 0;
+        buf[6] = 0;
+    }
+    block[1] = (DWORD)buf;
+    return block;
+}
+
+// sub_17E68F0 (0x17E68F0 - 0x17E6939): close the 8-byte file block
+static void CloseXmlFileBlock(DWORD *block)
+{
+    // sub_17E70D0(*block, block[1]): close the (0) file handle
+    DWORD *buf = (DWORD *)block[1];
+    if (buf != 0)
+    {
+        // sub_17E4930(buf): the buffer finalization (a no-op here)
+        XmlHeapFree((void *)buf[4]);    // the inner payload (0 here)
+        buf[4] = 0;
+        buf[5] = 0;
+        buf[6] = 0;
+        XmlHeapFree((void *)buf);
+    }
+}
+
+// sub_17DAA00 + sub_17DC290 (0x17DC290 - 0x17DC2B0): the CXMLReadStream ctor
+static void CXMLReadStreamCtor(F3XmlStream *obj)
+{
+    obj->vtable = (void *)g_CXMLStreamVtable;   // the sub_17DAA00 base ctor
+    obj->flags = 0x8000;
+    // sub_17E42C0 / sub_17E6390: the one-shot LHXML static initializers (no-op)
+    obj->fileBuf = 0;
+    obj->section = 0;
+    obj->sectionInfo = 0;
+    obj->sectionFound = 0;
+    obj->vtable = (void *)g_CXMLReadStreamVtable;   // the derived vtable
+}
+
+// sub_17DBD00 (0x17DBD00 - 0x17DBDB8): open + parse the XML file into the stream
+static char OpenXmlFile(F3XmlStream *obj, const char *fileName)
+{
+    DWORD *old = obj->fileBuf;
+    if (old != 0)
+    {
+        CloseXmlFileBlock(old);          // sub_17E68F0
+        XmlHeapFree(old);                // sub_17E65B0
+    }
+    DWORD *block = (DWORD *)XmlHeapAlloc(8);
+    obj->fileBuf = (block != 0) ? InitXmlFileBlock(block) : 0;
+    // sub_17E6AD0: the CXMLDocumentParser parse. [remaining stub] the LHXML
+    // parse engine is out of scope, so no file is ever read and the tree is
+    // never populated; the parse is reported to have succeeded only when the
+    // file exists (as it does for the game's well-formed config files), and
+    // the section search then finds nothing (see FindXmlSection below).
+    return (GetFileAttributesA(fileName) != INVALID_FILE_ATTRIBUTES) ? 1 : 0;
+}
+
+// sub_17E4350 (0x17E4350 - 0x17E438A): resolve an interned XML string handle
+static const char *ResolveXmlString(DWORD *handle)
+{
+    (void)handle;
+    return "";   // [remaining stub] no strings are interned in this build
+}
+
+// sub_17DC2E0 (0x17DC2E0 - 0x17DC39C): search a section / element node by name
+static char SearchXmlSection(F3XmlStream *obj, const char *name, DWORD step, char wrap)
+{
+    DWORD *node = (DWORD *)obj->section;
+    if (node == 0)
+    {
+        if (wrap == 0 && obj->sectionFound != 0)
+            return 0;
+        // The root node = *fileBuf[0]: the parse is a remaining stub, so the
+        // buffer is always empty and the search never finds a section.
+        DWORD root = (obj->fileBuf != 0) ? *obj->fileBuf : 0;
+        if (root != 0
+            && _mbscmp((const unsigned char *)ResolveXmlString((DWORD *)root + 2),
+                       (const unsigned char *)name) == 0)
+        {
+            obj->section = root;
+            obj->sectionInfo = *(DWORD *)root + 5;
+            *(DWORD *)&obj->sectionFound = 1;
+            return 1;
+        }
+        return 0;
+    }
+    if (wrap != 0 && step == 0)
+        step = obj->sectionInfo;
+    if (step == 0)
+        return 0;
+    for (DWORD *n = (DWORD *)step; ; n = *(DWORD **)(n + 1))
+    {
+        if (_mbscmp((const unsigned char *)ResolveXmlString((DWORD *)n + 2),
+                    (const unsigned char *)name) == 0)
+        {
+            obj->section = (DWORD)n;
+            obj->sectionInfo = n[5];
+            return 1;
+        }
+        if (*(DWORD **)(n + 1) == 0)
+        {
+            if (wrap == 0)
+                return 0;
+            n = (DWORD *)obj->sectionInfo;
+        }
+        if (n == (DWORD *)step)
+            return 0;
+    }
+}
+
+// sub_17DC6D0 (0x17DC6D0 - 0x17DC6E3): enter the named section of the stream
+static char FindXmlSection(F3XmlStream *obj, const char *name)
+{
+    return SearchXmlSection(obj, name, obj->sectionInfo, 1);
+}
+
+// sub_17DC2B0 + sub_17DAA20 (0x17DC2B0 - 0x17DC2DA): the CXMLReadStream dtor
+static void CXMLReadStreamDtor(F3XmlStream *obj)
+{
+    DWORD *block = obj->fileBuf;
+    obj->vtable = (void *)g_CXMLStreamVtable;
+    if (block != 0)
+    {
+        CloseXmlFileBlock(block);
+        XmlHeapFree(block);
+    }
+    obj->vtable = (void *)g_CXMLStreamVtable;   // the sub_17DAA20 base dtor
+    // sub_17E4390 / sub_17E63F0: the one-shot LHXML static teardowns (no-op)
+}
+
+// sub_40EDB0 / sub_40EFD0 / sub_40F1F0 (identical in all three types):
+// fresh 24-byte sentinel node {node, node, node, 0, 0, 0, color 1, leaf 1}
+static void InitOptionMapRoot(F3OptionMap *obj)
+{
+    F3OptionNode *node = (F3OptionNode *)LHAlloc(24);
+    if (node != 0)
+    {
+        node->link0 = 0;
+        node->link1 = 0;
+        node->link2 = 0;
+    }
+    node->color = 1;
+    obj->root = node;
+    node->leaf = 1;
+    node->link1 = node;
+    node->link0 = node;
+    node->link2 = node;
+    obj->count = 0;
+}
+
+// sub_40E6D0 / sub_40E780 / sub_40E830 (the three identical option-map
+// ctors): the 4-byte wrapper { &obj } into obj+0x00, then the sentinel node.
+static void InitOptionMapBase(F3OptionMap *obj, void *a2, void *a3)
+{
+    (void)a2;
+    (void)a3;
+    DWORD *w = (DWORD *)LHAlloc(4);
+    if (w != 0)
+        *w = (DWORD)obj;
+    obj->wrapper = w;
+    InitOptionMapRoot(obj);
+}
+static void InitIntOptionMap(F3OptionMap *obj, void *a2, void *a3)    { InitOptionMapBase(obj, a2, a3); }   // sub_40E6D0
+static void InitFloatOptionMap(F3OptionMap *obj, void *a2, void *a3)  { InitOptionMapBase(obj, a2, a3); }   // sub_40E780
+static void InitDetailOptionMap(F3OptionMap *obj, void *a2, void *a3) { InitOptionMapBase(obj, a2, a3); }   // sub_40E830
+
+// sub_1A012C0 (0x1A012C0 - 0x1A0131C): take a ref of the source slot's block
+static F3SharedBuffer **RefSharedSlot(F3SharedBuffer **dst, F3SharedBuffer **src)
+{
+    *dst = 0;
+    InterlockedIncrement(&g_Addend);
+    if (src != dst)
+    {
+        if (*dst != 0)
+        {
+            if (InterlockedDecrement(&(*dst)->refcount) <= 0 && *dst != 0)
+                SharedBufferFree(*dst);
+            *dst = 0;
+        }
+        if (*src != 0)
+        {
+            *dst = *src;
+            InterlockedIncrement(&(*dst)->refcount);
+        }
+    }
+    return dst;
+}
+
+// sub_487560 (0x487560 - 0x4875AE): fresh 24-byte copy node from the source
+static F3OptionNode *AllocOptionCopyNode(F3OptionNode *parent, F3OptionNode *left,
+                                         F3OptionNode *right, F3OptionNode *src,
+                                         BYTE color)
+{
+    F3OptionNode *node = (F3OptionNode *)LHAlloc(24);
+    node->link1 = left;
+    node->link0 = parent;
+    node->link2 = right;
+    RefSharedSlot(&node->key, &src->key);   // sub_1A012C0(node+12, src+12)
+    node->keyLen = src->keyLen;
+    node->color = color;
+    node->leaf = 0;
+    return node;
+}
+
+// sub_487400 / sub_487470 / sub_4874E0: the recursive option subtree copy
+static F3OptionNode *CopyOptionSubtree(F3OptionMap *obj, F3OptionNode *src, F3OptionNode *dst)
+{
+    F3OptionNode *root = obj->root;
+    if (src->leaf != 0)
+        return root;
+    F3OptionNode *node = AllocOptionCopyNode(root, dst, root, src, src->color);
+    if (root->leaf != 0)
+        root = node;
+    node->link0 = CopyOptionSubtree(obj, src->link0, node);
+    node->link2 = CopyOptionSubtree(obj, src->link2, node);
+    return root;
+}
+
+// sub_487270 / sub_4872F0 / sub_487370: copy the source map's tree into the
+// destination map (a fresh sentinel), then re-link the sentinel's links
+static void CopyOptionTree(F3OptionMap *dst, const F3OptionMap *src)
+{
+    F3OptionNode *node = dst->root;
+    node->link1 = CopyOptionSubtree(dst, (F3OptionNode *)src->root, node);
+    dst->count = src->count;
+    F3OptionNode *n = node->link1;
+    if (n->leaf != 0)
+    {
+        node->link0 = node;
+        node->link2 = node;
+    }
+    else
+    {
+        F3OptionNode *p = n->link0;
+        while (p->leaf == 0)
+            p = p->link0;
+        node->link0 = p;
+        F3OptionNode *last = node->link1->link2;
+        while (last->leaf == 0)
+            last = last->link2;
+        node->link2 = last;
+    }
+}
+
+// sub_776FD0 / sub_777050 / sub_7770D0 (the three identical map copy-ctors):
+// fresh wrapper + sentinel in the destination, then the tree copy
+static void CopyOptionMapBase(F3OptionMap *obj, const F3OptionMap *src)
+{
+    DWORD *w = (DWORD *)LHAlloc(4);
+    if (w != 0)
+        *w = (DWORD)obj;
+    obj->wrapper = w;
+    F3OptionNode *node = (F3OptionNode *)LHAlloc(24);
+    if (node != 0)
+    {
+        node->link0 = 0;
+        node->link1 = 0;
+        node->link2 = 0;
+    }
+    node->color = 1;
+    obj->root = node;
+    node->leaf = 1;
+    node->link1 = node;
+    node->link0 = node;
+    node->link2 = node;
+    obj->count = 0;
+    CopyOptionTree(obj, src);
+}
+static void CopyIntOptionMap(F3OptionMap *obj, const F3OptionMap *src)    { CopyOptionMapBase(obj, src); }   // sub_776FD0
+static void CopyFloatOptionMap(F3OptionMap *obj, const F3OptionMap *src)  { CopyOptionMapBase(obj, src); }   // sub_777050
+static void CopyDetailOptionMap(F3OptionMap *obj, const F3OptionMap *src) { CopyOptionMapBase(obj, src); }   // sub_7770D0
+
+// sub_410AB0 / sub_410CC0 (the Int / Float recursive subtree destructions;
+// the Detail variant sub_410ED0 skips the key release): for each non-leaf
+// node, destroy the right subtree, drop the key ref (freeing it at 0), drop
+// the live-slot counter, and free the node
+static void DestroyOptionSubtree(F3OptionNode *node)
+{
+    for (F3OptionNode *n = node; n->leaf == 0; )
+    {
+        DestroyOptionSubtree(n->link2);
+        F3SharedBuffer *key = n->key;
+        F3OptionNode *next = n->link0;
+        if (key != 0)
+        {
+            if (InterlockedDecrement(&key->refcount) <= 0 && key != 0)
+                SharedBufferFree(key);
+            n->key = 0;
+        }
+        InterlockedDecrement(&g_Addend);
+        n->key = 0;
+        LHFree(n);
+        n = next;
+    }
+}
+
+// sub_40ECC0 / sub_40EEE0 / sub_40F100 (the "find the sentinel node in the
+// map" steps, each taking its identity branch here): destroy the sentinel's
+// left subtree, reset the sentinel's links, and write the discarded 8-byte
+// result. Then free the sentinel node and the wrapper via the game heap and
+// null the object's fields.
+static void DestroyOptionMap(F3OptionMap *obj)
+{
+    DestroyOptionSubtree(obj->root->link1);
+    obj->root->link1 = obj->root;
+    obj->count = 0;
+    obj->root->link0 = obj->root;
+    obj->root->link2 = obj->root;
+    LHFree(obj->root);            // the sentinel node (dword_2075B24 + 16)
+    obj->root = 0;
+    obj->count = 0;
+    LHFree(obj->wrapper);         // the 4-byte wrapper (dword_2075B24 + 16)
+}
+
+// sub_40E1F0 (0x40E1F0 - 0x40E320): destroy the three contiguous option maps
+static void DestroyOptionMaps(void *obj)
+{
+    F3OptionMap *base = (F3OptionMap *)obj;
+    DestroyOptionMap(base + 2);   // the Detail map (+0x40, sub_40E3D0)
+    DestroyOptionMap(base + 1);   // the Float map (+0x20, sub_40E350)
+    DestroyOptionMap(base);       // the Int map (+0x00, the inline tail)
+}
+
+// sub_1A00C20 (0x1A00C20 - 0x1A00C2F): the C string of a shared slot
+static const char *GetSlotString(F3SharedBuffer **slot)
+{
+    F3SharedBuffer *block = *slot;
+    return (block != 0) ? block->data : "";   // Str1 (the empty string)
+}
+
+// The CXMLReadStream vtable slots the option readers dispatch through
+// (the placeholder g_CXMLReadStreamVtable keeps them zeroed in this build).
+typedef struct F3CXMLReadStreamVT
+{
+    void *                                    vt0;
+    char (*enterElement)(void *stream, const char *name);  // +0x04
+    void *                                    vt2;
+    void (*nextSibling)(void *stream);                      // +0x0C
+    void (*readPath)(void *stream, void *out);              // +0x10
+    void *                                    vt5;
+    void *                                    vt6;
+    void (*readFloat)(void *stream, float *out);            // +0x1C
+    void *                                    vt8;
+    void (*readInt)(void *stream, int *out);                // +0x24
+    void *                                    vt10[10];
+    void *(*currentNode)(void *stream);                     // +0x50
+} F3CXMLReadStreamVT;
+
+// The 12-byte reader region: the 4-byte key slot + the 8-byte interned
+// string object (the original's var_C + var_8 pair).
+typedef struct F3OptionReaderRegion
+{
+    F3SharedBuffer *block;    // +0: the key slot
+    DWORD           pathObj[2]; // +4: the interned-string object
+} F3OptionReaderRegion;
+
+static DWORD g_stubIntOptionValue = 0;
+static DWORD g_stubFloatOptionValue = 0;
+static F3SharedBuffer *g_stubDetailValueSlot = 0;
+
+// sub_777150 (0x777150 - 0x777220): find / insert the key in the Int map
+static DWORD *FindIntOptionValue(F3OptionMap *obj, F3SharedBuffer **keySlot)
+{
+    (void)obj;
+    (void)keySlot;
+    // [remaining stub] the tree key lookup / insert (sub_4122E0 / sub_403F10 /
+    // sub_776BF0) is out of scope; the value store lands in a static word.
+    return &g_stubIntOptionValue;
+}
+
+// sub_777220 (0x777220 - 0x7772A0?): find / insert the key in the Float map
+static DWORD *FindFloatOptionValue(F3OptionMap *obj, F3SharedBuffer **keySlot)
+{
+    (void)obj;
+    (void)keySlot;
+    // [remaining stub] as FindIntOptionValue; the value store is a static word.
+    return &g_stubFloatOptionValue;
+}
+
+// sub_75FE80 (0x75FE80 - 0x75FEE0?): find / insert the key in the Detail map
+static DWORD *FindDetailOptionValue(F3OptionMap *obj, F3SharedBuffer **keySlot)
+{
+    (void)obj;
+    (void)keySlot;
+    // [remaining stub] as FindIntOptionValue; the value slot is a static word.
+    return (DWORD *)&g_stubDetailValueSlot;
+}
+
+// sub_777360 (0x777360 - 0x77741A): read the IntSettings section's values
+static void ReadIntOptionSection(void *stream, F3SharedBuffer *key, void *dest)
+{
+    const F3CXMLReadStreamVT *vt = (const F3CXMLReadStreamVT *)*(void **)stream;
+    if (vt->enterElement(stream, GetSlotString((F3SharedBuffer **)&key)) != 0)
+    {
+        void *node = vt->currentNode(stream);
+        while (node != 0)
+        {
+            int value = 0;
+            vt->readInt(stream, &value);
+            F3SharedBuffer *slot = 0;
+            SetSharedSlot(&slot, (const char *)node, -1);   // the key = the node's bytes
+            *FindIntOptionValue((F3OptionMap *)dest, &slot) = value;
+            ReleaseSharedSlot(&slot);
+            vt->nextSibling(stream);
+            node = vt->currentNode(stream);
+        }
+        vt->nextSibling(stream);
+    }
+    ReleaseSharedSlot((F3SharedBuffer **)&key);
+}
+
+// sub_777420 (0x777420 - 0x7774DF): read the FloatSettings section's values
+static void ReadFloatOptionSection(void *stream, F3SharedBuffer *key, void *dest)
+{
+    const F3CXMLReadStreamVT *vt = (const F3CXMLReadStreamVT *)*(void **)stream;
+    if (vt->enterElement(stream, GetSlotString((F3SharedBuffer **)&key)) != 0)
+    {
+        void *node = vt->currentNode(stream);
+        while (node != 0)
+        {
+            float value = 0.0f;
+            vt->readFloat(stream, &value);
+            F3SharedBuffer *slot = 0;
+            SetSharedSlot(&slot, (const char *)node, -1);
+            *(float *)FindFloatOptionValue((F3OptionMap *)dest, &slot) = value;
+            ReleaseSharedSlot(&slot);
+            vt->nextSibling(stream);
+            node = vt->currentNode(stream);
+        }
+        vt->nextSibling(stream);
+    }
+    ReleaseSharedSlot((F3SharedBuffer **)&key);
+}
+
+// sub_17E4D10 (0x17E4D10 - 0x17E4DF8): intern a string in the global table,
+// returning the 32-bit handle. [remaining stub] the CStringHashMap interning
+// is out of scope; the (unreachable) detail reader interns to 0.
+static DWORD InternXmlString(const char *src)
+{
+    (void)src;
+    return 0;
+}
+
+// sub_775E10 (0x775E10 - 0x775EDA): read the DetailSettings section's paths
+static void ReadDetailOptionSection(void *stream, F3SharedBuffer *key, void *dest)
+{
+    const F3CXMLReadStreamVT *vt = (const F3CXMLReadStreamVT *)*(void **)stream;
+    if (vt->enterElement(stream, GetSlotString((F3SharedBuffer **)&key)) != 0)
+    {
+        void *node = vt->currentNode(stream);
+        while (node != 0)
+        {
+            F3OptionReaderRegion region;
+            region.block = 0;
+            region.pathObj[0] = InternXmlString("");   // sub_17E4D10(&region.pathObj, "")
+            region.pathObj[1] = 0;
+            vt->readPath(stream, &region);             // vt[4]: the path string
+            SetSharedSlot(&region.block, (const char *)node, -1);
+            SetSaveGamePath((F3SharedBuffer **)FindDetailOptionValue((F3OptionMap *)dest, &region.block),
+                            ResolveXmlString(region.pathObj));
+            ReleaseSharedSlot(&region.block);
+            vt->nextSibling(stream);
+            node = vt->currentNode(stream);
+        }
+        vt->nextSibling(stream);
+    }
+    ReleaseSharedSlot((F3SharedBuffer **)&key);
+}
+
+// ============================================================
+//  LoadVideoOptions  (0x00775EE0 - 0x00776012)  -- build the video-options
+//  triple (Int / Float / Detail maps) from VideoOptionsConfig.xml
+//  [NOT byte-identical] placement-dependent (relative calls to the option-
+//  map ctors / copies, the LHXML helpers, the option readers, and the game-
+//  heap free) plus the high-VA __security_cookie / __security_check_cookie.
+//
+//  void *LoadVideoOptions(void *obj)
+//
+//  Build the 96-byte option-map triple inside obj (the Int / Float / Detail
+//  settings, at +0x00 / +0x20 / +0x40): the three 32-byte local maps are
+//  constructed on the stack, the "ConfigSettings" section of
+//  VideoOptionsConfig.xml is read into them (IntSettings / FloatSettings /
+//  DetailSettings), and the locals are heap-copied into obj. The locals and
+//  the 24-byte stack LHXML stream are destroyed, and obj is returned.
+//  In this build the LHXML parse is a remaining stub, so the section search
+//  finds nothing and the maps stay empty (exactly the original's behavior
+//  when the file is missing); the map layout, the heap traffic, and the copy
+//  / destroy paths are all reproduced.
+//  Callers: RunFrontEnd (the 100-byte frontend object).
+// ============================================================
+static void *LoadVideoOptions(void *obj)
+{
+    F3XmlStream   xml;         // the 24-byte CXMLReadStream (sub_775EE0's v7)
+    F3OptionMap   maps[3];     // the three contiguous 32-byte local maps
+    char          dummy = 0;   // the 1-byte v6 local (an unused ctor argument)
+
+    InitIntOptionMap(&maps[0], &dummy, &dummy);          // sub_40E6D0
+    InitFloatOptionMap(&maps[1], &dummy, &dummy);        // sub_40E780
+    InitDetailOptionMap(&maps[2], &dummy, &dummy);       // sub_40E830
+    CXMLReadStreamCtor(&xml);                            // sub_17DC290
+
+    if (OpenXmlFile(&xml, "VideoOptionsConfig.xml") != 0        // sub_17DBD00
+        && FindXmlSection(&xml, "ConfigSettings") != 0)         // sub_17DC6D0
+    {
+        F3SharedBuffer *intKey = 0;
+        F3SharedBuffer *floatKey = 0;
+        F3SharedBuffer *detailKey = 0;
+        SetSharedSlot(&intKey, "IntSettings", -1);              // g_Addend++
+        ReadIntOptionSection(&xml, intKey, &maps[0]);           // sub_777360 (g_Addend--)
+        SetSharedSlot(&floatKey, "FloatSettings", -1);          // g_Addend++
+        ReadFloatOptionSection(&xml, floatKey, &maps[1]);       // sub_777420 (g_Addend--)
+        SetSharedSlot(&detailKey, "DetailSettings", -1);        // g_Addend++
+        ReadDetailOptionSection(&xml, detailKey, &maps[2]);     // sub_775E10 (g_Addend--)
+    }
+
+    CopyIntOptionMap((F3OptionMap *)obj, &maps[0]);             // sub_776FD0
+    CopyFloatOptionMap((F3OptionMap *)obj + 1, &maps[1]);       // sub_777050
+    CopyDetailOptionMap((F3OptionMap *)obj + 2, &maps[2]);      // sub_7770D0
+    CXMLReadStreamDtor(&xml);                                   // sub_17DC2B0
+    DestroyOptionMaps(&maps[0]);                                // sub_40E1F0
+    return obj;
+}
 
 // ============================================================
 //  Current-directory path cluster (0x18AE000-0x18C6000 helpers)
@@ -919,7 +1548,6 @@ static void *sub_731B80(void *obj) { return obj; }
 static void *sub_712430(void *obj) { return obj; }
 static void  nullsub_29(void) {}
 static void  sub_18FB930(void) {}
-static void  sub_40E1F0(void *obj) { (void)obj; }
 
 // F3_VT(OBJ): read OBJ's vtable (the first word) as a void ** so its slots
 // can be indexed. (OBJ is a class instance pointer.)
@@ -951,7 +1579,7 @@ char RunFrontEnd(void *obj, int arg)
 
     // ---- locals (the original's stack frame) ----
     F3SharedBuffer *steamSlot = 0;          // the "Data/ThisIsSteam" string slot
-    char            v108[100];              // sub_775EE0 object
+    char            v108[100];              // LoadVideoOptions object (the 96-byte option-map triple)
     DWORD           v70[5];                 // sub_72F7B0 object
     DWORD           str103[4];              // the 16-byte string (v103..v106)
     DWORD           v107 = 0;               // the separate command-line word
@@ -997,7 +1625,7 @@ char RunFrontEnd(void *obj, int arg)
     }
 
     // 4. Build the small frontend strings.
-    sub_775EE0(v108);
+    LoadVideoOptions(v108);   // 0x775EE0: build the video-options maps
     sub_72F7B0(v70);
     sub_775D10(str103, (char)v70[0]);
 
@@ -1379,6 +2007,6 @@ epilogue:
     ReleaseSharedSlot(&v96);
     v93[0] = (DWORD)g_CAFileVtable;
     ReleaseSharedSlot(&v88);
-    sub_40E1F0(v108);
+    DestroyOptionMaps(v108);   // 0x40E1F0: destroy the video-options maps
     return result;
 }
