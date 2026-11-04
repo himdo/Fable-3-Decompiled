@@ -91,19 +91,31 @@ for %%F in (%SRCS%) do (
 )
 
 echo.
-echo === lib: xlive.dll import library (from engine/xlive.def) ===
-lib /nologo /machine:x86 /def:..\..\engine\xlive.def /out:xlive.lib
-if errorlevel 1 (echo LIB FAILED & popd & exit /b 1)
+echo === lib: import libraries (from engine/*.def) ===
+rem One .def per non-SDK DLL the original imports; generate an import
+rem library for each so the linker can bind calls to those DLLs. (Standard
+rem Windows DLLs below use the Win SDK import libraries directly.)
+set "IMPORT_DEFS=xlive d3d9 dinput8 dsound xinput1_3 x3daudio1_7 d3dx9_42 binkw32 steam_api"
+for %%d in (%IMPORT_DEFS%) do (
+    lib /nologo /machine:x86 /def:..\..\engine\%%d.def /out:%%d.lib
+    if errorlevel 1 (echo LIB FAILED: %%d & popd & exit /b 1)
+)
 
 echo.
 echo === link, x86 ===
-link %LNKFLAGS% /out:Fable3.exe /pdb:Fable3.pdb main.obj framework.obj common.obj engine.obj worker.obj manager.obj object_registry.obj xlo_device.obj gameengine.obj gamethread.obj gamemain.obj netinit.obj thread.obj save.obj xlive.lib ws2_32.lib %RRES%
+rem .lib order: bundled third-party / DirectX import libs, then the standard
+rem Windows DLLs the original imports (kernel32 is pulled by the default CRT).
+set "IMPORT_LIBS=xlive.lib d3d9.lib dinput8.lib dsound.lib xinput1_3.lib x3daudio1_7.lib d3dx9_42.lib binkw32.lib steam_api.lib user32.lib gdi32.lib shell32.lib ole32.lib rpcrt4.lib oleaut32.lib ws2_32.lib"
+link %LNKFLAGS% /out:Fable3.exe /pdb:Fable3.pdb main.obj framework.obj common.obj engine.obj worker.obj manager.obj object_registry.obj xlo_device.obj gameengine.obj gamethread.obj gamemain.obj netinit.obj thread.obj save.obj %IMPORT_LIBS% %RRES%
 if errorlevel 1 (echo LINK FAILED & popd & popd & exit /b 1)
 
-rem The exe now really imports from the bundled XLiveAPI shim: copy
-rem xlive.dll (from the game directory) next to it so the loader binds.
-for %%d in ("%ORIG%") do set "GAMEDIR=%%~dpd"
-if exist "%GAMEDIR%xlive.dll" copy /y "%GAMEDIR%xlive.dll" . >nul
+rem The exe now really imports from the bundled third-party DLLs; copy the
+rem ones the original loads (xlive, binkw32, steam_api) from the project-root
+rem "dlls" folder next to the exe so the loader binds.
+set "DLLDIR=..\..\..\dlls"
+for %%d in (xlive.dll binkw32.dll steam_api.dll) do (
+    if exist "%DLLDIR%\%%d" copy /y "%DLLDIR%\%%d" . >nul
+)
 
 if exist ..\..\patch_rsrc.py (
     echo.

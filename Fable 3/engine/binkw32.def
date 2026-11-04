@@ -1,0 +1,18 @@
+LIBRARY binkw32.dll
+EXPORTS
+    _BinkDoFrame@4
+    _BinkNextFrame@4
+    _BinkOpenXAudio2@4
+    _BinkSetSoundSystem@8
+    _BinkClose@4
+    _BinkSetSpeakerVolumes@20
+    _BinkRegisterFrameBuffers@8
+    _BinkWait@4
+    _BinkShouldSkip@4
+    _BinkOpen@8
+    _BinkSetSoundTrack@8
+    _BinkSetSoundOnOff@8
+    _BinkSetVolume@12
+    _BinkPause@8
+    _BinkGoto@12
+    _BinkGetFrameBuffersInfo@8

@@ -1,0 +1,22 @@
+LIBRARY d3dx9_42.dll
+EXPORTS
+    D3DXFloat32To16Array
+    D3DXMatrixLookAtRH
+    D3DXMatrixOrthoOffCenterRH
+    D3DXSHEvalDirection
+    D3DXMatrixTranspose
+    D3DXVec4Transform
+    D3DXFillTexture
+    D3DXMatrixInverse
+    D3DXFloat16To32Array
+    D3DXCreateTextureFromFileA
+    D3DXFilterTexture
+    D3DXLoadSurfaceFromMemory
+    D3DXLoadSurfaceFromSurface
+    D3DXLoadSurfaceFromFileA
+    D3DXSaveSurfaceToFileA
+    D3DXSaveSurfaceToFileInMemory
+    D3DXCreateCubeTextureFromFileExA
+    D3DXLoadVolumeFromMemory
+    D3DXCreateTextureFromFileExA
+    D3DXVec4TransformArray

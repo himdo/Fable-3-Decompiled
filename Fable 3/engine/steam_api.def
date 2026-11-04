@@ -1,0 +1,5 @@
+LIBRARY steam_api.dll
+EXPORTS
+    SteamUtils
+    SteamFriends
+    SteamAPI_Init
