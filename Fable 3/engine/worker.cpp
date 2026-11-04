@@ -4,6 +4,7 @@
 #include "worker.h"
 #include "common/common.h"
 #include "manager.h"
+#include "gamemain.h"       // MakeAbnormalShutdownPath
 
 // g_Addend (0x2075C48, the live-slot counter) now lives in common/common.cpp
 // alongside InitSharedSlot / ReleaseSharedSlot, its primary users.
@@ -605,13 +606,6 @@ static LONG SaveSettingsBeforeExit(void)
     return 0;
 }
 
-// 0x67C930 -- fill a shared-buffer slot (used on the WM_CLOSE path to obtain
-// the "abnormal_shutdown.tmp" path). Matches the gamemain.cpp no-op stub.
-static void sub_67C930(void *obj)
-{
-    (void)obj;
-}
-
 // 0x18B0420 -- delete the file resolved from a shared-buffer slot. The
 // original resolves the path via sub_18AFB90 and DeleteFileA's it, releasing
 // the refcount; the path resolution is out of scope. [remaining stub]
@@ -720,7 +714,7 @@ static LRESULT DispatchWorkerMessage(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM 
                 if (wParam == 0)
                 {
                     F3SharedBuffer *slot = 0;
-                    sub_67C930(&slot);
+                    MakeAbnormalShutdownPath(&slot);   // 0x67C930: settings dir + "abnormal_shutdown.tmp"
                     DeleteSharedFile(slot);
                     ReleaseSharedSlot(&slot);
                 }

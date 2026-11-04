@@ -6,6 +6,7 @@
 #define _CRT_SECURE_NO_WARNINGS   // original used strstr / the CRT directly
 #endif
 
+#include <stdio.h>
 #include "gamemain.h"
 #include "common/common.h"        // LHAlloc / LHFree / InitSharedSlot / ReleaseSharedSlot
 #include "manager.h"              // GetManager
@@ -18,6 +19,7 @@
 #include <wchar.h>                // _wgetcwd
 #include <string.h>
 #include <mbstring.h>             // _mbscmp
+#include <math.h>                 // fabsf
 #include <direct.h>               // _chdir / _mkdir
 
 // ============================================================
@@ -45,6 +47,7 @@ static BYTE  g_byte_1DBD034 = 0;   // 0x1DBD034: WaitBeforeEnteringFrontEnd on t
 static BYTE  g_byte_1DBD03E = 0;   // 0x1DBD03E
 static BYTE  g_byte_1DBD01F = 0;   // 0x1DBD01F
 static BYTE  g_byte_2075F07 = 0;   // 0x2075F07
+static BYTE  g_byte_2075F4E = 1;   // 0x2075F4E: path-normalize enable flag
 // Function-pointer slots published by the frontend (0x1D8C850 / 0x1D8C854).
 static void *g_off_1D8C850 = 0;    // 0x1D8C850
 static void *g_off_1D8C854 = 0;    // 0x1D8C854
@@ -117,16 +120,297 @@ static int SteamAPI_Init(void)
 // ============================================================
 static int   sub_775DA0(void *str, char c) { (void)str; (void)c; return 0; }
 
-static int   g_sub61A000Buf[2] = { 0, 0 };
-static int  *sub_61A000(void *obj) { (void)obj; return g_sub61A000Buf; }
+// ============================================================
+//  CDiskFileWin32 disk-file object + Open (the sub_18C5xxx cluster).
+//
+//  The game's Win32 disk-file class (LHFile::CDiskFileWin32). The 28-byte
+//  object stores the vtable, the open mode, the file position / size, the
+//  HANDLE, an is-open flag, and the filename C string (at +0x18). The Open
+//  method (sub_18C5150) resolves the path, calls CreateFileA with the
+//  mode-dependent access / share / disposition, and on success fills in the
+//  HANDLE / size / position / is-open flag. The two constructors
+//  (sub_18C5450 stack, sub_18C5490 heap) zero the object, set the vtable,
+//  bump g_Addend, and forward to Open.
+// ============================================================
 
-static void  sub_67C930(void *obj) { (void)obj; }
+// Forward declarations (defined later in this file).
+static void DetachSharedSlot(F3SharedBuffer **slot);
+static void AppendSharedSlot(F3SharedBuffer **slot, const char *src);
+static F3SharedBuffer **ResolvePathSlot(F3SharedBuffer **a1, F3SharedBuffer **a2);
+static int SplitPathIntoSlots(F3SharedBuffer **path, F3SharedBuffer **driveOut,
+                              F3SharedBuffer **dirOut, F3SharedBuffer **fileOut,
+                              F3SharedBuffer **extOut);
+static int EnsureParentDirectory(F3SharedBuffer **pathSlot);
+
+struct CDiskFileWin32
+{
+    const void *      vtable;      // +0x00
+    int               mode;        // +0x04
+    DWORD             position;    // +0x08
+    DWORD             size;        // +0x0C
+    HANDLE            handle;      // +0x10
+    DWORD             openFlag;    // +0x14 (byte 0 = is-open)
+    const char *      fileName;    // +0x18 (the C string filename)
+};
+
+// sub_1A01270 (0x1A01270 - 0x1A012B7): copy-assign one shared slot onto
+//  another with refcounting. this / a2 are both slot addresses (the address
+//  of an F3SharedBuffer * field). Releases the old block this held
+//  (SharedBufferFree at zero refcount, then null), copies the source block
+//  pointer in, and increments the new block's refcount. A self-assign is a
+//  no-op. [NOT byte-identical] placement-independent but refs the Interlocked
+//  IAT slots and SharedBufferFree.
+static F3SharedBuffer **CopySharedSlot(F3SharedBuffer **thisSlot, F3SharedBuffer **srcSlot)
+{
+    F3SharedBuffer *old = *thisSlot;
+    F3SharedBuffer *src = (srcSlot != 0) ? *srcSlot : 0;
+    if (thisSlot == srcSlot || old == src)
+        return thisSlot;
+    if (old != 0)
+    {
+        if (InterlockedDecrement(&old->refcount) <= 0 && *thisSlot != 0)
+            SharedBufferFree(*thisSlot);
+        *thisSlot = 0;
+    }
+    if (src != 0)
+    {
+        *thisSlot = src;
+        InterlockedIncrement(&src->refcount);
+    }
+    return thisSlot;
+}
+
+// sub_1A01940 (0x1A01940 - 0x1A019A1): append (or copy) one slot's C string
+//  onto another. When thisSlot already holds a block, DetachSharedSlot makes
+//  a private copy and AppendSharedSlot appends the source C string. When
+//  thisSlot is empty, the source block is copied (with a refcount bump) and
+//  the source is left untouched. [NOT byte-identical] (placement-dependent
+//  relative calls to DetachSharedSlot / AppendSharedSlot + the Interlocked IAT).
+static F3SharedBuffer **AppendStringSlot(F3SharedBuffer **thisSlot, F3SharedBuffer **srcSlot)
+{
+    if (*thisSlot != 0)
+    {
+        DetachSharedSlot(thisSlot);
+        const char *src = (srcSlot != 0 && *srcSlot != 0) ? (*srcSlot)->data : "";
+        AppendSharedSlot(thisSlot, src);
+        return thisSlot;
+    }
+    F3SharedBuffer *src = (srcSlot != 0) ? *srcSlot : 0;
+    if (src != 0 && thisSlot != srcSlot)
+    {
+        *thisSlot = src;
+        InterlockedIncrement(&src->refcount);
+    }
+    return thisSlot;
+}
+
+// sub_18AFC00 (0x18AFC00 - 0x18AFC8E): resolve + split the path (the
+//  "normalize" step). Gated by g_byte_2075F4E (skips entirely when 0). When
+//  active: bump g_Addend, resolve the path through the resolver (sub_18AF9D0,
+//  encapsulated in ResolvePathSlot), split the resolved path into its
+//  components (SplitPathIntoSlots, the drive extracted into a local), then
+//  release both the resolved and drive blocks (SharedBufferFree at zero
+//  refcount) and drop g_Addend twice. The source slot is left unchanged. The
+//  net g_Addend traffic nets to zero (the resolver / splitter own their own
+//  increments). [NOT byte-identical] (placement-dependent relative calls to
+//  ResolvePathSlot / SplitPathIntoSlots + the Interlocked IAT).
+static void NormalizePathSlot(F3SharedBuffer **pathSlot)
+{
+    if (g_byte_2075F4E == 0)
+        return;
+    InterlockedIncrement(&g_Addend);
+    F3SharedBuffer *resolved = 0;
+    InterlockedIncrement(&g_Addend);
+    ResolvePathSlot(&resolved, pathSlot);   // sub_18AF9D0
+    F3SharedBuffer *drive = 0;
+    InterlockedIncrement(&g_Addend);
+    SplitPathIntoSlots(&resolved, &drive, 0, 0, 0);   // sub_18ABFA0
+    if (resolved != 0)
+    {
+        if (InterlockedDecrement(&resolved->refcount) <= 0 && resolved != 0)
+            SharedBufferFree(resolved);
+    }
+    InterlockedDecrement(&g_Addend);
+    if (drive != 0)
+    {
+        if (InterlockedDecrement(&drive->refcount) <= 0 && drive != 0)
+            SharedBufferFree(drive);
+    }
+    InterlockedDecrement(&g_Addend);
+}
+
+// sub_18C5150 (0x18C5150 - 0x18C53FA): CDiskFileWin32::Open
+//
+//  long CDiskFileWin32Open(CDiskFileWin32 *obj, F3SharedBuffer **name, int mode, int flags)
+//
+//  Open a file. `name` is a shared slot holding the filename block (the C
+//  string is at (*name)->data). The mode selects the CreateFileA access /
+//  share / disposition:
+//    1 = read  (OPEN_EXISTING, share read, GENERIC_READ|GENERIC_WRITE)
+//    2 = write (OPEN_EXISTING, share read, after path-normalize)
+//    3 = create(CREATE_ALWAYS, no share, after path-normalize)
+//    4 = open-or-create (OPEN_ALWAYS, no share, after path-normalize +
+//       EnsureParentDirectory).
+//  The desired access is always 0xC0000000 (GENERIC_READ|GENERIC_WRITE) for
+//  the valid modes. `flags` is passed directly as dwFlagsAndAttributes
+//  (FILE_FLAG_WRITE_THROUGH when the caller set bit 1). On success the
+//  HANDLE / size / position / is-open flag are filled in. On failure (a null
+//  or empty filename, or CreateFileA failing) an error string is built in a
+//  temp slot, the temp slots are released, and the new g_Addend value is
+//  returned. The object's fileName field (+0x18) is set to the filename C
+//  string up front (CopySharedSlot). [NOT byte-identical] (placement-
+//  dependent relative calls to the whole string / path cluster + the KERNEL32
+//  IAT slots) plus the high-VA globals g_Addend and Str1 (the empty string).
+static long CDiskFileWin32Open(CDiskFileWin32 *obj, F3SharedBuffer **name, int mode, int flags)
+{
+    // 1. Copy the filename into the object's fileName field (sub_1A01270).
+    CopySharedSlot((F3SharedBuffer **)&obj->fileName, name);
+
+    // 2. Resolve the path (sub_18AFB90 = ResolvePathSlot).
+    ResolvePathSlot(name, name);
+
+    // 3. Check the filename is non-null and non-empty.
+    if (name == 0 || *name == 0 || (*name)->length <= 0)
+        goto BadFilename;
+
+    // 4. Mode switch.
+    DWORD shareMode = 0, creationDisposition = 0, desiredAccess = 0;
+    switch (mode)
+    {
+        case 1:
+            shareMode = 1;                       // FILE_SHARE_READ
+            desiredAccess = 0xC0000000;          // GENERIC_READ | GENERIC_WRITE
+            creationDisposition = OPEN_EXISTING; // 3
+            obj->mode = mode;
+            break;
+        case 2:
+            NormalizePathSlot(name);             // sub_18AFC00
+            shareMode = 1;                       // FILE_SHARE_READ
+            desiredAccess = 0xC0000000;
+            creationDisposition = OPEN_EXISTING; // 3
+            obj->mode = mode;
+            break;
+        case 3:
+            NormalizePathSlot(name);             // sub_18AFC00
+            shareMode = 0;
+            desiredAccess = 0xC0000000;
+            creationDisposition = CREATE_ALWAYS; // 4
+            obj->mode = 2;
+            break;
+        case 4:
+            NormalizePathSlot(name);             // sub_18AFC00
+            EnsureParentDirectory(name);         // sub_18B1360
+            shareMode = 0;
+            desiredAccess = 0xC0000000;
+            creationDisposition = OPEN_ALWAYS;   // 2
+            obj->mode = 2;
+            break;
+        default:
+            break;
+    }
+
+    // 5. CreateFileA.
+    SetLastError(0x10000001);                    // the original's sentinel
+    const char *fileName = (name != 0 && *name != 0) ? (*name)->data : "";
+    HANDLE hFile = CreateFileA(fileName, desiredAccess, shareMode, 0,
+                               creationDisposition, (DWORD)flags, 0);
+    DWORD lastErr = GetLastError();
+
+    if (hFile == INVALID_HANDLE_VALUE || (lastErr & 0x10000000))
+        goto Error;
+
+    // 6. Success: fill in the object.
+    obj->size     = GetFileSize(hFile, 0);
+    SetFilePointer(hFile, 0, 0, FILE_BEGIN);
+    obj->handle   = hFile;
+    obj->position = 0;
+    obj->openFlag = 1;
+    SetFilePointer(hFile, 0, 0, FILE_END);
+    return ReleaseSharedSlot(name);
+
+BadFilename:
+    {
+        F3SharedBuffer *msg = 0;
+        SetSharedSlot(&msg, "Bad filename ", -1);
+        AppendStringSlot(&msg, name);            // msg += name
+        ReleaseSharedSlot(&msg);
+        return ReleaseSharedSlot(name);
+    }
+
+Error:
+    {
+        F3SharedBuffer *msg = 0;
+        char numBuf[32];
+        _snprintf(numBuf, sizeof(numBuf), "%d", (int)lastErr);
+        SetSharedSlot(&msg, "Cannot open file '", -1);
+        AppendStringSlot(&msg, name);            // msg += name
+        AppendSharedSlot(&msg, "' (Error ");
+        AppendSharedSlot(&msg, numBuf);
+        AppendSharedSlot(&msg, ")");
+        ReleaseSharedSlot(name);
+        return ReleaseSharedSlot(&msg);
+    }
+}
+
+// sub_18C5150 (0x18C5150 - 0x18C53FA) -- forwarder to CDiskFileWin32Open
 static void  sub_18C5150(void *obj, void *a, int b, int c)
-{ (void)obj; (void)a; (void)b; (void)c; }
+{
+    (void)CDiskFileWin32Open((CDiskFileWin32 *)obj, (F3SharedBuffer **)a, b, c);
+}
 static void  sub_18C4840(void *obj) { (void)obj; }
 
 static int   sub_1A02560(void *obj, void *str) { (void)obj; (void)str; return 0; }
 static void  sub_19FFA70(void *str) { (void)str; }
+
+// ============================================================
+//  GetDefaultResolution  (0x61A000 - 0x61A100)
+// ============================================================
+//
+//  Picks the default video resolution to run at based on the desktop's
+//  aspect ratio. It computes desktopX / desktopY (SM_CXSCREEN / SM_CYSCREEN
+//  via GetSystemMetrics), finds the closest candidate aspect ratio, and
+//  writes the matching { width, height } pair to *out, returning out.
+//
+//  Candidate aspect ratio -> resolution pairs (the aspect values are the
+//  rdata floats, kept at their original IDA names / addresses):
+//      dword_1BF95A4  1.7777778f  (16:9)  ->  1280 x 720
+//      dword_1AE9B04  1.3333334f  ( 4:3)  ->  1152 x 864
+//      dword_1AE9B00  1.6f        (16:10) ->  1280 x 800
+//  (dword_1AE9AF0 = -1.0f is the fabs sign mask the original ANDs with).
+//
+//  The closest-candidate scan keeps the first index on ties (a candidate
+//  only wins on a strictly smaller |aspect - candidate| difference). The
+//  first call-site is RunFrontEnd (0x61CC1D), which seeds the frontend
+//  resolution globals (dword_1C88DE4 / dword_1C88DE8) and, when the saved
+//  settings record is uncalibrated, the saved resolution words too.
+//
+//  [NOT byte-identical] -- refs the __imp_GetSystemMetrics IAT slot and the
+//  high-VA rdata floats above at their original addresses.
+static const float dword_1BF95A4 = 1.7777778f;   // 0x1BF95A4: 16:9
+static const float dword_1AE9B04 = 1.3333334f;   // 0x1AE9B04: 4:3
+static const float dword_1AE9B00 = 1.6f;         // 0x1AE9B00: 16:10
+static const float dword_1AE9AF0 = -1.0f;        // 0x1AE9AF0: fabs mask
+
+//  GetDefaultResolution  (0x61A000 - 0x61A100)  -- pick the default
+//  resolution matching the desktop's aspect ratio; returns *out.
+DWORD *GetDefaultResolution(DWORD *out)
+{
+    float aspect = (float)GetSystemMetrics(0) / (float)GetSystemMetrics(1);
+    const float candidates[]  = { dword_1BF95A4, dword_1AE9B04, dword_1AE9B00, 0.0f };
+    const int   resolutions[] = { 1280, 720,  1152, 864,  1280, 800 };
+    int best = 0;
+    for (int i = 0; candidates[i] > 0.0f; ++i)
+    {
+        // |x| as the original computes it (andps with the dword_1AE9AF0 mask).
+        float d1 = fabsf(candidates[i]   - aspect);
+        float d0 = fabsf(candidates[best] - aspect);
+        if (d1 < d0)
+            best = i;
+    }
+    out[0] = (DWORD)resolutions[best * 2];
+    out[1] = (DWORD)resolutions[best * 2 + 1];
+    return out;
+}
 
 // ============================================================
 //  Video-options option-map cluster (LoadVideoOptions, 0x775EE0, and the
@@ -438,7 +722,8 @@ static F3SharedBuffer **RefSharedSlot(F3SharedBuffer **dst, F3SharedBuffer **src
 //  g_dword_1DBE2F0 is the settings-directory shared-slot global (the IDA name
 //  is "dword_1DBE2F0"): .bss (starts null), populated by the settings
 //  subsystem before the paths below are built. It is also the base slot used
-//  by sub_67C910 / sub_67C930 / the AccessibilitySettings.xml builders.
+//  by sub_67C910 / MakeAbnormalShutdownPath / the AccessibilitySettings.xml
+//  builders.
 // ============================================================
 static F3SharedBuffer *g_dword_1DBE2F0 = 0;   // 0x1DBE2F0: settings-directory path slot
 
@@ -466,22 +751,25 @@ static int TopBitIndex(unsigned int x)
 static void EnsureBufferCapacity(F3SharedBuffer *blk, unsigned int needed)
 {
     unsigned int aligned = (needed + 4) & 0xFFFFFFFCu;
-    if (aligned <= (blk->capacity & 0x7FFFFFFFu))
+    unsigned int cap     = blk->capacity;
+    if (aligned <= (cap & 0x7FFFFFFFu))
         return;
 
     unsigned int newsz;
-    if ((blk->capacity & 0x80000000u) == 0)
+    if ((cap & 0x80000000u) == 0)
         newsz = aligned;                                  // exact-fit capacity
+    else if (aligned == 0)
+        newsz = 0;
     else
     {
         unsigned int v = aligned * 2u - 1u;               // 2*aligned - 1 (32-bit wrap)
-        newsz = (v == 0) ? 0u : (1u << TopBitIndex(v));   // next power of two
+        newsz = 1u << TopBitIndex(v);                     // next power of two
     }
 
     char *newdata = (char *)LHAlloc(newsz);
     unsigned int len  = blk->length;
     unsigned int tail = len + 1;
-    unsigned int pad  = ((tail + 4) & 0xFFFFFFFCu) - tail;
+    unsigned int pad  = ((len + 4) & 0xFFFFFFFCu) - tail; // align4(len+4) - (len+1)
     if (pad)
         memset(newdata + tail, 0, pad);
     memcpy(newdata, blk->data, len);
@@ -492,7 +780,7 @@ static void EnsureBufferCapacity(F3SharedBuffer *blk, unsigned int needed)
         blk->data = 0;
     }
     blk->data = newdata;
-    blk->capacity = (blk->capacity & 0x80000000u) | (newsz & 0x7FFFFFFFu);
+    blk->capacity = (cap & 0x80000000u) | (newsz & 0x7FFFFFFFu);
 }
 
 // sub_403D10 (0x403D10 - 0x403D63) -- append (src, len) to the end of the buffer
@@ -508,9 +796,10 @@ static void SharedBufferAppend(F3SharedBuffer *blk, const char *src, unsigned in
     memcpy(dest, src, len);
     dest[len] = 0;
     blk->length += len;
-    blk->data[blk->length] = 0;
-    unsigned int tail = blk->length + 1;
-    unsigned int pad  = ((tail + 4) & 0xFFFFFFFCu) - tail;
+    unsigned int newlen = blk->length;
+    blk->data[newlen] = 0;
+    unsigned int tail = newlen + 1;
+    unsigned int pad  = ((newlen + 4) & 0xFFFFFFFCu) - tail; // align4(newlen+4) - (newlen+1)
     if (pad)
         memset(blk->data + tail, 0, pad);
 }
@@ -621,12 +910,30 @@ static F3SharedBuffer **MakeSettingsFilePath(F3SharedBuffer **dst, F3SharedBuffe
 //  Build the video-options settings-file path: ref the settings-directory
 //  shared slot (g_dword_1DBE2F0) into obj and append the "VideoOptions.xml"
 //  filename, then return obj. One of several identical builders in the
-//  settings cluster (sub_67C910 "Controls\\", sub_67C930 "abnormal_shutdown.tmp",
-//  the AccessibilitySettings.xml builders). obj is a fresh caller slot (the
+//  settings cluster (sub_67C910 "Controls\\",
+//  MakeAbnormalShutdownPath "abnormal_shutdown.tmp", the
+//  AccessibilitySettings.xml builders). obj is a fresh caller slot (the
 //  RunFrontEnd v70 local); the caller ignores the returned pointer.
 static F3SharedBuffer **MakeVideoOptionsPath(F3SharedBuffer **obj)
 {
     return MakeSettingsFilePath(obj, &g_dword_1DBE2F0, "VideoOptions.xml");
+}
+
+//  MakeAbnormalShutdownPath  (0x67C930 - 0x67C94C)  -- settings dir + "abnormal_shutdown.tmp"
+//  [NOT byte-identical] placement-dependent (relative call to MakeSettingsFilePath
+//  + the high-VA string literal and the settings-directory global at 0x1DBE2F0).
+//
+//  Build the abnormal-shutdown marker path: ref the settings-directory shared
+//  slot (g_dword_1DBE2F0) into obj and append the "abnormal_shutdown.tmp"
+//  filename, then return obj. One of several identical builders in the
+//  settings cluster (MakeVideoOptionsPath "VideoOptions.xml", sub_67C910
+//  "Controls\\", the AccessibilitySettings.xml builders). RunFrontEnd uses it
+//  to report an existing marker file (info box); the worker WM_CLOSE path
+//  uses it to delete the marker on a clean exit. Both callers ignore the
+//  returned pointer. Declared in gamemain.h (the worker module calls it too).
+F3SharedBuffer **MakeAbnormalShutdownPath(F3SharedBuffer **obj)
+{
+    return MakeSettingsFilePath(obj, &g_dword_1DBE2F0, "abnormal_shutdown.tmp");
 }
 
 // sub_487560 (0x487560 - 0x4875AE): fresh 24-byte copy node from the source
@@ -1997,9 +2304,9 @@ char RunFrontEnd(void *obj, int arg)
     DWORD           v70[5];                 // the video-options file-path shared slot (MakeVideoOptionsPath)
     DWORD           str103[13];             // the 52-byte saved video-options record (v103..v106)
     DWORD           v107 = 0;               // the separate command-line word
-    int             v84;                    // sub_61A000 slot
-    F3SharedBuffer *v88 = 0;                // sub_67C930 / SharedFileExists slot
-    DWORD           v93[6];                 // the CDiskFileWin32 / CAFile object
+    DWORD           v84[2];                 // GetDefaultResolution slot ({width, height})
+    F3SharedBuffer *v88 = 0;                // MakeAbnormalShutdownPath / SharedFileExists slot
+    DWORD           v93[7];                 // the CDiskFileWin32 / CAFile object (28 bytes)
     F3SharedBuffer *v96;                    // InitSharedSlot / ReleaseSharedSlot slot
     DWORD           notify[2];              // the 8-byte XNotify buffer
     int             v76;                    // sub_1A02560 string
@@ -2044,7 +2351,7 @@ char RunFrontEnd(void *obj, int arg)
     LoadVideoOptionsValues(str103, (F3SharedBuffer **)v70);
 
     // 5. Parse the command-line / locale words.
-    int *parsed = sub_61A000(&v84);
+    DWORD *parsed = GetDefaultResolution(v84);    // 0x61A000: default resolution from the desktop aspect ratio
     g_dword_1C88DE4 = (DWORD)parsed[0];
     g_dword_1C88DE8 = (DWORD)parsed[1];
     if (((v107 >> 8) & 0xFF) == 0)   // BYTE1(v107)
@@ -2054,11 +2361,12 @@ char RunFrontEnd(void *obj, int arg)
     }
 
     // 6. Build the file object + shared slot; show an error box on failure.
-    sub_67C930(&v88);
+    MakeAbnormalShutdownPath(&v88);   // 0x67C930: settings dir + "abnormal_shutdown.tmp"
     v93[0] = (DWORD)g_CDiskFileWin32Vtable;
-    memset(&v93[1], 0, 20);
+    memset(&v93[1], 0, 24);
     InitSharedSlot(&v96);
-    if (SharedFileExists(&v88) != 0)
+    int v88Exists = SharedFileExists(&v88);
+    if (v88Exists != 0)
     {
         void *mgr   = GetManager();
         void **vt   = (void **)*(void ***)mgr;

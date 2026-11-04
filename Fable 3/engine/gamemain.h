@@ -20,7 +20,13 @@
 #ifndef F3_GAMEMAIN_H
 #define F3_GAMEMAIN_H
 
+#include "common/common.h"   // F3SharedBuffer
+
 // char RunFrontEnd(void *obj, int arg)   (obj = the CGameEngine, 356 bytes)
 char RunFrontEnd(void *obj, int arg);
+
+// F3SharedBuffer **MakeAbnormalShutdownPath(F3SharedBuffer **obj)   (0x67C930)
+// settings-directory slot + "abnormal_shutdown.tmp" (shared by the worker module)
+F3SharedBuffer **MakeAbnormalShutdownPath(F3SharedBuffer **obj);
 
 #endif  // F3_GAMEMAIN_H
