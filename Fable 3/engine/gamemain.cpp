@@ -2590,9 +2590,15 @@ static int WaitForEvent(void *obj, int dwMilliseconds, int bAlertable)
     }
     return bAlertable;
 }
-static int   sub_18FA3E0(void *hwnd) { (void)hwnd; return 0; }
-static int   sub_18FA3D0(int a) { (void)a; return 0; }
-static void  sub_145D7B0(int a) { (void)a; }
+// 0x18FA3E0 / 0x18FA3D0: the heap-manager getters. The original sub_18FA3E0
+// takes no argument (callers push a value on the stack for a later stdcall
+// call, which the decompiler mis-attributes to it). Remaining stubs: the heap
+// manager (dword_2075ED8) is not implemented in this build, so they return 0.
+void *GetHeapManager(void) { return 0; }
+void *GetHeapManagerSlot1C(void *hm) { (void)hm; return 0; }
+// 0x145D7B0: thiscall + one pushed int in the original: stores the pushed
+// int (the window handle) into dword_1DDC934, ignoring ECX. Stub no-op.
+static void sub_145D7B0(int slot, int hwnd) { (void)slot; (void)hwnd; }
 static void  sub_741E50(int a) { (void)a; }
 
 // Worker callback functions the frontend installs (their addresses are stored
@@ -2996,9 +3002,11 @@ signedIn:
         ((void (*)(void *, int))vt[10])(mgr, (unsigned char)g_byte_1DBD01F);
 
         HWND hwnd = (HWND)((int (*)(void *))vt[8])(GetManager());
-        int a = sub_18FA3E0(hwnd);
-        int b = sub_18FA3D0(a);
-        sub_145D7B0(b);
+        // Original: push hwnd; sub_18FA3E0() -> sub_18FA3D0(ecx = ...) ->
+        // sub_145D7B0(ecx = ..., arg = hwnd) storing hwnd into dword_1DDC934.
+        void *hm   = GetHeapManager();
+        void *slot = GetHeapManagerSlot1C(hm);
+        sub_145D7B0((int)slot, (int)hwnd);
         int c = sub_6A66C0();
         int d = sub_6A69A0(c);
         sub_741E50(d);

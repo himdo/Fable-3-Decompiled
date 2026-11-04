@@ -29,4 +29,13 @@ char RunFrontEnd(void *obj, int arg);
 // settings-directory slot + "abnormal_shutdown.tmp" (shared by the worker module)
 F3SharedBuffer **MakeAbnormalShutdownPath(F3SharedBuffer **obj);
 
+// 0x18FA3E0 - the global heap-manager object getter (dword_2075ED8; takes no
+// argument in the original). Remaining stub (returns 0 until the heap
+// manager is implemented).
+void *GetHeapManager(void);
+
+// 0x18FA3D0 - thiscall getter for the heap manager's +0x1C member. Remaining
+// stub (returns 0 until the heap manager is implemented).
+void *GetHeapManagerSlot1C(void *hm);
+
 #endif  // F3_GAMEMAIN_H

@@ -90,7 +90,650 @@ void *GetGameBuffer(void)
     return g_gameBuffer;   // originally 0x1DBD318
 }
 
-static void  sub_61BE00(void *obj) { (void)obj; }                       // cleanup (part 1)
+// ---- the post-game component shutdown pump (CGameEngineShutdown) -----------
+//
+// The CGameEngine's node list (the 12-byte self-linked head block stored at
+// +0x14, the count at +0x18, and the iterator pair at +0x1C/+0x20) holds
+// 12-byte circular-doubly-linked records {+0: link toward the head (older),
+// +4: link away from the head (newer), +8: value}. The values are 16-byte
+// CGameComponents; CStartupComponent is the concrete wrapper whose +0x0C
+// points at the 152-byte CStartupComponentImplementation.
+
+// 0x1DC2868: the currently published CStartupComponent (set by the ctor,
+// cleared by the dtor). The CGameComponent * type is declared below.
+typedef struct CGameComponent CGameComponent;
+static CGameComponent *g_startupComponent = 0;
+// 0x1DBD9E2: debug stall flag -- when set, the shutdown pump sleeps
+// 0x2710 ms (10 s) after each component tick.
+static BYTE g_byte_1DBD9E2 = 0;
+// 0x1DDC884: debug flag armed by the pump's step branch.
+static BYTE g_byte_1DDC884 = 0;
+
+// The original's debug-list iterator checks call the CRT's
+// __invalid_parameter_noinfo(), which reports to the (unset) invalid-parameter
+// handler and returns normally, so the original keeps executing after each
+// check. A no-op with the same return path is functionally equivalent here
+// (the VS2008 msvcrt import library does not carry the symbol).
+static void F3InvalidParam(void) {}
+
+// ============================================================
+//  CGameComponent  -- the 16-byte engine component wrapper
+//
+//  +0x00 vtable   CGameComponent / CStartupComponent vftable
+//  +0x04/+0x05    two flag bytes zeroed by CGameComponentCtor
+//  +0x08 engine   the CGameEngine that owns the component
+//  +0x0C impl     the 152-byte CStartupComponentImplementation
+// ============================================================
+struct CGameComponent
+{
+    void *   vtable;
+    char     flag04;
+    char     flag05;
+    char     _pad0[2];
+    void *   engine;
+    void *   impl;
+};
+
+// Single-slot placeholder vtables (unimplemented in this build) for the NTools
+// base classes and the CAInputProcess base object.
+static void *g_NToolsCBaseClassNonCopyableVtable[1] = { 0 };
+static void *g_NToolsCBaseClassVtable[1] = { 0 };
+static void *g_CAInputProcessVtable[1] = { 0 };
+
+// Release a vtable object through its vtable slot 0 with a 1 (the original's
+// `obj->vtable[0](obj, 1)` dispatch).
+static void *F3ReleaseOne(void *o)
+{
+    void **vt = (void **)*(void **)o;
+    return ((void *(*)(void *, int))vt[0])(o, 1);
+}
+
+// ============================================================
+//  CBaseClassNonCopyableCtor  (0x18984D0 - 0x18984D8)  -- base ctor
+//  [NOT byte-identical] placement-dependent: writes the NTools vtable at its
+//  original high VA, not present in this build.
+//
+//  void *CBaseClassNonCopyableCtor(void *obj)
+// ============================================================
+static void *CBaseClassNonCopyableCtor(void *obj)
+{
+    *(void **)obj = g_NToolsCBaseClassNonCopyableVtable;   // 0x...CBaseClassNonCopyable::vftable
+    return obj;
+}
+
+// ============================================================
+//  CBaseClassDtor  (0x18984C0 - 0x18984C6)  -- base dtor (vtable store)
+//  [NOT byte-identical] placement-dependent: writes the NTools::CBaseClass
+//  vtable at its original high VA, not present in this build.
+//
+//  void CBaseClassDtor(void *obj)
+// ============================================================
+static void CBaseClassDtor(void *obj)
+{
+    *(void **)obj = g_NToolsCBaseClassVtable;   // 0x...CBaseClass::vftable
+}
+
+// ============================================================
+//  CGameComponentDtor  (0xBF8730 - 0xBF874B)  -- the 16-byte wrapper dtor
+//  [NOT byte-identical] placement-dependent (relative calls to the base dtor
+//  and LHFree).
+//
+//  void *CGameComponentDtor(void *obj, int freeIt)
+// ============================================================
+static void *CGameComponentDtor(void *obj, int freeIt)
+{
+    CBaseClassDtor(obj);
+    if (freeIt & 1)
+        LHFree(obj);
+    return obj;
+}
+
+// nullsub_3553 / nullsub_3544 / nullsub_162: no-op component vtable slots.
+static void CGameComponentNoop(void) {}
+
+// CGameComponent vftable (0x1B1FB38).
+static void *g_CGameComponentVtable[6] = {
+    CGameComponentDtor,   // 0xBF8730
+    CGameComponentNoop,   // nullsub_3553
+    CGameComponentNoop,   // nullsub_3544
+    CGameComponentNoop,   // nullsub_162
+    CGameComponentNoop,   // nullsub_162
+    CGameComponentNoop    // nullsub_162
+};
+
+// 0x71E910 -- the 152-byte implementation's dtor body: releases the sub-object
+// slots (+0x90 via sub_71DE20, +0x8C, +0x48, +0x20, +0x1C via sub_B6EB90,
+// +0x18, +0x14, the two critical sections at +0x70/+0x50), zeroes them all,
+// and stores the CAInputProcess vtable (sub_B6A070). Every slot is zero in
+// this build, so only the CS deletes and the vtable store are live.
+static void CImpl90Release(void *obj)  { (void)obj; }   // sub_71DE20 -- remaining stub
+static void CImpl1CRelease(void *obj)  { (void)obj; }   // sub_B6EB90 -- remaining stub
+
+// ============================================================
+//  CStartupComponentImplDtorBody  (0x71E910 - 0x71E9C7)  -- impl dtor body
+//  [NOT byte-identical] placement-dependent (relative calls to LHFree,
+//  sub_71DE20 / sub_B6EB90, the CRT critical-section deletes, and the
+//  CAInputProcess vtable store).
+//
+//  void *CStartupComponentImplDtorBody(void *obj)
+// ============================================================
+static void *CStartupComponentImplDtorBody(void *impl)
+{
+    char  *b = (char *)impl;
+    void **d = (void **)impl;
+    void  *o;
+
+    if ((o = d[36]) != 0)               // +0x90
+    {
+        CImpl90Release(o);
+        LHFree(o);
+    }
+    d[36] = 0;
+    if ((o = d[35]) != 0)               // +0x8C
+        F3ReleaseOne(o);
+    d[35] = 0;
+    DeleteCriticalSection((CRITICAL_SECTION *)(b + 112));
+    DeleteCriticalSection((CRITICAL_SECTION *)(b + 80));
+    if ((o = d[18]) != 0)               // +0x48
+        F3ReleaseOne(o);
+    d[18] = 0;
+    if ((o = d[8]) != 0)                // +0x20
+        F3ReleaseOne(o);
+    d[8] = 0;
+    if ((o = d[7]) != 0)                // +0x1C
+    {
+        CImpl1CRelease(o);
+        LHFree(o);
+    }
+    d[7] = 0;
+    if ((o = d[6]) != 0)                // +0x18
+        F3ReleaseOne(o);
+    d[6] = 0;
+    if ((o = d[5]) != 0)                // +0x14
+        F3ReleaseOne(o);
+    d[5] = 0;
+    d[0] = g_CAInputProcessVtable;      // sub_B6A070: store the base vtable
+    return impl;
+}
+
+// ============================================================
+//  CStartupComponentImplDtor  (0x71F320 - 0x71F33B)  -- impl dtor
+//  [NOT byte-identical] placement-dependent (relative calls to the dtor body
+//  and LHFree).
+//
+//  void *CStartupComponentImplDtor(void *obj, int freeIt)
+// ============================================================
+static void *CStartupComponentImplDtor(void *obj, int freeIt)
+{
+    CStartupComponentImplDtorBody(obj);
+    if (freeIt & 1)
+        LHFree(obj);
+    return obj;
+}
+
+static void *g_CStartupComponentImplVtable[8] = {
+    CStartupComponentImplDtor,  // 0x71F320
+    0, 0, 0, 0, 0, 0, 0,        // 0x71E3B0..0x71E4C0, nullsub_4602 -- remaining stubs
+};
+
+// The implementation's big method bodies, reached through the CStartupComponent
+// vtable slots. They are remaining stubs: the 724-byte release (0x71E630), the
+// 333-byte second release (0x71D000), and the 2327-byte tick (0x71EA00). The
+// tick's return value (the next component, or 0) drives the shutdown pump;
+// returning 0 ends the pump after the first iteration, as the original does
+// once the shutdown chain is exhausted.
+static int   CStartupComponentImplRelease(void *impl)   { (void)impl; return 0; }   // 0x71E630
+static int   CStartupComponentImplRelease2(void *impl)  { (void)impl; return 0; }   // 0x71D000
+static void *CStartupComponentImplUpdate(void *impl)    { (void)impl; return 0; }   // 0x71EA00
+
+// 0x71C690 -- CStartupComponent vtable slot 1 (release).
+static int CStartupComponentRelease(CGameComponent *obj)
+{
+    // nullsub_3553: no-op
+    return CStartupComponentImplRelease(obj->impl);
+}
+
+// 0x71C600 -- CStartupComponent vtable slot 2 (second release).
+static int CStartupComponentRelease2(CGameComponent *obj)
+{
+    // nullsub_3544: no-op
+    return CStartupComponentImplRelease2(obj->impl);
+}
+
+// 0x71C6B0 -- CStartupComponent vtable slot 3 (tick: run this step of the
+// shutdown, return the next component or 0).
+static void *CStartupComponentUpdate(CGameComponent *obj)
+{
+    return CStartupComponentImplUpdate(obj->impl);
+}
+
+// 0x71C430 -- CStartupComponent vtable slot 4 (impl +16 getter).
+static void *CStartupComponentImplPtr16(CGameComponent *obj)
+{
+    return *(void **)((char *)obj->impl + 16);
+}
+
+// 0x71C440 -- CStartupComponent vtable slot 5 (impl +20 getter).
+static void *CStartupComponentImplPtr20(CGameComponent *obj)
+{
+    return *(void **)((char *)obj->impl + 20);
+}
+
+// The CStartupComponent vtable array is defined after the dtor (the dtor
+// stores it, so the two reference each other); the getter breaks the cycle.
+static void *GetCStartupComponentVtable(void);
+
+// ============================================================
+//  CStartupComponentDtor  (0x71D150 - 0x71D1A9)  -- component dtor
+//  [NOT byte-identical] placement-dependent (relative calls to the impl
+//  vtable, the base dtor, and LHFree; writes dword_1DC2868).
+//
+//  void *CStartupComponentDtor(CGameComponent *comp, int freeIt)
+//
+//  Restores the CStartupComponent vtable, releases the implementation through
+//  its vtable (twice -- the second read of comp->impl is already zero, so it
+//  is a no-op), clears the global, runs the base dtor, and frees the wrapper
+//  when freeIt is odd.
+// ============================================================
+static void *CStartupComponentDtor(CGameComponent *obj, int freeIt)
+{
+    obj->vtable = GetCStartupComponentVtable();
+    if (obj->impl != 0)
+        F3ReleaseOne(obj->impl);
+    obj->impl = 0;
+    g_startupComponent = 0;   // dword_1DC2868
+    CBaseClassDtor(obj);
+    if (freeIt & 1)
+        LHFree(obj);
+    return obj;
+}
+
+// CStartupComponent vftable (0x1AF4AB0).
+static void *g_CStartupComponentVtable[6] = {
+    CStartupComponentDtor,      // 0x71D150
+    CStartupComponentRelease,   // 0x71C690
+    CStartupComponentRelease2,  // 0x71C600
+    CStartupComponentUpdate,    // 0x71C6B0
+    CStartupComponentImplPtr16, // 0x71C430
+    CStartupComponentImplPtr20  // 0x71C440
+};
+
+static void *GetCStartupComponentVtable(void)
+{
+    return g_CStartupComponentVtable;
+}
+
+// ============================================================
+//  CGameComponentCtor  (0xBF86E0 - 0xBF8700)  -- the 16-byte wrapper ctor
+//  [NOT byte-identical] placement-dependent (relative call to the base ctor
+//  + the CGameComponent vtable store).
+//
+//  void *CGameComponentCtor(CGameComponent *comp, void *engine)
+// ============================================================
+static void *CGameComponentCtor(CGameComponent *comp, void *engine)
+{
+    CBaseClassNonCopyableCtor(comp);
+    comp->flag04 = 0;
+    comp->flag05 = 0;
+    comp->engine = engine;
+    comp->vtable = g_CGameComponentVtable;
+    return comp;
+}
+
+// ============================================================
+//  CStartupComponentImplCtor  (0x71E2F0 - 0x71F31F)  -- 152-byte impl ctor
+//  [NOT byte-identical] placement-dependent (relative calls to the CRT
+//  critical-section inits + the vtable store). The vtable slots and sub-object
+//  pointers are zeroed, the engine pointer is copied from comp+8, the +0x50
+//  and +0x70 critical sections are initialized, and the +0x69 byte is set to 1.
+//
+//  void *CStartupComponentImplCtor(void *obj, void *comp)
+// ============================================================
+static void *CStartupComponentImplCtor(void *impl, void *comp)
+{
+    char  *b = (char *)impl;
+    void **d = (void **)impl;
+
+    d[0]  = g_CStartupComponentImplVtable;
+    d[1]  = 0;
+    *(void **)(b + 8)  = 0;
+    *(void **)(b + 12) = 0;
+    d[5]  = 0;
+    d[6]  = 0;
+    d[7]  = 0;
+    d[8]  = 0;
+    *(void **)(b + 40) = 0;
+    *(void **)(b + 44) = 0;
+    d[12] = 0;
+    d[13] = 0;
+    d[14] = 0;
+    d[15] = 0;
+    d[16] = ((void **)comp)[2];    // *(comp+8) = the CGameEngine
+    b[68] = 0;
+    d[18] = 0;
+    d[19] = 0;
+    InitializeCriticalSection((CRITICAL_SECTION *)(b + 80));
+    b[104] = 0;
+    b[105] = 1;
+    b[106] = 0;
+    b[107] = 0;
+    b[108] = 0;
+    InitializeCriticalSection((CRITICAL_SECTION *)(b + 112));
+    d[34] = 0;
+    d[35] = 0;
+    d[36] = 0;
+    return impl;
+}
+
+// ============================================================
+//  CStartupComponentCtor  (0x71C630 - 0x71C686)  -- build the startup component
+//  [NOT byte-identical] placement-dependent (relative calls to the wrapper
+//  ctor, LHAlloc, the impl ctor, the old-impl release, and the
+//  CStartupComponent vtable store; writes dword_1DC2868).
+//
+//  CGameComponent *CStartupComponentCtor(CGameComponent *comp, void *engine)
+//
+//  Runs the 16-byte wrapper ctor (CGameComponent vtable first, then the
+//  CStartupComponent vtable), allocates the 152-byte implementation on the
+//  game heap and constructs it, releases the previous implementation through
+//  its vtable (zero on first construction), stores the new one at +0x0C, and
+//  publishes the wrapper into dword_1DC2868. Returns the wrapper.
+// ============================================================
+static CGameComponent *CStartupComponentCtor(CGameComponent *comp, void *engine)
+{
+    CGameComponentCtor(comp, engine);
+    comp->vtable = g_CStartupComponentVtable;
+    comp->impl   = 0;
+
+    void *impl = LHAlloc(152);
+    void *newImpl = 0;
+    if (impl != 0)
+        newImpl = CStartupComponentImplCtor(impl, comp);
+
+    void *old = comp->impl;   // 0 here: the vtable store zeroed it above
+    if (old != 0)
+        F3ReleaseOne(old);
+    comp->impl = newImpl;
+
+    g_startupComponent = comp;   // dword_1DC2868
+    return comp;
+}
+
+// ============================================================
+//  ListCountInc  (0x624360 - 0x62446F)  -- the list size increment
+//  [NOT byte-identical] placement-dependent and refs the std::length_error /
+//  exception machinery in its overflow path.
+//
+//  void ListCountInc(CGameEngine *obj, int n)
+//
+//  Thiscall + `retn 4`. Adds n to the list count at +0x18; when the unsigned
+//  remainder 0x3FFFFFFF - count is smaller than n, the original builds a
+//  std::length_error("list<T> too long") and throws. That path is unreachable
+//  with a list this size, so the throw is emulated with a plain C++ throw.
+// ============================================================
+static void ListCountInc(CGameEngine *obj, int n)
+{
+    DWORD *cnt = (DWORD *)&obj->listCount;
+    if (0x3FFFFFFF - *cnt < (DWORD)n)
+        throw 1;   // the original throws std::length_error("list<T> too long")
+    *cnt += (DWORD)n;
+}
+
+// ============================================================
+//  ListPushFront  (0x624BF0 - 0x624C45)  -- push a value onto the node list
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc and
+//  ListCountInc).
+//
+//  void *ListPushFront(CGameEngine *obj, int unused, void *head, void *value)
+//
+//  Thiscall + `retn 0Ch` (obj in ECX, three ints on the stack; the first is
+//  unused by the callee). Allocates a 12-byte node {head, first, *value} and
+//  splices it in front of the old first node (head+4 = the first node,
+//  head+0 = the last node: the new node's prev is the head, its next is the
+//  old first, the old first's prev becomes the new node -- when the list is
+//  empty the old first is the head block itself, so head+0 picks up the new
+//  node), then increments the engine's list count via ListCountInc. Returns
+//  the old first node (discarded by callers).
+// ============================================================
+static void *ListPushFront(CGameEngine *obj, int unused, void *head, void *value)
+{
+    (void)unused;
+    void *first = *(void **)((char *)head + 4);
+    void *node  = LHAlloc(12);
+    if (node != 0)
+        *(void **)node = head;
+    if (node != 0)
+        *(void **)((char *)node + 4) = first;
+    if (node != 0)
+        *(void **)((char *)node + 8) = *(void **)value;
+    ListCountInc(obj, 1);
+    *(void **)((char *)head + 4) = node;
+    *(void **)first = node;   // old first's prev = the new node (head[0] when empty)
+    return first;
+}
+
+// ============================================================
+//  ListErase  (0x622D20 - 0x622DA0)  -- unlink one node from the list
+//  [NOT byte-identical] placement-dependent (relative call to LHFree; the
+//  original's debug-list iterator checks are no-op __invalid_parameter_noinfo
+//  calls, so they are omitted).
+//
+//  void *ListErase(CGameEngine *obj, void *iter, void *last, void *node)
+//
+//  Thiscall + `retn 0Ch`. Unlinks `node` from the circular list rooted at
+//  obj->listFirst (the head block) and LHFrees it (skipped when node is the
+//  head itself), decrementing the count. The out `iter` (a 4-byte iterator
+//  pair) is set to {obj->heapNode, node's prev link} and returned.
+// ============================================================
+static void *ListErase(CGameEngine *obj, void *iter, void *last, void *node)
+{
+    (void)last;
+    void *prev = *(void **)node;
+    if (node != obj->listFirst)
+    {
+        void *next = *(void **)((char *)node + 4);
+        *(void **)next = prev;
+        *(void **)((char *)prev + 4) = next;
+        LHFree(node);
+        *(DWORD *)&obj->listCount = (DWORD)*(DWORD *)&obj->listCount - 1;
+    }
+    *(void **)iter = obj->heapNode;
+    *(void **)((char *)iter + 4) = prev;
+    return iter;
+}
+
+// ============================================================
+//  DestroyComponentsExcept  (0x61AA90 - 0x61ABA3)  -- drain the component list
+//  [NOT byte-identical] placement-dependent (relative calls to the component
+//  vtable slots, ListErase, and LHFree).
+//
+//  void DestroyComponentsExcept(CGameEngine *obj, void *keep)
+//
+//  Walks the node list from the last node toward the head. A node whose value
+//  equals `keep` is skipped; every other node's component is released through
+//  vtable slots 2 and 0(,1) and erased from the list. Once the walk reaches
+//  the head, the list is reset to empty (head+0 = head+4 = head, count = 0,
+//  every remaining node LHFreed) and the iterator pair is reset to
+//  {heapNode, head}.
+// ============================================================
+static void DestroyComponentsExcept(CGameEngine *obj, void *keep)
+{
+    void *head = obj->listFirst;
+    obj->listLast = obj->heapNode;
+    void *cur = *(void **)head;
+
+    for (;;)
+    {
+        if (obj->listLast == 0 || obj->listLast != obj->heapNode)
+            F3InvalidParam();
+        if (cur == head)
+            break;
+        void *val = *(void **)((char *)cur + 8);
+        if (val == keep)
+        {
+            cur = *(void **)cur;
+            continue;
+        }
+        void **vt = (void **)*(void **)val;
+        ((void (*)(void *))vt[2])(val);
+        F3ReleaseOne(val);
+        void *iter[2];
+        ListErase(obj, iter, obj->listLast, cur);
+        obj->listLast = *(void **)iter;
+        cur = *(void **)((char *)iter + 4);
+    }
+
+    head      = obj->listFirst;
+    void *node = *(void **)head;
+    *(void **)head = head;
+    *(void **)((char *)head + 4) = head;
+    obj->listCount = 0;
+    for (;; node = *(void **)node)
+    {
+        if (node == head)
+            break;
+        LHFree(node);
+    }
+    obj->listLast    = obj->heapNode;
+    obj->listSentinel = head;
+}
+
+// 0x14640C0 -- store a byte into byte_1DDC884 and return it (the 14-byte
+// 0x145D630 thunk forwards a pushed int to it with ECX preserved).
+static void SetDebugByte1DDC884(int v)
+{
+    g_byte_1DDC884 = (BYTE)v;
+}
+
+// ============================================================
+//  CGameEngineShutdown  (0x61BE00 - 0x61BFD6)  -- the post-game shutdown pump
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc,
+//  CStartupComponentCtor, the component vtable slots, ListPushFront,
+//  ListCountInc, DestroyComponentsExcept, Sleep, and the heap-manager getters)
+//  and it refs the high-VA debug flags byte_1DBD9E2 / byte_1DDC884.
+//
+//  void CGameEngineShutdown(CGameEngine *obj)
+//
+//  Called by GameThread when RunFrontEnd succeeds. It allocates the 16-byte
+//  CStartupComponent wrapper on the game heap, constructs it (publishing it
+//  into dword_1DC2868), runs its release step (vtable slot 1), and pushes it
+//  onto the engine's node list. It then pumps while the +0x24 done flag is
+//  clear: each iteration ticks the current node's component (vtable slot 3).
+//  A non-null result drains the list except for the result (release the rest
+//  through vtable slots 2/0, free the nodes), releases the result through
+//  vtable slot 1, and re-pushes it as the sole list node (iterator reset to
+//  {heapNode, last node}); a null result with the +0x25 flag set arms
+//  byte_1DDC884, steps the iterator to the previous node (wrapping to the last
+//  node at the head), releases that node's component through vtable slot 1,
+//  and clears the flag; a null result without the flag sets the done flag and
+//  returns. When byte_1DBD9E2 is set, the pump sleeps 0x2710 ms after each
+//  tick. The original's __invalid_parameter_noinfo debug-list checks are kept:
+//  they return normally, so the pump continues after each one.
+// ============================================================
+void CGameEngineShutdown(CGameEngine *obj)
+{
+    char  *base = (char *)obj;
+    DWORD *dw   = (DWORD *)obj;
+
+    // 1. Build the CStartupComponent and push it onto the node list.
+    CGameComponent *comp = (CGameComponent *)LHAlloc(16);
+    if (comp != 0)
+    {
+        comp = CStartupComponentCtor(comp, obj);
+        if (comp != 0)
+        {
+            void **vt = (void **)comp->vtable;
+            ((void (*)(void *))vt[1])(comp);
+            void *head = (void *)dw[5];
+            void *val  = comp;
+            ListPushFront(obj, (int)obj->heapNode, head, &val);
+            dw[7] = (DWORD)obj->heapNode;
+            dw[8] = (DWORD)*(void **)head;
+        }
+    }
+
+    // 2. Pump the current node until the done flag is set.
+    while (base[0x24] == 0)
+    {
+        void *it = (void *)dw[7];
+        if (it == 0)
+            F3InvalidParam();
+        void *val0 = (it != 0) ? *(void **)it : 0;
+        if ((void *)dw[8] == (val0 != 0 ? *(void **)((char *)val0 + 20) : 0))
+            F3InvalidParam();
+
+        void *val  = *(void **)((char *)(void *)dw[8] + 8);   // cur's value (component)
+        void **vt  = (void **)*(void **)val;
+        void *next = ((void *(*)(void *))vt[3])(val);
+
+        if (g_byte_1DBD9E2 != 0)
+            Sleep(0x2710);   // debug stall (10 s)
+
+        if (next != 0)
+        {
+            // New component: drain the list except for it, release it, and
+            // re-push it as the sole node.
+            DestroyComponentsExcept(obj, next);
+            void **nvt = (void **)*(void **)next;
+            ((void (*)(void *))nvt[1])(next);
+
+            void *head = (void *)dw[5];
+            void *oldFirst = *(void **)((char *)head + 4);
+            void *node = LHAlloc(12);
+            if (node != 0)
+            {
+                *(void **)node = head;
+                *(void **)((char *)node + 4) = oldFirst;
+                *(void **)((char *)node + 8) = next;
+            }
+            ListCountInc(obj, 1);
+            *(void **)((char *)head + 4) = node;
+            *(void **)oldFirst = node;   // old first's prev = the new node
+            dw[7] = (DWORD)obj->heapNode;
+            dw[8] = (DWORD)*(void **)head;   // head[0] = the new node (list was empty)
+        }
+        else if (base[0x25] != 0)
+        {
+            // Step: arm the debug flag, advance to the previous node (wrapping
+            // to the last node at the head), release the node's component,
+            // and clear the flag.
+            void *hm = GetHeapManager();            // 0x18FA3E0: dword_2075ED8
+            hm = GetHeapManagerSlot1C(hm);          // 0x18FA3D0: *(hm+0x1C)
+            SetDebugByte1DDC884(1);                 // 0x145D630(1) -> 0x14640C0
+            (void)hm;
+
+            it = (void *)dw[7];
+            if (it == 0)
+                F3InvalidParam();
+            void *val1 = (it != 0) ? *(void **)it : 0;
+            if ((void *)dw[8] == (val1 != 0 ? *(void **)((char *)val1 + 20) : 0))
+                F3InvalidParam();
+            dw[8] = (DWORD)*(void **)(void *)dw[8];   // cur = cur's prev link
+            if (it == 0 || it != obj->heapNode)       // debug checks after the step
+                F3InvalidParam();
+            if ((void *)dw[8] == (void *)dw[5])       // wrapped around to the head
+            {
+                dw[7] = (DWORD)obj->heapNode;
+                dw[8] = (DWORD)*(void **)(void *)dw[5];
+            }
+            it = (void *)dw[7];
+            if (it == 0)
+                F3InvalidParam();
+            void *val2 = (it != 0) ? *(void **)it : 0;
+            if ((void *)dw[8] == (val2 != 0 ? *(void **)((char *)val2 + 20) : 0))
+                F3InvalidParam();
+            void *valN = *(void **)((char *)(void *)dw[8] + 8);   // the new cur's value
+            void **svt = (void **)*(void **)valN;
+            ((void (*)(void *))svt[1])(valN);
+            base[0x25] = 0;
+        }
+        else
+        {
+            base[0x24] = 1;
+        }
+    }
+}
+
 static void  sub_61AE70(void *obj) { (void)obj; }                       // cleanup (part 2)
 static void  sub_61C670(void *obj) { (void)obj; }                       // cleanup (part 3)
 static long  sub_401700(F3ObjReg *reg) { (void)reg; return 0; }         // free the debug handler
@@ -146,7 +789,9 @@ static void *HeapStressTest(void)
 //       exe (-=[SMS_<exename>_SMS]=-). If the blob is missing, shows a message
 //       box and ExitProcess(1).
 //    4. Runs the game (CGameEngineCtor, RunFrontEnd) and sets the exit code
-//       (dword_1DBD00C), then cleans up (sub_61C670, sub_401700).
+//       (dword_1DBD00C); on success it pumps the component shutdown
+//       (CGameEngineShutdown, sub_61AE70), then cleans up (sub_61C670,
+//       sub_401700).
 // ============================================================
 void GameThread(void *a1)
 {
@@ -271,9 +916,9 @@ void GameThread(void *a1)
     char ArgList[356];
     memset(ArgList, 0, sizeof(ArgList));
     CGameEngineCtor(ArgList);
-    if (RunFrontEnd(ArgList, arg) != 0)
+    if (RunFrontEnd(ArgList, arg) != 0)   // success -> run the component shutdown
     {
-        sub_61BE00(ArgList);
+        CGameEngineShutdown((CGameEngine *)ArgList);
         sub_61AE70(ArgList);
         g_dword_1DBD00C = 0;   // process exit code (returned by RunGame)
     }
