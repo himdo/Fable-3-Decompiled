@@ -2285,8 +2285,31 @@ static void  sub_19FFA20(void *str) { (void)str; }
 static int   sub_19FF560(void *str) { (void)str; return 0; }
 static int   sub_18F02B0(void) { return 0; }
 
-static int   g_sub18F1100Buf[2] = { 0, 0 };
-static int  *sub_18F1100(void *obj) { (void)obj; return g_sub18F1100Buf; }
+// qword_20FC928 / dword_20FC92C: the current display resolution
+// {width, height}, set by the device creation (sub_18F1B30) from the
+// display-mode record. Read by GetCurrentResolution (0x18F1100), the
+// aspect-ratio getters (sub_18F0AA0 / sub_18F1120) and the 5%/95% split
+// helper (sub_18F0AE0).
+static DWORD g_qword_20FC928[2] = { 0, 0 };
+
+// ============================================================
+//  GetCurrentResolution  (0x18F1100 - 0x18F1115)  -- the current display
+//  resolution  [NOT byte-identical] refs the high-VA globals
+//  qword_20FC928 / dword_20FC92C (0x020FC928 / 0x020FC92C) at their
+//  original addresses.
+//
+//  Copies the current display resolution {width, height} out of the device
+//  globals into the 2-DWORD out parameter and returns it (cdecl, out pointer
+//  on the stack). Callers: RunFrontEnd (0x61CB70; re-saves the video options
+//  when the cached width/height words change) and sub_837D40 (UI aspect
+//  computation, alongside the sibling clones sub_18F0140 / sub_18F02C0).
+// ============================================================
+static DWORD *GetCurrentResolution(DWORD *out)
+{
+    out[0] = g_qword_20FC928[0];
+    out[1] = g_qword_20FC928[1];
+    return out;
+}
 
 static void  sub_18E6D40(void) {}
 static void  sub_619D70(void *p) { (void)p; }                     // _beginthread entry (no-op)
@@ -2404,7 +2427,7 @@ char RunFrontEnd(void *obj, int arg)
     F3SharedBuffer *v96;                    // InitSharedSlot / ReleaseSharedSlot slot
     DWORD           notify[2];              // the 8-byte XNotify buffer
     F3SharedBuffer *v76 = 0;               // SharedSlotToWide wide-string slot
-    int             v85, v86;               // sub_18F1100 strings
+    DWORD           v85, v86;               // GetCurrentResolution slots ({width, height})
     DWORD           v91, v92, v89, v90;     // sign-in UI strings
     DWORD           v102[2];
     DWORD           v97[2];
@@ -2490,13 +2513,13 @@ char RunFrontEnd(void *obj, int arg)
         ReleaseSharedSlotWide(&v76);
         if (r != 0)
         {
-            int *p = sub_18F1100(&v85);
+            DWORD *p = GetCurrentResolution(&v85);
             if ((unsigned char)str103[3] != (unsigned char)sub_18F02B0()
                 || (int)str103[1] != p[0]
                 || (int)str103[2] != p[1])
             {
                 str103[3] = (DWORD)sub_18F02B0();
-                int *p2 = sub_18F1100(&v86);
+                DWORD *p2 = GetCurrentResolution(&v86);
                 str103[1] = (DWORD)p2[0];
                 str103[2] = (DWORD)p2[1];
                 base[0x160] = 1;
