@@ -2,6 +2,7 @@
 // xlo_device.h for the module overview.
 
 #include "xlo_device.h"
+#include "xlive.h"                // the xlive.dll (XLiveAPI) import declarations
 #include <windows.h>
 #include <string.h>
 
@@ -16,24 +17,13 @@ static DWORD g_dword_1E2ED80[14];
 typedef struct F3XloDeviceCaps { DWORD field[14]; } F3XloDeviceCaps;
 typedef char F3XloDeviceCapsSizeCheck[(sizeof(F3XloDeviceCaps) == 56) ? 1 : -1];
 
-// XLiveOnCreateDevice -- XDK (Xbox 360) import (IAT thunk 0x17D1A54 ->
-// __imp_XLiveOnCreateDevice). Not present in a PC build, so stub it. Returns
-// the created-device result (DWORD). First arg is the device object value
-// (dword_1E2EEF4); second is the 56-byte caps block.
-static DWORD XLiveOnCreateDevice(DWORD device, F3XloDeviceCaps *caps)
-{
-    (void)device; (void)caps;
-    return 0;
-}
-
-// XLiveOnResetDevice -- XDK (Xbox 360) import (IAT thunk 0x17D1A5A ->
-// __imp_XLiveOnResetDevice). Not present in a PC build, so stub it.
-// Takes the 56-byte device-caps block.
-static DWORD XLiveOnResetDevice(F3XloDeviceCaps *caps)
-{
-    (void)caps;
-    return 0;
-}
+// XLiveOnCreateDevice (IAT thunk 0x17D1A54 -> __imp_XLiveOnCreateDevice)
+// and XLiveOnResetDevice (0x17D1A5A -> __imp_XLiveOnResetDevice) are the
+// real link-time xlive.dll (XLiveAPI) imports -- see engine/xlive.{h,def}:
+// the build links an import library generated from xlive.def (lib /def ->
+// xlive.lib). XLiveOnCreateDevice takes the device
+// object value (dword_1E2EEF4) + the 56-byte caps block and returns the
+// created-device result (DWORD); XLiveOnResetDevice takes the caps block.
 
 // ============================================================
 //  OnCreateDevice  (0x006152F0 - 0x00615336)  -- the worker's

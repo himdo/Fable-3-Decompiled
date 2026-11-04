@@ -1,5 +1,6 @@
 // Fable 3 — frontend run module implementation (RunFrontEnd, 0x61CB70, plus its
-// module-private globals, the xlive.dll / steam_api import stubs, and the
+// module-private globals, the steam_api dynamic import (the xlive.dll
+// functions are real link-time imports via engine/xlive.h), and the
 // unimplemented engine callees it drives).
 
 #ifndef _CRT_SECURE_NO_WARNINGS
@@ -13,6 +14,7 @@
 #include "netinit.h"              // InitNetworking
 #include "save/save.h"            // SetSaveGamePath (the shared-slot string setter)
 #include "worker.h"               // GetWorker
+#include "xlive.h"                // the xlive.dll (XLiveAPI) import declarations
 
 #include <windows.h>
 #include <process.h>              // _beginthread / _getdrive / _chdrive
@@ -60,24 +62,17 @@ static void *g_CDiskFileWin32Vtable[4] = { 0 };
 static void *g_CAFileVtable[4]         = { 0 };
 
 // ============================================================
-//  xlive.dll / steam_api import stubs
+//  xlive.dll / steam_api imports
 //
-//  In the original these are imported from xlive.dll (the bundled XLiveAPI
-//  shim) and steam_api. This self-contained build does not link either, so
-//  they are stubbed here. XUserGetSigninState reports "signed in" so the
-//  frontend takes the already-signed-in path and skips the blocking XNA
-//  sign-in / guide / message-box UI loops.
+//  The xlive.dll functions (XNotifyCreateListener, XNotifyGetNext,
+//  XUserGetSigninState, XShowSigninUI, XShowGuideUI, XShowMessageBoxUI,
+//  XCancelOverlapped) are now the real link-time imports from the bundled
+//  xlive.dll (XLiveAPI) -- see engine/xlive.{h,def}: the build links an
+//  import library generated from xlive.def (lib /def -> xlive.lib). XUserGetSigninState reports the XLiveAPI sign-in state (user 0
+//  signed in by default), so the frontend normally takes the
+//  already-signed-in path and skips the blocking XNA sign-in / guide /
+//  message-box UI loops. steam_api is resolved dynamically below.
 // ============================================================
-static int   XNotifyCreateListener(int a, int b) { (void)a; (void)b; return 1; }
-static int   XNotifyGetNext(int listener, int a, void *hi, void *lo)
-{ (void)listener; (void)a; (void)hi; (void)lo; return 0; }
-static int   XUserGetSigninState(int user) { (void)user; return 3; }   // XUSER_STATE_SIGNED_IN
-static int   XShowSigninUI(int a, int b) { (void)a; (void)b; return 0; }
-static int   XShowGuideUI(int a) { (void)a; return 0; }
-static int   XShowMessageBoxUI(int a, int b, int c, int d, void *e,
-                               int f, int g, void *h, void *i)
-{ (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i; return 6; }
-static int   XCancelOverlapped(void *p) { (void)p; return 0; }
 
 //  SteamAPI_Init  (0x17DA5EA - 0x17DA5F0)  -- steam_api.dll import thunk
 //
@@ -2377,8 +2372,6 @@ static int EnsureParentDirectory(F3SharedBuffer **pathSlot)
     return result;
 }
 
-static void  sub_19FFA20(void *str) { (void)str; }
-static int   sub_19FF560(void *str) { (void)str; return 0; }
 static int   sub_18F02B0(void) { return 0; }
 
 // qword_20FC928 / dword_20FC92C: the current display resolution
@@ -2407,7 +2400,142 @@ static DWORD *GetCurrentResolution(DWORD *out)
     return out;
 }
 
-static void  sub_18E6D40(void) {}
+// ============================================================
+//  ResetGraphicsSurfaces  (0x18E6D40 - 0x18E700C)  -- re-initialize the
+//  frontend graphics surfaces after a device create / reset or a
+//  display-mode change.  [NOT byte-identical] placement-dependent
+//  (relative calls to the graphics-surface subsystem callees below and
+//  the memset IAT slot) and refs the high-VA globals device object
+//  (dword_1E2EEF4), surface records (off_1DB12F8 / off_1DB1314), the
+//  device-acquired surface (dword_1DB1318), the surface param
+//  (dword_1D9B040), the surface flag (byte_2075F05) and the two 0x40-byte
+//  state blocks (dword_1E2EF10 / dword_1E2EF60) at their original
+//  addresses.
+//
+//  Flow:
+//    1. Reset graphics state (sub_18D1960(device)) + render state
+//       (sub_18CF6E0).  flags = byte_2075F05 ? 0x200 : 0;  fmt =
+//       (byte_2075F05 == 0).
+//    2. Create a 2x1 surface (sub_18D33B0); wrap texture slot 0 of the
+//       global CSurface record off_1DB12F8 into a frame-local wrapper
+//       (sub_18D36C0); clear it with the near-black color
+//       {0, fmt, 1, 1}/255 (sub_18D2940); release the wrapped surface.
+//    3. Create a 2x1x1x1 surface (sub_1A042B0 -> dword_1DB1334); release
+//       the existing device-acquired surface (dword_1DB1318), then
+//       acquire a fresh one through device vtable[25] (device, 1, 1,
+//       flags, dword_1D9B040, fmt, &dword_1DB1318, 0).
+//    4. For texture slots 0..5 of off_1DB1314: wrap (sub_1A046D0), clear
+//       with the same near-black color (sub_18D2940), release.
+//    5. Zero the 0x40-byte state blocks at 0x1E2EF10 / 0x1E2EF60 and the
+//       two qwords at 0x1E2EF50 / 0x1E2EF58.
+//
+//  Callers: RunFrontEnd (0x61CB70, after the video options are saved) and
+//  sub_19D4FC0 (after SetDisplayMode).  A null-guard on the device object
+//  is added where the original would fault (pre-device slot); the original
+//  reads the device vtable unconditionally.
+// ============================================================
+
+// 0x1E2EEF4: the current XLO device object (a vtable-backed pointer).
+// Defined separately (static) in worker.cpp / xlo_device.cpp.
+static void *g_dword_1E2EEF4  = 0;
+// 0x2075F05: surface-creation flag (nonzero -> 0x200 create flag + format 0).
+static BYTE  g_byte_2075F05   = 0;
+// 0x1D9B040: surface param passed to device vtable[25].
+static DWORD g_dword_1D9B040  = 0;
+// 0x1DB12F8 / 0x1DB1314: global 32-byte CSurface records {vtable, surface,
+// type, fmtInfo[4]} used as surface-wrapper source slots.
+static DWORD g_off_1DB12F8[8] = {0};
+static DWORD g_off_1DB1314[8] = {0};
+// 0x1DB1318: the device-acquired frontend surface (device vtable[25]).
+static void *g_dword_1DB1318  = 0;
+// 0x1E2EF10 / 0x1E2EF60: 0x40-byte surface state blocks zeroed on reset.
+static DWORD g_dword_1E2EF10[16] = {0};
+static DWORD g_dword_1E2EF60[16] = {0};
+// 0x1E2EF50 / 0x1E2EF58: two qwords between the two state blocks.
+static DWORD g_qword_1E2EF50[2]  = {0, 0};
+
+// A 32-byte CSurface record / frame-local wrapper: {vtable, surface, type,
+// fmtInfo[4]}.  sub_18D36C0 / sub_1A046D0 refresh a frame-local wrapper from
+// a global record; sub_18D2940 clears it (reading the format index at +12).
+struct F3CsurfaceSlot
+{
+    void *vt;          // NGraphics::CSurface::`vftable' after refresh
+    void *surface;     // the wrapped surface
+    int   type;        // 3 after refresh
+    int   fmtInfo[4];  // sub_5A2EF0 output (format index, ...)
+};
+
+// The graphics-surface subsystem callees (unimplemented in this build; their
+// real bodies live at the original addresses).  All are stubbed to no-ops /
+// trivial returns, so the surface creation / clearing below has no visible
+// effect beyond the state-block zeroing.  The two refresh helpers model the
+// thiscall (slot in the register, source record on the stack) and leave the
+// wrapped surface null in this build.
+static void  sub_18D1960(void *device) { (void)device; }          // reset graphics state (device)
+static void  sub_18CF6E0(void)          {}                        // reset render state
+static int   sub_18D33B0(int a1, int *dims, int flags, int fmt)
+    { (void)a1; (void)dims; (void)flags; (void)fmt; return 0; }  // create 2x1 surface
+static F3CsurfaceSlot *sub_18D36C0(F3CsurfaceSlot *slot, const F3CsurfaceSlot *src)
+    { (void)src; if (slot != 0) slot->surface = 0; return slot; } // wrap texture slot 0
+static int   sub_18D2940(const int *color, const F3CsurfaceSlot *rec)
+    { (void)color; (void)rec; return 0; }                        // clear surface with color
+static int   sub_1A042B0(int *dims, int flags)
+    { (void)dims; (void)flags; return 0; }                       // create 2x1x1x1 surface
+static F3CsurfaceSlot *sub_1A046D0(F3CsurfaceSlot *slot, const F3CsurfaceSlot *src, int idx)
+    { (void)src; (void)idx; if (slot != 0) slot->surface = 0; return slot; } // wrap texture slot idx
+
+static void ResetGraphicsSurfaces(void)
+{
+    int  flags = 0;
+    BOOL fmt   = 0;
+
+    sub_18D1960(g_dword_1E2EEF4);
+    sub_18CF6E0();
+    flags = g_byte_2075F05 != 0 ? 0x200 : 0;
+    fmt   = (g_byte_2075F05 == 0);
+
+    // {width, fmt, 1, 1, extra} record reused in place as the clear color
+    // {0, fmt, 1, 1} once the first element is zeroed.
+    int rec[5] = { 2, fmt, 1, 1, 0 };
+    sub_18D33B0(1, rec, flags, fmt);
+
+    F3CsurfaceSlot slot;
+    slot.vt = 0; slot.surface = 0; slot.type = 0;
+    slot.fmtInfo[0] = slot.fmtInfo[1] = slot.fmtInfo[2] = slot.fmtInfo[3] = 0;
+
+    rec[0] = 0;
+    F3CsurfaceSlot *v1 = sub_18D36C0(&slot, (const F3CsurfaceSlot *)g_off_1DB12F8);
+    sub_18D2940(rec, v1);
+    if (slot.surface != 0)
+        ((void (*)(void *))((void **)(*(void **)slot.surface))[2])(slot.surface);
+
+    rec[0] = 2; rec[4] = 1;
+    sub_1A042B0(rec, flags);
+    if (g_dword_1DB1318 != 0)
+    {
+        ((void (*)(void *))((void **)(*(void **)g_dword_1DB1318))[2])(g_dword_1DB1318);
+        g_dword_1DB1318 = 0;
+    }
+    if (g_dword_1E2EEF4 != 0)   // null-guard; the original would fault pre-device
+        ((void (*)(void *, int, int, int, DWORD, BOOL, void **, int))
+            (*(void ***)g_dword_1E2EEF4)[25])(
+            g_dword_1E2EEF4, 1, 1, flags, g_dword_1D9B040, fmt, &g_dword_1DB1318, 0);
+
+    for (int i = 0; i < 6; ++i)
+    {
+        rec[0] = 0;
+        F3CsurfaceSlot *v2 = sub_1A046D0(&slot, (const F3CsurfaceSlot *)g_off_1DB1314, i);
+        sub_18D2940(rec, v2);
+        if (slot.surface != 0)
+            ((void (*)(void *))((void **)(*(void **)slot.surface))[2])(slot.surface);
+    }
+
+    memset(&g_dword_1E2EF10, 0, 0x40);
+    memset(&g_dword_1E2EF60, 0, 0x40);
+    g_qword_1E2EF50[0] = 0;
+    g_qword_1E2EF50[1] = 0;
+}
+
 static void  sub_619D70(void *p) { (void)p; }                     // _beginthread entry (no-op)
 static void  sub_61C320(void *p) { (void)p; }                     // _beginthread entry (no-op)
 static int   sub_6A66C0(void) { return 0; }
@@ -2437,7 +2565,31 @@ static void  sub_627690(void *obj) { (void)obj; }
 static void  sub_619990(void) {}
 static void  sub_6199A0(void) {}
 static void  sub_18FA3F0(void) {}
-static void  sub_18C4560(void *obj, int a, int b) { (void)obj; (void)a; (void)b; }
+//  WaitForEvent  (0x18C4560 - 0x18C45B3)  -- block on the event stored in
+//  the frontend object (handle at obj+0x80; sibling sub_18C4540 does
+//  SetEvent on the same slot, sub_18C45E0 does CloseHandle). Wraps
+//  WaitForSingleObjectEx(hEvent, dwMilliseconds, bAlertable != 0) and maps
+//  the wait status: 0 = WAIT_TIMEOUT (0x102), 1 = 0xC0, 2 = WAIT_OBJECT_0 /
+//  WAIT_ABANDONED, and the raw bAlertable argument otherwise.
+//  [NOT byte-identical] the original calls the WaitForSingleObjectEx IAT slot
+//  at its original high VA (call ds:__imp_WaitForSingleObjectEx, 0x01ADC52F).
+static int WaitForEvent(void *obj, int dwMilliseconds, int bAlertable)
+{
+    HANDLE hEvent = *(HANDLE *)((char *)obj + 0x80);
+    DWORD  status = WaitForSingleObjectEx(hEvent, (DWORD)dwMilliseconds,
+                                          (BOOL)(bAlertable != 0));
+    if (status > 0xC0) {
+        if (status == WAIT_TIMEOUT)
+            return 0;
+    }
+    else {
+        if (status == 0xC0)
+            return 1;
+        if (status == WAIT_OBJECT_0 || status == WAIT_ABANDONED)
+            return 2;
+    }
+    return bAlertable;
+}
 static int   sub_18FA3E0(void *hwnd) { (void)hwnd; return 0; }
 static int   sub_18FA3D0(int a) { (void)a; return 0; }
 static void  sub_145D7B0(int a) { (void)a; }
@@ -2622,7 +2774,7 @@ char RunFrontEnd(void *obj, int arg)
                 MakeVideoOptionsPath((F3SharedBuffer **)v70);   // 0x72F7B0
                 SaveVideoOptionsFile((F3VideoOptions *)str103, (F3SharedBuffer **)v70);   // 0x775DA0
             }
-            sub_18E6D40();
+            ResetGraphicsSurfaces();
             v72 = 1;
         }
     }
@@ -2660,12 +2812,16 @@ char RunFrontEnd(void *obj, int arg)
             void *mgr = GetManager();
             void **vt = (void **)*(void ***)mgr;
             ((void (*)(void *, int))vt[12])(mgr, 1);
-            sub_19FFA20(GetLocaleEntry(g_dword_1DBDA80));
-            sub_19FFA20(GetLocaleEntry(g_dword_1DBDA84));
-            sub_19FFA20(GetLocaleEntry(g_dword_1DBDA88));
-            sub_19FFA20(GetLocaleEntry(g_dword_1DBDA7C));
-            v102[0] = (DWORD)sub_19FF560(&v91);
-            v102[1] = (DWORD)sub_19FF560(&v92);
+            // Copy the four localized sign-in UI strings into their wide slots
+            // (the wide shared-slot copy ctor, 0x19FFA20; thiscall + retn 4 in
+            // the original -- destination slot in ECX, the locale entry on the
+            // stack). Skipped in the standalone test (the user is signed in).
+            CopySharedSlotWide((F3SharedBuffer **)&v91, (F3SharedBuffer **)GetLocaleEntry(g_dword_1DBDA80));
+            CopySharedSlotWide((F3SharedBuffer **)&v92, (F3SharedBuffer **)GetLocaleEntry(g_dword_1DBDA84));
+            CopySharedSlotWide((F3SharedBuffer **)&v89, (F3SharedBuffer **)GetLocaleEntry(g_dword_1DBDA88));
+            CopySharedSlotWide((F3SharedBuffer **)&v90, (F3SharedBuffer **)GetLocaleEntry(g_dword_1DBDA7C));
+            v102[0] = (DWORD)GetSharedSlotWide((F3SharedBuffer **)&v91);
+            v102[1] = (DWORD)GetSharedSlotWide((F3SharedBuffer **)&v92);
             v98 = v99 = v100 = v101 = 0;
             v97[0] = v97[1] = 0;
 
@@ -2673,8 +2829,8 @@ char RunFrontEnd(void *obj, int arg)
             do
             {
                 v70[0] = (DWORD)&v98;
-                int a = sub_19FF560(&v89);
-                int b = sub_19FF560(&v90);
+                int a = (DWORD)GetSharedSlotWide((F3SharedBuffer **)&v89);
+                int b = (DWORD)GetSharedSlotWide((F3SharedBuffer **)&v90);
                 code = XShowMessageBoxUI(0, b, a, 2, v102, 0, 3, v97, &v98);
                 if (code == 5)
                 {
@@ -2730,7 +2886,7 @@ char RunFrontEnd(void *obj, int arg)
         // Cancelled: tear down the file object, post WM_CLOSE, return 0.
         (void)cancelled;
         g_byte_1DBD9E0 = 0;
-        sub_18C4560(&g_unk_1DBD9E8, -1, 0);
+        WaitForEvent(&g_unk_1DBD9E8, -1, 0);
         {
             void *mgr = GetManager();
             void **vt = (void **)*(void ***)mgr;
@@ -2827,7 +2983,7 @@ signedIn:
         sub_18FA3F0();
 
         g_byte_1DBD9E0 = 0;
-        sub_18C4560(&g_unk_1DBD9E8, -1, 0);
+        WaitForEvent(&g_unk_1DBD9E8, -1, 0);
     }
 
     if (v72 == 0)

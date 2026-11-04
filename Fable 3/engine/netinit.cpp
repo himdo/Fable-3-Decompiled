@@ -10,6 +10,7 @@
 #include "common/common.h"        // LHAlloc / LHFree
 #include "worker.h"               // CWorkerWin32 / GetWorker / SetPreTranslate
 #include "object_registry.h"      // F3SehBlock
+#include "xlive.h"                // the xlive.dll (XLiveAPI) import declarations
 
 #include <windows.h>
 #include <process.h>              // atexit
@@ -39,23 +40,17 @@ static void *g_CNetManagerVtable[8]          = { 0 };
 static void *g_CNetPacketCallbackVtable[8]   = { 0 };
 
 // ============================================================
-//  xlive.dll import stubs
+//  xlive.dll imports
 //
-//  In the original these are imported from xlive.dll (the bundled XLiveAPI
-//  shim). This self-contained build does not link it, so they are stubbed
-//  to success. XLivePreTranslateMessage is installed as the worker's
-//  pre-translate hook by InitNetworking; returning FALSE means "not
-//  handled" so the worker still translates / dispatches the message.
+//  XLiveInitializeEx / XNetStartup / XOnlineStartup / XPresenceInitialize /
+//  XNotifyCreateListener / XLivePreTranslateMessage are the real
+//  link-time imports from the bundled xlive.dll (XLiveAPI) -- see
+//  engine/xlive.{h,def}: the build links an import library generated from
+//  xlive.def (lib /def -> xlive.lib). XLivePreTranslateMessage
+//  is installed as the worker's pre-translate hook by InitNetworking;
+//  returning FALSE means "not handled" so the worker still translates /
+//  dispatches the message.
 // ============================================================
-static DWORD XLiveInitializeEx(const void *settings, DWORD xexVersion)
-{ (void)settings; (void)xexVersion; return 0; }
-static DWORD XNetStartup(const void *cfg) { (void)cfg; return 0; }
-static DWORD XOnlineStartup(const void *cfg) { (void)cfg; return 0; }
-static DWORD XPresenceInitialize(int timeoutMs) { (void)timeoutMs; return 0; }
-static int   XNotifyCreateListener(int type, int user)
-{ (void)type; (void)user; return 1; }
-static BOOL  WINAPI XLivePreTranslateMessage(LPMSG lpMsg)
-{ (void)lpMsg; return FALSE; }
 
 // ============================================================
 //  LIONHEAD::StartupNetworking  (0x181F4A0 - 0x181F569)
@@ -65,10 +60,11 @@ static BOOL  WINAPI XLivePreTranslateMessage(LPMSG lpMsg)
 //  void LIONHEAD_StartupNetworking(int enable)
 //
 //  Brings the networking stack up once (later calls only bump the start
-//  count): XNetStartup + XOnlineStartup with the static XNETCONFIG
-//  {0D 02 FF 20 20 FF FF FF} (byte 1 = 0A when disabled), then
+//  count): XNetStartup(&cfg) + XOnlineStartup() with the static XNETCONFIG
+//  {0D 02 00 00 20 20 FF FF} (byte 1 = 0A when disabled), then
 //  WSAStartup(MAKEWORD(2,2)) with a wVersion == 2.2 check (WSACleanup on
-//  mismatch).
+//  mismatch). The original passes the config to XNetStartup only and calls
+//  XOnlineStartup with no arguments (0x181F506-0x181F50b).
 // ============================================================
 static void LIONHEAD_StartupNetworking(int enable)
 {
@@ -77,11 +73,11 @@ static void LIONHEAD_StartupNetworking(int enable)
         g_dword_1E2D8C0++;
         return;
     }
-    BYTE cfg[8] = { 0x0D, 0x02, 0xFF, 0x20, 0x20, 0xFF, 0xFF, 0xFF };
+    BYTE cfg[8] = { 0x0D, 0x02, 0x00, 0x00, 0x20, 0x20, 0xFF, 0xFF };
     if (enable == 0)
         cfg[1] = 0x0A;
     XNetStartup(cfg);
-    XOnlineStartup(cfg);
+    XOnlineStartup();   // zero-arg call, matching the original (0x181F50b)
     WSADATA wsadata;
     if (WSAStartup(MAKEWORD(2, 2), &wsadata) != 0)
         return;
@@ -272,7 +268,7 @@ int InitNetworking(void)
     //    GameThread with no worker, so skip when there is none.)
     void *worker = GetWorker();
     if (worker != 0)
-        SetPreTranslate(worker, XLivePreTranslateMessage);
+        SetPreTranslate(worker, (F3PreTranslateFn)XLivePreTranslateMessage);
 
     // 3. Bring up the LIONHEAD networking stack (XNet / XOnline / Winsock).
     LIONHEAD_StartupNetworking((int)g_byte_1C86C17);

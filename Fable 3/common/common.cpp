@@ -362,6 +362,55 @@ long ReleaseSharedSlotWide(F3SharedBuffer **slot)
 }
 
 // ============================================================
+//  CopySharedSlotWide  (0x19FFA20 - 0x19FFA65)  -- wide shared-slot copy ctor
+//  [NOT byte-identical] placement-dependent (relative call to the family's
+//  release clone at sub_19FF9B0) plus the high-VA wide live-slot counter
+//  (0x02075C4C) and the InterlockedIncrement IAT slot (0x01AD52F8).
+//
+//  F3SharedBuffer ** CopySharedSlotWide(F3SharedBuffer **this_, F3SharedBuffer **src)
+//
+//  The copy constructor of the wide (WCHAR) shared-slot family -- the
+//  counterpart to the wide null-ctor (sub_19FF580) and the wide analogue of
+//  the ANSI copy (sub_1A012C0 / the project's static CopySharedSlot).
+//  thiscall in the original (this_ in ECX, src on the stack, callee cleans
+//  via `retn 4`); declared as a plain free function to match the project
+//  convention. It is used as a memberwise copy of the single-word slot field
+//  at the start of a larger object (e.g. sub_67ED30 copies the slot, then
+//  copies the object's trailing DWORDs).
+//
+//  It nulls the destination slot and registers the fresh slot in the wide
+//  live-slot count (g_WideSlotCount, 0x02075C4C). Then, when src is a
+//  different, non-empty slot, it releases any block the destination still
+//  held (unreachable in practice, since the slot was just nulled -- the
+//  original keeps the guard) and, when src holds a block, shares it: it
+//  copies the block pointer in and increments that block's refcount (at +12).
+//  Returns the destination slot. The sibling copy-ASSIGNMENT (sub_19FF9E0) is
+//  byte-for-byte the same body minus the up-front null + counter bump, so
+//  assignment reuses an already-registered slot without re-counting it.
+// ============================================================
+F3SharedBuffer **CopySharedSlotWide(F3SharedBuffer **this_, F3SharedBuffer **src)
+{
+    *this_ = 0;
+    InterlockedIncrement(&g_WideSlotCount);
+
+    if (src != this_ && *src != *this_)
+    {
+        if (*this_ != 0)
+        {
+            if (InterlockedDecrement(&(*this_)->refcount) <= 0 && *this_ != 0)
+                SharedBufferFree(*this_);   // original: sub_19FF9B0 (wide release)
+            *this_ = 0;
+        }
+        if (*src != 0)
+        {
+            *this_ = *src;
+            InterlockedIncrement(&(*src)->refcount);
+        }
+    }
+    return this_;
+}
+
+// ============================================================
 //  SetSharedSlot  (0x1A01CC0 - 0x1A01D26)  -- assign (src, size) into a shared slot
 //  [NOT byte-identical] placement-dependent (relative calls to SharedBufferCreate
 //  and SharedBufferFree), plus the InterlockedIncrement / InterlockedDecrement IAT
@@ -440,6 +489,44 @@ const WCHAR *GetLocalizedString(const WCHAR ***obj)
     const WCHAR **p = *obj;
     if (p != 0)
         return *p;
+    return g_defaultLocalizedString;
+}
+
+// ============================================================
+//  GetSharedSlotWide  (0x019FF560 - 0x019FF56F)  -- wide shared-slot string
+//  getter  [NOT byte-identical] placement-independent (no calls / relative
+//  jumps), but refs the default "Path" wide-string global (0x01BDFD28) at its
+//  original high VA, which is not present in this build.
+//
+//  const WCHAR * GetSharedSlotWide(F3SharedBuffer **slot)
+//
+//  The wide-string getter for the WIDE (WCHAR) shared-slot family -- the
+//  accessor counterpart to the wide null-ctor (sub_19FF580), the wide copy
+//  ctor CopySharedSlotWide (0x19FFA20) and the wide dtor
+//  ReleaseSharedSlotWide (0x19FFA70). thiscall in the original (the slot
+//  pointer in ECX, no stack args, plain `retn`); declared here as a plain free
+//  function (first param = the slot, the thiscall `this`). `slot` is a pointer
+//  to a wide slot (an `F3SharedBuffer *` block whose data member is the wide
+//  string). If the slot holds a block it returns block->data (the wide
+//  string); otherwise it returns the default empty wide string (the original
+//  "Path" global at 0x01BDFD28). Byte-identical body to GetLocalizedString
+//  (0x19FF570), which does the same "read the string out of a slot, defaulting
+//  to empty" for a per-LCID locale entry.
+//
+//  Original body (15 bytes, 8B 01 85 C0 75 06 B8 28 FD BD 01 C3 8B 00 C3):
+//      mov eax, [ecx]        ; eax = *slot    = the block
+//      test eax, eax
+//      jnz  L_ret            ; if block != 0
+//      mov eax, offset Path  ; else return the default (0x01BDFD28)
+//      retn
+//  L_ret:
+//      mov eax, [eax]        ; eax = block->data = the wide string
+//      retn
+// ============================================================
+const WCHAR *GetSharedSlotWide(F3SharedBuffer **slot)
+{
+    if (*slot != 0)
+        return (const WCHAR *)(*slot)->data;
     return g_defaultLocalizedString;
 }
 

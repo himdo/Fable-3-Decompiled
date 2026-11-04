@@ -101,6 +101,17 @@ long ReleaseSharedSlotWide(F3SharedBuffer **slot);
 // any old block the slot still holds, stores the new block, and returns the slot.
 F3SharedBuffer **SetSharedSlot(F3SharedBuffer **obj, const char *src, int size);
 
+// CopySharedSlotWide (0x19FFA20) - the copy constructor of the WIDE (WCHAR)
+// shared-slot family (counterpart to the wide null-ctor, sub_19FF580, and the
+// wide analogue of the ANSI copy, sub_1A012C0). thiscall in the original (slot
+// in ECX, src on the stack, retn 4); declared as a plain free function here.
+// Nulls the destination slot, registers it in the wide live-slot count
+// (g_WideSlotCount, 0x2075C4C), and when src is a different non-empty slot,
+// shares its block: copies the block pointer in and increments the block's
+// refcount (at +12). Returns the destination slot. The sibling copy-assignment
+// (sub_19FF9E0) is the same body minus the up-front null + counter bump.
+F3SharedBuffer **CopySharedSlotWide(F3SharedBuffer **this_, F3SharedBuffer **src);
+
 // GetLocalizedString (0x19FF570) - thiscall accessor for a per-LCID
 // localized-string entry. obj points to a word holding the current-locale
 // string pointer (a `const WCHAR **`); returns *that pointer (the wide string)
@@ -117,5 +128,19 @@ F3SharedBuffer **SetSharedSlot(F3SharedBuffer **obj, const char *src, int size);
 int *GetLocaleEntry(int key);
 
 const WCHAR *GetLocalizedString(const WCHAR ***obj);
+
+// GetSharedSlotWide (0x19FF560) - the wide-string getter for the WIDE (WCHAR)
+// shared-slot family (the accessor counterpart to the wide null-ctor
+// sub_19FF580, the wide copy ctor CopySharedSlotWide 0x19FFA20 and the wide
+// dtor ReleaseSharedSlotWide 0x19FFA70). thiscall in the original (slot in
+// ECX, no stack args, plain `retn`); declared as a plain free function here.
+// `slot` is a pointer to a wide slot (an `F3SharedBuffer *` block whose data
+// member is the wide string); returns block->data (the wide string) when the
+// slot holds a block, otherwise the default empty wide string (the original
+// "Path" global at 0x01BDFD28). Byte-identical body to GetLocalizedString
+// (0x19FF570). Replaces the `sub_19FF560` no-op stub in RunFrontEnd (used to
+// pull the four localized sign-in UI strings out of their wide slots for
+// XShowMessageBoxUI).
+const WCHAR *GetSharedSlotWide(F3SharedBuffer **slot);
 
 #endif  // F3_COMMON_H

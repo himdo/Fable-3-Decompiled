@@ -91,9 +91,19 @@ for %%F in (%SRCS%) do (
 )
 
 echo.
+echo === lib: xlive.dll import library (from engine/xlive.def) ===
+lib /nologo /machine:x86 /def:..\..\engine\xlive.def /out:xlive.lib
+if errorlevel 1 (echo LIB FAILED & popd & exit /b 1)
+
+echo.
 echo === link, x86 ===
-link %LNKFLAGS% /out:Fable3.exe /pdb:Fable3.pdb main.obj framework.obj common.obj engine.obj worker.obj manager.obj object_registry.obj xlo_device.obj gameengine.obj gamethread.obj gamemain.obj netinit.obj thread.obj save.obj ws2_32.lib %RRES%
+link %LNKFLAGS% /out:Fable3.exe /pdb:Fable3.pdb main.obj framework.obj common.obj engine.obj worker.obj manager.obj object_registry.obj xlo_device.obj gameengine.obj gamethread.obj gamemain.obj netinit.obj thread.obj save.obj xlive.lib ws2_32.lib %RRES%
 if errorlevel 1 (echo LINK FAILED & popd & popd & exit /b 1)
+
+rem The exe now really imports from the bundled XLiveAPI shim: copy
+rem xlive.dll (from the game directory) next to it so the loader binds.
+for %%d in ("%ORIG%") do set "GAMEDIR=%%~dpd"
+if exist "%GAMEDIR%xlive.dll" copy /y "%GAMEDIR%xlive.dll" . >nul
 
 if exist ..\..\patch_rsrc.py (
     echo.

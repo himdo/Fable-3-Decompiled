@@ -1,0 +1,16 @@
+LIBRARY xlive.dll
+EXPORTS
+    XNotifyCreateListener@8 @5270
+    XNotifyGetNext@16 @651
+    XUserGetSigninState@4 @5262
+    XShowSigninUI@8 @5260
+    XShowGuideUI@4 @5215
+    XShowMessageBoxUI@36 @5266
+    XCancelOverlapped@4 @5254
+    XLiveInitializeEx@8 @5297
+    XNetStartup@4 @51
+    XOnlineStartup @5310
+    XPresenceInitialize@4 @5313
+    XLivePreTranslateMessage@4 @5030
+    XLiveOnCreateDevice@8 @5005
+    XLiveOnResetDevice@4 @5007

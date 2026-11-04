@@ -9,8 +9,14 @@ if not exist test_out mkdir test_out
 pushd test_out
 cl /nologo /c /I .. /O2 /Ob2 /DNDEBUG /DWIN32 /D_WINDOWS /W3 /EHsc /GS /MT /Z7 ..\test_engine.cpp ..\engine\engine.cpp ..\engine\worker.cpp ..\engine\manager.cpp ..\engine\object_registry.cpp ..\engine\xlo_device.cpp ..\engine\gameengine.cpp ..\engine\gamethread.cpp ..\engine\gamemain.cpp ..\engine\netinit.cpp ..\engine\thread.cpp ..\common\common.cpp ..\save\save.cpp ..\framework\framework.cpp
 if errorlevel 1 (echo COMPILE FAILED & popd & exit /b 1)
-link /nologo /subsystem:console /machine:x86 /out:test_engine.exe test_engine.obj engine.obj worker.obj manager.obj object_registry.obj xlo_device.obj gameengine.obj gamethread.obj gamemain.obj netinit.obj thread.obj common.obj save.obj framework.obj user32.lib kernel32.lib gdi32.lib ws2_32.lib
+rem Build the xlive.dll import library from the module-definition file.
+lib /nologo /machine:x86 /def:..\engine\xlive.def /out:xlive.lib
+if errorlevel 1 (echo LIB FAILED & popd & exit /b 1)
+link /nologo /subsystem:console /machine:x86 /out:test_engine.exe test_engine.obj engine.obj worker.obj manager.obj object_registry.obj xlo_device.obj gameengine.obj gamethread.obj gamemain.obj netinit.obj thread.obj common.obj save.obj framework.obj xlive.lib user32.lib kernel32.lib gdi32.lib ws2_32.lib
 if errorlevel 1 (echo LINK FAILED & popd & exit /b 1)
+rem The exe now really imports from the bundled XLiveAPI shim: copy
+rem xlive.dll (game dir = three levels up) next to it so the loader binds.
+if exist ..\..\..\xlive.dll copy /y ..\..\..\xlive.dll . >nul
 echo === BUILD OK ===
 test_engine.exe
 echo exit=%ERRORLEVEL%
