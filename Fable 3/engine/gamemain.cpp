@@ -126,7 +126,7 @@ static int   sub_775DA0(void *str, char c) { (void)str; (void)c; return 0; }
 //  The game's Win32 disk-file class (LHFile::CDiskFileWin32). The 28-byte
 //  object stores the vtable, the open mode, the file position / size, the
 //  HANDLE, an is-open flag, and the filename C string (at +0x18). The Open
-//  method (sub_18C5150) resolves the path, calls CreateFileA with the
+//  method (CDiskFileWin32Open, 0x18C5150) resolves the path, calls CreateFileA with the
 //  mode-dependent access / share / disposition, and on success fills in the
 //  HANDLE / size / position / is-open flag. The two constructors
 //  (sub_18C5450 stack, sub_18C5490 heap) zero the object, set the vtable,
@@ -239,54 +239,60 @@ static void NormalizePathSlot(F3SharedBuffer **pathSlot)
     InterlockedDecrement(&g_Addend);
 }
 
-// sub_18C5150 (0x18C5150 - 0x18C53FA): CDiskFileWin32::Open
+// CDiskFileWin32Open  (0x18C5150 - 0x18C53FA)  -- LHFile::CDiskFileWin32::Open
 //
 //  long CDiskFileWin32Open(CDiskFileWin32 *obj, F3SharedBuffer **name, int mode, int flags)
 //
 //  Open a file. `name` is a shared slot holding the filename block (the C
 //  string is at (*name)->data). The mode selects the CreateFileA access /
 //  share / disposition:
-//    1 = read  (OPEN_EXISTING, share read, GENERIC_READ|GENERIC_WRITE)
+//    1 = read  (OPEN_EXISTING, share read, GENERIC_READ only)
 //    2 = write (OPEN_EXISTING, share read, after path-normalize)
 //    3 = create(CREATE_ALWAYS, no share, after path-normalize)
 //    4 = open-or-create (OPEN_ALWAYS, no share, after path-normalize +
 //       EnsureParentDirectory).
-//  The desired access is always 0xC0000000 (GENERIC_READ|GENERIC_WRITE) for
-//  the valid modes. `flags` is passed directly as dwFlagsAndAttributes
-//  (FILE_FLAG_WRITE_THROUGH when the caller set bit 1). On success the
-//  HANDLE / size / position / is-open flag are filled in. On failure (a null
-//  or empty filename, or CreateFileA failing) an error string is built in a
-//  temp slot, the temp slots are released, and the new g_Addend value is
-//  returned. The object's fileName field (+0x18) is set to the filename C
-//  string up front (CopySharedSlot). [NOT byte-identical] (placement-
-//  dependent relative calls to the whole string / path cluster + the KERNEL32
-//  IAT slots) plus the high-VA globals g_Addend and Str1 (the empty string).
+//  Modes 2-4 use the desired access 0xC0000000 (GENERIC_READ|GENERIC_WRITE);
+//  mode 1 uses 0x80000000 (GENERIC_READ) only; an invalid mode uses 0 (and
+//  fails in CreateFileA). `flags` selects dwFlagsAndAttributes:
+//  FILE_FLAG_WRITE_THROUGH (0x8000000) when the caller set bit 1, else 0.
+//  On success the HANDLE / size / position / is-open flag are filled in.
+//  On failure (a null or empty filename, or CreateFileA failing) an error
+//  string is built in temp slots, the slots are released, and the new
+//  g_Addend value is returned. The object's fileName field (+0x18) is set
+//  up front (CopySharedSlot) and the HANDLE field is cleared before the
+//  CreateFileA attempt. [NOT byte-identical] (placement-dependent relative
+//  calls to the whole string / path cluster + the KERNEL32 IAT slots, the
+//  thiscall+retn-0Ch hybrid convention, plus the high-VA globals g_Addend
+//  and Str1 (0x1BD44D7, the empty string)).
 static long CDiskFileWin32Open(CDiskFileWin32 *obj, F3SharedBuffer **name, int mode, int flags)
 {
     // 1. Copy the filename into the object's fileName field (sub_1A01270).
     CopySharedSlot((F3SharedBuffer **)&obj->fileName, name);
 
-    // 2. Resolve the path (sub_18AFB90 = ResolvePathSlot).
+    // 2. Clear the HANDLE up front (the original zeroes [this+10h] here).
+    obj->handle = 0;
+
+    // 3. Resolve the path (sub_18AFB90 = ResolvePathSlot).
     ResolvePathSlot(name, name);
 
-    // 3. Check the filename is non-null and non-empty.
+    // 4. Check the filename is non-null and non-empty.
     if (name == 0 || *name == 0 || (*name)->length <= 0)
         goto BadFilename;
 
-    // 4. Mode switch.
+    // 5. Mode switch.
     DWORD shareMode = 0, creationDisposition = 0, desiredAccess = 0;
     switch (mode)
     {
         case 1:
             shareMode = 1;                       // FILE_SHARE_READ
-            desiredAccess = 0xC0000000;          // GENERIC_READ | GENERIC_WRITE
+            desiredAccess = 0x80000000;          // GENERIC_READ
             creationDisposition = OPEN_EXISTING; // 3
             obj->mode = mode;
             break;
         case 2:
             NormalizePathSlot(name);             // sub_18AFC00
             shareMode = 1;                       // FILE_SHARE_READ
-            desiredAccess = 0xC0000000;
+            desiredAccess = 0xC0000000;          // GENERIC_READ | GENERIC_WRITE
             creationDisposition = OPEN_EXISTING; // 3
             obj->mode = mode;
             break;
@@ -309,17 +315,19 @@ static long CDiskFileWin32Open(CDiskFileWin32 *obj, F3SharedBuffer **name, int m
             break;
     }
 
-    // 5. CreateFileA.
+    // 6. CreateFileA.
     SetLastError(0x10000001);                    // the original's sentinel
-    const char *fileName = (name != 0 && *name != 0) ? (*name)->data : "";
+    const char *fileName = (name != 0 && *name != 0) ? (*name)->data : ""; // Str1 (0x1BD44D7)
     HANDLE hFile = CreateFileA(fileName, desiredAccess, shareMode, 0,
-                               creationDisposition, (DWORD)flags, 0);
+                               creationDisposition,
+                               (flags & 2) ? 0x8000000 : 0,   // FILE_FLAG_WRITE_THROUGH
+                               0);
     DWORD lastErr = GetLastError();
 
     if (hFile == INVALID_HANDLE_VALUE || (lastErr & 0x10000000))
         goto Error;
 
-    // 6. Success: fill in the object.
+    // 7. Success: fill in the object.
     obj->size     = GetFileSize(hFile, 0);
     SetFilePointer(hFile, 0, 0, FILE_BEGIN);
     obj->handle   = hFile;
@@ -352,12 +360,29 @@ Error:
     }
 }
 
-// sub_18C5150 (0x18C5150 - 0x18C53FA) -- forwarder to CDiskFileWin32Open
-static void  sub_18C5150(void *obj, void *a, int b, int c)
+// CDiskFileWin32Close  (0x18C4840 - 0x18C4873)  -- LHFile::CDiskFileWin32::Close
+//
+//  BOOL CDiskFileWin32Close(CDiskFileWin32 *obj)
+//
+//  Close the disk file. When the is-open flag (+0x14) is set, rewind the file
+//  pointer to the start (SetFilePointer, BEGIN), flush the buffers
+//  (FlushFileBuffers), and close the HANDLE (CloseHandle). The is-open flag is
+//  always cleared. The CloseHandle result is returned (when not already open,
+//  eax holds its pre-call value, modelled here as TRUE). [NOT byte-identical]
+//  (refs the SetFilePointer / FlushFileBuffers / CloseHandle KERNEL32 IAT
+//  slots).
+static BOOL CDiskFileWin32Close(CDiskFileWin32 *obj)
 {
-    (void)CDiskFileWin32Open((CDiskFileWin32 *)obj, (F3SharedBuffer **)a, b, c);
+    BOOL result = TRUE;
+    if (obj->openFlag != 0)
+    {
+        SetFilePointer(obj->handle, 0, 0, FILE_BEGIN);
+        FlushFileBuffers(obj->handle);
+        result = CloseHandle(obj->handle);
+    }
+    obj->openFlag = 0;
+    return result;
 }
-static void  sub_18C4840(void *obj) { (void)obj; }
 
 static int   sub_1A02560(void *obj, void *str) { (void)obj; (void)str; return 0; }
 static void  sub_19FFA70(void *str) { (void)str; }
@@ -2138,7 +2163,7 @@ static char SharedPathExists(F3SharedBuffer **slot)
 //  CreatePathTree (the mkdir walk). All local slots are released (refcount +
 //  g_Addend--) before returning. Returns 1 unless the directory walk failed.
 //  Callers: RunFrontEnd (the abnormal-shutdown file's directory), sub_775DA0,
-//  sub_BC9B50, sub_18C5150, ApplyDisplaySettings.
+//  sub_BC9B50, CDiskFileWin32Open, ApplyDisplaySettings.
 // ============================================================
 static int EnsureParentDirectory(F3SharedBuffer **pathSlot)
 {
@@ -2378,8 +2403,8 @@ char RunFrontEnd(void *obj, int arg)
     else
     {
         EnsureParentDirectory(&v88);
-        sub_18C5150(v93, &v88, 4, 2);
-        sub_18C4840(v93);
+        CDiskFileWin32Open((CDiskFileWin32 *)v93, &v88, 4, 2);
+        CDiskFileWin32Close((CDiskFileWin32 *)v93);
     }
 
     v72 = 0;
@@ -2529,7 +2554,7 @@ char RunFrontEnd(void *obj, int arg)
         sub_19FFA70(&v90);
         sub_19FFA70(&v92);
         v93[0] = (DWORD)g_CDiskFileWin32Vtable;
-        sub_18C4840(v93);
+        CDiskFileWin32Close((CDiskFileWin32 *)v93);
         goto epilogue;
     }
 
@@ -2725,7 +2750,7 @@ epilogue:
     // Shared cleanup epilogue (identical on the success and cancel / failure
     // paths; only the return value differs).
     v93[0] = (DWORD)g_CDiskFileWin32Vtable;
-    sub_18C4840(v93);
+    CDiskFileWin32Close((CDiskFileWin32 *)v93);
     ReleaseSharedSlot(&v96);
     v93[0] = (DWORD)g_CAFileVtable;
     ReleaseSharedSlot(&v88);
