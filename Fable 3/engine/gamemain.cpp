@@ -118,7 +118,8 @@ static int SteamAPI_Init(void)
 //  They are "remaining stubs": real per-function behavior is out of scope
 //  until each is decompiled on its own.
 // ============================================================
-static int   sub_775DA0(void *str, char c) { (void)str; (void)c; return 0; }
+// (sub_775DA0, the saved-video-options file writer, is implemented below near
+//  LoadVideoOptionsValues as SaveVideoOptionsFile -- no longer a stub.)
 
 // ============================================================
 //  CDiskFileWin32 disk-file object + Open (the sub_18C5xxx cluster).
@@ -490,8 +491,9 @@ typedef struct F3XmlStream
 // Placeholder LHXML vtables: the stack stream's slots are never dispatched
 // in this build (the parse below is a remaining stub, so no section is ever
 // found and the option readers are unreachable).
-static void *g_CXMLStreamVtable[8]      = { 0 };
-static void *g_CXMLReadStreamVtable[32] = { 0 };
+static void *g_CXMLStreamVtable[8]       = { 0 };
+static void *g_CXMLReadStreamVtable[32]  = { 0 };
+static void *g_CXMLWriteStreamVtable[32] = { 0 };
 
 // sub_17DC6D0 (defined below): the real vtable[1] slot (enter a section)
 static char FindXmlSection(F3XmlStream *obj, const char *name);
@@ -675,6 +677,68 @@ static void CXMLReadStreamDtor(F3XmlStream *obj)
     }
     obj->vtable = (void *)g_CXMLStreamVtable;   // the sub_17DAA20 base dtor
     // sub_17E4390 / sub_17E63F0: the one-shot LHXML static teardowns (no-op)
+}
+
+// sub_17DB6C0 (placeholder for the CXMLWriteStream vtable[1] slot): enter a
+// named element on the (write) stream. The LHXML serializer is a remaining
+// stub in this build, so entering an element always fails (returns 0) and the
+// tree is never populated; ReadVideoOptionsValues then writes nothing, which
+// is exactly the original's behavior when the serializer is unavailable.
+static char WriteStreamEnterElement(void *stream, const char *name)
+{
+    (void)stream;
+    (void)name;
+    return 0;
+}
+
+// sub_17DB800 + sub_17DAA00 (0x17DB800 - 0x17DB830): the CXMLWriteStream ctor
+//  [NOT byte-identical] placement-dependent (relative calls to the base ctor
+//  sub_17DAA00 + the one-shot LHXML static initializers sub_17E42C0 / 17E6390).
+static void CXMLWriteStreamCtor(F3XmlStream *obj)
+{
+    obj->vtable = (void *)g_CXMLStreamVtable;    // the sub_17DAA00 base ctor
+    obj->flags = 0x8000;
+    // sub_17E42C0 / sub_17E6390: the one-shot LHXML static initializers (no-op)
+    obj->fileBuf = 0;
+    obj->section = 0;
+    obj->sectionInfo = 0;
+    obj->vtable = (void *)g_CXMLWriteStreamVtable;    // the derived vtable
+    if (g_CXMLWriteStreamVtable[1] == 0)
+        g_CXMLWriteStreamVtable[1] = (void *)WriteStreamEnterElement;   // vt[1]
+    *(BYTE *)&obj->sectionFound = 1;   // byte 20 = 1 (a write stream starts "found")
+}
+
+// sub_17DB830 + sub_17DAA20 (0x17DB830 - 0x17DB84F): the CXMLWriteStream dtor
+//  [NOT byte-identical] placement-dependent (relative calls to CloseXmlFileBlock,
+//  the LHXML heap-free, and the base dtor sub_17DAA20).
+static void CXMLWriteStreamDtor(F3XmlStream *obj)
+{
+    DWORD *block = obj->fileBuf;
+    obj->vtable = (void *)g_CXMLWriteStreamVtable;
+    if (block != 0)
+    {
+        CloseXmlFileBlock(block);              // sub_17E68F0
+        XmlHeapFree(block);                    // j_XmlHeapFree_2 (free the 8-byte block)
+    }
+    obj->vtable = (void *)g_CXMLStreamVtable;   // the sub_17DAA20 base dtor
+    // sub_17E4390 / sub_17E63F0: the one-shot LHXML static teardowns (no-op)
+}
+
+// sub_17DB2C0 + sub_17E6870 (0x17DB2C0 - 0x17E68A9): serialize the (write)
+// stream's XML tree to a file.  [NOT byte-identical] the LHXML tree serializer
+// (sub_17E6660) is a remaining stub; for the empty tree this build produces the
+// original writes only the constant prologue, so we write the same bytes here
+// (sub_17E5B70: fopen "wb" + fwrite + fclose).
+static void WriteXmlStreamToFile(F3XmlStream *obj, const char *fileName)
+{
+    (void)obj;   // the empty-tree serializer writes only the prologue
+    FILE *f = fopen(fileName, "wb");
+    if (f != 0)
+    {
+        static const char prologue[] = "<?xml version=\"1.0\"?>\r\n";
+        fwrite(prologue, 1, sizeof(prologue) - 1, f);
+        fclose(f);
+    }
 }
 
 // sub_40EDB0 / sub_40EFD0 / sub_40F1F0 (identical in all three types):
@@ -1472,6 +1536,37 @@ static void *LoadVideoOptionsValues(void *obj, F3SharedBuffer **pathSlot)
     return obj;
 }
 
+//  SaveVideoOptionsFile  (0x775DA0 - 0x775E09)  -- write the saved video options
+//  to the settings file
+//  [NOT byte-identical] placement-dependent (relative calls to the CXMLWriteStream
+//  ctor / dtor, EnsureParentDirectory, ReadVideoOptionsValues, GetSlotString,
+//  WriteXmlStreamToFile, ReleaseSharedSlot; the /GS cookie refs high-VA data).
+//
+//  long SaveVideoOptionsFile(F3VideoOptions *opts, F3SharedBuffer **pathSlot)
+//
+//  The write-side counterpart of LoadVideoOptionsValues: build a 24-byte stack
+//  CXMLWriteStream (sub_17DB800), make sure the path's parent directory exists
+//  (EnsureParentDirectory), write the "VideoOptions" element's fields from the
+//  52-byte record into the stream (ReadVideoOptionsValues, 0x775A60 -- the same
+//  generic element accessor used by the reader, dispatched through the write
+//  stream's vtable), serialize the tree to the file (sub_17DB2C0), destroy the
+//  stream (sub_17DB830), and release the path slot (the long slot count is
+//  returned). In this build the LHXML serializer is a remaining stub, so the
+//  element is never entered and only the XML prologue reaches the file (exactly
+//  the original's behavior with no serializable content). Callers: RunFrontEnd
+//  (re-saves the options when the cached resolution / adapter words change) and
+//  sub_72F990 (a settings path-builder for VideoOptions.xml).
+static long SaveVideoOptionsFile(F3VideoOptions *opts, F3SharedBuffer **pathSlot)
+{
+    F3XmlStream xml;                                       // the 24-byte CXMLWriteStream
+    CXMLWriteStreamCtor(&xml);                             // sub_17DB800
+    EnsureParentDirectory(pathSlot);                       // 0x18B1360
+    ReadVideoOptionsValues(&xml, opts);                    // 0x775A60
+    WriteXmlStreamToFile(&xml, GetSlotString(pathSlot));   // sub_17DB2C0
+    CXMLWriteStreamDtor(&xml);                             // sub_17DB830
+    return ReleaseSharedSlot(pathSlot);                    // 0x1A01320
+}
+
 // ============================================================
 //  Current-directory path cluster (0x18AE000-0x18C6000 helpers)
 //
@@ -2231,8 +2326,9 @@ static char SharedPathExists(F3SharedBuffer **slot)
 //  when that directory path itself does not exist, create it recursively via
 //  CreatePathTree (the mkdir walk). All local slots are released (refcount +
 //  g_Addend--) before returning. Returns 1 unless the directory walk failed.
-//  Callers: RunFrontEnd (the abnormal-shutdown file's directory), sub_775DA0,
-//  sub_BC9B50, CDiskFileWin32Open, ApplyDisplaySettings.
+//  Callers: RunFrontEnd (the abnormal-shutdown file's directory),
+//  SaveVideoOptionsFile (0x775DA0), sub_BC9B50, CDiskFileWin32Open,
+//  ApplyDisplaySettings.
 // ============================================================
 static int EnsureParentDirectory(F3SharedBuffer **pathSlot)
 {
@@ -2524,7 +2620,7 @@ char RunFrontEnd(void *obj, int arg)
                 str103[2] = (DWORD)p2[1];
                 base[0x160] = 1;
                 MakeVideoOptionsPath((F3SharedBuffer **)v70);   // 0x72F7B0
-                sub_775DA0(str103, (char)v70[0]);
+                SaveVideoOptionsFile((F3VideoOptions *)str103, (F3SharedBuffer **)v70);   // 0x775DA0
             }
             sub_18E6D40();
             v72 = 1;
