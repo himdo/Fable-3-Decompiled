@@ -384,9 +384,6 @@ static BOOL CDiskFileWin32Close(CDiskFileWin32 *obj)
     return result;
 }
 
-static int   sub_1A02560(void *obj, void *str) { (void)obj; (void)str; return 0; }
-static void  sub_19FFA70(void *str) { (void)str; }
-
 // ============================================================
 //  GetDefaultResolution  (0x61A000 - 0x61A100)
 // ============================================================
@@ -1496,6 +1493,78 @@ static F3SharedBuffer *g_cwdBlock      = 0;  // 0x02122DE4: current dir (wide) b
 static DWORD           g_dword_2075C4C = 0;  // 0x02075C4C: live-wide-slot counter
 
 // ============================================================
+//  SharedSlotCloneWide  (0x1A00580 - 0x1A00615)  -- fresh wide block from a slot
+//  [NOT byte-identical] placement-dependent (relative calls to the
+//  InterlockedIncrement IAT, LHAlloc, and SharedBufferAssignWide) plus the
+//  empty-string "Str1" global (0x01BD44D7) at its original high VA.
+//
+//  F3SharedBuffer **SharedSlotCloneWide(F3SharedBuffer **destSlot, F3SharedBuffer **srcSlot)
+//
+//  Build a fresh wide-text counted block holding a char->wide copy of the
+//  source slot's string and store it in destSlot: bump the live-wide-slot
+//  counter (g_dword_2075C4C), LHAlloc(16) a control block (0 on OOM), zero
+//  data / length / capacity, SharedBufferAssignWide it to the source length
+//  (the length field of the source block, 0 when the slot holds no block),
+//  set the refcount to 1, store the block in destSlot, then copy each source
+//  byte into a 16-bit code unit of the new buffer (zero-extended). The source
+//  string falls back to the empty string (Str1) when the slot holds no block,
+//  but the copy loop is skipped entirely in that case (length 0). Returns
+//  destSlot. This is the core of SharedSlotToWide (0x1A02560); the sibling
+//  sub_1A00620 wraps the same core with a plain cdecl convention. The copy
+//  loop dereferences the new block's buffer unconditionally in the original
+//  (it faults on OOM when the length is nonzero; modelled the same).
+// ============================================================
+static F3SharedBuffer **SharedSlotCloneWide(F3SharedBuffer **destSlot, F3SharedBuffer **srcSlot)
+{
+    InterlockedIncrement(&g_dword_2075C4C);
+
+    F3SharedBuffer *src = (srcSlot != 0 && *srcSlot != 0) ? *srcSlot : 0;
+    unsigned int len = (src != 0) ? src->length : 0;
+
+    F3SharedBuffer *blk = (F3SharedBuffer *)LHAlloc(16);
+    if (blk != 0)
+    {
+        blk->data     = 0;
+        blk->length   = 0;
+        blk->capacity = 0;
+        SharedBufferAssignWide(blk, len);
+        blk->refcount = 1;
+    }
+    else
+        blk = 0;
+
+    *destSlot = blk;
+    const WCHAR *dst  = (blk != 0) ? (const WCHAR *)blk->data : 0;
+    const char  *srcd = (src != 0) ? src->data : "";   // Str1 (0x01BD44D7): empty string
+    for (unsigned int i = 0; i < len; i++)
+        ((WCHAR *)dst)[i] = (unsigned char)srcd[i];
+    return destSlot;
+}
+
+// ============================================================
+//  SharedSlotToWide  (0x1A02560 - 0x1A02572)  -- convert a slot's string into a
+//  fresh wide block
+//  [NOT byte-identical] placement-dependent (relative call to
+//  SharedSlotCloneWide) and a thiscall + `retn 4` hybrid in the original
+//  (source slot in ECX, destination slot on the stack), so it is declared as
+//  a plain free function (first param = the thiscall source slot) here.
+//
+//  F3SharedBuffer **SharedSlotToWide(F3SharedBuffer **thisSlot, F3SharedBuffer **destSlot)
+//
+//  Convert the source slot's (byte) string into a fresh wide-text block in the
+//  destination slot and return the destination slot (SharedSlotCloneWide,
+//  0x1A00580). ~150 call sites across the engine, mostly where a shared-slot
+//  string (often a lowercased localized-lookup slot) needs to become a wide
+//  string for UI / manager dispatch; RunFrontEnd passes the converted slot
+//  into the manager "run the game" vtable slot. Declared as a plain free
+//  function to match the project convention for thiscall hybrids.
+// ============================================================
+static F3SharedBuffer **SharedSlotToWide(F3SharedBuffer **thisSlot, F3SharedBuffer **destSlot)
+{
+    return SharedSlotCloneWide(destSlot, thisSlot);
+}
+
+// ============================================================
 //  sub_19FFB60  (0x19FFB60 - 0x19FFBD4)  -- fresh wide-text counted block
 //  [NOT byte-identical] placement-dependent (relative call to LHAlloc).
 //
@@ -2334,7 +2403,7 @@ char RunFrontEnd(void *obj, int arg)
     DWORD           v93[7];                 // the CDiskFileWin32 / CAFile object (28 bytes)
     F3SharedBuffer *v96;                    // InitSharedSlot / ReleaseSharedSlot slot
     DWORD           notify[2];              // the 8-byte XNotify buffer
-    int             v76;                    // sub_1A02560 string
+    F3SharedBuffer *v76 = 0;               // SharedSlotToWide wide-string slot
     int             v85, v86;               // sub_18F1100 strings
     DWORD           v91, v92, v89, v90;     // sign-in UI strings
     DWORD           v102[2];
@@ -2413,12 +2482,12 @@ char RunFrontEnd(void *obj, int arg)
     {
         void *mgr  = GetManager();
         void **vt  = (void **)*(void ***)mgr;
-        int   v13  = sub_1A02560(&g_unk_1DBD048, &v76);
+        int   v13  = (int)(DWORD)SharedSlotToWide((F3SharedBuffer **)&g_unk_1DBD048, &v76);
         int   r    =
             ((int (*)(void *, int, int, int, int, int, int, int, int))vt[1])(
                 mgr, (int)v107, (int)str103[1], (int)str103[2], (int)str103[0], arg,
                 (int)g_dword_1C86BF0, (int)g_dword_1C86C08, v13);
-        sub_19FFA70(&v76);
+        ReleaseSharedSlotWide(&v76);
         if (r != 0)
         {
             int *p = sub_18F1100(&v85);
@@ -2530,10 +2599,10 @@ char RunFrontEnd(void *obj, int arg)
 
             int signState = XUserGetSigninState(0);
             Sleep(1);
-            sub_19FFA70(&v91);
-            sub_19FFA70(&v89);
-            sub_19FFA70(&v90);
-            sub_19FFA70(&v92);
+            ReleaseSharedSlotWide((F3SharedBuffer **)&v91);
+            ReleaseSharedSlotWide((F3SharedBuffer **)&v89);
+            ReleaseSharedSlotWide((F3SharedBuffer **)&v90);
+            ReleaseSharedSlotWide((F3SharedBuffer **)&v92);
 
             if (signState != 0)
                 goto signedIn;   // LABEL_46: the user signed in mid-loop
@@ -2549,10 +2618,10 @@ char RunFrontEnd(void *obj, int arg)
             HWND hwnd = (HWND)((int (*)(void *))vt[8])(mgr);
             PostMessageA(hwnd, 0x10, 0, 0);   // WM_CLOSE
         }
-        sub_19FFA70(&v91);
-        sub_19FFA70(&v89);
-        sub_19FFA70(&v90);
-        sub_19FFA70(&v92);
+        ReleaseSharedSlotWide((F3SharedBuffer **)&v91);
+        ReleaseSharedSlotWide((F3SharedBuffer **)&v89);
+        ReleaseSharedSlotWide((F3SharedBuffer **)&v90);
+        ReleaseSharedSlotWide((F3SharedBuffer **)&v92);
         v93[0] = (DWORD)g_CDiskFileWin32Vtable;
         CDiskFileWin32Close((CDiskFileWin32 *)v93);
         goto epilogue;

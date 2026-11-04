@@ -44,6 +44,11 @@ static DWORD g_dword_1DADD10 = 0;  // 0x1DADD10: verbose / OOM-report flag
 // worker dtor body. (Was worker.cpp; moved here with its slot ctor/dtor.)
 DWORD g_Addend = 0;
 
+// 0x2075C4C: the live-slot counter for the WIDE (WCHAR) shared-slot family --
+// a second, separate counter from g_Addend. Bumped by the wide slot ctor
+// (sub_19FF580) / wide setters, dropped by ReleaseSharedSlotWide (0x19FFA70).
+DWORD g_WideSlotCount = 0;
+
 // ============================================================
 //  OutOfMemory  (0x01A034F0 - 0x01A0356C)  -- report an out-of-memory condition
 //  [NOT byte-identical] placement-dependent (relative calls to swprintf_s, OutputDebugStringW, DebugBreak).
@@ -146,6 +151,52 @@ void SharedBufferAssign(F3SharedBuffer *this_, const char *src, unsigned int len
         buf[len] = 0;
         if (aligned > len + 1)
             memset(buf + len + 1, 0, aligned - (len + 1));
+    }
+}
+
+// ============================================================
+//  SharedBufferAssignWide  (0x404CC0 - 0x404D59)  -- resize a block to len wide
+//  code units
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc,
+//  memset, and the heap table's free member) plus the heap-table free slot at
+//  its original high VA.
+//
+//  void SharedBufferAssignWide(F3SharedBuffer *this_, unsigned int len)
+//
+//  The wide-text counterpart of SharedBufferAssign (0x403FE0): instead of
+//  copying len bytes from a source it resizes the block to hold len wide code
+//  units: free any old payload, allocate (2*len+5)&~3 bytes, space-fill the
+//  payload, write the wide null terminator at code unit len, zero the
+//  trailing padding, and update capacity (XOR-merge the aligned size, top bit
+//  preserved) and length (the wide-char count). The original's space fill is a
+//  DWORD/word rep-stos tail (shr ecx,1; rep stosd; adc ecx,ecx; rep stosw)
+//  that can overshoot the allocation for larger len; the equivalent
+//  2*len-byte fill is used here (the terminal state of the block is the
+//  same). userpurge in the original (block in ESI, count in EAX); the primary
+//  caller is SharedSlotCloneWide (0x1A00580).
+// ============================================================
+void SharedBufferAssignWide(F3SharedBuffer *this_, unsigned int len)
+{
+    if (this_->data != 0)
+    {
+        g_heapTable.free(this_->data);
+        this_->data = 0;
+    }
+
+    unsigned int aligned = (2 * len + 5) & 0xFFFFFFFCu;
+    char *buf = (char *)LHAlloc(aligned);
+
+    this_->capacity = ((aligned ^ this_->capacity) & 0x7FFFFFFFu) ^ this_->capacity;
+    this_->data     = buf;
+    this_->length   = len;
+
+    if (buf != 0)
+    {
+        if (len != 0)
+            memset(buf, 0x20, 2 * len);               // the original pre-fills with spaces
+        ((WCHAR *)buf)[len] = 0;                      // wide terminator at code unit len
+        if (aligned > 2 * len + 2)
+            memset(buf + 2 * len + 2, 0, aligned - (2 * len + 2));
     }
 }
 
@@ -257,6 +308,55 @@ long ReleaseSharedSlot(F3SharedBuffer **slot)
         *slot = 0;
     }
     long result = InterlockedDecrement(&g_Addend);
+    *slot = 0;
+    return result;
+}
+
+// ============================================================
+//  ReleaseSharedSlotWide  (0x19FFA70 - 0x19FFAAD)  -- destroy a (wide) shared slot
+//  [NOT byte-identical] placement-dependent (relative call to the family's
+//  inline buffer-free clone at 0x404370), plus the high-VA wide live-slot
+//  counter (0x02075C4C) and the InterlockedDecrement IAT slot.
+//
+//  long ReleaseSharedSlotWide(F3SharedBuffer **slot)
+//
+//  The destructor of the wide (WCHAR) shared-slot family -- the counterpart to
+//  the wide ctor (sub_19FF580) and the wide analogue of ReleaseSharedSlot
+//  (0x1A01320). Byte-for-byte the same control flow as ReleaseSharedSlot but
+//  differing in exactly two ways: it drops the wide-family live-slot counter
+//  (0x02075C4C) rather than the ANSI-family g_Addend (0x02075C48), and on zero
+//  refcount it frees the block through the family's private inline clone of
+//  SharedBufferFree (sub_404370, which is byte-identical to 0x403820) rather
+//  than SharedBufferFree itself. `slot` points at the single-word
+//  F3SharedBuffer * slot; when it holds a control block the block's refcount
+//  (at +12) is decremented, on zero the block is freed and the slot nulled,
+//  then the wide live-slot counter is dropped and returned. __thiscall in the
+//  original (slot in ECX, plain `retn`); declared as a plain free function to
+//  match the project convention.
+//
+//  Original body (61 bytes):
+//      53 8B 1D FC 52 AD 01       push ebx; mov ebx, InterlockedDecrement
+//      57 8B F8                   push edi; mov edi, ecx
+//      8B 07 85 C0 74 1D          mov eax, [edi]; test eax, eax; jz L_globdec
+//      83 C0 0C 50 FF D3          add eax, 0Ch; push eax; call ebx
+//      85 C0 7F 0D                test eax, eax; jg L_nullslot
+//      56 8B 37 85 F6 74 05       push esi; mov esi, [edi]; test esi, esi; jz L_skipfree
+//      E8 DA 48 A0 FE             call sub_404370
+//      5E                          L_skipfree: pop esi
+//      C7 07 00 00 00 00           L_nullslot: mov [edi], 0
+//      68 4C 5C 07 02 FF D3        L_globdec: push offset 0x2075C4C; call ebx
+//      C7 07 00 00 00 00          mov [edi], 0
+//      5F 5B C3                   pop edi; pop ebx; retn
+// ============================================================
+long ReleaseSharedSlotWide(F3SharedBuffer **slot)
+{
+    if (*slot != 0)
+    {
+        if (InterlockedDecrement(&(*slot)->refcount) <= 0 && *slot != 0)
+            SharedBufferFree(*slot);   // original: sub_404370 (inline clone of 0x403820)
+        *slot = 0;
+    }
+    long result = InterlockedDecrement(&g_WideSlotCount);
     *slot = 0;
     return result;
 }

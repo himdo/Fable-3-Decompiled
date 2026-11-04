@@ -40,6 +40,14 @@ void LHFree(void *p);
 // null-terminates and zeroes the trailing padding, updates length + capacity.
 void SharedBufferAssign(F3SharedBuffer *this_, const char *src, unsigned int len);
 
+// SharedBufferAssignWide (0x404CC0) - the wide-text counterpart of
+// SharedBufferAssign: resize the block to hold len wide code units (no source
+// copy): free the old payload, allocate (2*len+5)&~3 bytes, space-fill it,
+// write the wide null terminator at code unit len, zero the trailing padding,
+// and update capacity (aligned size XOR-merge, top bit preserved) and length
+// (wide-char count). userpurge in the original (block in ESI, count in EAX).
+void SharedBufferAssignWide(F3SharedBuffer *this_, unsigned int len);
+
 // SharedBufferFree (0x403820) - release a counted buffer: free the payload, clear
 // length, set the capacity flag, then free the control block itself.
 void SharedBufferFree(F3SharedBuffer *this_);
@@ -50,10 +58,16 @@ void SharedBufferFree(F3SharedBuffer *this_);
 // refcount to 1, and return the block (0 on OOM).
 F3SharedBuffer *SharedBufferCreate(const char *src, int size);
 
-// 0x2075C48 - global live-object count for the shared slots below (the IDA
-// name is "Addend"): InitSharedSlot bumps it, ReleaseSharedSlot drops it; the
-// worker ctor / dtor body do as well.
+// 0x2075C48 - global live-object count for the (ANSI) shared slots below (the
+// IDA name is "Addend"): InitSharedSlot bumps it, ReleaseSharedSlot drops it;
+// the worker ctor / dtor body do as well.
 extern DWORD g_Addend;
+
+// 0x2075C4C - the live-object count for the WIDE (WCHAR) shared-slot family
+// (a second, separate counter from g_Addend). Bumped by the wide slot ctor
+// (sub_19FF580) and the wide setters/cloner, dropped by
+// ReleaseSharedSlotWide (0x19FFA70).
+extern DWORD g_WideSlotCount;
 
 // InitSharedSlot (0x1A00C30) - construct a (null) shared slot and register it
 // in the live-slot count. __thiscall in the original: the slot pointer is in
@@ -68,6 +82,16 @@ F3SharedBuffer ** InitSharedSlot(F3SharedBuffer **obj);
 // via SharedBufferFree on zero, nulls the slot, and drops the global
 // live-slot count (g_Addend). Returns the new g_Addend value.
 long ReleaseSharedSlot(F3SharedBuffer **slot);
+
+// ReleaseSharedSlotWide (0x19FFA70) - the destructor of the WIDE (WCHAR)
+// shared-slot family (the counterpart to the wide ctor, sub_19FF580, and the
+// wide analogue of ReleaseSharedSlot, 0x1A01320). Identical in behaviour to
+// ReleaseSharedSlot except it drops the wide live-slot counter (g_WideSlotCount,
+// 0x2075C4C) rather than g_Addend, and on zero refcount frees the block through
+// the family's inline clone of SharedBufferFree (sub_404370, byte-identical to
+// 0x403820) rather than SharedBufferFree itself. Decrements the block's
+// refcount, frees on zero, nulls the slot, and returns the new counter value.
+long ReleaseSharedSlotWide(F3SharedBuffer **slot);
 
 // SetSharedSlot (0x1A01CC0) - the general shared-slot setter (the generic core of
 // SetSaveGamePath). thiscall in the original (slot in ECX, src + size on the
