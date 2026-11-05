@@ -2378,7 +2378,36 @@ static int EnsureParentDirectory(F3SharedBuffer **pathSlot)
     return result;
 }
 
-static int   sub_18F02B0(void) { return 0; }
+// 0x1E2EDA0: the device display-mode state word in the frontend device
+// state block (the .data region around 0x1E2ED40..0x1E2EEF0 image-initializes
+// to 0xFFFFFFFF). No code in the exe writes it — the only reference in the
+// whole binary is this getter's read (a byte scan for the 4-byte VA over
+// .text/.rdata/.data/.idata/.orpc/.rsrc finds just the one cmp) — so the
+// initial image value 0xFFFFFFFF is kept and the getter returns 0 in this
+// build, exactly as it does before any device write in the original.
+static DWORD g_dword_1E2EDA0 = 0xFFFFFFFF;
+
+// ============================================================
+//  IsFullScreen  (0x18F02B0 - 0x18F02BC)  -- the device's current
+//  display-mode getter  [NOT byte-identical] placement-independent (no
+//  calls / relative jumps), but refs the device state word
+//  dword_1E2EDA0 (0x01E2EDA0) at its original high VA not present in the
+//  build.
+//
+//  int IsFullScreen(void)   (cdecl, no args, 0 / 1 in EAX)
+//
+//  Returns (dword_1E2EDA0 == 0) — the device's current fullscreen state
+//  word: nonzero (fullscreen) when the word is clear. RunFrontEnd uses it
+//  as the "current fullscreen" side of the saved-options comparison (the
+//  record's Fullscreen byte, +0x0C) and, when the cached values changed,
+//  stores it back into the record before re-saving VideoOptions.xml.
+//  Callers: RunFrontEnd only (the two call sites at 0x61CD98 / 0x61CDCA).
+//  Replaces the sub_18F02B0 no-op stub in RunFrontEnd.
+// ============================================================
+static int IsFullScreen(void)
+{
+    return g_dword_1E2EDA0 == 0;
+}
 
 // qword_20FC928 / dword_20FC92C: the current display resolution
 // {width, height}, set by the device creation (sub_18F1B30) from the
@@ -4048,8 +4077,346 @@ static void  sub_18FBD00(int a) { (void)a; }
 static void  nullsub_7(void) {}
 static void  sub_770960(void) {}
 static void  sub_620F30(void *obj) { (void)obj; }
-static void *sub_18EADB0(void *obj) { return obj; }
-static void  sub_18EB1A0(void *obj) { (void)obj; }
+// ============================================================
+//  SortedMapHeadInit  (0x579280 - 0x5792C4)  -- initialize the embedded
+//  sorted node list of a sorted-map object (head node at obj+0x18, node
+//  count at obj+0x1C)
+//
+//  void *SortedMapHeadInit(void)   -- usercall: the object comes in ESI
+//
+//  Allocates the 24-byte sentinel head node from the game heap (LHAlloc),
+//  zeroes its first three dwords, marks its +0x14 / +0x15 flag bytes 1,
+//  stores it at obj+0x18, self-links next / prev / right, and zeroes the
+//  node count at obj+0x1C. Returns the head node.
+//
+//  [NOT byte-identical] placement-dependent: the body is the original's
+//  exact instruction sequence (__declspec(naked) inline asm, the object in
+//  ESI), but the relative E8 call to LHAlloc displaces to a different
+//  offset in this build's layout than in the original.
+//
+//  Shared list initializer for the 0x38-byte sorted map (CSortedMapCtor,
+//  0x18EADB0) and the CS-less 0x28-byte variants (0x577BA0 / 0x5785D0);
+//  the same sequence is inlined into sub_1979610.
+// ============================================================
+static __declspec(naked) void *SortedMapHeadInit(void)
+{
+    __asm {
+        push 18h
+        call LHAlloc
+        xor edx, edx
+        add esp, 4
+        cmp eax, edx
+        jz short f3_smhi_skip1
+        mov [eax], edx
+    f3_smhi_skip1:
+        lea ecx, [eax+4]
+        cmp ecx, edx
+        jz short f3_smhi_skip2
+        mov [ecx], edx
+    f3_smhi_skip2:
+        lea ecx, [eax+8]
+        cmp ecx, edx
+        jz short f3_smhi_skip3
+        mov [ecx], edx
+    f3_smhi_skip3:
+        mov cl, 1
+        mov [eax+14h], cl
+        mov [esi+18h], eax
+        mov [eax+15h], cl
+        mov eax, [esi+18h]
+        mov [eax+4], eax
+        mov eax, [esi+18h]
+        mov [eax], eax
+        mov eax, [esi+18h]
+        mov [eax+8], eax
+        mov [esi+1Ch], edx
+        ret
+    }
+}
+
+// ============================================================
+//  CSortedMapCtor  (0x18EADB0 - 0x18EADD C)  -- the 0x38-byte CS-guarded
+//  sorted-map object's constructor (game-engine member 0x98)
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc and
+//  SortedMapHeadInit) and refs the InitializeCriticalSection IAT slot
+//  (ds:__imp_InitializeCriticalSection) at its original high VA
+//  0x01AD531C.
+//
+//  void *CSortedMapCtor(void *obj)   -- thiscall, returns obj
+//
+//  The object is a critical-section-guarded sorted map: a red-black tree
+//  held as a circular doubly-linked list of 24-byte nodes ({next +0, prev
+//  +4, right +8, key +0xC, refcounted object +0x10, flags +0x14/+0x15}),
+//  keyed on the node's 32-bit key; the binary search walks the in-order
+//  next/prev links and right pointers (sub_5780D0 / sub_577C10 family).
+//  Layout (56 bytes): +0x00 a 4-byte heap owner tag (LHAlloc(4) block
+//  holding a back-pointer to the object; NULL on allocation failure),
+//  +0x04..+0x17 class data not initialized here, +0x18 the sentinel head
+//  node, +0x1C the node count, +0x20..+0x37 the CRITICAL_SECTION.
+//  Allocates the owner tag, initializes the list head / count
+//  (SortedMapHeadInit), initializes the critical section at +0x20,
+//  and returns obj. Sole caller: RunFrontEnd (LHAlloc(0x38) + this),
+//  stored into engine member 0x98 (released by the CSortedMapDtor
+//  (0x18EB1A0) + LHFree in RunFrontEnd / CGameEngineDestroy).
+// ============================================================
+static void *CSortedMapCtor(void *obj)
+{
+    void *tag = LHAlloc(4);
+    if (tag != 0)
+        *(void **)tag = obj;
+    *(void **)obj = tag;
+    __asm {
+        mov esi, obj
+        call SortedMapHeadInit
+    }
+    InitializeCriticalSection((CRITICAL_SECTION *)((char *)obj + 0x20));
+    return obj;
+}
+// The original's sorted-map debug-iterator checks call the CRT's
+// __invalid_parameter_noinfo(), which reports to the (unset) invalid-parameter
+// handler and returns normally, so the original keeps executing after each
+// check. A no-op with the same return path is functionally equivalent here
+// (the VS2008 msvcrt import library does not carry the symbol).
+static void F3InvalidParam(void) {}
+
+// ============================================================
+//  SortedMapNodeTreeDestroy  (0x578660 - 0x5786EE)  -- recursive in-order
+//  destroy of the sorted map's red-black tree
+//  [NOT byte-identical] placement-dependent (the relative recursive call)
+//  and refs the heap table (dword_2075B24) at its original high VA (the node
+//  frees go through its +16 slot, i.e. LHFree).
+//
+//  void SortedMapNodeTreeDestroy(void *obj, void *node)
+//
+//  Original: thiscall + `retn 4` (obj in ECX, the node on the stack). Destroys
+//  the 24-byte tree nodes starting at `node` in in-order: recurse into the
+//  node's right subtree (+8), release the node's refcounted entry object
+//  (+0x10: InterlockedDecrement its refcount at +4, call the object's vtable
+//  slot 1 at zero, then null the slot), and free the node through the heap
+//  table; then advance to the node's in-order successor (+0) and repeat.
+//  Stops (without freeing) at the sentinel -- the flag byte at +0x15 is set
+//  on the sentinel node, which the caller frees separately.
+// ============================================================
+static void SortedMapNodeTreeDestroy(void *obj, void *node)
+{
+    for (;;)
+    {
+        char *n = (char *)node;
+        if (*(BYTE *)(n + 0x15) != 0)      // the sentinel
+            break;
+
+        SortedMapNodeTreeDestroy(obj, *(void **)(n + 8));    // the right subtree
+
+        void *entry = *(void **)(n + 0x10);    // captured before the node free
+        void *next  = *(void **)n;
+        if (entry != 0)
+        {
+            if (InterlockedDecrement((LONG *)entry + 1) == 0)
+                ((void (*)(void *))((void **)*(void **)entry)[1])(entry);
+            *(void **)(n + 0x10) = 0;
+        }
+        LHFree(node);
+        node = next;
+    }
+}
+
+// ============================================================
+//  SortedMapIterFixup  (0x579A70 - 0x579AD1)  -- debug-iterator fixup for the
+//  sorted map's {tag, node} iterator pair
+//  [NOT byte-identical] placement-dependent (the relative call/jmp to the
+//  __invalid_parameter_noinfo IAT slot).
+//
+//  void SortedMapIterFixup(void *pair)   -- original: usercall (pair in ESI,
+//                                            plain `retn`)
+//
+//  `pair` is an adjacent {tag, node} DWORD pair (the original passes the
+//  address of the caller's stack slots). The tag must be non-zero and the
+//  node must not be the sentinel (flag byte +0x15) -- the original calls
+//  __invalid_parameter_noinfo on failure (the tag check returns; the
+//  sentinel-node check is a `jmp`, so it never returns). Otherwise the
+//  pair's node is re-pointed at a tree-adjacent node: when the node's right
+//  child (+8) is real, the node becomes the last non-sentinel node of the
+//  in-order successor chain starting at the right child; when the right
+//  child is the sentinel, the node walks the prev chain (+4) up as long as
+//  each ancestor's right child (+8) is the previous node, and becomes the
+//  first ancestor that fails the test (or the sentinel).
+// ============================================================
+static void SortedMapIterFixup(void *pair)
+{
+    char *pr = (char *)pair;
+    if (*(void **)pr == 0)
+        F3InvalidParam();
+    void *node = *(void **)(pr + 4);
+    if (*(BYTE *)((char *)node + 0x15) != 0)
+    {
+        F3InvalidParam();
+        return;        // original: jmp __invalid_parameter_noinfo (no return)
+    }
+
+    void *right = *(void **)((char *)node + 8);
+    if (*(BYTE *)((char *)right + 0x15) == 0)
+    {
+        void *cur = right;
+        void *nxt = *(void **)cur;
+        while (*(BYTE *)((char *)nxt + 0x15) == 0)
+        {
+            cur = nxt;
+            nxt = *(void **)cur;
+        }
+        *(void **)(pr + 4) = cur;
+    }
+    else
+    {
+        void *anc = *(void **)((char *)node + 4);
+        for (;;)
+        {
+            if (*(BYTE *)((char *)anc + 0x15) != 0)
+                break;
+            if (*(void **)(pr + 4) != *(void **)((char *)anc + 8))
+                break;
+            *(void **)(pr + 4) = anc;
+            anc = *(void **)((char *)anc + 4);
+        }
+        *(void **)(pr + 4) = anc;
+    }
+}
+
+// sub_577D00 (0x577D00) -- the 918-byte single-node red-black erase from the
+// sorted map's tree: rebalances through the sub_578990 / sub_578940 /
+// sub_5789F0 rotation family, releases the node's refcounted entry object
+// (+0x10), frees the node through the heap table, decrements the map's node
+// count (+0x1C) when non-zero, and writes the {tag, node} out-iterator pair.
+// Remaining stub: it is only reached from SortedMapEraseRange's non-empty
+// erase loop, which this build never runs (the map is constructed empty and
+// nothing is ever inserted into it).
+static void SortedMapNodeErase(void *obj, void *out, void *tag, void *node)
+{ (void)obj; (void)out; (void)tag; (void)node; }
+
+// ============================================================
+//  SortedMapEraseRange  (0x579190 - 0x579275)  -- erase the sorted map's
+//  in-order node range [node1, node3)
+//  [NOT byte-identical] placement-dependent (the relative calls to
+//  SortedMapNodeTreeDestroy / SortedMapIterFixup / SortedMapNodeErase and
+//  the __invalid_parameter_noinfo checks).
+//
+//  void *SortedMapEraseRange(void *obj, void *out, void *tag0, void *node1,
+//                            void *tag2, void *node3)
+//
+//  Original: thiscall + `retn 0x10` (obj in ECX, the 8-byte {tag, node}
+//  out-iterator scratch in EDX, the two debug-iterator bounds tag0/node1 and
+//  tag2/node3 on the stack). The bounds must match the map's owner tag at
+//  +0x00 (non-zero bounds must be equal to it; __invalid_parameter_noinfo
+//  otherwise) and node1 must be the map's first node ([head]). When the
+//  range is empty (node3 is the sentinel head itself) it takes the direct
+//  path: SortedMapNodeTreeDestroy from the sentinel's predecessor, reset the
+//  list to empty (self-linked head, count 0), and write {tag, head} to the
+//  out scratch. Otherwise it loops: fix up the {tag0, node1} iterator pair
+//  (the original passes the two adjacent stack slots) and erase one node
+//  (SortedMapNodeErase into a second 8-byte local scratch), until node1
+//  reaches node3, then writes {tag, node1} to the out scratch. Returns the
+//  out scratch (the caller discards it).
+// ============================================================
+static void *SortedMapEraseRange(void *obj, void *out, void *tag0, void *node1,
+                                 void *tag2, void *node3)
+{
+    char *m = (char *)obj;
+    void *tag   = *(void **)m;
+    void *head  = *(void **)(m + 0x18);
+    void *first = *(void **)head;
+
+    if (tag0 != 0 && tag0 != tag)
+        F3InvalidParam();
+    if (node1 == first && tag2 != 0 && tag2 != tag)
+        F3InvalidParam();
+    if (node1 == first && node3 == first)
+    {
+        // Direct path (empty range): destroy from the sentinel's
+        // predecessor and reset the list to empty.
+        SortedMapNodeTreeDestroy(obj, *(void **)((char *)head + 4));
+        head = *(void **)(m + 0x18);
+        *(void **)((char *)head + 4) = head;
+        *(int *)(m + 0x1C) = 0;
+        *(void **)head = head;
+        *(void **)((char *)head + 8) = head;
+        *(void **)out = 0;
+        ((void **)out)[1] = *(void **)head;
+        *(void **)out = tag;
+        return out;
+    }
+
+    DWORD next[2] = { 0, 0 };      // the original's v15 out-iterator scratch
+    for (;;)
+    {
+        if (tag0 != 0 && tag0 != tag2)
+            F3InvalidParam();
+        if (node1 == node3)
+            break;
+        DWORD iter[2] = { (DWORD)tag0, (DWORD)node1 };   // the original's adjacent {tag0, node1} pair
+        SortedMapIterFixup((void *)iter);
+        tag0  = (void *)iter[0];
+        node1 = (void *)iter[1];
+        SortedMapNodeErase(obj, (void *)next, tag0, node1);
+    }
+    ((void **)out)[0] = tag;
+    ((void **)out)[1] = node1;
+    return out;
+}
+
+// ============================================================
+//  SortedMapTreeDestroy  (0x578A40 - 0x578A7D)  -- destroy the sorted map's
+//  whole tree (all nodes + the sentinel)
+//  [NOT byte-identical] placement-dependent (the relative call to
+//  SortedMapEraseRange) and refs the heap table (dword_2075B24) at its
+//  original high VA (the sentinel free goes through its +16 slot, i.e. LHFree).
+//
+//  void SortedMapTreeDestroy(void *obj)   -- original: usercall (obj in ESI,
+//                                            plain `retn`)
+//
+//  Erases the whole in-order range (first node .. sentinel) through
+//  SortedMapEraseRange (passing an 8-byte {tag, node} stack scratch as the
+//  out iterator, which is discarded), then frees the 24-byte sentinel head
+//  node and zeroes the map's head (+0x18) and node count (+0x1C).
+// ============================================================
+static void SortedMapTreeDestroy(void *obj)
+{
+    char *m = (char *)obj;
+    void *head = *(void **)(m + 0x18);
+    void *tag  = *(void **)m;
+    DWORD out[2] = { 0, 0 };        // the original's 8-byte EDX stack scratch
+
+    SortedMapEraseRange(obj, (void *)out, tag, *(void **)head, tag, head);
+
+    LHFree(*(void **)(m + 0x18));
+    *(void **)(m + 0x18) = 0;
+    *(int *)(m + 0x1C) = 0;
+}
+
+// ============================================================
+//  CSortedMapDtor  (0x18EB1A0 - 0x18EB1C5)  -- the 0x38-byte CS-guarded
+//  sorted map object's destructor (the counterpart of CSortedMapCtor)
+//  [NOT byte-identical] placement-dependent (the relative call to
+//  SortedMapTreeDestroy) and refs the DeleteCriticalSection IAT slot
+//  (ds:__imp_DeleteCriticalSection, 0x01AD52E8) and the heap table
+//  (dword_2075B24) at their original high VAs.
+//
+//  void CSortedMapDtor(void *obj)   -- original: thiscall (obj in ECX, plain
+//                                      `retn`; the free result is in EAX)
+//
+//  Deletes the critical section at +0x20, destroys the tree's nodes and
+//  sentinel (SortedMapTreeDestroy, 0x578A40), and frees the 4-byte heap
+//  owner tag at +0x00 through the heap table's free slot (the original
+//  passes the tag as both the this register and the stack argument; the
+//  free ignores this, so LHFree is equivalent). The 0x38-byte object block
+//  itself is freed by the caller (RunFrontEnd / CGameEngineDestroy each
+//  LHFree engine member 0x98 after this).
+// ============================================================
+void CSortedMapDtor(void *obj)
+{
+    char *m = (char *)obj;
+    DeleteCriticalSection((CRITICAL_SECTION *)(m + 0x20));
+    SortedMapTreeDestroy(obj);
+    LHFree(*(void **)m);
+}
 static void  sub_719770(void) {}
 static int   sub_1801C20(void) { return 0; }
 static void  sub_4358A0(void *obj, const char *name) { (void)obj; (void)name; }
@@ -4323,11 +4690,11 @@ char RunFrontEnd(void *obj, int arg)
         if (r != 0)
         {
             DWORD *p = GetCurrentResolution(&v85);
-            if ((unsigned char)str103[3] != (unsigned char)sub_18F02B0()
+            if ((unsigned char)str103[3] != (unsigned char)IsFullScreen()
                 || (int)str103[1] != p[0]
                 || (int)str103[2] != p[1])
             {
-                str103[3] = (DWORD)sub_18F02B0();
+                str103[3] = (DWORD)IsFullScreen();
                 DWORD *p2 = GetCurrentResolution(&v86);
                 str103[1] = (DWORD)p2[0];
                 str103[2] = (DWORD)p2[1];
@@ -4486,11 +4853,11 @@ signedIn:
         dw[0x20 / 4] = (DWORD)listFirst;
 
         void *p56 = LHAlloc(0x38);
-        int   v35 = (p56 != 0) ? (int)sub_18EADB0(p56) : 0;
+        int   v35 = (p56 != 0) ? (int)CSortedMapCtor(p56) : 0;
         void *v36 = (void *)dw[0x98 / 4];
         if (v36 != 0)
         {
-            sub_18EB1A0(v36);
+            CSortedMapDtor(v36);
             LHFree(v36);
         }
         dw[0x98 / 4] = (DWORD)v35;

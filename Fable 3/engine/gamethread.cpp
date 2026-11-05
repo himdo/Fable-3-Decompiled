@@ -878,11 +878,6 @@ static void  sub_6234A0(void *obj) { (void)obj; }
 //   lists + CNetPacketCallbackDtor + ReleaseSharedSlot). Remaining stub.
 static void  sub_627690(void *obj) { (void)obj; }
 
-// sub_18EB1A0 (0x18EB1A0) -- the 0x38-byte object's dtor (DeleteCriticalSection
-//   at +32, sub_578A40, then a virtual call through the global vtable at
-//   0x2075B24+16). Remaining stub.
-static void  sub_18EB1A0(void *obj) { (void)obj; }
-
 // ============================================================
 //  SubNodeTreeDtor  (0x625BB0 - 0x625C2F)  -- recursive node-tree destructor
 //  [NOT byte-identical] placement-dependent (relative recursive call, the
@@ -1186,10 +1181,10 @@ static void CGameEngineDestroy(CGameEngine *obj)
         F3ReleaseOne(obj->member0x9C);
     obj->member0x9C = 0;
 
-    // 13. member0x98: the 0x38-byte object (0x18EB1A0 dtor) + free.
+    // 13. member0x98: the 0x38-byte sorted map (CSortedMapDtor, 0x18EB1A0) + free.
     if (obj->member0x98 != 0)
     {
-        sub_18EB1A0(obj->member0x98);
+        CSortedMapDtor(obj->member0x98);
         LHFree(obj->member0x98);
     }
     obj->member0x98 = 0;

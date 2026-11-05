@@ -29,6 +29,12 @@ char RunFrontEnd(void *obj, int arg);
 // settings-directory slot + "abnormal_shutdown.tmp" (shared by the worker module)
 F3SharedBuffer **MakeAbnormalShutdownPath(F3SharedBuffer **obj);
 
+// 0x18EB1A0 - the 0x38-byte CS-guarded sorted map object's destructor (the
+// counterpart of the static CSortedMapCtor, 0x18EADB0, in gamemain.cpp):
+// DeleteCriticalSection at +0x20, the tree + sentinel destroy
+// (SortedMapTreeDestroy, 0x578A40), and the owner-tag LHFree.
+void CSortedMapDtor(void *obj);
+
 // 0x18FA3E0 - the global heap-manager object getter (dword_2075ED8; takes no
 // argument in the original). Remaining stub (returns 0 until the heap
 // manager is implemented).
