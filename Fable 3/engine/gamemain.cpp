@@ -2413,8 +2413,9 @@ static DWORD *GetCurrentResolution(DWORD *out)
 //  addresses.
 //
 //  Flow:
-//    1. Reset graphics state (sub_18D1960(device)) + render state
-//       (sub_18CF6E0).  flags = byte_2075F05 ? 0x200 : 0;  fmt =
+//    1. Reset graphics state (ResetGraphicsEntities(device)) + re-register
+//       the graphics state records (ReRegisterGraphicsState).  flags =
+//       byte_2075F05 ? 0x200 : 0;  fmt =
 //       (byte_2075F05 == 0).
 //    2. Create a 2x1 surface (sub_18D33B0); wrap texture slot 0 of the
 //       global CSurface record off_1DB12F8 into a frame-local wrapper
@@ -2454,6 +2455,22 @@ static DWORD g_dword_1E2EF60[16] = {0};
 // 0x1E2EF50 / 0x1E2EF58: two qwords between the two state blocks.
 static DWORD g_qword_1E2EF50[2]  = {0, 0};
 
+// --- Frontend graphics-entity subsystem globals (ResetGraphicsEntities) ---
+// 0x2120420: base of the frontend graphics-entity pool (0x1DF8 bytes); zeroed
+// on reset, then re-initialised by the pool builder (sub_18CFA70).  Kept at its
+// original high VA as a static (the memset target).
+static DWORD g_dword_2120420[0x1DF8/4] = {0};
+// 0x2073938: count of dirty resource registrations (reset to 0 on reset).
+static DWORD g_dword_2073938 = 0;
+// 0x2063134: count of entities in the pool (reset to 0 on reset).
+static DWORD g_dword_2063134 = 0;
+// 0x211C402: graphics-entity subsystem state byte (set to 3 on reset).
+static BYTE  g_byte_211C402  = 0;
+// 0x2075F54: the device object the entities are synced to (vtable-backed).
+static void *g_dword_2075F54 = 0;
+// 0x2075F4D: entity-sync flag (cleared on reset).
+static BYTE  g_byte_2075F4D  = 0;
+
 // A 32-byte CSurface record / frame-local wrapper: {vtable, surface, type,
 // fmtInfo[4]}.  sub_18D36C0 / sub_1A046D0 refresh a frame-local wrapper from
 // a global record; sub_18D2940 clears it (reading the format index at +12).
@@ -2471,8 +2488,239 @@ struct F3CsurfaceSlot
 // effect beyond the state-block zeroing.  The two refresh helpers model the
 // thiscall (slot in the register, source record on the stack) and leave the
 // wrapped surface null in this build.
-static void  sub_18D1960(void *device) { (void)device; }          // reset graphics state (device)
-static void  sub_18CF6E0(void)          {}                        // reset render state
+// 0x207393C: index of the next state descriptor to write (the pending
+// batch's current length).  0x2075F58: the record global the pending
+// batch belongs to.
+static DWORD g_stateDescCount = 0;
+static void *g_stateDescOwner = 0;
+
+// 0x2074140: the 128-entry (0x400-byte) state descriptor table
+// (word_2074140 / word_2074142 / byte_2074144..byte_2074147 in IDA).  A
+// pending batch is a run of these entries terminated by a {0x00FF, 0,
+// 0x11, 0, 0, 0} entry; the device's state method reads the table until the
+// terminator.
+struct F3StateDescriptor
+{
+    WORD field;   // +0x0: field index within the record (a3)
+    WORD value;   // +0x2: value / offset (a4)
+    BYTE code1;   // +0x4: size-class code g_byte_1D9ACD8[a1]
+    BYTE code2;   // +0x5: the constant byte_1D9ACBC (0)
+    BYTE code3;   // +0x6: format-class code g_byte_1D9AD60[a5]
+    BYTE flags;   // +0x7: a6
+};
+static F3StateDescriptor g_stateDescTable[128] = {{0}};
+
+// --- rdata class tables (the original reads these at their high VAs) ---
+// 0x1D9ACD8: descriptor code1 per size class a1.
+static const BYTE  g_byte_1D9ACD8[] = { 0x00, 0x04, 0x01, 0x08, 0x02, 0x0C, 0x03 };
+// 0x1D9ACDC: value delta per size class a1, added to a4 when the record's
+// field slot is written.
+static const DWORD g_dword_1D9ACDC[] = { 0x04, 0x01, 0x08, 0x02, 0x0C, 0x03, 0x10 };
+// 0x1D9AD60: descriptor code3 per format class a5.
+static const BYTE  g_byte_1D9AD60[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 0xA, 0xB, 0xC, 0xD };
+
+// ============================================================
+//  AddStateRegistration  (0x18CDB70 - 0x18CDC3C)  -- append one field
+//  descriptor to the pending state-registration batch.
+//  [NOT byte-identical] the original is a register-parameter hybrid
+//  (a1 in EDI, a2 in ESI, four stack args, retn 0x10) with a security
+//  cookie, and refs the high-VA globals descriptor table word_2074140,
+//  count dword_207393C, owner pointer dword_2075F58, and the class tables
+//  byte_1D9ACBC / byte_1D9ACD8 / byte_1D9AD60 / dword_1D9ACDC.
+//
+//  int AddStateRegistration(int a1, DWORD *a2, int a3, int a4, int a5, int a6)
+//
+//  The device keeps a table of "state field" descriptors that bind global
+//  state records to device state.  A2 is the address of a 36-byte state
+//  record ({state object, field cursor, ...}); the record's state object is
+//  the pending registration's owner.  Behavior:
+//    1. If the record's state object (record+0) is nonzero, flush the
+//       previous owner first: obj->vt[4](obj, table, &count) with count
+//       pre-loaded with the table capacity 0x80 (128), set the descriptor
+//       count to count-1, obj->vt[2](obj), then clear record+0.
+//    2. Append one descriptor at index dword_207393C: {a3, a4,
+//       g_byte_1D9ACD8[a1], 0 (byte_1D9ACBC), g_byte_1D9AD60[a5], a6}.
+//    3. Write the record's field slot record[a3+1] = a4 +
+//       g_dword_1D9ACDC[a1] (a running registration cursor when a3 == 0),
+//       set the owner pointer dword_2075F58 = a2, and increment the
+//       count, which is returned.
+//
+//  ~33 call sites (AddStateRegistration is the batch's field-adder; the
+//  state object's vt[4]/vt[2] slots are called with the object as the first
+//  stack argument, matching this codebase's device-method convention).
+// ============================================================
+static int AddStateRegistration(int a1, DWORD *a2, int a3, int a4, int a5, int a6)
+{
+    void *obj = (void *)a2[0];
+    if (obj != 0)
+    {
+        int count = 0x80;
+        ((void (*)(void *, F3StateDescriptor *, int *))(*(void ***)obj)[4])
+            (obj, g_stateDescTable, &count);
+        obj = (void *)a2[0];          // the original re-reads it after vt[4]
+        g_stateDescCount = (DWORD)(count - 1);
+        ((void (*)(void *))(*(void ***)obj)[2])(obj);
+        a2[0] = 0;
+    }
+
+    int idx = (int)g_stateDescCount;
+    F3StateDescriptor *e = &g_stateDescTable[idx];
+    e->code1 = g_byte_1D9ACD8[a1];
+    e->code2 = 0;                          // the constant byte_1D9ACBC (0)
+    e->code3 = g_byte_1D9AD60[a5];
+    e->flags = (BYTE)a6;
+    e->field = (WORD)a3;
+    e->value = (WORD)a4;
+    a2[a3 + 1] = (DWORD)(a4 + g_dword_1D9ACDC[a1]);
+    g_stateDescOwner = (void *)a2;
+    g_stateDescCount = (DWORD)(idx + 1);
+    return (int)g_stateDescCount;
+}
+
+// ============================================================
+//  SubmitStateRegistration  (0x18CDE00 - 0x18CDE63)  -- append the
+//  terminator entry and hand the pending state-registration batch to the
+//  device's state method.
+//  [NOT byte-identical] refs the high-VA globals descriptor table
+//  word_2074140, count dword_207393C, owner pointer dword_2075F58, and the
+//  device object dword_1E2EEF4.  A null-guard on the device object is added
+//  where the original would fault (pre-device slot).
+//
+//  int SubmitStateRegistration(void *record)
+//
+//  1. Writes the terminator descriptor {0x00FF, 0, 0x11, 0, 0, 0} at the
+//     current index (one past the last field entry; the device reads the
+//     table until it).
+//    2. Calls the device state method, device vtable slot 86 (offset
+//       0x158): result = vt[86](device, table, record) with the device
+//       object (dword_1E2EEF4) as the first stack argument.
+//    3. Resets the batch: owner pointer dword_2075F58 = 0, descriptor
+//       count dword_207393C = 0; returns the device method's result.
+//
+//  ~33 call sites (one per registered state record, paired with its
+//  AddStateRegistration fields).
+// ============================================================
+static int SubmitStateRegistration(void *record)
+{
+    int idx = (int)g_stateDescCount;
+    F3StateDescriptor *e = &g_stateDescTable[idx];
+    e->field = 0xFF;
+    e->value = 0;
+    e->code1 = 0x11;
+    e->code2 = 0;
+    e->code3 = 0;
+    e->flags = 0;
+
+    int result = 0;
+    if (g_dword_1E2EEF4 != 0)   // null-guard; the original would fault pre-device
+        result = ((int (*)(void *, F3StateDescriptor *, void *))
+            (*(void ***)g_dword_1E2EEF4)[86])(g_dword_1E2EEF4, g_stateDescTable, record);
+    g_stateDescOwner = 0;
+    g_stateDescCount = 0;
+    return result;
+}
+
+// 36-byte frontend graphics state records (dword_212223C .. dword_212235C
+// in IDA, nine 0x24-byte records): {state object, field cursor (+4),
+// ...}.  Re-registered with the device by ReRegisterGraphicsState after a
+// device create / reset.  In this build they remain zero (no state object
+// is ever bound to them, so no flush path runs).
+struct F3StateRecord
+{
+    void  *stateObj;   // +0x00: registered state object (nonzero -> flushed on re-registration)
+    DWORD  data[8];    // +0x04: field slots (field N is written at data[N])
+};
+static F3StateRecord g_dword_212223C;
+static F3StateRecord g_dword_2122260;
+static F3StateRecord g_dword_2122284;
+static F3StateRecord g_dword_21222A8;
+static F3StateRecord g_dword_21222CC;
+static F3StateRecord g_unk_21222F0;
+static F3StateRecord g_unk_2122314;
+static F3StateRecord g_dword_2122338;
+static F3StateRecord g_dword_212235C;
+
+// ============================================================
+//  ReRegisterGraphicsState  (0x18CF6E0 - 0x18CF957)  -- re-register the
+//  nine frontend graphics state records with the device after a device
+//  create / reset.
+//  [NOT byte-identical] placement-dependent (33 relative calls to
+//  AddStateRegistration + 9 relative calls to SubmitStateRegistration)
+//  and refs the nine high-VA state records (dword_212223C ..
+//  dword_212235C) at their original addresses.
+//
+//  int ReRegisterGraphicsState(void)
+//
+//  For each of the nine records: the first AddStateRegistration call
+//  (size class 2, field 0, value 0, format class 0, flags 0) flushes any
+//  pending batch by committing the previously registered state object
+//  (record+0), appends the record's header descriptor (writing the field
+//  cursor record+4 = 8), the remaining calls append the record's field
+//  descriptors (all at field 0, advancing the record+4 cursor to a4 +
+//  the size-class delta), and the group ends with
+//  SubmitStateRegistration(&record), which terminates the batch and
+//  submits it to the device's state method (vtable slot 86).  Returns the
+//  last submit's device-method result (ignored by the caller).
+//
+//  Sole caller: ResetGraphicsSurfaces (0x18E6D40), right after
+//  ResetGraphicsEntities -- the "reset render state" step of the
+//  frontend graphics-surface re-init.  Replaces the sub_18CF6E0 no-op
+//  stub in ResetGraphicsSurfaces.
+// ============================================================
+static int ReRegisterGraphicsState(void)
+{
+    AddStateRegistration(2, (DWORD *)&g_dword_2122260, 0, 0,  0, 0);
+    AddStateRegistration(4, (DWORD *)&g_dword_2122260, 0, 12, 9, 0);
+    SubmitStateRegistration(&g_dword_2122260);
+
+    AddStateRegistration(2, (DWORD *)&g_dword_212223C, 0, 0,  0, 0);
+    AddStateRegistration(4, (DWORD *)&g_dword_212223C, 0, 12, 9, 0);
+    AddStateRegistration(1, (DWORD *)&g_dword_212223C, 0, 16, 5, 0);
+    SubmitStateRegistration(&g_dword_212223C);
+
+    AddStateRegistration(2, (DWORD *)&g_dword_21222A8, 0, 0, 0, 0);
+    SubmitStateRegistration(&g_dword_21222A8);
+
+    AddStateRegistration(2, (DWORD *)&g_dword_2122284, 0, 0,  0, 0);
+    AddStateRegistration(1, (DWORD *)&g_dword_2122284, 0, 12, 5, 0);
+    SubmitStateRegistration(&g_dword_2122284);
+
+    AddStateRegistration(2, (DWORD *)&g_dword_21222CC, 0, 0,  0, 0);
+    AddStateRegistration(1, (DWORD *)&g_dword_21222CC, 0, 12, 5, 0);
+    AddStateRegistration(1, (DWORD *)&g_dword_21222CC, 0, 20, 5, 1);
+    SubmitStateRegistration(&g_dword_21222CC);
+
+    AddStateRegistration(2, (DWORD *)&g_unk_21222F0, 0, 0,  0, 0);
+    AddStateRegistration(2, (DWORD *)&g_unk_21222F0, 0, 12, 3, 0);
+    AddStateRegistration(3, (DWORD *)&g_unk_21222F0, 0, 24, 5, 0);
+    AddStateRegistration(1, (DWORD *)&g_unk_21222F0, 0, 40, 5, 1);
+    AddStateRegistration(1, (DWORD *)&g_unk_21222F0, 0, 48, 5, 2);
+    SubmitStateRegistration(&g_unk_21222F0);
+
+    AddStateRegistration(2, (DWORD *)&g_unk_2122314, 0, 0,  0, 0);
+    AddStateRegistration(2, (DWORD *)&g_unk_2122314, 0, 12, 3, 0);
+    AddStateRegistration(3, (DWORD *)&g_unk_2122314, 0, 24, 5, 0);
+    AddStateRegistration(1, (DWORD *)&g_unk_2122314, 0, 40, 5, 1);
+    AddStateRegistration(1, (DWORD *)&g_unk_2122314, 0, 48, 5, 2);
+    AddStateRegistration(1, (DWORD *)&g_unk_2122314, 0, 56, 5, 3);
+    SubmitStateRegistration(&g_unk_2122314);
+
+    AddStateRegistration(2, (DWORD *)&g_dword_2122338, 0, 0,  0, 0);
+    AddStateRegistration(2, (DWORD *)&g_dword_2122338, 0, 12, 3, 0);
+    AddStateRegistration(4, (DWORD *)&g_dword_2122338, 0, 24, 9, 0);
+    SubmitStateRegistration(&g_dword_2122338);
+
+    AddStateRegistration(2, (DWORD *)&g_dword_212235C, 0, 0,  0, 0);
+    AddStateRegistration(2, (DWORD *)&g_dword_212235C, 0, 12, 3, 0);
+    AddStateRegistration(2, (DWORD *)&g_dword_212235C, 0, 24, 6, 0);
+    AddStateRegistration(2, (DWORD *)&g_dword_212235C, 0, 36, 7, 0);
+    AddStateRegistration(1, (DWORD *)&g_dword_212235C, 0, 48, 5, 0);
+    AddStateRegistration(1, (DWORD *)&g_dword_212235C, 0, 56, 5, 1);
+    AddStateRegistration(0, (DWORD *)&g_dword_212235C, 0, 64, 5, 2);
+    AddStateRegistration(4, (DWORD *)&g_dword_212235C, 0, 68, 9, 0);
+    return SubmitStateRegistration(&g_dword_212235C);
+}
+
 static int   sub_18D33B0(int a1, int *dims, int flags, int fmt)
     { (void)a1; (void)dims; (void)flags; (void)fmt; return 0; }  // create 2x1 surface
 static F3CsurfaceSlot *sub_18D36C0(F3CsurfaceSlot *slot, const F3CsurfaceSlot *src)
@@ -2484,13 +2732,60 @@ static int   sub_1A042B0(int *dims, int flags)
 static F3CsurfaceSlot *sub_1A046D0(F3CsurfaceSlot *slot, const F3CsurfaceSlot *src, int idx)
     { (void)src; (void)idx; if (slot != 0) slot->surface = 0; return slot; } // wrap texture slot idx
 
+// The graphics-entity subsystem callees (unimplemented in this build; their
+// real bodies live at the original addresses).  All are stubbed to no-ops /
+// trivial returns, so the pool rebuild, dirty registration, and device sync
+// below have no visible effect beyond the globals ResetGraphicsEntities itself
+// sets.  sub_18D02E0 is the tail-called sync step; its one unconditional side
+// effect (clearing the dirty-registration counter) is modelled here.
+static int sub_18CFA70(void) { return 0; }                       // rebuild the entity pool + index lists (dword_2073138 / dword_2073134)
+static int sub_18D04D0(void) { return 0; }                       // register the dirty entities (dword_2073940)
+static int sub_18D02E0(void) { g_dword_2073938 = 0; return 0; }  // sync/commit the entities to the device
+
+// ============================================================
+//  ResetGraphicsEntities  (0x18D1960 - 0x18D19AE)  -- reset and rebuild the
+//  frontend graphics-entity pool and rebind it to the device.
+//  [NOT byte-identical] placement-dependent (relative calls to the
+//  graphics-entity subsystem callees sub_18CFA70 / sub_18D04D0 / sub_18D02E0
+//  below and the memset IAT slot) and refs the high-VA globals (the
+//  dword_2120420 pool, the dword_2073938 / dword_2063134 counters, byte_211C402,
+//  dword_2075F54, byte_2075F4D) at their original addresses.
+//
+//  Flow (exactly the original 78-byte body):
+//    1. memset(&dword_2120420, 0, 0x1DF8)  -- zero the entity pool.
+//    2. dword_2073938 = 0; dword_2063134 = 0;  -- reset the two counters.
+//    3. sub_18CFA70();  -- rebuild the entity pool + index lists.
+//    4. byte_211C402 = 3;  -- set the subsystem state.
+//    5. dword_2075F54 = device;  -- bind the device object.
+//    6. byte_2075F4D = 0;  -- clear the sync flag.
+//    7. sub_18D04D0();  -- register the dirty entities.
+//    8. return sub_18D02E0();  -- sync/commit the entities to the device.
+//
+//  Called by ResetGraphicsSurfaces (0x18E6D40) with the current device object
+//  (dword_1E2EEF4) as the argument.  The return value is forwarded from the
+//  tail-called sync step (sub_18D02E0) and ignored by the caller.  Replaces
+//  the sub_18D1960 no-op stub in ResetGraphicsSurfaces.
+// ============================================================
+static int ResetGraphicsEntities(void *device)
+{
+    memset(&g_dword_2120420, 0, 0x1DF8);
+    g_dword_2073938 = 0;
+    g_dword_2063134 = 0;
+    sub_18CFA70();
+    g_byte_211C402  = 3;
+    g_dword_2075F54 = device;
+    g_byte_2075F4D  = 0;
+    sub_18D04D0();
+    return sub_18D02E0();
+}
+
 static void ResetGraphicsSurfaces(void)
 {
     int  flags = 0;
     BOOL fmt   = 0;
 
-    sub_18D1960(g_dword_1E2EEF4);
-    sub_18CF6E0();
+    ResetGraphicsEntities(g_dword_1E2EEF4);
+    ReRegisterGraphicsState();
     flags = g_byte_2075F05 != 0 ? 0x200 : 0;
     fmt   = (g_byte_2075F05 == 0);
 
@@ -2613,9 +2908,22 @@ static int WaitForEvent(void *obj, int dwMilliseconds, int bAlertable)
 // manager (dword_2075ED8) is not implemented in this build, so they return 0.
 void *GetHeapManager(void) { return 0; }
 void *GetHeapManagerSlot1C(void *hm) { (void)hm; return 0; }
-// 0x145D7B0: thiscall + one pushed int in the original: stores the pushed
-// int (the window handle) into dword_1DDC934, ignoring ECX. Stub no-op.
-static void sub_145D7B0(int slot, int hwnd) { (void)slot; (void)hwnd; }
+// 0x145D7B0  (0x145D7B0 - 0x145D7BC)  -- SetSoundHWND: __stdcall with one
+// pushed int: store the window handle into dword_1DDC934 and return it.
+//  [NOT byte-identical] refs the high-VA global dword_1DDC934 (0x01DDC934).
+//  The original 12 bytes:
+//    8B 44 24 04    mov eax, [esp+arg_0]
+//    A3 34 C9 DD 01 mov dword_1DDC934, eax
+//    C2 04 00       retn 4
+// dword_1DDC934 is the HWND the lazy DirectSound8 init (sub_146D480, which
+// reads it at 0x146D4A5) passes to SetCooperativeLevel (dwLevel = 2,
+// DSSCL_NORMAL). The only caller is RunFrontEnd (0x61D47B).
+static DWORD g_dword_1DDC934 = 0;   // 0x1DDC934: DirectSound SetCooperativeLevel window handle
+static int __stdcall SetSoundHWND(int hwnd)
+{
+    g_dword_1DDC934 = (DWORD)hwnd;
+    return (int)g_dword_1DDC934;
+}
 static void  sub_741E50(int a) { (void)a; }
 
 // Worker callback functions the frontend installs (their addresses are stored
@@ -3032,11 +3340,16 @@ signedIn:
         ((void (*)(void *, int))vt[10])(mgr, (unsigned char)g_byte_1DBD01F);
 
         HWND hwnd = (HWND)((int (*)(void *))vt[8])(GetManager());
-        // Original: push hwnd; sub_18FA3E0() -> sub_18FA3D0(ecx = ...) ->
-        // sub_145D7B0(ecx = ..., arg = hwnd) storing hwnd into dword_1DDC934.
-        void *hm   = GetHeapManager();
-        void *slot = GetHeapManagerSlot1C(hm);
-        sub_145D7B0((int)slot, (int)hwnd);
+        // Original: `push hwnd` once at 0x61D46C, then GetHeapManager
+        // (sub_18FA3E0) — which takes no argument; the push is the pending
+        // stdcall argument the decompiler mis-attributes to it — and
+        // GetHeapManagerSlot1C (sub_18FA3D0, thiscall); SetSoundHWND
+        // (sub_145D7B0) finally consumes the pushed hwnd, storing it into
+        // dword_1DDC934 (the DirectSound SetCooperativeLevel window handle).
+        // The stored value / return value are unused at this call site.
+        void *hm = GetHeapManager();
+        GetHeapManagerSlot1C(hm);
+        SetSoundHWND((int)hwnd);
         int c = (int)(DWORD)GetNetManager();
         int d = sub_6A69A0(c);
         sub_741E50(d);
