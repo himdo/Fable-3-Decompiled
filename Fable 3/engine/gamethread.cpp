@@ -14,6 +14,7 @@
 #include "manager.h"              // SetManager / DisposeManager / CManagerWin32Ctor
 #include "gameengine.h"           // CGameEngineCtor
 #include "gamemain.h"             // RunFrontEnd
+#include "netinit.h"              // g_dword_1DC2550/554 + CNetManagerShutdown
 
 #include <windows.h>
 #include <string.h>
@@ -734,7 +735,130 @@ void CGameEngineShutdown(CGameEngine *obj)
     }
 }
 
-static void  sub_61AE70(void *obj) { (void)obj; }                       // cleanup (part 2)
+// ---- the post-pump engine cleanup (CGameEngineCleanup, 0x61AE70) ---------
+//
+// Engine-service teardown + unimplemented callees of CGameEngineCleanup.
+//
+// The 0x18E-series engine-time / audio-queue teardown (remaining stubs):
+//  sub_18EC3E0  resets two global node lists (dword_20FD110 / dword_20FD0B4)
+//               and clears byte_2075F28; sub_18E7710  spin-waits (SwitchToThread)
+//               for byte_2075F38 to clear under stru_20FD1B4 (arming
+//               byte_2075F39 when it was set); sub_18E7830  drains four queue
+//               lists (sub_584870 release + list reset each) and frees the
+//               dword_1DB12E8 block through the heap table; sub_18E8B70  is
+//               sub_57FDF0() + dword_20FD1AC = 0.
+static void  EngineTimeReset(void) { }                                    // sub_18EC3E0
+static void  EngineTimeWaitIdle(void) { }                                 // sub_18E7710
+static void  EngineQueueDrain(void) { }                                   // sub_18E7830
+static void  EngineServiceStop(void) { }                                  // sub_18E8B70
+// sub_718C50 (sub_718140 + sub_17CA260) and the sub_1926120 -> sub_1922420
+// thunk: engine-subsystem stops (remaining stubs).
+static void  sub_718C50(void) { }
+static int   sub_1926120(void) { return 0; }
+// The +0xBC release chain (remaining stubs): sub_6AA2C0 clears the net
+// manager's +0x1C sub-object's internal list (sub_6AB810 + reset),
+// sub_6281B0 forwards to sub_5EDFE0 (the +0xBC object's release), and
+// sub_717AB0 frees the dword_1DC26E4 global (sub_19FEA30 / sub_19FE510
+// releases + LHFree).
+static void  sub_6AA2C0(void *obj) { (void)obj; }
+static void  sub_6281B0(int a) { (void)a; }
+static void  sub_717AB0(void) { }
+// nullsub_189 / nullsub_190: bare `retn` thunks (no-ops).
+static void  nullsub_189(void) { }
+static void  nullsub_190(void) { }
+
+// 0x6A6900 -- thiscall getter for the CNetManager's +0x1C sub-object.
+// (GetNetManager / sub_6A66C0 is canonical in netinit.cpp, extern via netinit.h.)
+static void *CNetManagerSlot1C(void *obj) { return *(void **)((char *)obj + 0x1C); }
+
+// ============================================================
+//  CGameEngineCleanup  (0x61AE70 - 0x61AF33)  -- post-pump engine cleanup
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  DestroyComponentsExcept, the engine-time teardowns, the net-manager
+//  teardown, the Win32 IAT slots, and the shared 0x6A72F0 epilogue).
+//
+//  void CGameEngineCleanup(CGameEngine *obj)
+//
+//  Called by GameThread right after CGameEngineShutdown on the RunFrontEnd
+//  success path. It drains the component list (DestroyComponentsExcept
+//  (obj, 0)), closes the +0xE8 handle (CloseHandle when nonzero), runs the
+//  engine-time / queue teardowns (sub_18EC3E0 / sub_18E7710 / sub_18E7830),
+//  dispatches the manager's vtable slot 2 (sub_18F6DC0 in the original),
+//  stops the engine services (sub_18E8B70 / sub_718C50 / sub_1926120), and
+//  sleeps 10 ms. It then releases the +0xC0 object through its deleting
+//  destructor (vtable[0](slot, 1), zeroed) and, when the +0xBC handle is
+//  set, clears the net manager's +0x1C sub-object list (sub_6A66C0 /
+//  sub_6A6900 / sub_6AA2C0), releases the +0xBC object (sub_6281B0, zeroed),
+//  and frees the dword_1DC26E4 global (sub_717AB0). The trailing no-op
+//  thunks (nullsub_189 / nullsub_190) lead into the shared 0x6A72F0
+//  epilogue: when the net-manager pair (dword_1DC2550 / dword_1DC2554) is
+//  active, it stops the net manager (CNetManagerShutdown, 0x6A70F0),
+//  releases the pair's SEH block (InterlockedDecrement; on zero the block's
+//  handler is invoked with its arg + LHFree), and clears both globals.
+//  The return register is discarded by the sole caller.
+// ============================================================
+void CGameEngineCleanup(CGameEngine *obj)
+{
+    DestroyComponentsExcept(obj, 0);
+
+    if (obj->member0xE8 != 0)
+    {
+        CloseHandle((HANDLE)obj->member0xE8);
+        obj->member0xE8 = 0;
+    }
+
+    EngineTimeReset();          // sub_18EC3E0
+    EngineTimeWaitIdle();       // sub_18E7710
+    EngineQueueDrain();         // sub_18E7830
+
+    void *mgr = GetManager();
+    if (mgr != 0)
+    {
+        void **vt = (void **)*(void **)mgr;
+        ((void (*)(void *))vt[2])(mgr);   // vtable slot 2 (offset 8)
+    }
+
+    EngineServiceStop();        // sub_18E8B70
+    sub_718C50();
+    (void)sub_1926120();
+    Sleep(10);
+
+    if (obj->member0xC0 != 0)
+        F3ReleaseOne(obj->member0xC0);   // vtable[0](slot, 1)
+    obj->member0xC0 = 0;
+
+    if (obj->member0xBC != 0)
+    {
+        sub_6AA2C0(CNetManagerSlot1C(GetNetManager()));
+        if (obj->member0xBC != 0)
+        {
+            sub_6281B0((int)obj->member0xBC);
+            obj->member0xBC = 0;
+        }
+        sub_717AB0();
+    }
+
+    nullsub_189();
+    nullsub_190();
+
+    // The shared 0x6A72F0 epilogue: tear down the net-manager pair.
+    if (g_dword_1DC2550 != 0)
+    {
+        CNetManagerShutdown((void *)g_dword_1DC2550);
+        if (g_dword_1DC2554 != 0)
+        {
+            F3SehBlock *block = (F3SehBlock *)g_dword_1DC2554;
+            if (InterlockedDecrement((volatile long *)&block->refcount) == 0)
+            {
+                block->handler(block->arg);
+                LHFree(block);
+            }
+        }
+        g_dword_1DC2554 = 0;
+        g_dword_1DC2550 = 0;
+    }
+}
+
 static void  sub_61C670(void *obj) { (void)obj; }                       // cleanup (part 3)
 static long  sub_401700(F3ObjReg *reg) { (void)reg; return 0; }         // free the debug handler
 
@@ -790,8 +914,8 @@ static void *HeapStressTest(void)
 //       box and ExitProcess(1).
 //    4. Runs the game (CGameEngineCtor, RunFrontEnd) and sets the exit code
 //       (dword_1DBD00C); on success it pumps the component shutdown
-//       (CGameEngineShutdown, sub_61AE70), then cleans up (sub_61C670,
-//       sub_401700).
+//       (CGameEngineShutdown, CGameEngineCleanup), then cleans up
+//       (sub_61C670, sub_401700).
 // ============================================================
 void GameThread(void *a1)
 {
@@ -919,7 +1043,7 @@ void GameThread(void *a1)
     if (RunFrontEnd(ArgList, arg) != 0)   // success -> run the component shutdown
     {
         CGameEngineShutdown((CGameEngine *)ArgList);
-        sub_61AE70(ArgList);
+        CGameEngineCleanup((CGameEngine *)ArgList);
         g_dword_1DBD00C = 0;   // process exit code (returned by RunGame)
     }
     else

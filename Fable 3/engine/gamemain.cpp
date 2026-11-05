@@ -2538,7 +2538,7 @@ static void ResetGraphicsSurfaces(void)
 
 static void  sub_619D70(void *p) { (void)p; }                     // _beginthread entry (no-op)
 static void  sub_61C320(void *p) { (void)p; }                     // _beginthread entry (no-op)
-static int   sub_6A66C0(void) { return 0; }
+// sub_6A66C0 is the canonical GetNetManager (netinit.cpp / netinit.h).
 static int   sub_6A6960(int a) { (void)a; return 0; }
 static int   sub_6A69A0(int a) { (void)a; return 0; }
 static void  sub_772190(int a) { (void)a; }
@@ -2911,7 +2911,7 @@ char RunFrontEnd(void *obj, int arg)
 signedIn:
     // 10. The signed-in continuation: front-end data + device construction.
     {
-        int a = sub_6A66C0();
+        int a = (int)(DWORD)GetNetManager();
         int b = sub_6A6960(a);
         sub_772190(b);
         sub_61B090(obj);
@@ -3007,7 +3007,7 @@ signedIn:
         void *hm   = GetHeapManager();
         void *slot = GetHeapManagerSlot1C(hm);
         sub_145D7B0((int)slot, (int)hwnd);
-        int c = sub_6A66C0();
+        int c = (int)(DWORD)GetNetManager();
         int d = sub_6A69A0(c);
         sub_741E50(d);
 

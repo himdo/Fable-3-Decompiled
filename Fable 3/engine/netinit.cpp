@@ -26,8 +26,10 @@ static DWORD g_dword_1DBE280 = 0;   // 0x1DBE280
 // The enable flag handed to LIONHEAD::StartupNetworking (0 = disabled).
 static BYTE  g_byte_1C86C17 = 0;    // 0x1C86C17
 // The current CNetManager + its SEH cleanup block (the manager pair).
-static DWORD g_dword_1DC2550 = 0;   // 0x1DC2550
-static DWORD g_dword_1DC2554 = 0;   // 0x1DC2554
+// Non-static (declared extern in netinit.h): CGameEngineCleanup tears the
+// pair down at the end of the game thread.
+DWORD g_dword_1DC2550 = 0;   // 0x1DC2550
+DWORD g_dword_1DC2554 = 0;   // 0x1DC2554
 
 // 0x1DBDDA8 - the global CNetLiveSystem (spans 0x1DBDDA8..0x1DBE280; the
 // ctor / dtor touch up through +0x4D7). The stubbed ctor / dtor below treat
@@ -36,8 +38,18 @@ static BYTE g_CNetLiveSystem[0x4D8] = { 0 };   // 0x1DBDDA8
 
 // Placeholder vtables for the objects the (stubbed) ctors construct.
 static void *g_CNetLiveSystemVtable[8]       = { 0 };
-static void *g_CNetManagerVtable[8]          = { 0 };
+static void *g_NToolsCBaseClassVtable[1]     = { 0 };
 static void *g_CNetPacketCallbackVtable[8]   = { 0 };
+
+// Forward declarations so the vtable (below) can reference the deleting
+// dtor (defined further down).
+static void *CNetManagerDtorBody(void *obj);
+static void *CNetManagerDtor(void *obj, int freeIt);
+
+// CNetManager vftable: slot 0 = the deleting dtor (sub_6A8600); the rest are
+// zero (nothing implemented yet dispatches through them).
+static void *g_CNetManagerVtable[8] = { CNetManagerDtor, 0, 0, 0, 0, 0, 0, 0 };
+static void *GetCNetManagerVtable(void) { return g_CNetManagerVtable; }
 
 // ============================================================
 //  xlive.dll imports
@@ -167,25 +179,25 @@ static void *CNetManagerCtor(void *obj)
 
 // ============================================================
 //  DisposeNetManager  (0x6A76C0 - 0x6A76D1)  -- the net-manager SEH handler
-//  [BYTE-IDENTICAL]
+//  [NOT byte-identical]
 //
 //  int DisposeNetManager(int arg)   (arg = the CNetManager, or 0)
 //
 //  Deleting-destructor dispatch: vtable[0](arg, 1).
+//
+//  The original is a 17-byte thiscall thunk (obj at [esp+4], `push 1; call
+//  [vtable[0]]; retn`) that the caller invokes thiscall-style. This build is
+//  driven through the SEH block as `block->handler(block->arg)` (a plain
+//  cdecl call, like the sibling DisposeManager/DisposeWorker), so the obj is
+//  read from the cdecl arg slot and the deleting destructor is dispatched
+//  as a plain call. Functionally identical (destroys + frees the CNetManager).
 // ============================================================
-static __declspec(naked) int DisposeNetManager(int arg)
+static int DisposeNetManager(int arg)
 {
-    __asm {
-        mov    ecx, [esp]
-        test   ecx, ecx
-        jz     DisposeNetManagerDone
-        mov    eax, [ecx]
-        mov    edx, [eax]
-        push   1
-        call   edx
-    DisposeNetManagerDone:
-        ret
-    }
+    if (arg == 0)
+        return 0;
+    void **vt = (void **)*(void **)(void *)arg;
+    return ((int (*)(void *, int))vt[0])((void *)arg, 1);
 }
 
 // ============================================================
@@ -242,6 +254,164 @@ static void *SetNetManager(void *obj)
 static int CNetManagerStart(void *obj)
 { (void)obj; return 0; }
 
+// The CNetManagerShutdown direct-release callees (remaining stubs): the
+// +0x10 sub-object release (thiscall + a 0 flag), the +0x34 sub-object
+// release, and the +0x10 sub-object dtor. All slots are zero in this build,
+// so the only observable effect is the slot zeroing + LHFree calls below.
+static void CNetMgr10Release(void *obj, int flag) { (void)flag; (void)obj; }   // sub_6834D0
+static void CNetMgr34Release(void *obj) { (void)obj; }                          // sub_6A84C0
+static void CNetMgr10Dtor(void *obj) { (void)obj; }                             // sub_692830
+
+// Release a vtable object through vtable slot 0 with a 1 (the original's
+// `obj->vtable[0](obj, 1)` dispatch).
+static void CNetReleaseOne(void *o)
+{
+    void **vt = (void **)*(void **)o;
+    ((void (*)(void *, int))vt[0])(o, 1);
+}
+
+// ============================================================
+//  CNetManagerShutdown  (0x6A70F0 - 0x6A720C)  -- the 80-byte CNetManager
+//  teardown (CGameEngineCleanup's net-manager stop)
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  CNetMgr10Release / CNetMgr34Release / CNetMgr10Dtor / LHFree and the
+//  sub-object vtable dispatches).
+//
+//  void CNetManagerShutdown(void *obj)
+//
+//  Tears the net manager down in place: releases the +0x10 sub-object
+//  (sub_6834D0(slot, 0), unconditional) and LHFrees the +0x38 sub-object
+//  (unconditional), then releases the +0x34 sub-object (sub_6A84C0 + LHFree),
+//  +0x20/+0x1C/+0x18/+0x14/+0x0C/+0x48/+0x08/+0x04 (vtable[0](slot, 1)), the
+//  +0x10 sub-object (sub_692830 + LHFree), and +0x2C/+0x24/+0x28
+//  (vtable[0](slot, 1)) -- every slot zeroed. Returns nothing (the return
+//  register is discarded by the sole caller).
+// ============================================================
+void CNetManagerShutdown(void *obj)
+{
+    DWORD *dw = (DWORD *)obj;
+
+    CNetMgr10Release((void *)dw[0x10 / 4], 0);
+    LHFree((void *)dw[0x38 / 4]);
+    dw[0x38 / 4] = 0;
+
+    if (dw[0x34 / 4] != 0)
+    {
+        CNetMgr34Release((void *)dw[0x34 / 4]);
+        LHFree((void *)dw[0x34 / 4]);
+    }
+    dw[0x34 / 4] = 0;
+
+    if (dw[0x20 / 4] != 0) { CNetReleaseOne((void *)dw[0x20 / 4]); } dw[0x20 / 4] = 0;
+    if (dw[0x1C / 4] != 0) { CNetReleaseOne((void *)dw[0x1C / 4]); } dw[0x1C / 4] = 0;
+    if (dw[0x18 / 4] != 0) { CNetReleaseOne((void *)dw[0x18 / 4]); } dw[0x18 / 4] = 0;
+    if (dw[0x14 / 4] != 0) { CNetReleaseOne((void *)dw[0x14 / 4]); } dw[0x14 / 4] = 0;
+    if (dw[0x0C / 4] != 0) { CNetReleaseOne((void *)dw[0x0C / 4]); } dw[0x0C / 4] = 0;
+    if (dw[0x48 / 4] != 0) { CNetReleaseOne((void *)dw[0x48 / 4]); } dw[0x48 / 4] = 0;
+    if (dw[0x08 / 4] != 0) { CNetReleaseOne((void *)dw[0x08 / 4]); } dw[0x08 / 4] = 0;
+    if (dw[0x04 / 4] != 0) { CNetReleaseOne((void *)dw[0x04 / 4]); } dw[0x04 / 4] = 0;
+
+    if (dw[0x10 / 4] != 0)
+    {
+        CNetMgr10Dtor((void *)dw[0x10 / 4]);
+        LHFree((void *)dw[0x10 / 4]);
+    }
+    dw[0x10 / 4] = 0;
+
+    if (dw[0x2C / 4] != 0) { CNetReleaseOne((void *)dw[0x2C / 4]); } dw[0x2C / 4] = 0;
+    if (dw[0x24 / 4] != 0) { CNetReleaseOne((void *)dw[0x24 / 4]); } dw[0x24 / 4] = 0;
+    if (dw[0x28 / 4] != 0) { CNetReleaseOne((void *)dw[0x28 / 4]); } dw[0x28 / 4] = 0;
+}
+
+// ============================================================
+//  CNetPacketCallbackDtor  (0x1898510 - 0x1898553)  -- [remaining stub]
+//
+//  The CNetManager's +0x3C CNetPacketCallback (DNameNode base) dtor: stores
+//  the NTools::CBaseObject vtable, releases the +4 node through the heap,
+//  then stores the NTools::CBaseClass vtable and zeroes the node. Out of
+//  scope: the packet-callback object is a placeholder in this build.
+// ============================================================
+static void *CNetPacketCallbackDtor(void *obj) { (void)obj; return obj; }
+
+// 0x18984C0 -- the NTools::CBaseClass base dtor (vtable store).
+static void CNetBaseClassDtor(void *obj)
+{
+    *(void **)obj = g_NToolsCBaseClassVtable;
+}
+
+// ============================================================
+//  CNetManagerDtorBody  (0x6A6C70 - 0x6A6DAA)  -- the 80-byte CNetManager
+//  dtor body (restores the vtable first, runs the base dtor last)
+//  [NOT byte-identical] placement-dependent (relative calls to the
+//  CNetPacketCallback dtor, LHFree, the sub-object vtable dispatches, and
+//  the tail jmp CBaseClassDtor).
+//
+//  void *CNetManagerDtorBody(void *obj)
+//
+//  Restores the CNetManager vtable, then releases in order: +0x48
+//  (vtable[0](slot, 1)), the +0x3C packet callback (CNetPacketCallbackDtor),
+//  the +0x38 sub-object (LHFree, unconditional), +0x34 (sub_6A84C0 + LHFree),
+//  +0x30/+0x2C/+0x28/+0x24/+0x20/+0x1C/+0x18/+0x14 (vtable[0](slot, 1)),
+//  +0x10 (sub_692830 + LHFree), and +0x0C/+0x08/+0x04
+//  (vtable[0](slot, 1)) -- every slot zeroed -- and tail-calls the
+//  NTools::CBaseClass base dtor.
+// ============================================================
+static void *CNetManagerDtorBody(void *obj)
+{
+    DWORD *dw = (DWORD *)obj;
+    *(void **)obj = GetCNetManagerVtable();   // restore the CNetManager vtable
+
+    if (dw[0x48 / 4] != 0) { CNetReleaseOne((void *)dw[0x48 / 4]); } dw[0x48 / 4] = 0;
+    CNetPacketCallbackDtor((char *)obj + 0x3C);   // sub_1898510
+    LHFree((void *)dw[0x38 / 4]);
+    dw[0x38 / 4] = 0;
+    if (dw[0x34 / 4] != 0)
+    {
+        CNetMgr34Release((void *)dw[0x34 / 4]);
+        LHFree((void *)dw[0x34 / 4]);
+    }
+    dw[0x34 / 4] = 0;
+    if (dw[0x30 / 4] != 0) { CNetReleaseOne((void *)dw[0x30 / 4]); } dw[0x30 / 4] = 0;
+    if (dw[0x2C / 4] != 0) { CNetReleaseOne((void *)dw[0x2C / 4]); } dw[0x2C / 4] = 0;
+    if (dw[0x28 / 4] != 0) { CNetReleaseOne((void *)dw[0x28 / 4]); } dw[0x28 / 4] = 0;
+    if (dw[0x24 / 4] != 0) { CNetReleaseOne((void *)dw[0x24 / 4]); } dw[0x24 / 4] = 0;
+    if (dw[0x20 / 4] != 0) { CNetReleaseOne((void *)dw[0x20 / 4]); } dw[0x20 / 4] = 0;
+    if (dw[0x1C / 4] != 0) { CNetReleaseOne((void *)dw[0x1C / 4]); } dw[0x1C / 4] = 0;
+    if (dw[0x18 / 4] != 0) { CNetReleaseOne((void *)dw[0x18 / 4]); } dw[0x18 / 4] = 0;
+    if (dw[0x14 / 4] != 0) { CNetReleaseOne((void *)dw[0x14 / 4]); } dw[0x14 / 4] = 0;
+    if (dw[0x10 / 4] != 0)
+    {
+        CNetMgr10Dtor((void *)dw[0x10 / 4]);
+        LHFree((void *)dw[0x10 / 4]);
+    }
+    dw[0x10 / 4] = 0;
+    if (dw[0x0C / 4] != 0) { CNetReleaseOne((void *)dw[0x0C / 4]); } dw[0x0C / 4] = 0;
+    if (dw[0x08 / 4] != 0) { CNetReleaseOne((void *)dw[0x08 / 4]); } dw[0x08 / 4] = 0;
+    if (dw[0x04 / 4] != 0) { CNetReleaseOne((void *)dw[0x04 / 4]); } dw[0x04 / 4] = 0;
+
+    CNetBaseClassDtor(obj);   // tail jmp CBaseClassDtor
+    return obj;
+}
+
+// ============================================================
+//  CNetManagerDtor  (0x6A8600 - 0x6A861B)  -- the CNetManager deleting dtor
+//  (vtable slot 0; DisposeNetManager's dispatch target)
+//  [NOT byte-identical] placement-dependent (relative calls to the dtor body
+//  and LHFree; thiscall + `retn 4`).
+//
+//  The original is thiscall + `retn 4` (obj in ECX, freeIt on the stack,
+//  callee cleans the arg). This build dispatches it as a plain call through
+//  the vtable (see DisposeNetManager), so it is a plain function taking the
+//  obj explicitly. The body + free step matches the original.
+// ============================================================
+static void *CNetManagerDtor(void *obj, int freeIt)
+{
+    CNetManagerDtorBody(obj);
+    if (freeIt & 1)
+        LHFree(obj);
+    return obj;
+}
+
 // ============================================================
 //  InitNetworking  (0x6A7210 - 0x6A72EF)  -- the network-subsystem
 //  bootstrap (RunFrontEnd calls it first, right after InitEngineTime)
@@ -289,4 +459,18 @@ int InitNetworking(void)
     mgr = (mgr != 0) ? CNetManagerCtor(mgr) : 0;
     SetNetManager(mgr);
     return CNetManagerStart((void *)g_dword_1DC2550);
+}
+
+// ============================================================
+//  GetNetManager  (sub_6A66C0)  -- the current CNetManager getter
+//  [NOT byte-identical] placement-dependent (absolute ref to the global).
+//
+//  void *GetNetManager(void)
+//
+//  Returns the current CNetManager (g_dword_1DC2550), or 0 when no net
+//  manager is installed.
+// ============================================================
+void *GetNetManager(void)
+{
+    return (void *)g_dword_1DC2550;
 }

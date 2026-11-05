@@ -71,6 +71,9 @@ static __declspec(naked) void *CManagerWin32_Dtor(void)
 //
 //  slot 1  (0x04)  "run the game" -- the big start-up dispatch. Returns 1 so the
 //              frontend proceeds down the success path.
+//  slot 2  (0x08)  sub_18F6DC0 -- returns *(dword_20FC8F0 + 568) (the
+//              worker-pair global's +0x238 word); CGameEngineCleanup calls it
+//              on shutdown and discards the result, so 0 here matches.
 //  slot 8  (0x20)  GetWindow -- the manager's HWND (0 = none, the desktop).
 //  slot 10 (0x28)  a flag setter called as (this, byte).
 //  slot 12 (0x30)  a setter called as (this, 1) on the sign-in paths.
@@ -81,13 +84,15 @@ static int CManagerWin32_RunGame(void *obj, int a1, int a2, int a3, int a4,
     (void)a6; (void)a7; (void)a8;
     return 1;
 }
+static int  CManagerWin32_GetPlus568(void *obj) { (void)obj; return 0; }
 static void *CManagerWin32_GetWindow(void *obj) { (void)obj; return 0; }
 static void  CManagerWin32_SetFlag(void *obj, int flag) { (void)obj; (void)flag; }
 
 static void *g_CManagerWin32Vtable[16] = {
     (void *)CManagerWin32_Dtor,        // 0
     (void *)CManagerWin32_RunGame,     // 1
-    0, 0, 0, 0, 0, 0,                  // 2..7
+    (void *)CManagerWin32_GetPlus568,  // 2
+    0, 0, 0, 0, 0,                     // 3..7
     (void *)CManagerWin32_GetWindow,   // 8
     0,                                 // 9
     (void *)CManagerWin32_SetFlag,     // 10
