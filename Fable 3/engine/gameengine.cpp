@@ -129,6 +129,12 @@ static void *CGameEngineSubCtor(void *obj, void *a2, void *a3)
 // 0x1DBD9DC: the current game engine object (set by CGameEngineCtor, cleared by the dtor).
 static void *g_GameEngine = 0;
 
+// SetGameEngineInstance -- publish (or clear with 0) the current instance.
+void SetGameEngineInstance(void *obj)
+{
+    g_GameEngine = obj;
+}
+
 // ============================================================
 //  CGameEngineCtor  (0x61C530 - 0x61C66C)  -- construct the game engine
 //  [NOT byte-identical] placement-dependent (relative calls to LHAlloc,

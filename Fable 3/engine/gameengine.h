@@ -2,8 +2,9 @@
 //
 // The engine object lives in a 356-byte stack buffer inside GameThread
 // (ArgList in IDA). It is constructed by CGameEngineCtor, run by RunFrontEnd
-// (0x61CB70), and torn down by sub_61C670. The current instance is published into the
-// global dword_1DBD9DC (read back by the getter sub_619A90).
+// (0x61CB70), and torn down by CGameEngineDestroy (0x61C670). The current
+// instance is published into the global dword_1DBD9DC (read back by the
+// getter sub_619A90).
 #ifndef F3_GAMEENGINE_H
 #define F3_GAMEENGINE_H
 
@@ -91,8 +92,7 @@ typedef struct CGameEngine
     void *           member0xB8;    // +0xB8
     void *           member0xBC;    // +0xBC
     void *           member0xC0;    // +0xC0
-    char             member0xC4;    // +0xC4
-    char             _pad5[3];      // +0xC5 .. +0xC8
+    void *           member0xC4;    // +0xC4
     void *           sub0xC8Node;   // +0xC8
     char             _pad6[12];     // +0xCC .. +0xD8
     char             _pad7[8];      // +0xD8 .. +0xE0
@@ -110,5 +110,10 @@ typedef char CGameEngineSizeCheck[(sizeof(CGameEngine) == 356) ? 1 : -1];
 
 // CGameEngineCtor (0x61C530) -- construct the 356-byte game engine in place.
 void *CGameEngineCtor(void *obj);
+
+// 0x1DBD9DC -- publish (or clear with 0) the current engine instance; the
+// setter half of the global written by CGameEngineCtor and cleared by
+// CGameEngineDestroy.
+void SetGameEngineInstance(void *obj);
 
 #endif  // F3_GAMEENGINE_H

@@ -2553,7 +2553,24 @@ static void  sub_719770(void) {}
 static int   sub_1801C20(void) { return 0; }
 static void  sub_4358A0(void *obj, const char *name) { (void)obj; (void)name; }
 static void  sub_1801580(void *obj, void *str) { (void)obj; (void)str; }
-static void *sub_767360(void *obj) { return obj; }
+// Placeholder vtables for the frontend's stub-constructed engine members.
+// The original constructors store real vtables (NUI::CLoadingScreen, 0x7330F0;
+// CGameRenderer, 0x72FB30; NUI::CFullScreenMoviePlayer, 0x731B80; 0x767360:
+// CPackageManager); those tables are unimplemented in this build, but slot 0
+// (the `vt[0](obj, 1)` release dispatch used by RunFrontEnd's old-value frees
+// and by CGameEngineDestroy) must be a callable no-op so the teardown does not
+// dispatch through unconstructed memory.
+static void F3StubRelease(void *obj, int freeIt) { (void)obj; (void)freeIt; }
+static void *g_CLoadingScreenVtable[2]         = { (void *)F3StubRelease, 0 };
+static void *g_CGameRendererVtable[2]          = { (void *)F3StubRelease, 0 };
+static void *g_CFullScreenMoviePlayerVtable[2] = { (void *)F3StubRelease, 0 };
+static void *g_CPackageManagerVtable[2]        = { (void *)F3StubRelease, 0 };
+
+// sub_767360 -- CPackageManager ctor (0x30 bytes): stub stores the
+// placeholder vtable and zeroes +4/+8.
+static void *sub_767360(void *obj)
+{ *(void **)obj = g_CPackageManagerVtable; *(void **)((char *)obj + 4) = 0;
+  *(void **)((char *)obj + 8) = 0; return obj; }
 static void *sub_762490(void *obj, void *a) { (void)a; return obj; }
 static void  sub_6234A0(void *obj) { (void)obj; }
 static void  sub_7672E0(void *obj) { (void)obj; }
@@ -2626,8 +2643,14 @@ static int   sub_18E8960(int a, int b) { (void)a; (void)b; return 0; }
 static void  sub_18E8D50(void *obj, int a) { (void)obj; (void)a; }
 static void  sub_18E7180(void) {}
 static void  sub_18E84C0(void) {}
-static void *sub_7330F0(void *obj) { return obj; }
-static void *sub_72FB30(void *obj) { return obj; }
+// sub_7330F0 -- NUI::CLoadingScreen ctor (0x58 bytes): stub stores the
+// placeholder vtable and zeroes +4 (the CS slot).
+static void *sub_7330F0(void *obj)
+{ *(void **)obj = g_CLoadingScreenVtable; *(void **)((char *)obj + 4) = 0; return obj; }
+// sub_72FB30 -- CGameRenderer ctor (8 bytes): stub stores the placeholder
+// vtable and zeroes +4 (the impl slot).
+static void *sub_72FB30(void *obj)
+{ *(void **)obj = g_CGameRendererVtable; *(void **)((char *)obj + 4) = 0; return obj; }
 static void  sub_72FB10(void *obj, void *argList, void *a, void *b)
 { (void)obj; (void)argList; (void)a; (void)b; }
 static void  nullsub_28(int a) { (void)a; }
@@ -2636,8 +2659,15 @@ static void  sub_18F0180(void) {}
 static void  sub_72FAE0(void *obj) { (void)obj; }
 static void  sub_61BFE0(void *obj, int a) { (void)obj; (void)a; }
 static void  sub_61A5E0(void *obj) { (void)obj; }
-static void *sub_731B80(void *obj) { return obj; }
-static void *sub_712430(void *obj) { return obj; }
+// sub_731B80 -- NUI::CFullScreenMoviePlayer ctor (8 bytes): stub stores the
+// placeholder vtable and zeroes +4.
+static void *sub_731B80(void *obj)
+{ *(void **)obj = g_CFullScreenMoviePlayerVtable; *(void **)((char *)obj + 4) = 0; return obj; }
+// sub_712430 -- the 8-byte {value, SEH block} wrapper ctor: zeroes both words
+// (the original then allocates the 96-byte impl and registers it via
+// sub_7172D0, which the stub skips; the SEH slot stays 0).
+static void *sub_712430(void *obj)
+{ *(void **)obj = 0; *(void **)((char *)obj + 4) = 0; return obj; }
 static void  nullsub_29(void) {}
 static void  sub_18FB930(void) {}
 

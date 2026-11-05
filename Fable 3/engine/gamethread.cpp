@@ -859,8 +859,415 @@ void CGameEngineCleanup(CGameEngine *obj)
     }
 }
 
-static void  sub_61C670(void *obj) { (void)obj; }                       // cleanup (part 3)
-static long  sub_401700(F3ObjReg *reg) { (void)reg; return 0; }         // free the debug handler
+// sub_72F8E0 / sub_72F7E0 / sub_72F7D0 -- the CGameRenderer debug/log
+//   family: the 0x72F8E0 flag getter (impl+136 byte), the 0x72F7E0 flush
+//   (sub_72FC70 on the impl), and the 0x72F7D0 log flush (sub_19E1FA0).
+//   Remaining stubs: the renderer's 776-byte impl is not constructed in this
+//   build, so the flag is always 0 and the flushes are no-ops.
+static int   sub_72F8E0(void *obj) { (void)obj; return 0; }
+static void  sub_72F7E0(void *obj) { (void)obj; }
+static void  sub_72F7D0(void *obj) { (void)obj; }
+
+// sub_6234A0 (0x6234A0) -- the 0x120-byte object's dtor (nine 28-byte
+//   elements, each released through sub_4890E0). Remaining stub: its element
+//   releases are unimplemented and the object here is a stub-constructed raw
+//   block.
+static void  sub_6234A0(void *obj) { (void)obj; }
+
+// sub_627690 (0x627690) -- the 0x2E0-byte net object's dtor (nine nested
+//   lists + CNetPacketCallbackDtor + ReleaseSharedSlot). Remaining stub.
+static void  sub_627690(void *obj) { (void)obj; }
+
+// sub_18EB1A0 (0x18EB1A0) -- the 0x38-byte object's dtor (DeleteCriticalSection
+//   at +32, sub_578A40, then a virtual call through the global vtable at
+//   0x2075B24+16). Remaining stub.
+static void  sub_18EB1A0(void *obj) { (void)obj; }
+
+// ============================================================
+//  SubNodeTreeDtor  (0x625BB0 - 0x625C2F)  -- recursive node-tree destructor
+//  [NOT byte-identical] placement-dependent (relative recursive call, the
+//  vtable slot 2 dispatch, and the LHFree calls).
+//
+//  void SubNodeTreeDtor(void *node)
+//
+//  stdcall. Walks the node list rooted at `node` (circular, +0 links) while
+//  the node's +0x29 flag byte is 0 (the 12/44-byte sentinels carry 1 and stop
+//  the walk): recurses into the child list (+8), releases every entry of the
+//  +0x1C..+0x20 entry array through vtable slot 2 and frees the array, zeroes
+//  +0x1C/+0x20/+0x24, frees the +0x10 pointer's object, and frees the node.
+// ============================================================
+static void SubNodeTreeDtor(void *node)
+{
+    for (;; node = *(void **)node)
+    {
+        char *b = (char *)node;
+        if (*(BYTE *)(b + 0x29) != 0)
+            break;
+
+        SubNodeTreeDtor(*(void **)(b + 8));          // the child list
+
+        void *arr  = *(void **)(b + 0x1C);
+        void *next = *(void **)b;
+        if (arr != 0)
+        {
+            for (void *j = *(void **)(b + 0x20); arr != j; j = (char *)j + 4)
+            {
+                void *v = *(void **)j;
+                if (v != 0)
+                    ((void (*)(void *))((void **)*(void **)v)[2])(v);
+            }
+            LHFree(arr);
+        }
+
+        *(void **)(b + 0x1C) = 0;
+        *(void **)(b + 0x20) = 0;
+        *(void **)(b + 0x24) = 0;
+        LHFree(*(void **)(b + 0x10));
+        LHFree(node);
+        node = next;
+    }
+}
+
+// ============================================================
+//  SubListDtor  (0x626420 - 0x6266A3)  -- the +0xC8 sub-object list dtor
+//  [NOT byte-identical] placement-dependent (relative calls to SubNodeTreeDtor).
+//
+//  void *SubListDtor(void *obj, void *out, void *a3, void *a4, void *a5, void *a6)
+//
+//  Thiscall on the +0xC8 sub-object. The iterator pair (a3/a5 = the 4-byte
+//  heap node, a4/a6 = the 44-byte sentinel block) always satisfies the
+//  empty-list checks as called from CGameEngineDestroy, so the live path is:
+//  SubNodeTreeDtor on the last node, self-relink the sentinel, zero the count
+//  (+0x1C), and set the out pair to {0, first} then {*this, first}.
+// ============================================================
+static void *SubListDtor(void *obj, void *out, void *a3, void *a4, void *a5, void *a6)
+{
+    (void)a4; (void)a6;
+    char *b = (char *)obj;
+    void *block = *(void **)(b + 0x18);
+
+    SubNodeTreeDtor(*(void **)((char *)block + 4));
+    *(void **)((char *)block + 4) = block;
+    *(void **)(b + 0x1C)          = 0;
+    *(void **)block               = block;
+    *(void **)((char *)block + 8) = block;
+
+    void **o = (void **)out;
+    o[0] = 0;
+    o[1] = *(void **)block;
+    o[0] = *(void **)b;
+    return out;
+}
+
+// ============================================================
+//  SehBlockArrayDtor  (0x622C00 - 0x622C53)  -- release an SEH-block array
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  InterlockedDecrement and LHFree).
+//
+//  void SehBlockArrayDtor(void *begin, void *end)
+//
+//  For every 8-byte entry in [begin, end): release the SEH block at +4
+//  (refcount, handler, arg) when its refcount drops to zero, then zero both
+//  words. The extra two arguments the original caller pushes are unused.
+// ============================================================
+static void SehBlockArrayDtor(void *begin, void *end)
+{
+    for (char *i = (char *)begin; i != (char *)end; i += 8)
+    {
+        void *block = *(void **)(i + 4);
+        if (block != 0 && InterlockedDecrement((volatile LONG *)block) == 0)
+        {
+            void **b = (void **)block;
+            ((void (*)(void *))b[1])(b[2]);
+            LHFree(block);
+        }
+        *(void **)i       = 0;
+        *(void **)(i + 4) = 0;
+    }
+}
+
+// Release a direct F3SehBlock pointer ({refcount, handler, arg}): decrement
+// the refcount, and at zero invoke the handler on the arg and free the block.
+static void F3SehBlockRelease(void *p)
+{
+    if (p == 0)
+        return;
+    if (InterlockedDecrement((volatile LONG *)p) == 0)
+    {
+        void **b = (void **)p;
+        ((void (*)(void *))b[1])(b[2]);
+        LHFree(p);
+    }
+}
+
+// Reset one CGameVersion node list (12-byte sentinel at `headSlot`, 4-byte
+// heap node at `nodeSlot`, count at headSlot+1): self-relink the sentinel,
+// zero the count, free every list node, free the sentinel, zero the head
+// slot, and free the heap node.
+static void VersionListDtor(void **headSlot, void **nodeSlot)
+{
+    void *head = *headSlot;
+    void *node = *(void **)head;
+    *(void **)head              = head;
+    *(void **)((char *)head + 4) = head;
+    headSlot[1]                 = 0;
+    for (;; node = *(void **)node)
+    {
+        if (node == head)
+            break;
+        LHFree(node);
+    }
+    LHFree(head);
+    *headSlot  = 0;
+    LHFree(*nodeSlot);
+}
+
+// ============================================================
+//  CGameEngineDestroy  (0x61C670 - 0x61CB62)  -- the game engine destructor
+//  [NOT byte-identical] placement-dependent (relative calls to the component
+//  vtable slot 0, LHFree, the CRT DeleteCriticalSection, and the remaining
+//  stubs above) and it writes the high-VA global dword_1DBD9DC.
+//
+//  void CGameEngineDestroy(CGameEngine *obj)
+//
+//  Thiscall. The third and last of the post-game teardown trio (it runs
+//  after CGameEngineCleanup on both the success and failure paths of
+//  RunFrontEnd). It: flushes the CGameRenderer (+0x9C) through the 0x72F7xx
+//  log family; releases every component on the node list through vtable slot
+//  0 (freeIt = 1), walking the +0 links from the front node to the back;
+//  resets the node list to empty and frees its nodes; clears the
+//  current-instance global (dword_1DBD9DC) and deletes cs3 (+0x148); tears
+//  down the three CGameVersion lists (+0x108/+0x124/+0x140); destroys the
+//  +0xC8 sub-object's list and frees its 44-byte block and 4-byte heap node;
+//  releases member0xC4/member0xC0/member0xB8 (vtable slot 0) and frees the
+//  8-byte SEH wrapper at member0xB4; frees the member0xB0 (0x6234A0) and
+//  member0xA8 (0x627690) objects; releases the direct SEH-block members
+//  member0xA4/member0x94/member0x8C, zeroing their +0xA0/+0x90/+0x88
+//  partners; releases member0x9C (vtable slot 0) and frees the member0x98
+//  object (0x18EB1A0); invokes vtable slot 2 on member0x7C/member0x78 (not
+//  zeroed); deletes cs2 (+0x60) and cs1 (+0x48); destroys the +0x30
+//  sub-object's SEH array (0x622C00) and frees sub0x30A and the 4-byte heap
+//  node (+0x30), zeroing sub0x30A/B/C; releases member0x2C/member0x28
+//  (vtable slot 0); resets the node list a second time, this time also
+//  freeing the 12-byte sentinel and zeroing listFirst; and frees the 4-byte
+//  heap node (+0x00).
+// ============================================================
+static void CGameEngineDestroy(CGameEngine *obj)
+{
+    // 1. The CGameRenderer (+0x9C): the 0x72F7xx debug/log family.
+    if (obj->member0x9C != 0)
+    {
+        if (sub_72F8E0(obj->member0x9C) != 0)
+            sub_72F7E0(obj->member0x9C);
+        sub_72F7D0(obj->member0x9C);
+    }
+
+    // 2. Release every component on the node list (vtable slot 0, freeIt = 1),
+    //    walking the +0 links from the front node to the back.
+    void *head = obj->listFirst;
+    obj->listLast = obj->heapNode;
+    void *cur = *(void **)head;
+    for (;; cur = *(void **)cur)
+    {
+        obj->listSentinel = cur;
+        if (obj->listLast == 0 || obj->listLast != obj->heapNode)
+            F3InvalidParam();
+        if (cur == head)
+            break;
+        void *val = *(void **)((char *)cur + 8);
+        if (val != 0)
+            F3ReleaseOne(val);
+    }
+
+    // 3. Reset the list to empty (the sentinel is kept), free the nodes, and
+    //    reset the iterator pair to {heapNode, head}.
+    head = obj->listFirst;
+    {
+        void *node = *(void **)head;
+        *(void **)head              = head;
+        *(void **)((char *)head + 4) = head;
+        obj->listCount = 0;
+        for (;; node = *(void **)node)
+        {
+            if (node == head)
+                break;
+            LHFree(node);
+        }
+    }
+    obj->listLast     = obj->heapNode;
+    obj->listSentinel = head;
+
+    SetGameEngineInstance(0);            // dword_1DBD9DC = 0
+    DeleteCriticalSection(&obj->cs3);
+
+    // 4. The three CGameVersion lists (+0x108/+0x124/+0x140).
+    CGameVersion *v = &obj->version;
+    VersionListDtor(&v->list1Head, &v->node1);
+    VersionListDtor(&v->list2Head, &v->node2);
+    VersionListDtor(&v->list3Head, &v->node3);
+
+    // 5. The +0xC8 sub-object: reset its +0xE0 list, free the 44-byte block,
+    //    zero +0xE0/+0xE4, free the 4-byte heap node.
+    {
+        void *out[2];
+        void *block  = obj->sub0xE0Block;
+        void *nodeC8 = obj->sub0xC8Node;
+        SubListDtor((char *)obj + 0xC8, out, nodeC8, *(void **)block,
+                    nodeC8, block);
+        LHFree(block);
+        obj->sub0xE0Block = 0;
+        obj->sub0xE4Count = 0;
+        LHFree(obj->sub0xC8Node);
+    }
+
+    // 6. The component members (vtable slot 0 releases, then zero).
+    if (obj->member0xC4 != 0)
+        F3ReleaseOne(obj->member0xC4);
+    obj->member0xC4 = 0;
+    if (obj->member0xC0 != 0)
+        F3ReleaseOne(obj->member0xC0);
+    obj->member0xC0 = 0;
+    if (obj->member0xB8 != 0)
+        F3ReleaseOne(obj->member0xB8);
+    obj->member0xB8 = 0;
+
+    // 7. member0xB4: the 8-byte {value, SEH block} wrapper (sub_712430 shape).
+    if (obj->member0xB4 != 0)
+    {
+        void *w     = obj->member0xB4;
+        void *block = *(void **)((char *)w + 4);
+        if (block != 0 && InterlockedDecrement((volatile LONG *)block) == 0)
+        {
+            void **b = (void **)block;
+            ((void (*)(void *))b[1])(b[2]);
+            LHFree(block);
+        }
+        *(void **)w       = 0;
+        *(void **)((char *)w + 4) = 0;
+        LHFree(w);
+    }
+    obj->member0xB4 = 0;
+
+    // 8. member0xB0: the 0x120-byte object (0x6234A0 dtor) + free.
+    if (obj->member0xB0 != 0)
+    {
+        sub_6234A0(obj->member0xB0);
+        LHFree(obj->member0xB0);
+    }
+    obj->member0xB0 = 0;
+
+    // 9. member0xAC: vtable slot 0 release + zero.
+    if (obj->member0xAC != 0)
+        F3ReleaseOne(obj->member0xAC);
+    obj->member0xAC = 0;
+
+    // 10. member0xA8: the 0x2E0-byte object (0x627690 dtor) + free.
+    if (obj->member0xA8 != 0)
+    {
+        sub_627690(obj->member0xA8);
+        LHFree(obj->member0xA8);
+    }
+    obj->member0xA8 = 0;
+
+    // 11. The direct SEH-block members (refcount, handler, arg), zeroing
+    //     their +0xA0/+0x90/+0x88 partners.
+    F3SehBlockRelease(obj->member0xA4);
+    obj->member0xA0 = 0;
+    obj->member0xA4 = 0;
+    F3SehBlockRelease(obj->member0x94);
+    obj->member0x90 = 0;
+    obj->member0x94 = 0;
+    F3SehBlockRelease(obj->member0x8C);
+    obj->member0x88 = 0;
+    obj->member0x8C = 0;
+
+    // 12. member0x9C: vtable slot 0 release + zero.
+    if (obj->member0x9C != 0)
+        F3ReleaseOne(obj->member0x9C);
+    obj->member0x9C = 0;
+
+    // 13. member0x98: the 0x38-byte object (0x18EB1A0 dtor) + free.
+    if (obj->member0x98 != 0)
+    {
+        sub_18EB1A0(obj->member0x98);
+        LHFree(obj->member0x98);
+    }
+    obj->member0x98 = 0;
+
+    // 14. member0x7C / member0x78: vtable slot 2 (not zeroed).
+    if (obj->member0x7C != 0)
+        ((void (*)(void *))((void **)*(void **)obj->member0x7C)[2])(obj->member0x7C);
+    if (obj->member0x78 != 0)
+        ((void (*)(void *))((void **)*(void **)obj->member0x78)[2])(obj->member0x78);
+
+    DeleteCriticalSection(&obj->cs2);
+    DeleteCriticalSection(&obj->cs1);
+
+    // 15. The +0x30 sub-object: the SEH array (0x622C00), free sub0x30A and
+    //     the 4-byte heap node, zero sub0x30A/B/C.
+    if (obj->sub0x30A != 0)
+    {
+        SehBlockArrayDtor(obj->sub0x30A, obj->sub0x30B);
+        LHFree(obj->sub0x30A);
+    }
+    obj->sub0x30A = 0;
+    obj->sub0x30B = 0;
+    obj->sub0x30C = 0;
+    LHFree(obj->sub0x30Node);
+
+    // 16. member0x2C / member0x28: vtable slot 0 releases + zero.
+    {
+        void *m;
+        m = *(void **)((char *)obj + 0x2C);
+        if (m != 0)
+            F3ReleaseOne(m);
+        *(void **)((char *)obj + 0x2C) = 0;
+        m = *(void **)((char *)obj + 0x28);
+        if (m != 0)
+            F3ReleaseOne(m);
+        *(void **)((char *)obj + 0x28) = 0;
+    }
+
+    // 17. The final list reset: free the remaining nodes, then the 12-byte
+    //     sentinel itself, and zero listFirst.
+    head = obj->listFirst;
+    {
+        void *node = *(void **)head;
+        *(void **)head              = head;
+        *(void **)((char *)head + 4) = head;
+        obj->listCount = 0;
+        for (;; node = *(void **)node)
+        {
+            if (node == head)
+                break;
+            LHFree(node);
+        }
+    }
+    LHFree(head);
+    obj->listFirst = 0;
+
+    // 18. Free the 4-byte heap node (not zeroed).
+    LHFree(obj->heapNode);
+}
+
+// ============================================================
+//  ReleaseDebugHandlerPair  (0x00401700 - 0x00401742)  -- release the debug
+//  handler pair registration
+//  [NOT byte-identical] references the high-VA InterlockedDecrement IAT slot
+//  (0x01AD52FC) and the heap table (dword_2075B24, 0x02075B24) via absolute
+//  memory ops.
+//
+//  void ReleaseDebugHandlerPair(F3ObjReg *reg)
+//
+//  Byte-for-byte identical body to ReleaseObjectPair (0x403220) / the pair
+//  releasers at 0x55DB10 / 0x55D7C0: decrement the SEH block's refcount, and
+//  when it reaches zero invoke handler(arg) and free the block via the game
+//  heap, then clear both words of the pair. Its sole call is GameThread's
+//  end-of-thread release of the CFableWindowsDebugHandler registration it
+//  built locally (reg1); the global pair keeps owning its own reference.
+//  Delegates to ReleaseObjectPair for the identical release sequence.
+// ============================================================
+static void ReleaseDebugHandlerPair(F3ObjReg *reg) { ReleaseObjectPair(reg); }
 
 // ============================================================
 //  HeapStressTest  (0x18986E0 - 0x189888C)  -- engine heap sanity check
@@ -907,7 +1314,7 @@ static void *HeapStressTest(void)
 //    1. Names the thread "GameThread", sets heap info (class 1), FrameworkInit.
 //    2. Creates a debug handler, a 48-byte object, and a CDebugTraceFable, each
 //       with an SEH cleanup block. The debug handler's SEH block is kept
-//       (released at the end by sub_401700); the other two release their local
+//       (released at the end by ReleaseDebugHandlerPair); the other two release their local
 //       reference immediately (leaving the global as the owner).
 //    3. Clears the game buffer and loads a shared-memory blob named after the
 //       exe (-=[SMS_<exename>_SMS]=-). If the blob is missing, shows a message
@@ -915,7 +1322,7 @@ static void *HeapStressTest(void)
 //    4. Runs the game (CGameEngineCtor, RunFrontEnd) and sets the exit code
 //       (dword_1DBD00C); on success it pumps the component shutdown
 //       (CGameEngineShutdown, CGameEngineCleanup), then cleans up
-//       (sub_61C670, sub_401700).
+//       (CGameEngineDestroy, ReleaseDebugHandlerPair).
 // ============================================================
 void GameThread(void *a1)
 {
@@ -927,7 +1334,7 @@ void GameThread(void *a1)
     FrameworkInit();
 
     // 2. Debug handler (4-byte) + SEH block (LHFreeHandler). The SEH block is
-    //    kept (released at the end by sub_401700), not released here.
+    //    kept (released at the end by ReleaseDebugHandlerPair), not released here.
     F3ObjReg reg1;
     reg1.object = LHAlloc(4);
     if (reg1.object)
@@ -1050,8 +1457,8 @@ void GameThread(void *a1)
     {
         g_dword_1DBD00C = 1;
     }
-    sub_61C670(ArgList);
+    CGameEngineDestroy((CGameEngine *)ArgList);
 
-    // 9. Free the debug handler.
-    sub_401700(&reg1);
+    // 9. Free the debug handler (release the local SEH-block reference).
+    ReleaseDebugHandlerPair(&reg1);
 }
