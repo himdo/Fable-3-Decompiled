@@ -1,0 +1,26 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 10.00
+# Visual Studio 2008
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Fable 3", "Fable 3.vcproj", "{DDB05BA3-5F44-48AB-BB50-F09A407397B8}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Fable 3 Launcher", "..\..\Fable 3 Launcher\Fable 3 Launcher.vcproj", "{4E1F028F-EC4B-487B-9653-D304EE198D80}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Win32 = Debug|Win32
+		Release|Win32 = Release|Win32
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{DDB05BA3-5F44-48AB-BB50-F09A407397B8}.Debug|Win32.ActiveCfg = Release|Win32
+		{DDB05BA3-5F44-48AB-BB50-F09A407397B8}.Debug|Win32.Build.0 = Release|Win32
+		{DDB05BA3-5F44-48AB-BB50-F09A407397B8}.Release|Win32.ActiveCfg = Release|Win32
+		{DDB05BA3-5F44-48AB-BB50-F09A407397B8}.Release|Win32.Build.0 = Release|Win32
+		{4E1F028F-EC4B-487B-9653-D304EE198D80}.Debug|Win32.ActiveCfg = Release|Win32
+		{4E1F028F-EC4B-487B-9653-D304EE198D80}.Debug|Win32.Build.0 = Release|Win32
+		{4E1F028F-EC4B-487B-9653-D304EE198D80}.Release|Win32.ActiveCfg = Release|Win32
+		{4E1F028F-EC4B-487B-9653-D304EE198D80}.Release|Win32.Build.0 = Release|Win32
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal
