@@ -12,7 +12,11 @@ if errorlevel 1 (echo COMPILE FAILED & popd & exit /b 1)
 rem Build the xlive.dll import library from the module-definition file.
 lib /nologo /machine:x86 /def:..\engine\xlive.def /out:xlive.lib
 if errorlevel 1 (echo LIB FAILED & popd & exit /b 1)
-link /nologo /subsystem:console /machine:x86 /out:test_engine.exe test_engine.obj engine.obj worker.obj manager.obj object_registry.obj xlo_device.obj gameengine.obj gamethread.obj gamemain.obj netinit.obj thread.obj common.obj save.obj framework.obj xlive.lib user32.lib kernel32.lib gdi32.lib ws2_32.lib
+rem The ClearCsurface path imports D3DXFloat32To16Array: build the d3dx9_42
+rem import lib too (the DLL itself ships in System32/SysWOW64).
+lib /nologo /machine:x86 /def:..\engine\d3dx9_42.def /out:d3dx9_42.lib
+if errorlevel 1 (echo LIB FAILED & popd & exit /b 1)
+link /nologo /subsystem:console /machine:x86 /out:test_engine.exe test_engine.obj engine.obj worker.obj manager.obj object_registry.obj xlo_device.obj gameengine.obj gamethread.obj gamemain.obj netinit.obj thread.obj common.obj save.obj framework.obj xlive.lib d3dx9_42.lib user32.lib kernel32.lib gdi32.lib ws2_32.lib
 if errorlevel 1 (echo LINK FAILED & popd & exit /b 1)
 rem The exe now really imports from the bundled XLiveAPI shim: copy
 rem xlive.dll (game dir = three levels up) next to it so the loader binds.
