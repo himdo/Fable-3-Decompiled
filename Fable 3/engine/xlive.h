@@ -45,6 +45,11 @@ int   __stdcall XShowMessageBoxUI(int dwUser, int pszTitle, int pszText,
 // XCancelOverlapped      ordinal 5254  stdcall @4
 int   __stdcall XCancelOverlapped(void *pOverlapped);
 
+// XLiveRender            ordinal 5002  stdcall @0, bare `retn` (zero args).
+// The XNA live-render pump; RunGameLoop (0x619D70) calls it once per frame
+// while the device is not in a lost state.
+int   __stdcall XLiveRender(void);
+
 // ---- xlive.dll imports driven by InitNetworking (0x6A7210) et al. ----
 // XLiveInitializeEx      ordinal 5297  stdcall @8
 DWORD __stdcall XLiveInitializeEx(const void *pConfiguration, DWORD dwVersion);

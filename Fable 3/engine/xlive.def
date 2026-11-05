@@ -12,5 +12,6 @@ EXPORTS
     XOnlineStartup @5310
     XPresenceInitialize@4 @5313
     XLivePreTranslateMessage@4 @5030
+    XLiveRender@0 @5002
     XLiveOnCreateDevice@8 @5005
     XLiveOnResetDevice@4 @5007

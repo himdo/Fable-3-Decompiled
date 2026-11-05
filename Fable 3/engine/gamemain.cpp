@@ -56,7 +56,13 @@ static void *g_off_1D8C854 = 0;    // 0x1D8C854
 // Global "this" objects the frontend dispatches through (0x1DBD048 / 0x1DBD9E8).
 // The callees (stubs) never dereference them, so a zeroed block stands in.
 static int   g_unk_1DBD048[8] = { 0 };   // 0x1DBD048
-static int   g_unk_1DBD9E8[8] = { 0 };   // 0x1DBD9E8
+// 0x1DBD9E8: the frontend object.  The original constructor (sub_18C46E0,
+// thiscall + retn 8, invoked at registration by sub_1A5C6A0) stores a
+// CreateEventA handle at +0x80; WaitForEvent / SetFrontendEvent / the
+// CloseHandle sibling all read that slot.  It is not created in this build,
+// so the 0x84-byte block stays zeroed: SetEvent(0) is a no-op failure and
+// WaitForSingleObjectEx(0, ...) returns WAIT_FAILED immediately.
+static int   g_unk_1DBD9E8[33] = { 0 };  // 0x1DBD9E8 (0x84 bytes)
 // Placeholder vtables for the two file objects created on the frontend.
 static void *g_CDiskFileWin32Vtable[4] = { 0 };
 static void *g_CAFileVtable[4]         = { 0 };
@@ -2423,7 +2429,8 @@ static DWORD *GetCurrentResolution(DWORD *out)
 //       (RefreshCsurfaceSlot, 0x18D36C0); clear it with the near-black color
 //       {0, fmt, 1, 1}/255 (ClearCsurface, 0x18D2940); release the wrapped
 //       surface.
-//    3. Create a 2x1x1x1 surface (sub_1A042B0 -> dword_1DB1334); release
+//    3. Create a 2x1x1x1 surface (CreateCsurface, 0x1A042B0, ->
+//       dword_1DB1334); release
 //       the existing device-acquired surface (dword_1DB1318), then
 //       acquire a fresh one through device vtable[25] (device, 1, 1,
 //       flags, dword_1D9B040, fmt, &dword_1DB1318, 0).
@@ -2451,6 +2458,9 @@ static DWORD g_off_1DB12F8[8] = {0};
 static DWORD g_off_1DB1314[8] = {0};
 // 0x1DB1318: the device-acquired frontend surface (device vtable[25]).
 static void *g_dword_1DB1318  = 0;
+// 0x1DB1334: the frontend CSurface created from a texture source-descriptor
+// table row (CreateCsurface, device vtable[3]); released on re-create.
+static void *g_dword_1DB1334  = 0;
 // 0x1E2EF10 / 0x1E2EF60: 0x40-byte surface state blocks zeroed on reset.
 static DWORD g_dword_1E2EF10[16] = {0};
 static DWORD g_dword_1E2EF60[16] = {0};
@@ -2458,14 +2468,43 @@ static DWORD g_dword_1E2EF60[16] = {0};
 static DWORD g_qword_1E2EF50[2]  = {0, 0};
 
 // --- Frontend graphics-entity subsystem globals (ResetGraphicsEntities) ---
-// 0x2120420: base of the frontend graphics-entity pool (0x1DF8 bytes); zeroed
-// on reset, then re-initialised by the pool builder (sub_18CFA70).  Kept at its
-// original high VA as a static (the memset target).
-static DWORD g_dword_2120420[0x1DF8/4] = {0};
+// 0x2120420: base of the frontend graphics-entity pool; the first 0x1DF8
+// bytes are the entity-pool region (zeroed on reset, then re-initialised by
+// the pool builder BuildGraphicsEntityPool).  RegisterGraphicsEntities
+// (0x18D04D0) additionally reads 28-byte descriptor records at pool offsets
+// up to ~0x3608 (the second-loop table bases 0x2120A08..0x2121DB8 plus the
+// high offsets 0x1C24..0x1C58); that tail sits past the 0x1DF8 memset region
+// and stays zero (BSS) between resets, so the buffer is sized to cover it.
+// Modelled as one static at the original high VA (the memset target).
+static DWORD g_dword_2120420[0x3800/4] = {0};
 // 0x2073938: count of dirty resource registrations (reset to 0 on reset).
 static DWORD g_dword_2073938 = 0;
 // 0x2063134: count of entities in the pool (reset to 0 on reset).
 static DWORD g_dword_2063134 = 0;
+// 0x2073134: the entity index list - 266 DWORD slots, each a pointer into
+// the entity pool.  Slot 0 is unused (zero).  BuildGraphicsEntityPool
+// (0x18CFA70) fills slots 1..265 (265 entries) and sets g_dword_2063134.
+// (In the binary the list is accessed through three overlapping views:
+// dword_2073134 / dword_2073138 / dword_207313C.)
+static void *g_dword_2073134[266] = {0};
+// 0x211A408: the frontend graphics-entity OBJECT pool.  Each object is
+// 0x2008 (8200) bytes: a list of 1024 {ptr, key} entries at +0x0000, the
+// mask-source word at +0x2000 and the running entry count at +0x2004.
+// RegisterGraphicsEntities (0x18D04D0) appends each freshly-registered
+// descriptor to the per-object list.  The descriptor index bytes reference
+// only objects 0..2, but the index is a full byte so 256 objects are kept to
+// cover the whole space (matches the original 8200-byte stride indexing).
+struct F3GraphicsEntityObj
+{
+    DWORD list[2048];  // +0x0000: 1024 x {ptr, key}
+    DWORD maskSrc;     // +0x2000: mask source OR'd into the descriptor mask
+    DWORD count;       // +0x2004: number of registered {ptr,key} entries
+};
+static F3GraphicsEntityObj g_objPool[256];
+// 0x2073940: the dirty-registration pointer list appended by
+// RegisterGraphicsEntities; its length is g_dword_2073938 (224 slots max, one
+// per descriptor, so 256 is a safe bound).
+static DWORD g_dword_2073940[256] = {0};
 // 0x211C402: graphics-entity subsystem state byte (set to 3 on reset).
 static BYTE  g_byte_211C402  = 0;
 // 0x2075F54: the device object the entities are synced to (vtable-backed).
@@ -2487,8 +2526,9 @@ struct F3CsurfaceSlot
 
 // The remaining graphics-surface subsystem callees (unimplemented in this
 // build; their real bodies live at the original addresses) are stubbed to
-// no-ops / trivial returns: the 2x1x1x1 surface create (sub_1A042B0) and
-// the index-wrap (sub_1A046D0) have no visible effect.  The surface clear
+// no-ops / trivial returns: the index-wrap (sub_1A046D0) has no visible
+// effect (the 2x1x1x1 surface create, CreateCsurface 0x1A042B0, is
+// implemented below).  The surface clear
 // (ClearCsurface, 0x18D2940), RefreshCsurfaceSlot (0x18D36C0) and its
 // format helper QueryCsurfaceFormat (0x5A2EF0) are implemented below: the
 // wrap refreshes the
@@ -3306,26 +3346,426 @@ static int ClearCsurface(const int *color, const F3CsurfaceSlot *rec)
         return ((int (*)(void *))(*(void ***)surface)[14])(surface);
     return 0;
 }
-static int   sub_1A042B0(int *dims, int flags)
-    { (void)dims; (void)flags; return 0; }                       // create 2x1x1x1 surface
+// ============================================================
+//  CreateCsurface  (0x1A042B0 - 0x1A0430A)  --  create the frontend CSurface
+//  from a texture source-descriptor table row.
+//  [NOT byte-identical] the original is a register/stack hybrid (the 3-word
+//  dims record in ESI, the format flag in EDI, the index pointer + create
+//  flags on the stack, retn 8); this build calls it as a plain C function.
+//
+//  BOOL CreateCsurface(int flags, int fmt, int *dims, int index)
+//
+//  1. Release the existing cached surface (dword_1DB1334) through its
+//     vtable slot 2 and clear the global.
+//  2. Look up row `index` of the texture source-descriptor table
+//     (dword_1D9AF60, 0x70-byte rows) and create the surface through device
+//     vtable[3] (offset 0x60): (device, dims[0], dims[1], 1, dims[2], flags,
+//     &row, fmt, &dword_1DB1334, 0) -- the surface is returned in the out
+//     parameter; null-guarded pre-device (the original would fault).
+//  3. Return success (the device result >= 0).
+//
+//  Sole caller: ResetGraphicsSurfaces (0x18E6D40), with dims {1,1,1}, row 2,
+//  the 0x200 create flag and the byte_2075F05 format flag (return discarded).
+//  The cached surface is released by the frontend teardowns (sub_18E6870,
+//  sub_1AC1090) and zeroed by the frontend reset (sub_5857D0).
+// ============================================================
+static BOOL CreateCsurface(int flags, int fmt, int *dims, int index)
+{
+    if (g_dword_1DB1334 != 0)
+    {
+        ((void (*)(void *))((void **)(*(void **)g_dword_1DB1334))[2])(g_dword_1DB1334);
+        g_dword_1DB1334 = 0;
+    }
+
+    const DWORD *row = &g_dword_1D9AF60[(size_t)index * 28];
+    int r = 0;
+    if (g_dword_1E2EEF4 != 0)   // null-guard; the original would fault pre-device
+        r = ((int (*)(void *, int, int, int, int, int, const void *, int, void **, int))
+                (*(void ***)g_dword_1E2EEF4)[3])(
+                g_dword_1E2EEF4, dims[0], dims[1], 1, dims[2], flags, row, fmt,
+                &g_dword_1DB1334, 0);
+    return r >= 0;
+}
 static F3CsurfaceSlot *sub_1A046D0(F3CsurfaceSlot *slot, const F3CsurfaceSlot *src, int idx)
     { (void)src; (void)idx; if (slot != 0) slot->surface = 0; return slot; } // wrap texture slot idx
 
-// The graphics-entity subsystem callees (unimplemented in this build; their
-// real bodies live at the original addresses).  All are stubbed to no-ops /
-// trivial returns, so the pool rebuild, dirty registration, and device sync
-// below have no visible effect beyond the globals ResetGraphicsEntities itself
-// sets.  sub_18D02E0 is the tail-called sync step; its one unconditional side
-// effect (clearing the dirty-registration counter) is modelled here.
-static int sub_18CFA70(void) { return 0; }                       // rebuild the entity pool + index lists (dword_2073138 / dword_2073134)
-static int sub_18D04D0(void) { return 0; }                       // register the dirty entities (dword_2073940)
+// BuildGraphicsEntityPool  (0x18CFA70 - 0x18D02D5)  --  Rebuild the contents
+// of the frontend graphics-entity pool and the entity index list.
+// [NOT byte-identical] 2149-byte straight-line constant initializer: it
+// writes the high-VA globals (the 0x2120420 pool, the 0x2073134 index list
+// and the 0x2063134 counter) through absolute memory operands
+// (mov [ecx*4+0x2073138h], ...), which MSVC inline asm cannot emit.  The
+// write set (739 non-zero pool writes + 265 index entries) was extracted by
+// instruction-level simulation of the original disassembly.
+//
+// Original body (no calls; two fixed-stride loops):
+//   1. 29 pre-loop pool records (24 bytes, 0x18 stride): {+0x00=0, +0x04=0,
+//      +0x0E=1, +0x14=id, +0x18=0}, one index entry each.
+//   2. Loop 1: four 0x70-byte records (0x70 stride, base pool+0x3B8) with
+//      flag bytes +0x0E/+0x2A/+0x46 = 1 and the t0/t1/t2 dwords +0x14/+0x30/
+//      +0x4C from the rdata table at 0x1D9DF98 (0x80..0x87, 0xC6..0xCD -
+//      one triple per record), four index entries each.
+//   3. Loop 2: twenty 0x1C-byte records (0x1C stride, base pool+0xCD8),
+//      each associated with eleven 0x230-byte sub-structures (code at
+//      +0x0C, k+2 at +0x0E, a value at +0x14), eleven index entries each.
+//   4. Index slots 1..265 end up filled and the counter := 265.
+//
+// The sole caller, ResetGraphicsEntities (0x18D1960), memsets the pool to
+// zero first, so only the non-zero field writes are reproduced here
+// (memset + non-zero writes == the original's full constant write set).
+// The original's return value (a leftover loop-boundary EAX) is discarded
+// by the caller.
+//
+// The remaining graphics-entity callees: RegisterGraphicsEntities
+// (0x18D04D0, the dirty registration) is implemented below, and sub_18D02E0
+// is the tail-called sync step whose one unconditional side effect (clearing
+// the dirty-registration counter) is modelled.
+// Non-zero pool field writes (offset from pool base, size, value).
+// The pool is zeroed by ResetGraphicsEntities before the builder runs,
+// so only the non-zero writes are listed.  Sizes: 4 = dword, 2 = word,
+// 1 = byte (some dword writes are unaligned, hence byte-level application).
+static const struct { int off; int sz; unsigned val; } sPoolFieldWrites[] =
+{
+    {0x000E, 4, 0x00000001},{0x0014, 4, 0x00000008},{0x002A, 4, 0x00000001},{0x0030, 4, 0x000000A8},{0x0046, 4, 0x00000001},
+    {0x004C, 4, 0x0000000E},{0x0062, 4, 0x00000001},{0x0068, 4, 0x00000007},{0x007E, 4, 0x00000001},{0x0084, 4, 0x00000017},
+    {0x009A, 4, 0x00000001},{0x00A0, 4, 0x00000016},{0x00B6, 4, 0x00000001},{0x00BC, 4, 0x00000019},{0x00D2, 4, 0x00000001},
+    {0x00D8, 4, 0x0000001B},{0x00EE, 4, 0x00000001},{0x00F4, 4, 0x0000000F},{0x010A, 4, 0x00000001},{0x0110, 4, 0x00000018},
+    {0x0126, 4, 0x00000001},{0x012C, 4, 0x00000013},{0x0142, 4, 0x00000001},{0x0148, 4, 0x00000014},{0x0196, 4, 0x00000001},
+    {0x019C, 4, 0x0000009C},{0x01B2, 4, 0x00000001},{0x01B8, 4, 0x0000009A},{0x01CE, 4, 0x00000001},{0x01D4, 4, 0x0000009B},
+    {0x01EA, 4, 0x00000001},{0x01F0, 4, 0x000000A6},{0x0222, 4, 0x00000001},{0x0228, 4, 0x000000C3},{0x023E, 4, 0x00000001},
+    {0x0244, 4, 0x000000AF},{0x025A, 4, 0x00000001},{0x0260, 4, 0x00000034},{0x0276, 4, 0x00000001},{0x027C, 4, 0x00000035},
+    {0x0292, 4, 0x00000001},{0x0298, 4, 0x00000036},{0x02AE, 4, 0x00000001},{0x02B4, 4, 0x00000037},{0x02CA, 4, 0x00000001},
+    {0x02D0, 4, 0x00000038},{0x02E6, 4, 0x00000001},{0x02EC, 4, 0x00000039},{0x0302, 4, 0x00000001},{0x0308, 4, 0x0000003A},
+    {0x031E, 4, 0x00000001},{0x0324, 4, 0x0000003B},{0x0356, 4, 0x00000001},{0x035C, 4, 0x000000AB},{0x038E, 4, 0x00000001},
+    {0x0394, 4, 0x000000C1},{0x03AA, 4, 0x00000001},{0x03B0, 4, 0x000000C2},{0x03C6, 1, 0x00000001},{0x03CC, 4, 0x00000080},
+    {0x03E2, 1, 0x00000001},{0x03E8, 4, 0x00000081},{0x03FE, 1, 0x00000001},{0x0404, 4, 0x00000082},{0x041A, 1, 0x00000001},
+    {0x0420, 4, 0x00000083},{0x0436, 1, 0x00000001},{0x043C, 4, 0x00000084},{0x0452, 1, 0x00000001},{0x0458, 4, 0x00000085},
+    {0x046E, 1, 0x00000001},{0x0474, 4, 0x00000086},{0x048A, 1, 0x00000001},{0x0490, 4, 0x00000087},{0x04A6, 1, 0x00000001},
+    {0x04AC, 4, 0x000000C6},{0x04C2, 1, 0x00000001},{0x04C8, 4, 0x000000C7},{0x04DE, 1, 0x00000001},{0x04E4, 4, 0x000000C8},
+    {0x04FA, 1, 0x00000001},{0x0500, 4, 0x000000C9},{0x0516, 1, 0x00000001},{0x051C, 4, 0x000000CA},{0x0532, 1, 0x00000001},
+    {0x0538, 4, 0x000000CB},{0x054E, 1, 0x00000001},{0x0554, 4, 0x000000CC},{0x056A, 1, 0x00000001},{0x0570, 4, 0x000000CD},
+    {0x05F6, 4, 0x00000002},{0x05FC, 2, 0x0000000A},{0x0610, 4, 0x00000001},{0x0612, 4, 0x00000002},{0x0618, 2, 0x0000000A},
+    {0x062C, 4, 0x00000002},{0x062E, 4, 0x00000002},{0x0634, 2, 0x0000000A},{0x0648, 4, 0x00000003},{0x064A, 4, 0x00000002},
+    {0x0650, 2, 0x0000000A},{0x0664, 4, 0x00000004},{0x0666, 4, 0x00000002},{0x066C, 2, 0x0000000A},{0x0680, 4, 0x00000005},
+    {0x0682, 4, 0x00000002},{0x0688, 2, 0x0000000A},{0x069C, 4, 0x00000006},{0x069E, 4, 0x00000002},{0x06A4, 2, 0x0000000A},
+    {0x06B8, 4, 0x00000007},{0x06BA, 4, 0x00000002},{0x06C0, 2, 0x0000000A},{0x06D4, 4, 0x00000008},{0x06D6, 4, 0x00000002},
+    {0x06DC, 2, 0x0000000A},{0x06F0, 4, 0x00000009},{0x06F2, 4, 0x00000002},{0x06F8, 2, 0x0000000A},{0x070C, 4, 0x0000000A},
+    {0x070E, 4, 0x00000002},{0x0714, 2, 0x0000000A},{0x0728, 4, 0x0000000B},{0x072A, 4, 0x00000002},{0x0730, 2, 0x0000000A},
+    {0x0744, 4, 0x0000000C},{0x0746, 4, 0x00000002},{0x074C, 2, 0x0000000A},{0x0760, 4, 0x0000000D},{0x0762, 4, 0x00000002},
+    {0x0768, 2, 0x0000000A},{0x077C, 4, 0x0000000E},{0x077E, 4, 0x00000002},{0x0784, 2, 0x0000000A},{0x0798, 4, 0x0000000F},
+    {0x079A, 4, 0x00000002},{0x07A0, 2, 0x0000000A},{0x07B4, 4, 0x00000010},{0x07B6, 4, 0x00000002},{0x07BC, 2, 0x0000000A},
+    {0x07D0, 4, 0x00000011},{0x07D2, 4, 0x00000002},{0x07D8, 2, 0x0000000A},{0x07EC, 4, 0x00000012},{0x07EE, 4, 0x00000002},
+    {0x07F4, 2, 0x0000000A},{0x0808, 4, 0x00000013},{0x080A, 4, 0x00000002},{0x0810, 2, 0x0000000A},{0x0826, 4, 0x00000002},
+    {0x082C, 2, 0x00000008},{0x0840, 4, 0x00000001},{0x0842, 4, 0x00000002},{0x0848, 2, 0x00000008},{0x085C, 4, 0x00000002},
+    {0x085E, 4, 0x00000002},{0x0864, 2, 0x00000008},{0x0878, 4, 0x00000003},{0x087A, 4, 0x00000002},{0x0880, 2, 0x00000008},
+    {0x0894, 4, 0x00000004},{0x0896, 4, 0x00000002},{0x089C, 2, 0x00000008},{0x08B0, 4, 0x00000005},{0x08B2, 4, 0x00000002},
+    {0x08B8, 2, 0x00000008},{0x08CC, 4, 0x00000006},{0x08CE, 4, 0x00000002},{0x08D4, 2, 0x00000008},{0x08E8, 4, 0x00000007},
+    {0x08EA, 4, 0x00000002},{0x08F0, 2, 0x00000008},{0x0904, 4, 0x00000008},{0x0906, 4, 0x00000002},{0x090C, 2, 0x00000008},
+    {0x0920, 4, 0x00000009},{0x0922, 4, 0x00000002},{0x0928, 2, 0x00000008},{0x093C, 4, 0x0000000A},{0x093E, 4, 0x00000002},
+    {0x0944, 2, 0x00000008},{0x0958, 4, 0x0000000B},{0x095A, 4, 0x00000002},{0x0960, 2, 0x00000008},{0x0974, 4, 0x0000000C},
+    {0x0976, 4, 0x00000002},{0x097C, 2, 0x00000008},{0x0990, 4, 0x0000000D},{0x0992, 4, 0x00000002},{0x0998, 2, 0x00000008},
+    {0x09AC, 4, 0x0000000E},{0x09AE, 4, 0x00000002},{0x09B4, 2, 0x00000008},{0x09C8, 4, 0x0000000F},{0x09CA, 4, 0x00000002},
+    {0x09D0, 2, 0x00000008},{0x09E4, 4, 0x00000010},{0x09E6, 4, 0x00000002},{0x09EC, 2, 0x00000008},{0x0A00, 4, 0x00000011},
+    {0x0A02, 4, 0x00000002},{0x0A08, 2, 0x00000008},{0x0A1C, 4, 0x00000012},{0x0A1E, 4, 0x00000002},{0x0A24, 2, 0x00000008},
+    {0x0A38, 4, 0x00000013},{0x0A3A, 4, 0x00000002},{0x0A40, 2, 0x00000008},{0x0A56, 4, 0x00000002},{0x0A5C, 2, 0x00000009},
+    {0x0A70, 4, 0x00000001},{0x0A72, 4, 0x00000002},{0x0A78, 2, 0x00000009},{0x0A8C, 4, 0x00000002},{0x0A8E, 4, 0x00000002},
+    {0x0A94, 2, 0x00000009},{0x0AA8, 4, 0x00000003},{0x0AAA, 4, 0x00000002},{0x0AB0, 2, 0x00000009},{0x0AC4, 4, 0x00000004},
+    {0x0AC6, 4, 0x00000002},{0x0ACC, 2, 0x00000009},{0x0AE0, 4, 0x00000005},{0x0AE2, 4, 0x00000002},{0x0AE8, 2, 0x00000009},
+    {0x0AFC, 4, 0x00000006},{0x0AFE, 4, 0x00000002},{0x0B04, 2, 0x00000009},{0x0B18, 4, 0x00000007},{0x0B1A, 4, 0x00000002},
+    {0x0B20, 2, 0x00000009},{0x0B34, 4, 0x00000008},{0x0B36, 4, 0x00000002},{0x0B3C, 2, 0x00000009},{0x0B50, 4, 0x00000009},
+    {0x0B52, 4, 0x00000002},{0x0B58, 2, 0x00000009},{0x0B6C, 4, 0x0000000A},{0x0B6E, 4, 0x00000002},{0x0B74, 2, 0x00000009},
+    {0x0B88, 4, 0x0000000B},{0x0B8A, 4, 0x00000002},{0x0B90, 2, 0x00000009},{0x0BA4, 4, 0x0000000C},{0x0BA6, 4, 0x00000002},
+    {0x0BAC, 2, 0x00000009},{0x0BC0, 4, 0x0000000D},{0x0BC2, 4, 0x00000002},{0x0BC8, 2, 0x00000009},{0x0BDC, 4, 0x0000000E},
+    {0x0BDE, 4, 0x00000002},{0x0BE4, 2, 0x00000009},{0x0BF8, 4, 0x0000000F},{0x0BFA, 4, 0x00000002},{0x0C00, 2, 0x00000009},
+    {0x0C14, 4, 0x00000010},{0x0C16, 4, 0x00000002},{0x0C1C, 2, 0x00000009},{0x0C30, 4, 0x00000011},{0x0C32, 4, 0x00000002},
+    {0x0C38, 2, 0x00000009},{0x0C4C, 4, 0x00000012},{0x0C4E, 4, 0x00000002},{0x0C54, 2, 0x00000009},{0x0C68, 4, 0x00000013},
+    {0x0C6A, 4, 0x00000002},{0x0C70, 2, 0x00000009},{0x0C86, 4, 0x00000002},{0x0C8C, 2, 0x00000007},{0x0CA0, 4, 0x00000001},
+    {0x0CA2, 4, 0x00000002},{0x0CA8, 2, 0x00000007},{0x0CBC, 4, 0x00000002},{0x0CBE, 4, 0x00000002},{0x0CC4, 2, 0x00000007},
+    {0x0CD8, 4, 0x00000003},{0x0CDA, 4, 0x00000002},{0x0CE0, 2, 0x00000007},{0x0CF4, 4, 0x00000004},{0x0CF6, 4, 0x00000002},
+    {0x0CFC, 2, 0x00000007},{0x0D10, 4, 0x00000005},{0x0D12, 4, 0x00000002},{0x0D18, 2, 0x00000007},{0x0D2C, 4, 0x00000006},
+    {0x0D2E, 4, 0x00000002},{0x0D34, 2, 0x00000007},{0x0D48, 4, 0x00000007},{0x0D4A, 4, 0x00000002},{0x0D50, 2, 0x00000007},
+    {0x0D64, 4, 0x00000008},{0x0D66, 4, 0x00000002},{0x0D6C, 2, 0x00000007},{0x0D80, 4, 0x00000009},{0x0D82, 4, 0x00000002},
+    {0x0D88, 2, 0x00000007},{0x0D9C, 4, 0x0000000A},{0x0D9E, 4, 0x00000002},{0x0DA4, 2, 0x00000007},{0x0DB8, 4, 0x0000000B},
+    {0x0DBA, 4, 0x00000002},{0x0DC0, 2, 0x00000007},{0x0DD4, 4, 0x0000000C},{0x0DD6, 4, 0x00000002},{0x0DDC, 2, 0x00000007},
+    {0x0DF0, 4, 0x0000000D},{0x0DF2, 4, 0x00000002},{0x0DF8, 2, 0x00000007},{0x0E0C, 4, 0x0000000E},{0x0E0E, 4, 0x00000002},
+    {0x0E14, 2, 0x00000007},{0x0E28, 4, 0x0000000F},{0x0E2A, 4, 0x00000002},{0x0E30, 2, 0x00000007},{0x0E44, 4, 0x00000010},
+    {0x0E46, 4, 0x00000002},{0x0E4C, 2, 0x00000007},{0x0E60, 4, 0x00000011},{0x0E62, 4, 0x00000002},{0x0E68, 2, 0x00000007},
+    {0x0E7C, 4, 0x00000012},{0x0E7E, 4, 0x00000002},{0x0E84, 2, 0x00000007},{0x0E98, 4, 0x00000013},{0x0E9A, 4, 0x00000002},
+    {0x0EA0, 2, 0x00000007},{0x0EB6, 4, 0x00000002},{0x0EBC, 2, 0x00000001},{0x0ED0, 4, 0x00000001},{0x0ED2, 4, 0x00000002},
+    {0x0ED8, 2, 0x00000001},{0x0EEC, 4, 0x00000002},{0x0EEE, 4, 0x00000002},{0x0EF4, 2, 0x00000001},{0x0F08, 4, 0x00000003},
+    {0x0F0A, 4, 0x00000002},{0x0F10, 2, 0x00000001},{0x0F24, 4, 0x00000004},{0x0F26, 4, 0x00000002},{0x0F2C, 2, 0x00000001},
+    {0x0F40, 4, 0x00000005},{0x0F42, 4, 0x00000002},{0x0F48, 2, 0x00000001},{0x0F5C, 4, 0x00000006},{0x0F5E, 4, 0x00000002},
+    {0x0F64, 2, 0x00000001},{0x0F78, 4, 0x00000007},{0x0F7A, 4, 0x00000002},{0x0F80, 2, 0x00000001},{0x0F94, 4, 0x00000008},
+    {0x0F96, 4, 0x00000002},{0x0F9C, 2, 0x00000001},{0x0FB0, 4, 0x00000009},{0x0FB2, 4, 0x00000002},{0x0FB8, 2, 0x00000001},
+    {0x0FCC, 4, 0x0000000A},{0x0FCE, 4, 0x00000002},{0x0FD4, 2, 0x00000001},{0x0FE8, 4, 0x0000000B},{0x0FEA, 4, 0x00000002},
+    {0x0FF0, 2, 0x00000001},{0x1004, 4, 0x0000000C},{0x1006, 4, 0x00000002},{0x100C, 2, 0x00000001},{0x1020, 4, 0x0000000D},
+    {0x1022, 4, 0x00000002},{0x1028, 2, 0x00000001},{0x103C, 4, 0x0000000E},{0x103E, 4, 0x00000002},{0x1044, 2, 0x00000001},
+    {0x1058, 4, 0x0000000F},{0x105A, 4, 0x00000002},{0x1060, 2, 0x00000001},{0x1074, 4, 0x00000010},{0x1076, 4, 0x00000002},
+    {0x107C, 2, 0x00000001},{0x1090, 4, 0x00000011},{0x1092, 4, 0x00000002},{0x1098, 2, 0x00000001},{0x10AC, 4, 0x00000012},
+    {0x10AE, 4, 0x00000002},{0x10B4, 2, 0x00000001},{0x10C8, 4, 0x00000013},{0x10CA, 4, 0x00000002},{0x10D0, 2, 0x00000001},
+    {0x10E6, 4, 0x00000002},{0x10EC, 4, 0x00000002},{0x1100, 4, 0x00000001},{0x1102, 4, 0x00000002},{0x1108, 4, 0x00000002},
+    {0x111C, 4, 0x00000002},{0x111E, 4, 0x00000002},{0x1124, 4, 0x00000002},{0x1138, 4, 0x00000003},{0x113A, 4, 0x00000002},
+    {0x1140, 4, 0x00000002},{0x1154, 4, 0x00000004},{0x1156, 4, 0x00000002},{0x115C, 4, 0x00000002},{0x1170, 4, 0x00000005},
+    {0x1172, 4, 0x00000002},{0x1178, 4, 0x00000002},{0x118C, 4, 0x00000006},{0x118E, 4, 0x00000002},{0x1194, 4, 0x00000002},
+    {0x11A8, 4, 0x00000007},{0x11AA, 4, 0x00000002},{0x11B0, 4, 0x00000002},{0x11C4, 4, 0x00000008},{0x11C6, 4, 0x00000002},
+    {0x11CC, 4, 0x00000002},{0x11E0, 4, 0x00000009},{0x11E2, 4, 0x00000002},{0x11E8, 4, 0x00000002},{0x11FC, 4, 0x0000000A},
+    {0x11FE, 4, 0x00000002},{0x1204, 4, 0x00000002},{0x1218, 4, 0x0000000B},{0x121A, 4, 0x00000002},{0x1220, 4, 0x00000002},
+    {0x1234, 4, 0x0000000C},{0x1236, 4, 0x00000002},{0x123C, 4, 0x00000002},{0x1250, 4, 0x0000000D},{0x1252, 4, 0x00000002},
+    {0x1258, 4, 0x00000002},{0x126C, 4, 0x0000000E},{0x126E, 4, 0x00000002},{0x1274, 4, 0x00000002},{0x1288, 4, 0x0000000F},
+    {0x128A, 4, 0x00000002},{0x1290, 4, 0x00000002},{0x12A4, 4, 0x00000010},{0x12A6, 4, 0x00000002},{0x12AC, 4, 0x00000002},
+    {0x12C0, 4, 0x00000011},{0x12C2, 4, 0x00000002},{0x12C8, 4, 0x00000002},{0x12DC, 4, 0x00000012},{0x12DE, 4, 0x00000002},
+    {0x12E4, 4, 0x00000002},{0x12F8, 4, 0x00000013},{0x12FA, 4, 0x00000002},{0x1300, 4, 0x00000002},{0x1316, 4, 0x00000002},
+    {0x131C, 2, 0x00000003},{0x1330, 4, 0x00000001},{0x1332, 4, 0x00000002},{0x1338, 2, 0x00000003},{0x134C, 4, 0x00000002},
+    {0x134E, 4, 0x00000002},{0x1354, 2, 0x00000003},{0x1368, 4, 0x00000003},{0x136A, 4, 0x00000002},{0x1370, 2, 0x00000003},
+    {0x1384, 4, 0x00000004},{0x1386, 4, 0x00000002},{0x138C, 2, 0x00000003},{0x13A0, 4, 0x00000005},{0x13A2, 4, 0x00000002},
+    {0x13A8, 2, 0x00000003},{0x13BC, 4, 0x00000006},{0x13BE, 4, 0x00000002},{0x13C4, 2, 0x00000003},{0x13D8, 4, 0x00000007},
+    {0x13DA, 4, 0x00000002},{0x13E0, 2, 0x00000003},{0x13F4, 4, 0x00000008},{0x13F6, 4, 0x00000002},{0x13FC, 2, 0x00000003},
+    {0x1410, 4, 0x00000009},{0x1412, 4, 0x00000002},{0x1418, 2, 0x00000003},{0x142C, 4, 0x0000000A},{0x142E, 4, 0x00000002},
+    {0x1434, 2, 0x00000003},{0x1448, 4, 0x0000000B},{0x144A, 4, 0x00000002},{0x1450, 2, 0x00000003},{0x1464, 4, 0x0000000C},
+    {0x1466, 4, 0x00000002},{0x146C, 2, 0x00000003},{0x1480, 4, 0x0000000D},{0x1482, 4, 0x00000002},{0x1488, 2, 0x00000003},
+    {0x149C, 4, 0x0000000E},{0x149E, 4, 0x00000002},{0x14A4, 2, 0x00000003},{0x14B8, 4, 0x0000000F},{0x14BA, 4, 0x00000002},
+    {0x14C0, 2, 0x00000003},{0x14D4, 4, 0x00000010},{0x14D6, 4, 0x00000002},{0x14DC, 2, 0x00000003},{0x14F0, 4, 0x00000011},
+    {0x14F2, 4, 0x00000002},{0x14F8, 2, 0x00000003},{0x150C, 4, 0x00000012},{0x150E, 4, 0x00000002},{0x1514, 2, 0x00000003},
+    {0x1528, 4, 0x00000013},{0x152A, 4, 0x00000002},{0x1530, 2, 0x00000003},{0x1546, 4, 0x00000002},{0x154C, 2, 0x00000006},
+    {0x1560, 4, 0x00000001},{0x1562, 4, 0x00000002},{0x1568, 2, 0x00000006},{0x157C, 4, 0x00000002},{0x157E, 4, 0x00000002},
+    {0x1584, 2, 0x00000006},{0x1598, 4, 0x00000003},{0x159A, 4, 0x00000002},{0x15A0, 2, 0x00000006},{0x15B4, 4, 0x00000004},
+    {0x15B6, 4, 0x00000002},{0x15BC, 2, 0x00000006},{0x15D0, 4, 0x00000005},{0x15D2, 4, 0x00000002},{0x15D8, 2, 0x00000006},
+    {0x15EC, 4, 0x00000006},{0x15EE, 4, 0x00000002},{0x15F4, 2, 0x00000006},{0x1608, 4, 0x00000007},{0x160A, 4, 0x00000002},
+    {0x1610, 2, 0x00000006},{0x1624, 4, 0x00000008},{0x1626, 4, 0x00000002},{0x162C, 2, 0x00000006},{0x1640, 4, 0x00000009},
+    {0x1642, 4, 0x00000002},{0x1648, 2, 0x00000006},{0x165C, 4, 0x0000000A},{0x165E, 4, 0x00000002},{0x1664, 2, 0x00000006},
+    {0x1678, 4, 0x0000000B},{0x167A, 4, 0x00000002},{0x1680, 2, 0x00000006},{0x1694, 4, 0x0000000C},{0x1696, 4, 0x00000002},
+    {0x169C, 2, 0x00000006},{0x16B0, 4, 0x0000000D},{0x16B2, 4, 0x00000002},{0x16B8, 2, 0x00000006},{0x16CC, 4, 0x0000000E},
+    {0x16CE, 4, 0x00000002},{0x16D4, 2, 0x00000006},{0x16E8, 4, 0x0000000F},{0x16EA, 4, 0x00000002},{0x16F0, 2, 0x00000006},
+    {0x1704, 4, 0x00000010},{0x1706, 4, 0x00000002},{0x170C, 2, 0x00000006},{0x1720, 4, 0x00000011},{0x1722, 4, 0x00000002},
+    {0x1728, 2, 0x00000006},{0x173C, 4, 0x00000012},{0x173E, 4, 0x00000002},{0x1744, 2, 0x00000006},{0x1758, 4, 0x00000013},
+    {0x175A, 4, 0x00000002},{0x1760, 2, 0x00000006},{0x1776, 4, 0x00000002},{0x177C, 2, 0x00000005},{0x1790, 4, 0x00000001},
+    {0x1792, 4, 0x00000002},{0x1798, 2, 0x00000005},{0x17AC, 4, 0x00000002},{0x17AE, 4, 0x00000002},{0x17B4, 2, 0x00000005},
+    {0x17C8, 4, 0x00000003},{0x17CA, 4, 0x00000002},{0x17D0, 2, 0x00000005},{0x17E4, 4, 0x00000004},{0x17E6, 4, 0x00000002},
+    {0x17EC, 2, 0x00000005},{0x1800, 4, 0x00000005},{0x1802, 4, 0x00000002},{0x1808, 2, 0x00000005},{0x181C, 4, 0x00000006},
+    {0x181E, 4, 0x00000002},{0x1824, 2, 0x00000005},{0x1838, 4, 0x00000007},{0x183A, 4, 0x00000002},{0x1840, 2, 0x00000005},
+    {0x1854, 4, 0x00000008},{0x1856, 4, 0x00000002},{0x185C, 2, 0x00000005},{0x1870, 4, 0x00000009},{0x1872, 4, 0x00000002},
+    {0x1878, 2, 0x00000005},{0x188C, 4, 0x0000000A},{0x188E, 4, 0x00000002},{0x1894, 2, 0x00000005},{0x18A8, 4, 0x0000000B},
+    {0x18AA, 4, 0x00000002},{0x18B0, 2, 0x00000005},{0x18C4, 4, 0x0000000C},{0x18C6, 4, 0x00000002},{0x18CC, 2, 0x00000005},
+    {0x18E0, 4, 0x0000000D},{0x18E2, 4, 0x00000002},{0x18E8, 2, 0x00000005},{0x18FC, 4, 0x0000000E},{0x18FE, 4, 0x00000002},
+    {0x1904, 2, 0x00000005},{0x1918, 4, 0x0000000F},{0x191A, 4, 0x00000002},{0x1920, 2, 0x00000005},{0x1934, 4, 0x00000010},
+    {0x1936, 4, 0x00000002},{0x193C, 2, 0x00000005},{0x1950, 4, 0x00000011},{0x1952, 4, 0x00000002},{0x1958, 2, 0x00000005},
+    {0x196C, 4, 0x00000012},{0x196E, 4, 0x00000002},{0x1974, 2, 0x00000005},{0x1988, 4, 0x00000013},{0x198A, 4, 0x00000002},
+    {0x1990, 2, 0x00000005},{0x19A6, 4, 0x00000002},{0x19AC, 2, 0x00000004},{0x19C0, 4, 0x00000001},{0x19C2, 4, 0x00000002},
+    {0x19C8, 2, 0x00000004},{0x19DC, 4, 0x00000002},{0x19DE, 4, 0x00000002},{0x19E4, 2, 0x00000004},{0x19F8, 4, 0x00000003},
+    {0x19FA, 4, 0x00000002},{0x1A00, 2, 0x00000004},{0x1A14, 4, 0x00000004},{0x1A16, 4, 0x00000002},{0x1A1C, 2, 0x00000004},
+    {0x1A30, 4, 0x00000005},{0x1A32, 4, 0x00000002},{0x1A38, 2, 0x00000004},{0x1A4C, 4, 0x00000006},{0x1A4E, 4, 0x00000002},
+    {0x1A54, 2, 0x00000004},{0x1A68, 4, 0x00000007},{0x1A6A, 4, 0x00000002},{0x1A70, 2, 0x00000004},{0x1A84, 4, 0x00000008},
+    {0x1A86, 4, 0x00000002},{0x1A8C, 2, 0x00000004},{0x1AA0, 4, 0x00000009},{0x1AA2, 4, 0x00000002},{0x1AA8, 2, 0x00000004},
+    {0x1ABC, 4, 0x0000000A},{0x1ABE, 4, 0x00000002},{0x1AC4, 2, 0x00000004},{0x1AD8, 4, 0x0000000B},{0x1ADA, 4, 0x00000002},
+    {0x1AE0, 2, 0x00000004},{0x1AF4, 4, 0x0000000C},{0x1AF6, 4, 0x00000002},{0x1AFC, 2, 0x00000004},{0x1B10, 4, 0x0000000D},
+    {0x1B12, 4, 0x00000002},{0x1B18, 2, 0x00000004},{0x1B2C, 4, 0x0000000E},{0x1B2E, 4, 0x00000002},{0x1B34, 2, 0x00000004},
+    {0x1B48, 4, 0x0000000F},{0x1B4A, 4, 0x00000002},{0x1B50, 2, 0x00000004},{0x1B64, 4, 0x00000010},{0x1B66, 4, 0x00000002},
+    {0x1B6C, 2, 0x00000004},{0x1B80, 4, 0x00000011},{0x1B82, 4, 0x00000002},{0x1B88, 2, 0x00000004},{0x1B9C, 4, 0x00000012},
+    {0x1B9E, 4, 0x00000002},{0x1BA4, 2, 0x00000004},{0x1BB8, 4, 0x00000013},{0x1BBA, 4, 0x00000002},{0x1BC0, 2, 0x00000004},
+    {0x1BD6, 4, 0x00000002},{0x1BDC, 2, 0x0000000B},{0x1BF0, 4, 0x00000001},{0x1BF2, 4, 0x00000002},{0x1BF8, 2, 0x0000000B},
+    {0x1C0C, 4, 0x00000002},{0x1C0E, 4, 0x00000002},{0x1C14, 2, 0x0000000B},{0x1C28, 4, 0x00000003},{0x1C2A, 4, 0x00000002},
+    {0x1C30, 2, 0x0000000B},{0x1C44, 4, 0x00000004},{0x1C46, 4, 0x00000002},{0x1C4C, 2, 0x0000000B},{0x1C60, 4, 0x00000005},
+    {0x1C62, 4, 0x00000002},{0x1C68, 2, 0x0000000B},{0x1C7C, 4, 0x00000006},{0x1C7E, 4, 0x00000002},{0x1C84, 2, 0x0000000B},
+    {0x1C98, 4, 0x00000007},{0x1C9A, 4, 0x00000002},{0x1CA0, 2, 0x0000000B},{0x1CB4, 4, 0x00000008},{0x1CB6, 4, 0x00000002},
+    {0x1CBC, 2, 0x0000000B},{0x1CD0, 4, 0x00000009},{0x1CD2, 4, 0x00000002},{0x1CD8, 2, 0x0000000B},{0x1CEC, 4, 0x0000000A},
+    {0x1CEE, 4, 0x00000002},{0x1CF4, 2, 0x0000000B},{0x1D08, 4, 0x0000000B},{0x1D0A, 4, 0x00000002},{0x1D10, 2, 0x0000000B},
+    {0x1D24, 4, 0x0000000C},{0x1D26, 4, 0x00000002},{0x1D2C, 2, 0x0000000B},{0x1D40, 4, 0x0000000D},{0x1D42, 4, 0x00000002},
+    {0x1D48, 2, 0x0000000B},{0x1D5C, 4, 0x0000000E},{0x1D5E, 4, 0x00000002},{0x1D64, 2, 0x0000000B},{0x1D78, 4, 0x0000000F},
+    {0x1D7A, 4, 0x00000002},{0x1D80, 2, 0x0000000B},{0x1D94, 4, 0x00000010},{0x1D96, 4, 0x00000002},{0x1D9C, 2, 0x0000000B},
+    {0x1DB0, 4, 0x00000011},{0x1DB2, 4, 0x00000002},{0x1DB8, 2, 0x0000000B},{0x1DCC, 4, 0x00000012},{0x1DCE, 4, 0x00000002},
+    {0x1DD4, 2, 0x0000000B},{0x1DE8, 4, 0x00000013},{0x1DEA, 4, 0x00000002},{0x1DF0, 2, 0x0000000B},
+};
+
+// The 265 entity index-list entries (dword_2073134[1..265]); each is an
+// offset from the pool base (dword_2120420).  Index 0 is unused (zero).
+static const unsigned int sEntityIndexOffsets[265] =
+{
+    0x0000u,0x001Cu,0x0038u,0x0070u,0x0054u,0x008Cu,0x0118u,0x0134u,0x00C4u,0x00E0u,
+    0x00A8u,0x00FCu,0x039Cu,0x0188u,0x01A4u,0x01C0u,0x01DCu,0x0348u,0x0380u,0x024Cu,
+    0x0268u,0x0284u,0x02A0u,0x02BCu,0x02D8u,0x02F4u,0x0310u,0x0214u,0x0230u,0x03B8u,
+    0x03D4u,0x03F0u,0x040Cu,0x0428u,0x0444u,0x0460u,0x047Cu,0x0498u,0x04B4u,0x04D0u,
+    0x04ECu,0x0508u,0x0524u,0x0540u,0x055Cu,0x0C78u,0x0EA8u,0x10D8u,0x1308u,0x1768u,
+    0x1538u,0x0818u,0x0A48u,0x1998u,0x05E8u,0x1BC8u,0x0C94u,0x0EC4u,0x10F4u,0x1324u,
+    0x1784u,0x1554u,0x0834u,0x0A64u,0x19B4u,0x0604u,0x1BE4u,0x0CB0u,0x0EE0u,0x1110u,
+    0x1340u,0x17A0u,0x1570u,0x0850u,0x0A80u,0x19D0u,0x0620u,0x1C00u,0x0CCCu,0x0EFCu,
+    0x112Cu,0x135Cu,0x17BCu,0x158Cu,0x086Cu,0x0A9Cu,0x19ECu,0x063Cu,0x1C1Cu,0x0CE8u,
+    0x0F18u,0x1148u,0x1378u,0x17D8u,0x15A8u,0x0888u,0x0AB8u,0x1A08u,0x0658u,0x1C38u,
+    0x0D04u,0x0F34u,0x1164u,0x1394u,0x17F4u,0x15C4u,0x08A4u,0x0AD4u,0x1A24u,0x0674u,
+    0x1C54u,0x0D20u,0x0F50u,0x1180u,0x13B0u,0x1810u,0x15E0u,0x08C0u,0x0AF0u,0x1A40u,
+    0x0690u,0x1C70u,0x0D3Cu,0x0F6Cu,0x119Cu,0x13CCu,0x182Cu,0x15FCu,0x08DCu,0x0B0Cu,
+    0x1A5Cu,0x06ACu,0x1C8Cu,0x0D58u,0x0F88u,0x11B8u,0x13E8u,0x1848u,0x1618u,0x08F8u,
+    0x0B28u,0x1A78u,0x06C8u,0x1CA8u,0x0D74u,0x0FA4u,0x11D4u,0x1404u,0x1864u,0x1634u,
+    0x0914u,0x0B44u,0x1A94u,0x06E4u,0x1CC4u,0x0D90u,0x0FC0u,0x11F0u,0x1420u,0x1880u,
+    0x1650u,0x0930u,0x0B60u,0x1AB0u,0x0700u,0x1CE0u,0x0DACu,0x0FDCu,0x120Cu,0x143Cu,
+    0x189Cu,0x166Cu,0x094Cu,0x0B7Cu,0x1ACCu,0x071Cu,0x1CFCu,0x0DC8u,0x0FF8u,0x1228u,
+    0x1458u,0x18B8u,0x1688u,0x0968u,0x0B98u,0x1AE8u,0x0738u,0x1D18u,0x0DE4u,0x1014u,
+    0x1244u,0x1474u,0x18D4u,0x16A4u,0x0984u,0x0BB4u,0x1B04u,0x0754u,0x1D34u,0x0E00u,
+    0x1030u,0x1260u,0x1490u,0x18F0u,0x16C0u,0x09A0u,0x0BD0u,0x1B20u,0x0770u,0x1D50u,
+    0x0E1Cu,0x104Cu,0x127Cu,0x14ACu,0x190Cu,0x16DCu,0x09BCu,0x0BECu,0x1B3Cu,0x078Cu,
+    0x1D6Cu,0x0E38u,0x1068u,0x1298u,0x14C8u,0x1928u,0x16F8u,0x09D8u,0x0C08u,0x1B58u,
+    0x07A8u,0x1D88u,0x0E54u,0x1084u,0x12B4u,0x14E4u,0x1944u,0x1714u,0x09F4u,0x0C24u,
+    0x1B74u,0x07C4u,0x1DA4u,0x0E70u,0x10A0u,0x12D0u,0x1500u,0x1960u,0x1730u,0x0A10u,
+    0x0C40u,0x1B90u,0x07E0u,0x1DC0u,0x0E8Cu,0x10BCu,0x12ECu,0x151Cu,0x197Cu,0x174Cu,
+    0x0A2Cu,0x0C5Cu,0x1BACu,0x07FCu,0x1DDCu
+};
+static int BuildGraphicsEntityPool(void)
+{
+    BYTE *pool = (BYTE *)g_dword_2120420;
+
+    // Pool field initialisation: apply the non-zero field writes (the pool
+    // was just zeroed by the caller).  Byte-level copy: some of the
+    // original dword writes are unaligned.
+    DWORD i;
+    for (i = 0; i < sizeof(sPoolFieldWrites) / sizeof(sPoolFieldWrites[0]); i++)
+        memcpy(&pool[sPoolFieldWrites[i].off], &sPoolFieldWrites[i].val,
+               (size_t)sPoolFieldWrites[i].sz);
+
+    // Entity index list: slot i+1 -> pool + sEntityIndexOffsets[i].
+    for (i = 0; i < 265; i++)
+        g_dword_2073134[i + 1] = &pool[sEntityIndexOffsets[i]];
+
+    // Entity count (last valid index).
+    g_dword_2063134 = 265;
+    return 0;
+}
+// ============================================================
+//  RegisterGraphicsEntities  (0x18D04D0 - 0x18D195E)  -- register the
+//  frontend graphics-entity descriptors (built by BuildGraphicsEntityPool)
+//  into the per-object lists of the graphics-entity object pool (0x211A408)
+//  and append each newly-registered descriptor to the dirty list
+//  (dword_2073940 / count dword_2073938).
+//  [NOT byte-identical] refs the high-VA object pool (0x211A408), the
+//  descriptor pool (0x2120420), the dirty list (dword_2073940) and the rdata
+//  source values (0x1D9DF8C..0x1D9E0CC) at their original addresses.  No
+//  function calls (pure data registration): a straight-line run of 20
+//  descriptors, a 4x4 do-while over 16 descriptors, a 20x9 second loop over
+//  the descriptor tables, and a final 8-descriptor tail.
+//
+//  Each descriptor is a 28-byte record in the descriptor pool:
+//     +0x00  ptr (self: the record base, stored in the object list / dirty list)
+//     +0x04  key   (compared to the expected value; written to expected)
+//     +0x08  mask  (OR'd with the object's mask source)
+//     +0x0E  idx   (index byte into the object pool)
+//     +0x18  flag  (one-shot "already registered" byte)
+//  A descriptor is (re)registered when its key != expected: if
+//  (object.maskSrc & mask) == 0 the {ptr, key} entry is appended to the
+//  object's list (object.maskSrc is NOT modified, only the descriptor's mask
+//  field accumulates it), the key is set to expected, and if the flag was
+//  clear the ptr is pushed onto the dirty list and the flag set.
+//
+//  The object pool is only referenced via indices 0..2 at run time, so the
+//  {ptr,key} list never overflows (max 112 entries observed).  Return value
+//  (the last descriptor's object base) is discarded by the sole caller
+//  ResetGraphicsEntities, so 0 is returned.
+// ============================================================
+static void RegGraphicsEntity(BYTE *pool, int off, DWORD expected)
+{
+    BYTE *rec = pool + off;
+    DWORD key = *(DWORD *)(rec + 4);
+    if (key != expected)
+    {
+        F3GraphicsEntityObj *obj = &g_objPool[rec[14]];   // idx is a byte < 256
+        DWORD maskSrc = obj->maskSrc;
+        DWORD mask    = *(DWORD *)(rec + 8);
+        if ((maskSrc & mask) == 0)
+        {
+            *(DWORD *)(rec + 8) = maskSrc | mask;
+            int c = (int)obj->count;
+            obj->list[c * 2]     = (DWORD)rec;
+            obj->list[c * 2 + 1] = key;
+            obj->count = (DWORD)(c + 1);
+        }
+        *(DWORD *)(rec + 4) = expected;
+        if (rec[24] == 0)
+        {
+            g_dword_2073940[g_dword_2073938] = (DWORD)rec;
+            rec[24] = 1;
+            g_dword_2073938++;
+        }
+    }
+}
+static int RegisterGraphicsEntities(void)
+{
+    BYTE *pool = (BYTE *)g_dword_2120420;
+
+    // Straight-line descriptors (order == the original's execution order).
+    RegGraphicsEntity(pool, 0x0054, 1);             // 0x2120474
+    RegGraphicsEntity(pool, 0x0038, 1);             // 0x2120458
+    RegGraphicsEntity(pool, 0x0070, 4);             // 0x2120490  (dword_1D9E004)
+    RegGraphicsEntity(pool, 0x0000, 3);             // 0x2120420  (dword_1D9E0C0)
+    RegGraphicsEntity(pool, 0x00E0, 0);             // 0x2120500
+    RegGraphicsEntity(pool, 0x00FC, 0x80);          // 0x212051C
+    RegGraphicsEntity(pool, 0x00A8, 8);             // 0x21204C8  (dword_1D9DFF4)
+    RegGraphicsEntity(pool, 0x0118, 2);             // 0x2120538  (dword_1D9E088)
+    RegGraphicsEntity(pool, 0x0134, 1);             // 0x2120554  (dword_1D9E084)
+    RegGraphicsEntity(pool, 0x008C, 3);             // 0x21204AC  (dword_1D9E0CC)
+    RegGraphicsEntity(pool, 0x00C4, 0);             // 0x21204E4
+    RegGraphicsEntity(pool, 0x001C, 15);            // 0x212043C
+    RegGraphicsEntity(pool, 0x0214, 0);             // 0x2120634
+    RegGraphicsEntity(pool, 0x0230, 0);             // 0x2120650
+    RegGraphicsEntity(pool, 0x0188, 0);             // 0x21205A8
+    RegGraphicsEntity(pool, 0x01A4, 0x42800000);    // 0x21205C4
+    RegGraphicsEntity(pool, 0x01C0, 0x3F800000);    // 0x21205E0
+    RegGraphicsEntity(pool, 0x01DC, 0x42800000);    // 0x21205FC
+    RegGraphicsEntity(pool, 0x0348, 1);             // 0x2120768  (dword_1D9E050)
+    RegGraphicsEntity(pool, 0x0380, 0xFFFFFFFF);    // 0x21207A0
+
+    // Do-while: 4 iterations x 112-byte blocks == 16 contiguous 28-byte
+    // descriptors starting at 0x21207D8 (expected key 0 for all).
+    RegGraphicsEntity(pool, 0x03B8, 0);
+    RegGraphicsEntity(pool, 0x03D4, 0);
+    RegGraphicsEntity(pool, 0x03F0, 0);
+    RegGraphicsEntity(pool, 0x040C, 0);
+    RegGraphicsEntity(pool, 0x0428, 0);
+    RegGraphicsEntity(pool, 0x0444, 0);
+    RegGraphicsEntity(pool, 0x0460, 0);
+    RegGraphicsEntity(pool, 0x047C, 0);
+    RegGraphicsEntity(pool, 0x0498, 0);
+    RegGraphicsEntity(pool, 0x04B4, 0);
+    RegGraphicsEntity(pool, 0x04D0, 0);
+    RegGraphicsEntity(pool, 0x04EC, 0);
+    RegGraphicsEntity(pool, 0x0508, 0);
+    RegGraphicsEntity(pool, 0x0524, 0);
+    RegGraphicsEntity(pool, 0x0540, 0);
+    RegGraphicsEntity(pool, 0x055C, 0);
+
+    // Second loop: 20 iterations x 9 descriptor tables.  The iteration
+    // offset is 28*i for i<16 and 28*i+0x1A5C for i>=16 (the 4 high blocks).
+    int i;
+    for (i = 0; i < 20; i++)
+    {
+        int off = 28 * i + (i >= 16 ? 0x1A5C : 0);
+        RegGraphicsEntity(pool, 0x1538 + off, 2);   // 0x2121958 (dword_1D9E03C)
+        RegGraphicsEntity(pool, 0x1768 + off, 2);   // 0x2121B88 (dword_1D9E03C)
+        RegGraphicsEntity(pool, 0x0EA8 + off, 3);   // 0x21212C8 (dword_1D9DF8C)
+        RegGraphicsEntity(pool, 0x10D8 + off, 3);   // 0x21214F8 (dword_1D9DF8C)
+        RegGraphicsEntity(pool, 0x1308 + off, 3);   // 0x2121728 (dword_1D9DF8C)
+        RegGraphicsEntity(pool, 0x0818 + off, 0);   // 0x2120C38 (xmm1 == 0)
+        RegGraphicsEntity(pool, 0x0C78 + off, 2);   // 0x2121098 (dword_1D9E048)
+        RegGraphicsEntity(pool, 0x05E8 + off, 1);   // 0x2120A08
+        RegGraphicsEntity(pool, 0x1998 + off, 0);   // 0x2121DB8
+    }
+
+    // Tail descriptors.
+    RegGraphicsEntity(pool, 0x024C, 0);             // 0x212066C
+    RegGraphicsEntity(pool, 0x0268, 1);             // 0x2120688  (dword_1D9E064)
+    RegGraphicsEntity(pool, 0x0284, 1);             // 0x21206A4  (dword_1D9E064)
+    RegGraphicsEntity(pool, 0x02A0, 1);             // 0x21206C0  (dword_1D9E064)
+    RegGraphicsEntity(pool, 0x02BC, 8);             // 0x21206DC  (dword_1D9E034)
+    RegGraphicsEntity(pool, 0x02D8, 0);             // 0x21206F8
+    RegGraphicsEntity(pool, 0x02F4, 0xFFFFFFFF);    // 0x2120714
+    RegGraphicsEntity(pool, 0x0310, 0xFFFFFFFF);    // 0x2120730
+
+    return 0;   // original returns the last descriptor's object base (ignored)
+}
 static int sub_18D02E0(void) { g_dword_2073938 = 0; return 0; }  // sync/commit the entities to the device
 
 // ============================================================
 //  ResetGraphicsEntities  (0x18D1960 - 0x18D19AE)  -- reset and rebuild the
 //  frontend graphics-entity pool and rebind it to the device.
 //  [NOT byte-identical] placement-dependent (relative calls to the
-//  graphics-entity subsystem callees sub_18CFA70 / sub_18D04D0 / sub_18D02E0
+//  graphics-entity subsystem callees BuildGraphicsEntityPool /
+//  RegisterGraphicsEntities / sub_18D02E0
 //  below and the memset IAT slot) and refs the high-VA globals (the
 //  dword_2120420 pool, the dword_2073938 / dword_2063134 counters, byte_211C402,
 //  dword_2075F54, byte_2075F4D) at their original addresses.
@@ -3333,11 +3773,11 @@ static int sub_18D02E0(void) { g_dword_2073938 = 0; return 0; }  // sync/commit 
 //  Flow (exactly the original 78-byte body):
 //    1. memset(&dword_2120420, 0, 0x1DF8)  -- zero the entity pool.
 //    2. dword_2073938 = 0; dword_2063134 = 0;  -- reset the two counters.
-//    3. sub_18CFA70();  -- rebuild the entity pool + index lists.
+//    3. BuildGraphicsEntityPool();  -- rebuild the pool + index list.
 //    4. byte_211C402 = 3;  -- set the subsystem state.
 //    5. dword_2075F54 = device;  -- bind the device object.
 //    6. byte_2075F4D = 0;  -- clear the sync flag.
-//    7. sub_18D04D0();  -- register the dirty entities.
+//    7. RegisterGraphicsEntities();  -- register the dirty entities.
 //    8. return sub_18D02E0();  -- sync/commit the entities to the device.
 //
 //  Called by ResetGraphicsSurfaces (0x18E6D40) with the current device object
@@ -3350,11 +3790,11 @@ static int ResetGraphicsEntities(void *device)
     memset(&g_dword_2120420, 0, 0x1DF8);
     g_dword_2073938 = 0;
     g_dword_2063134 = 0;
-    sub_18CFA70();
+    BuildGraphicsEntityPool();
     g_byte_211C402  = 3;
     g_dword_2075F54 = device;
     g_byte_2075F4D  = 0;
-    sub_18D04D0();
+    RegisterGraphicsEntities();
     return sub_18D02E0();
 }
 
@@ -3389,8 +3829,8 @@ static void ResetGraphicsSurfaces(void)
     if (slot.surface != 0)
         ((void (*)(void *))((void **)(*(void **)slot.surface))[2])(slot.surface);
 
-    rec[0] = 2; rec[4] = 1;
-    sub_1A042B0(rec, flags);
+    int csurfDims[3] = { 1, 1, 1 };
+    CreateCsurface(flags, fmt, csurfDims, /*index*/2);
     if (g_dword_1DB1318 != 0)
     {
         ((void (*)(void *))((void **)(*(void **)g_dword_1DB1318))[2])(g_dword_1DB1318);
@@ -3416,7 +3856,188 @@ static void ResetGraphicsSurfaces(void)
     g_qword_1E2EF50[1] = 0;
 }
 
-static void  sub_619D70(void *p) { (void)p; }                     // _beginthread entry (no-op)
+// ============================================================
+//  Game-frame steps driven by RunGameLoop (0x619D70), the frontend's
+//  per-frame device pump.
+//
+//  The XLO device vtable slots used here (device in ECX, stdcall-style push
+//  args): [3]  = status query (0x88760868 / 0x88760869 == device lost),
+//  [17] = frame flush/submit, [41] = begin (first frame only),
+//  [42] = end (when the frame counter wraps to 0),
+//  [43] = present (the 4-byte device-slot state packed little-endian + a
+//  trailing zeroed 8-byte float slot).
+// ============================================================
+static DWORD g_unk_1DB12B4   = 0xFF000000;  // 0x1DB12B4  device-slot state (worker.cpp keeps its own copy)
+static int   g_dword_1E2ED7C = 0;           // 0x1E2ED7C  frame-nesting counter
+static CRITICAL_SECTION g_stru_20FC948;     // 0x20FC948  device critical section
+static int   g_stru_20FC948Init = 0;
+static double g_dbl_20FC960  = 0.0;         // 0x20FC960  last frame time (under the device CS)
+static BYTE  g_unk_1DB21F0[0x3418] = { 0 }; // 0x1DB21F0  per-frame graphics-state block
+static BYTE  g_unk_2063030[0x40]   = { 0 }; // 0x2063030
+static BYTE  g_unk_2063070[0x40]   = { 0 }; // 0x2063070
+
+// sub_18DDDB0 -- per-frame graphics-state flush (device-table vtable slots,
+// the 0x2000-byte state-region 0xFE mask reset).  Remaining stub: it is its
+// own unimplemented cluster, called once per frame by BeginFrame.
+static void sub_18DDDB0(void) {}
+// sub_18CB6A0 -- flush the pending device-operation lists (0x715-byte
+// cluster over the 0x20FC98C..0x20FC9C8 object lists + the FPS records at
+// 0x2074548/0x20B5F70).  Remaining stub, called by FlushRenderFrame.
+static void sub_18CB6A0(void) {}
+// sub_18F0460 -- interpolated frame time from the per-slot time records
+// (sub_18CB350 + the 0x1E2ED74/0x1E2ED78 scalars).  Remaining stub.
+static double sub_18F0460(void) { return 0.0; }
+
+//  PresentFrame  (0x18F1060 - 0x18F10A7)  -- present the previous frame.
+//  stdcall @4, arg = pointer to the 4-byte device-slot state (packed
+//  little-endian into one DWORD).  Dispatches device vtable[43] (0xAC):
+//    (device, 0, 0, 1, packedSlotState, 0.0)
+//  where the trailing value is the 8-byte zeroed float slot the original
+//  writes with `fstp` (0x0 as both a float and a double).
+//  [NOT byte-identical] placement-dependent (relative call, the vtable
+//  dispatch through the high-VA device global) and refs g_dword_1E2EEF4 / the
+//  slot-state byte at their original high VAs; null-guarded (the original
+//  would fault pre-device).
+static void PresentFrame(const DWORD *slotState)
+{
+    if (g_dword_1E2EEF4 == 0)
+        return;
+    ((void (*)(void *, int, int, int, DWORD, double))
+        (*(void ***)g_dword_1E2EEF4)[43])(
+        g_dword_1E2EEF4, 0, 0, 1, *slotState, 0.0);
+}
+
+//  BeginFrame  (0x18F0B60 - 0x18F0BBE)  -- per-frame bookkeeping.
+//  On the first frame (frame-nesting counter 0) dispatches device vtable[41]
+//  (0xA4) with the device as its single argument; increments the counter;
+//  flushes the per-frame graphics state (sub_18DDDB0, stub); and 0xFE-poisons
+//  the three state blocks (0x1DB21F0 x 0x3418, 0x2063070 x 0x40,
+//  0x2063030 x 0x40).
+//  [NOT byte-identical] placement-dependent (relative calls + the memset IAT
+//  slot at its original high VA) and refs the high-VA state globals;
+//  null-guarded (the original would fault pre-device).
+static void BeginFrame(void)
+{
+    if (g_dword_1E2ED7C == 0 && g_dword_1E2EEF4 != 0)
+        ((void (*)(void *))(*(void ***)g_dword_1E2EEF4)[41])(g_dword_1E2EEF4);
+    ++g_dword_1E2ED7C;
+    sub_18DDDB0();
+    memset(g_unk_1DB21F0, 0xFE, 0x3418);
+    memset(g_unk_2063070, 0xFE, 0x40);
+    memset(g_unk_2063030, 0xFE, 0x40);
+}
+
+//  IsDeviceLost  (0x18EFFA0 - 0x18EFFC1)  -- query the device status
+//  (vtable[3], 0x0C) and report 1 when it is 0x88760868 or 0x88760869
+//  (the device's lost/reset-pending states).  [NOT byte-identical] refs the
+//  high-VA device global; null-guarded (pre-device counts as "lost" so the
+//  loop skips XLiveRender before the XLO device exists).
+static int IsDeviceLost(void)
+{
+    if (g_dword_1E2EEF4 == 0)
+        return 1;
+    int st = (int)(DWORD)((int (*)(void *))(*(void ***)g_dword_1E2EEF4)[3])(g_dword_1E2EEF4);
+    return (st == 0x88760868 || st == 0x88760869);
+}
+
+//  EndFrame  (0x18F0100 - 0x18F011A)  -- decrement the frame-nesting counter
+//  and, when it wraps to 0, dispatch device vtable[42] (0xA8) with the device
+//  as its single argument.  [NOT byte-identical] placement-dependent and refs
+//  the high-VA device global; null-guarded (the original would fault
+//  pre-device).
+static void EndFrame(void)
+{
+    if (--g_dword_1E2ED7C == 0 && g_dword_1E2EEF4 != 0)
+        ((void (*)(void *))(*(void ***)g_dword_1E2EEF4)[42])(g_dword_1E2EEF4);
+}
+
+//  FlushRenderFrame  (0x18F1F60 - 0x18F1FB4)  -- per-frame device check, flush
+//  and frame-time update.  Dispatches device vtable[17] (0x44) with
+//  (device, 0, 0, 0, 0); when the result is 0x88760868 (lost) it returns 0
+//  (the loop then closes and waits on the worker).  Otherwise it flushes the
+//  pending device operations (sub_18CB6A0, stub) and, under the device
+//  critical section stru_20FC948, stores the current frame time
+//  (sub_18F0460, stub) into dbl_20FC960, and returns 1.
+//  [NOT byte-identical] placement-dependent (relative calls + the
+//  Enter/LeaveCriticalSection IAT slots at their original high VAs) and refs
+//  the high-VA device global / critical section / time slot; null-guarded (a
+//  missing device reads as "no problem", so the worker is not closed
+//  pre-device).
+static int FlushRenderFrame(void)
+{
+    if (g_dword_1E2EEF4 == 0)
+        return 1;
+    int st = (int)(DWORD)((int (*)(void *, int, int, int, int))
+        (*(void ***)g_dword_1E2EEF4)[17])(g_dword_1E2EEF4, 0, 0, 0, 0);
+    if (st == 0x88760868)
+        return 0;
+    sub_18CB6A0();
+    if (!g_stru_20FC948Init)
+    {
+        InitializeCriticalSection(&g_stru_20FC948);
+        g_stru_20FC948Init = 1;
+    }
+    EnterCriticalSection(&g_stru_20FC948);
+    g_dbl_20FC960 = sub_18F0460();
+    LeaveCriticalSection(&g_stru_20FC948);
+    return 1;
+}
+
+//  WaitForWorkerClose  (0x18F6C10 - 0x18F6C3C)  -- thiscall stop-worker step.
+//  Posts WM_CLOSE (0x8000) to the worker window (worker+0x238) and blocks on
+//  the worker's thread-exit event (worker+0x1A4, auto-reset) with an INFINITE
+//  timeout, returning the wait status.  [NOT byte-identical] refs the Post /
+//  Wait IAT slots at their original high VAs; null-guarded (a missing worker
+//  is a no-op).
+static DWORD WaitForWorkerClose(void *worker)
+{
+    if (worker == 0)
+        return 0;
+    PostMessageA(*(HWND *)((char *)worker + 0x238), 0x8000, 0, 0);
+    return WaitForSingleObjectEx(*(HANDLE *)((char *)worker + 0x1A4), INFINITE, FALSE);
+}
+
+// ============================================================
+//  SetFrontendEvent is defined below with its WaitForEvent sibling (the
+//  tail-jump target); declared here so the loop can call it.
+static void SetFrontendEvent(void *obj);
+
+// ============================================================
+//  RunGameLoop  (0x619D70 - 0x619DD3)  -- the frontend game/render loop.
+//  [NOT byte-identical] placement-dependent (relative calls to the frame
+//  steps above, the XLiveRender IAT thunk, and the Sleep IAT slot at its
+//  original high VA 0x01AD5xxx) and refs the high-VA globals byte_1DBD9E0
+//  (0x01DBD9E0) and the frontend object dword_1DBD9E8 (0x01DBD9E8).
+//
+//  The _beginthread entry RunFrontEnd starts after `g_byte_1DBD9E0 = 1`.
+//  While the "entered" flag is nonzero, each iteration: presents the previous
+//  frame (PresentFrame on the device-slot state at 0x1DB12B4), runs the
+//  per-frame bookkeeping (BeginFrame), pumps the XNA live render
+//  (XLiveRender) unless the device is in a lost state (IsDeviceLost), runs
+//  the end-of-frame step (EndFrame), checks/flushes the frame device
+//  (FlushRenderFrame -- when it reports the lost state 0x88760868 the loop
+//  closes the worker window and waits for the worker thread to exit, via
+//  WaitForWorkerClose on GetWorker()), and sleeps 1 ms.  On exit it tail-
+//  jumps to SetFrontendEvent (0x18C4540), which signals the frontend event
+//  (SetEvent on dword_1DBD9E8+0x80) to unblock RunFrontEnd's WaitForEvent
+//  gate.
+// ============================================================
+static void RunGameLoop(void *unused)
+{
+    (void)unused;
+    while (g_byte_1DBD9E0 != 0)
+    {
+        PresentFrame(&g_unk_1DB12B4);
+        BeginFrame();
+        if (IsDeviceLost() == 0)
+            XLiveRender();
+        EndFrame();
+        if (FlushRenderFrame() == 0)
+            WaitForWorkerClose(GetWorker());
+        Sleep(1);
+    }
+    SetFrontendEvent(g_unk_1DBD9E8);
+}
 static void  sub_61C320(void *p) { (void)p; }                     // _beginthread entry (no-op)
 // sub_6A66C0 is the canonical GetNetManager (netinit.cpp / netinit.h).
 static int   sub_6A6960(int a) { (void)a; return 0; }
@@ -3463,7 +4084,7 @@ static void  sub_619990(void) {}
 static void  sub_6199A0(void) {}
 static void  sub_18FA3F0(void) {}
 //  WaitForEvent  (0x18C4560 - 0x18C45B3)  -- block on the event stored in
-//  the frontend object (handle at obj+0x80; sibling sub_18C4540 does
+//  the frontend object (handle at obj+0x80; sibling SetFrontendEvent does
 //  SetEvent on the same slot, sub_18C45E0 does CloseHandle). Wraps
 //  WaitForSingleObjectEx(hEvent, dwMilliseconds, bAlertable != 0) and maps
 //  the wait status: 0 = WAIT_TIMEOUT (0x102), 1 = 0xC0, 2 = WAIT_OBJECT_0 /
@@ -3486,6 +4107,17 @@ static int WaitForEvent(void *obj, int dwMilliseconds, int bAlertable)
             return 2;
     }
     return bAlertable;
+}
+//  SetFrontendEvent  (0x18C4540 - 0x18C454E)  -- thiscall sibling of
+//  WaitForEvent: signal the event stored at obj+0x80 of the frontend object
+//  (the sub_18C46E0 constructor's CreateEventA handle; 0 in this build, so
+//  SetEvent fails quietly).  The tail jump of RunGameLoop (0x619D70) lands
+//  here with the frontend object (dword_1DBD9E8) in ECX.  [NOT byte-
+//  identical] the original calls the SetEvent IAT slot at its original high
+//  VA (call ds:__imp_SetEvent, 0x01AD5xxx).
+static void SetFrontendEvent(void *obj)
+{
+    SetEvent(*(HANDLE *)((char *)obj + 0x80));
 }
 // 0x18FA3E0 / 0x18FA3D0: the heap-manager getters. The original sub_18FA3E0
 // takes no argument (callers push a value on the stack for a later stdcall
@@ -3710,7 +4342,7 @@ char RunFrontEnd(void *obj, int arg)
 
     // 8. Start the pump thread, set the cursor, and handle XNA sign-in.
     g_byte_1DBD9E0 = 1;
-    _beginthread(sub_619D70, 0, 0);
+    _beginthread(RunGameLoop, 0, 0);
     SetCursor(LoadCursorA(0, (LPCSTR)0x7F00));
     v71 = 1;
     if (XUserGetSigninState(0) == 0)
