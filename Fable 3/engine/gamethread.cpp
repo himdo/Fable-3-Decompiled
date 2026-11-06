@@ -783,8 +783,9 @@ static void *CNetManagerSlot1C(void *obj) { return *(void **)((char *)obj + 0x1C
 //  success path. It drains the component list (DestroyComponentsExcept
 //  (obj, 0)), closes the +0xE8 handle (CloseHandle when nonzero), runs the
 //  engine-time / queue teardowns (sub_18EC3E0 / sub_18E7710 / sub_18E7830),
-//  dispatches the manager's vtable slot 2 (sub_18F6DC0 in the original),
-//  stops the engine services (sub_18E8B70 / sub_718C50 / sub_1926120), and
+//  dispatches the manager's vtable slot 2 (sub_18F6F80 in the original: the
+//  stop-worker step -- KillTimer 0x1000 on the worker window + pump state 3
+//  under the worker CS), stops the engine services (sub_18E8B70 / sub_718C50 / sub_1926120), and
 //  sleeps 10 ms. It then releases the +0xC0 object through its deleting
 //  destructor (vtable[0](slot, 1), zeroed) and, when the +0xBC handle is
 //  set, clears the net manager's +0x1C sub-object list (sub_6A66C0 /

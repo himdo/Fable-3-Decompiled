@@ -44,4 +44,12 @@ void *GetHeapManager(void);
 // stub (returns 0 until the heap manager is implemented).
 void *GetHeapManagerSlot1C(void *hm);
 
+// 0x1A01270 - copy-assign one shared slot onto another with refcounting
+// (this / src are both the addresses of F3SharedBuffer * fields).
+F3SharedBuffer **CopySharedSlot(F3SharedBuffer **thisSlot, F3SharedBuffer **srcSlot);
+
+// 0x19FFAB0 - build a fresh ANSI slot from the low byte of each wide code
+// unit of the source wide block and store it in the out slot.
+F3SharedBuffer **AnsiFromWideSlot(F3SharedBuffer *wide, F3SharedBuffer **out);
+
 #endif  // F3_GAMEMAIN_H

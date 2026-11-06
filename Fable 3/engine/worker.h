@@ -10,6 +10,7 @@
 
 #include <windows.h>
 #include "object_registry.h"
+#include "common/common.h"   // F3SharedBuffer
 
 // A callback the engine invokes on its worker threads.
 typedef int (*F3CallbackFn)(void);
@@ -86,6 +87,15 @@ int InitEngineTime(void);
 // 0x18F6A40 - return the current worker (dword_20FC8F0). Used pervasively by
 // the engine to reach the current CWorkerWin32.
 void *GetWorker(void);
+
+// 0x18F7C50 - the worker's "run the game" step (called by the manager's run
+// dispatch, CManagerWin32_RunGame). See worker.cpp.
+char CWorkerWin32_RunGame(void *worker, int a2, int a3, int a4, int a5,
+                          int a6, int a8, F3SharedBuffer *wideSlot);
+
+// 0x188EC90 - find the active input device on the input manager's device
+// list (obj +12 / +16); returns the first device whose vtable[1] returns 3.
+void *FindActiveInputDevice(void *obj);
 
 // 0x00615880 - the worker's SEH dispose handler [BYTE-IDENTICAL]. Invoked by
 // the SEH block when its refcount reaches zero; calls vtable[0](worker, 1).

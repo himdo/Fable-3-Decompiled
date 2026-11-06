@@ -163,7 +163,7 @@ struct CDiskFileWin32
 //  pointer in, and increments the new block's refcount. A self-assign is a
 //  no-op. [NOT byte-identical] placement-independent but refs the Interlocked
 //  IAT slots and SharedBufferFree.
-static F3SharedBuffer **CopySharedSlot(F3SharedBuffer **thisSlot, F3SharedBuffer **srcSlot)
+F3SharedBuffer **CopySharedSlot(F3SharedBuffer **thisSlot, F3SharedBuffer **srcSlot)
 {
     F3SharedBuffer *old = *thisSlot;
     F3SharedBuffer *src = (srcSlot != 0) ? *srcSlot : 0;
@@ -2037,7 +2037,7 @@ static F3SharedBuffer ** RefCwdSlot(F3SharedBuffer **slot)
 //  On allocation failure the out slot is still set through SetSharedSlot with
 //  no source (the slot is nulled, g_Addend bumped, no block).
 // ============================================================
-static F3SharedBuffer ** AnsiFromWideSlot(F3SharedBuffer *wide, F3SharedBuffer **out)
+F3SharedBuffer ** AnsiFromWideSlot(F3SharedBuffer *wide, F3SharedBuffer **out)
 {
     unsigned int len  = (wide != 0) ? wide->length : 0;
     const char *data  = (wide != 0) ? wide->data : 0;

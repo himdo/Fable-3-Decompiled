@@ -506,7 +506,7 @@ static void SetInputActive(void *obj, unsigned char state)
 
 // 0x188EC90 -- find the active input device. Walks the device list at
 // obj[12..16); returns the first device whose vtable[1] returns 3, else 0.
-static void *FindActiveInputDevice(void *obj)
+void *FindActiveInputDevice(void *obj)
 {
     if (obj == 0)
         return 0;
@@ -526,6 +526,89 @@ static void *FindActiveInputDevice(void *obj)
         if (i == end)
             return 0;
     }
+}
+
+// ============================================================
+//  InitAccessibilitySettings  (0x18F72B0 - 0x18F7455)  -- [remaining stub]
+//
+//  The accessibility-settings start-up load: applies the SystemParametersInfoA
+//  overrides (SPI_GETHIDCONFIRM 0x3A / GETKEYBOARDSPEED 0x34 / GETKEYBOARDPREECHO
+//  0x32 into dword_1D9E18C / dword_1D9E194 / byte_1D9E19C), and when
+//  "AccessibilitySettings.xml" exists in the settings directory (the
+//  0x1DBE2F0 slot + "AccessibilitySettings.xml", SharedFileExists), opens it
+//  through CXMLReadStream + FindXmlSection and loads the three accessibility
+//  values into dword_20FC8DC / dword_20FC8E0 / dword_20FC8E4 / byte_1D9E19C,
+//  then runs SaveSettingsBeforeExit. The LHXML engine and the settings-value
+//  consumers are out of scope here, so this remains a no-op stub (the
+//  original's behavior with no settings file: the defaults stand).
+// ============================================================
+static void InitAccessibilitySettings(void)
+{
+}
+
+// ============================================================
+//  CWorkerWin32_RunGame  (0x18F7C50 - 0x18F7D21)  -- the worker's "run the
+//  game" step (the manager's run dispatch delegates to this with the worker
+//  in ECX/EDI)
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  AnsiFromWideSlot / CopySharedSlot / SharedBufferFree / InitAccessibilitySettings and the
+//  Enter / LeaveCriticalSection / InterlockedDecrement / WaitForSingleObjectEx
+//  IAT slots) plus the high-VA live-slot counter g_Addend (0x02075C48).
+//
+//  __usercall in the original (worker in EDI, seven stack args, retn 0x1C;
+//  the manager's a7 is not forwarded). Reimplemented as a plain thiscall
+//  free function (worker as the first parameter).
+//
+//  char CWorkerWin32_RunGame(CWorkerWin32 *worker, int a2, int a3, int a4,
+//                            int a5, int a6, int a8, F3SharedBuffer *a9)
+//
+//  Under the worker CS: stores the parsed start-up parameters in the
+//  worker's display-mode / requested-size fields (+0x240 a2, +0x244 a3,
+//  +0x248 a4, +0x24C a5 byte, +0x24D a6 byte, +0x250 a8), converts the
+//  wide locale slot (a9) into a fresh ANSI shared slot (AnsiFromWideSlot,
+//  0x19FFAB0), assigns it into the worker's sharedBlock slot (+0x254,
+//  CopySharedSlot, 0x1A01270), then releases the temporary local slot
+//  (SharedBufferFree at zero buffer refcount + the g_Addend decrement). It
+//  sets the pump state to 1 (window create), leaves the CS, runs the
+//  accessibility-settings load (sub_18F72B0, stubbed), blocks on event1
+//  (+0x9C, INFINITE), and returns (hwnd != 0) -- nonzero only once the
+//  main thread's pump (PumpWorker state 1) has created the worker window
+//  and signalled event1. Null-guarded (the original assumes the worker
+//  global is live; the standalone test has no worker).
+// ============================================================
+char CWorkerWin32_RunGame(void *worker, int a2, int a3, int a4, int a5, int a6,
+                          int a8, F3SharedBuffer *wideSlot)
+{
+    if (worker == 0)
+        return 0;
+    CWorkerWin32 *w = (CWorkerWin32 *)worker;
+    char *c = (char *)w;
+
+    EnterCriticalSection(&w->cs);
+    w->f_0240       = a2;     // +0x240
+    w->windowWidth  = a3;     // +0x244
+    w->windowHeight = a4;     // +0x248
+    c[0x24C]        = (char)a5;   // fullscreen byte
+    c[0x24D]        = (char)a6;   // refresh byte
+    *(int *)(c + 0x250) = a8;     // +0x250
+
+    F3SharedBuffer *local = 0;
+    AnsiFromWideSlot(wideSlot, &local);   // 0x19FFAB0
+    CopySharedSlot((F3SharedBuffer **)(c + 0x254), &local);   // 0x1A01270
+    if (local != 0)   // release the temporary local slot
+    {
+        if (InterlockedDecrement((volatile long *)((char *)local + 12)) <= 0)
+            SharedBufferFree(local);
+    }
+    InterlockedDecrement(&g_Addend);
+
+    w->workerState = 1;      // +0x22C: request the window create
+    LeaveCriticalSection(&w->cs);
+
+    InitAccessibilitySettings();   // sub_18F72B0 (stub)
+
+    WaitForSingleObjectEx(w->event1, INFINITE, FALSE);   // +0x9C
+    return (w->hwnd != 0);
 }
 
 // 0x188D710 -- handle a raw-input report (obj, HRAWINPUT). The original calls
