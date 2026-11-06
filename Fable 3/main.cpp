@@ -40,6 +40,54 @@
 static BYTE g_byte_1DBD01B = 0;  // 0x1DBD01B: set 1 when -loadsavegame is given
 static BYTE g_byte_1C86BD9 = 0;  // 0x1C86BD9: set 0 when -loadsavegame is given
 
+#ifdef FABLE3_WAIT_FOR_DEBUGGER
+// ============================================================
+//  WaitForDebuggerOrTimeout  -- debug-build-only convenience (NOT part of the
+//  original). Compiled only when FABLE3_WAIT_FOR_DEBUGGER is defined: the debug
+//  build (build_vs2008_debug.bat) sets it, the release build does not, so this
+//  pause is present in debug builds and entirely absent from release builds.
+//
+//  The reconstructed Fable3.exe is a small GUI exe that, when launched
+//  through the FableLauncher -> F3Secu -> Fable3 chain, starts running (and
+//  can exit) before a debugger has time to attach by name. To make attach-by-
+//  name reliable, pause at the very start of the process and spin until a
+//  debugger is attached (PEB->BeingDebugged set), so the process stays alive
+//  and halted-in-user-code long enough to attach to.
+//
+//  Controlled by the FABLE3_WAIT_DEBUGGER_MS environment variable
+//  (inherited through CreateProcess by the launch chain):
+//      unset          -> 60000 (default: wait up to 60 s for a debugger)
+//      FABLE3_WAIT_DEBUGGER_MS=0    -> no wait (run immediately)
+//      FABLE3_WAIT_DEBUGGER_MS=-1   -> wait indefinitely until a debugger attaches
+//      FABLE3_WAIT_DEBUGGER_MS=<n>  -> wait up to <n> ms
+// ============================================================
+static void WaitForDebuggerOrTimeout(void)
+{
+    long timeoutMs = 60000;   // default: wait up to 60 seconds
+    const char *env = getenv("FABLE3_WAIT_DEBUGGER_MS");
+    if (env != NULL && *env != '\0')
+        timeoutMs = strtol(env, NULL, 10);
+
+    const int indefinite = (timeoutMs < 0);
+    if (timeoutMs == 0)       // explicitly disabled
+        return;
+
+    OutputDebugStringA("[Fable3] Waiting for debugger to attach...\n");
+    const DWORD start = GetTickCount();
+    for (;;)
+    {
+        if (IsDebuggerPresent())
+        {
+            OutputDebugStringA("[Fable3] Debugger attached; continuing.\n");
+            break;
+        }
+        if (!indefinite && (long)(GetTickCount() - start) >= timeoutMs)
+            break;          // timed out without a debugger -> proceed normally
+        Sleep(50);
+    }
+}
+#endif // FABLE3_WAIT_FOR_DEBUGGER
+
 // ============================================================
 //  WinMain  (0x005CF170 - 0x005CF2E1)  -- Fable 3 entry point
 //
@@ -54,6 +102,11 @@ static BYTE g_byte_1C86BD9 = 0;  // 0x1C86BD9: set 0 when -loadsavegame is given
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nShowCmd)
 {
+#ifdef FABLE3_WAIT_FOR_DEBUGGER
+    // --- debug hook: pause until a debugger attaches (see above) ---
+    WaitForDebuggerOrTimeout();
+#endif
+
     // --- single-instance guard ---
     HANDLE hMutex = CreateMutexA(NULL, TRUE, "Local\\FableIII");
     if (GetLastError() == ERROR_ALREADY_EXISTS)   // 183: an instance is already running

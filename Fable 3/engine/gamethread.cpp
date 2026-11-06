@@ -23,10 +23,10 @@
 
 // 0x1DBD008: 1 when the shared-memory blob was loaded, 0 otherwise.
 static BYTE  g_byte_1DBD008 = 0;
-// 0x1DBD010 / 0x1DBD014: objects whose strings form the error message box
-// (body / title) shown when the shared-memory blob is missing.
-static DWORD g_dword_1DBD010 = 0;
-static DWORD g_dword_1DBD014 = 0;
+// 0x1DBD010 / 0x1DBD014: the "wrong executable" message-box string keys
+// (title / body). Defined + populated in common.cpp (the LocaleInit static
+// ctor, which runs before main) and declared in common/common.h (included
+// above). See locale_static_ctor_callpath.md.
 
 // Placeholder vtables for the two objects created on the game thread.
 static void *g_CFableWindowsDebugHandlerVtable[4] = { 0 };

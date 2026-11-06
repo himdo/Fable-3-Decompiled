@@ -1,0 +1,23 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Attach to Fable3.exe",
+            "type": "cppvsdbg",
+            "request": "attach",
+            "program": "${workspaceFolder}/Fable 3/Release/Win32/Fable3.exe"
+        },
+        {
+            "name": "Debug Fable3.exe (direct)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "preLaunchTask": "build Fable3.exe",
+            "program": "${workspaceFolder}/Fable 3/Release/Win32/Fable3.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}/Fable 3/Release/Win32",
+            "stopAtEntry": true,
+            "console": "internalConsole",
+            "externalConsole": false
+        }
+    ]
+}

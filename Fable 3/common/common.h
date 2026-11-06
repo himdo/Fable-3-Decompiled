@@ -129,6 +129,14 @@ int *GetLocaleEntry(int key);
 
 const WCHAR *GetLocalizedString(const WCHAR ***obj);
 
+// Per-message localized-string ID keys for the "wrong executable" message box
+// (title = g_dword_1DBD010, body = g_dword_1DBD014). Defined in common.cpp and
+// populated by the LocaleInit static global constructor at startup (before
+// main/WinMain), mirroring the original's static ctors sub_1A5B5F0/sub_1A5B620.
+// See locale_static_ctor_callpath.md.
+extern DWORD g_dword_1DBD010;   // 0x1DBD010: GUI_WRONG_EXECUTABLE_NAME
+extern DWORD g_dword_1DBD014;   // 0x1DBD014: GUI_WRONG_EXECUTABLE_DESC
+
 // GetSharedSlotWide (0x19FF560) - the wide-string getter for the WIDE (WCHAR)
 // shared-slot family (the accessor counterpart to the wide null-ctor
 // sub_19FF580, the wide copy ctor CopySharedSlotWide 0x19FFA20 and the wide

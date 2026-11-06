@@ -573,6 +573,104 @@ static DWORD g_localeDefault[9]       = { F3_LOCALE_TABLE_INIT };  // 0x20B6078:
 
 #undef F3_LOCALE_TABLE_INIT
 
+// ---------------------------------------------------------------------------
+//  g_dword_1DBD010 / g_dword_1DBD014   (0x1DBD010 / 0x1DBD014, .data)
+//
+//  The two localized-string ID keys for the "wrong executable" message box
+//  (title = _1DBD010, body = _1DBD014). .data-initialized to 0xFFFFFFFF (the
+//  runtime "not yet set" sentinel) and filled in at static-init time by the
+//  LocaleInit object below. The original does this in the static constructors
+//  sub_1A5B5F0 / sub_1A5B620, which the CRT's __initterm runs before
+//  main/WinMain (see locale_static_ctor_callpath.md). External linkage so this
+//  stub can write them; consumed by GameThread (engine/gamethread.cpp).
+// ---------------------------------------------------------------------------
+DWORD g_dword_1DBD010 = 0xFFFFFFFF;   // 0x1DBD010
+DWORD g_dword_1DBD014 = 0xFFFFFFFF;   // 0x1DBD014
+
+// ---------------------------------------------------------------------------
+//  LocaleInit -- static global constructor  (see locale_static_ctor_callpath.md)
+//
+//  In the original, the per-LCID localized-string tables + the 9-entry key
+//  table + the per-message ID keys are all filled in by C-style static global
+//  constructors that the CRT's __initterm walks at process start, *before*
+//  main/WinMain. A namespace-scope object with a non-trivial constructor
+//  reproduces exactly that timing in this build: its constructor runs during
+//  static initialization (before WinMain), so the tables are populated before
+//  any GetLocaleEntry/GetLocalizedString call can read them.
+//
+//  STUB -- populates just enough to render the "wrong executable" box:
+//    * the key table (g_localeKeys, 0x1DBD2F4) with the 9 string-name hashes
+//    * the two "wrong executable" ID keys (g_dword_1DBD010 / g_dword_1DBD014)
+//    * every per-LCID string table + the not-found default, all pointed at the
+//      same English strings (so any user LCID returns a valid entry)
+//  TODO (add afterwards): the other per-message ID globals (dword_1DBDA8x /
+//  0x20FC8Ex, ...) and the real per-locale wide string blocks (the sub_1A00310
+//  shared-slot blocks written by sub_1A5BE60/sub_1A5BF10/...). Those are still
+//  the 0xFFFFFFFF sentinel.
+// ---------------------------------------------------------------------------
+static DWORD LocaleNameHash(const char *s)   // seed 0x811C9DC5, prime 0x01000193
+{
+    DWORD v0 = 0x811C9DC5u;
+    for (; *s; ++s)
+        v0 = (DWORD)(unsigned char)*s ^ (0x01000193u * v0);
+    return v0;
+}
+
+// English strings for the 9 key-table entries (sub_1A5BDB0, table 0x1DBD120).
+// The original "Games for Windows \u2013 LIVE" uses an en-dash (U+2013); kept
+// ASCII here as a stub.
+static const WCHAR *const g_localeStrings_ENUS[9] = {
+    L"OK",
+    L"Quit",
+    L"Sign in required",
+    L"To play this game, you must be signed in to Games for Windows - LIVE. Do you want to sign in?",
+    L"Improper shutdown detected - if this persists, please check the readme file.",
+    L"Error",
+    L"Direct3D failed to initialise. Please check your system settings and video drivers.",
+    L"Wrong executable",
+    L"You cannot run the game directly from Fable3.exe. Please use FableLauncher.exe in the install directory to launch the game.",
+};
+
+static void LocaleInit_Run()
+{
+    // Key table dword_1DBD2F4 (sub_1A5BC00): the 9 string-name hashes.
+    static const char *const keys[9] = {
+        "GUI_OK", "GUI_QUIT", "GUI_SIGN_IN_REQUIRED_TITLE", "GUI_SIGN_IN_REQUIRED",
+        "GUI_IMPROPER_SHUTDOWN_ERROR", "GUI_ERROR", "GUI_DIRECTX_INITIALISE_ERROR",
+        "GUI_WRONG_EXECUTABLE_NAME", "GUI_WRONG_EXECUTABLE_DESC",
+    };
+    for (int i = 0; i < 9; ++i)
+        g_localeKeys[i] = LocaleNameHash(keys[i]);
+
+    // "wrong executable" message-box ID keys (sub_1A5B5F0 / sub_1A5B620).
+    g_dword_1DBD010 = g_localeKeys[7];   // GUI_WRONG_EXECUTABLE_NAME
+    g_dword_1DBD014 = g_localeKeys[8];   // GUI_WRONG_EXECUTABLE_DESC
+
+    // Point every per-LCID string table + the not-found default at the same
+    // English strings so GetLocaleEntry returns a valid entry for any LCID.
+    // GetLocalizedString reads *cell then *(that); each cell is therefore the
+    // address of a `const WCHAR *` slot, not the string pointer itself.
+    static DWORD *const tables[] = {
+        (DWORD *)g_localeTable_1DBD120, (DWORD *)g_localeTable_1DBD144,
+        (DWORD *)g_localeTable_1DBD168, (DWORD *)g_localeTable_1DBD18C,
+        (DWORD *)g_localeTable_1DBD1B0, (DWORD *)g_localeTable_1DBD1D4,
+        (DWORD *)g_localeTable_1DBD1F8, (DWORD *)g_localeTable_1DBD21C,
+        (DWORD *)g_localeTable_1DBD240, (DWORD *)g_localeTable_1DBD264,
+        (DWORD *)g_localeTable_1DBD288, (DWORD *)g_localeTable_1DBD2AC,
+        (DWORD *)g_localeTable_1DBD2D0, (DWORD *)g_localeDefault,
+    };
+    for (unsigned t = 0; t < sizeof(tables) / sizeof(tables[0]); ++t)
+        for (int i = 0; i < 9; ++i)
+            tables[t][i] = (DWORD)&g_localeStrings_ENUS[i];
+}
+
+namespace {
+struct LocaleInit {
+    LocaleInit() { LocaleInit_Run(); }
+};
+LocaleInit g_localeInit;   // <- constructor runs at static init, before main/WinMain
+}
+
 // ============================================================
 //  GetLocaleEntry  (0x006195C0 - 0x00619850)  -- per-LCID localized-string
 //  entry lookup
