@@ -23,6 +23,7 @@
 #include <mbstring.h>             // _mbscmp
 #include <math.h>                 // fabsf
 #include <direct.h>               // _chdir / _mkdir
+#include <stdexcept>              // std::length_error (F3ListSizeAdd overflow path)
 
 // ============================================================
 //  Globals referenced by RunFrontEnd (kept at their original IDs)
@@ -4434,11 +4435,251 @@ static void *g_CGameRendererVtable[2]          = { (void *)F3StubRelease, 0 };
 static void *g_CFullScreenMoviePlayerVtable[2] = { (void *)F3StubRelease, 0 };
 static void *g_CPackageManagerVtable[2]        = { (void *)F3StubRelease, 0 };
 
-// sub_767360 -- CPackageManager ctor (0x30 bytes): stub stores the
-// placeholder vtable and zeroes +4/+8.
-static void *sub_767360(void *obj)
-{ *(void **)obj = g_CPackageManagerVtable; *(void **)((char *)obj + 4) = 0;
-  *(void **)((char *)obj + 8) = 0; return obj; }
+// 0x18984D0 -- the NTools::CBaseClassNonCopyable base ctor (also implemented
+// as a static in gamethread.cpp): store the base vtable, return obj.
+static void *g_NToolsCBaseClassNonCopyableVtable[1] = { 0 };
+static void *F3BaseClassNonCopyableCtor(void *obj)
+{ *(void **)obj = g_NToolsCBaseClassNonCopyableVtable; return obj; }
+
+// ============================================================
+//  F3ListStructCtor  (sub_76C680 / sub_76C700 / sub_76C780,
+//  0x76C680 - 0x76C7F2)  -- the 28-byte { node, head, size } struct ctor
+//  [NOT byte-identical] relative calls to LHAlloc.
+//
+//  void F3ListStructCtor(void *obj, unsigned headSize, unsigned flagOffset)
+//
+//  The three originals are identical except for the head-block size (28 / 24
+//  / 40) and the byte offset of the flag pair (0x18 / 0x14 / 0x20), so one
+//  parameterized function covers them. Original calling convention: thiscall
+//  + two unused stack args, callee-cleanup (retn 8). It builds:
+//    +0x00 node   LHAlloc(4); *node = obj (0 on allocation failure)
+//    +0x18 head   LHAlloc(headSize); head[0] = head[1] = head[2] = head
+//                 (self-referencing); the original first stores 0 at
+//                 byte flagOffset+1, stores 1 at byte flagOffset, then
+//                 re-stores 1 at byte flagOffset (so both bytes end 1)
+//    +0x1C size   0
+//  The 20 bytes between the node and the head, and the rest of the head
+//  block (bytes 12..flagOffset-1 and flagOffset+2..headSize-1), are left
+//  as the heap returned them. The original crashes on a failed head
+//  allocation (unguarded writes through a null head); the guards above
+//  keep the node/head stores faithful while the unguarded byte writes
+//  mirror the original.
+// ============================================================
+static void F3ListStructCtor(void *obj, unsigned headSize, unsigned flagOffset)
+{
+    DWORD *m = (DWORD *)obj;
+    void *node = LHAlloc(4);
+    if (node != 0)
+        *(void **)node = obj;
+    else
+        node = 0;
+    m[0] = (DWORD)node;
+    DWORD *head = (DWORD *)LHAlloc(headSize);
+    if (head != 0)
+        head[0] = 0;
+    if (head != (DWORD *)-1)
+        head[1] = 0;
+    if (head != (DWORD *)-2)
+        head[2] = 0;
+    ((BYTE *)head)[flagOffset + 1] = 0;
+    ((BYTE *)head)[flagOffset] = 1;
+    m[6] = (DWORD)head;
+    ((BYTE *)head)[flagOffset] = 1;
+    head[1] = (DWORD)head;
+    head[0] = (DWORD)head;
+    head[2] = (DWORD)head;
+    m[7] = 0;
+}
+
+// ============================================================
+//  CPackageDataStateReset  (sub_764930, 0x764930 - 0x7649A4)  -- reset the
+//  package-data subobject's handle / range fields
+//  [NOT byte-identical] relative calls to CloseHandle / _memmove_s (the
+//  memmove branch is dead code: its size always computes to 0).
+//
+//  int CPackageDataStateReset(void *obj)
+//
+//  Thiscall (plain retn), returns 0. Zeros +0x78; if +0x7C is not
+//  INVALID_HANDLE_VALUE, CloseHandle it and set +0x7C = -1; zeros +0x80..
+//  +0x9B (24 bytes + the +0x98 word); if +0x70 != +0x6C, stores +0x6C into
+//  +0x70 (the original does this through a memmove_s whose size computes to
+//  0, i.e. just the word store); finally zeros +0x60.
+// ============================================================
+static int CPackageDataStateReset(void *obj)
+{
+    DWORD *m = (DWORD *)obj;
+    DWORD h = m[0x7C / 4];
+    m[0x78 / 4] = 0;
+    if (h != 0xFFFFFFFF)
+    {
+        CloseHandle((HANDLE)h);
+        m[0x7C / 4] = 0xFFFFFFFF;
+    }
+    *(void **)((char *)obj + 0x80) = 0;
+    *(void **)((char *)obj + 0x88) = 0;
+    *(void **)((char *)obj + 0x90) = 0;
+    m[0x98 / 4] = 0;
+    if (m[0x70 / 4] != m[0x6C / 4])
+        m[0x70 / 4] = m[0x6C / 4];
+    m[0x60 / 4] = 0;
+    return 0;
+}
+
+// ============================================================
+//  CPackageDataCtor  (sub_766430, 0x766430 - 0x7664EE)  -- the 188-byte
+//  (0xBC) package-data subobject ctor
+//  [NOT byte-identical] relative calls to LHAlloc / F3ListStructCtor /
+//  CPackageDataStateReset.
+//
+//  void *CPackageDataCtor(void *obj)
+//
+//  Thiscall (plain retn), returns obj. It only writes the words below;
+//  the other words (the struct middles at +0x08..+0x1F / +0x44..+0x5F /
+//  +0xA0..+0xBB, +0x28..+0x37, +0x00) are left as the heap returned them:
+//    +0x04 struct A  F3ListStructCtor (28-byte head)
+//    +0x24 node      LHAlloc(4), *node = obj+0x24 (0 on failure)
+//    +0x38 head      LHAlloc(40), head[0] = head[1] = head (self)
+//    +0x3C 0
+//    +0x40 struct B  F3ListStructCtor (24-byte head)
+//    +0x60 +0x6C +0x70 +0x74 +0x78  0
+//    +0x7C 0xFFFFFFFF (INVALID_HANDLE_VALUE)
+//    +0x80..+0x97  0 (24 bytes)
+//    +0x9C struct C  F3ListStructCtor (40-byte head)
+//    +0x98 0
+//  then CPackageDataStateReset(obj) (every branch a no-op at construction:
+//  the handle is already -1 and the range words already equal).
+// ============================================================
+static void *CPackageDataCtor(void *obj)
+{
+    DWORD *m = (DWORD *)obj;
+    char *c = (char *)obj;
+    F3ListStructCtor(c + 4, 28, 0x18);
+    void *node = LHAlloc(4);
+    if (node != 0)
+        *(void **)node = c + 0x24;
+    else
+        node = 0;
+    m[0x24 / 4] = (DWORD)node;
+    DWORD *head = (DWORD *)LHAlloc(40);
+    if (head != 0)
+        head[0] = (DWORD)head;
+    if (head != (DWORD *)-1)
+        head[1] = (DWORD)head;
+    m[0x38 / 4] = (DWORD)head;
+    m[0x3C / 4] = 0;
+    F3ListStructCtor(c + 0x40, 24, 0x14);
+    m[0x60 / 4] = 0;
+    m[0x6C / 4] = 0;
+    m[0x70 / 4] = 0;
+    m[0x74 / 4] = 0;
+    m[0x78 / 4] = 0;
+    m[0x7C / 4] = 0xFFFFFFFF;
+    *(void **)(c + 0x80) = 0;
+    *(void **)(c + 0x88) = 0;
+    *(void **)(c + 0x90) = 0;
+    F3ListStructCtor(c + 0x9C, 40, 0x20);
+    m[0x98 / 4] = 0;
+    CPackageDataStateReset(obj);
+    return obj;
+}
+
+// ============================================================
+//  F3ListSizeAdd  (sub_76CE80, 0x76CE80 - 0x76CF90)  -- list size increment
+//  [NOT byte-identical] refs the std::length_error / exception machinery
+//  and the high-VA global dword_1DDCFC8 (0x01DDCFC8) in the overflow path.
+//
+//  int F3ListSizeAdd(void *obj, int n)
+//
+//  Thiscall + `retn 4`, with an extra (unused) EBX argument (the list index
+//  the caller holds in EBX). The sibling of ListCountInc (0x624360,
+//  threshold 0x3FFFFFFF) with threshold 0x1FFFFFFF: when
+//  0x1FFFFFFF - size < n (unsigned) it builds
+//  std::length_error("list<T> too long") (invoking the non-NULL callback
+//  at dword_1DDCFC8 first, then std::_Throw); otherwise it adds n to the
+//  size word at obj+0x18 and returns n.
+// ============================================================
+static void (*g_dword_1DDCFC8)(const void *) = 0;   // 0x01DDCFC8: exception hook (0 here)
+static int F3ListSizeAdd(void *obj, int n)
+{
+    unsigned *size = (unsigned *)((char *)obj + 0x18);
+    if (0x1FFFFFFFu - *size < (unsigned)n)
+    {
+        std::length_error err("list<T> too long");
+        if (g_dword_1DDCFC8 != 0)
+            g_dword_1DDCFC8(&err);
+        throw err;
+    }
+    *size += (unsigned)n;
+    return n;
+}
+
+// ============================================================
+//  CPackageManagerCtor  (sub_767360, 0x767360 - 0x76746E)  -- the 48-byte
+//  (0x30) CPackageManager ctor
+//  [NOT byte-identical] relative calls (base ctor, LHAlloc,
+//  CPackageDataCtor, F3ListSizeAdd) and the CPackageManager vtable store
+//  (the placeholder g_CPackageManagerVtable in this build).
+//
+//  void *CPackageManagerCtor(void *obj)
+//
+//  Thiscall (plain retn), returns obj. Runs the NTools base ctor, stores
+//  the CPackageManager vtable, then:
+//    +0x04/+0x08  0
+//    +0x0C node   LHAlloc(4), *node = obj+0x0C (0 on failure)
+//    +0x20 head   LHAlloc(16), head[0] = head[1] = head (the self-
+//                 referencing circular list head); +0x24 (the list size) and
+//                 +0x28 = 0
+//    +0x2C sub    LHAlloc(0xBC) + CPackageDataCtor (0 on allocation failure)
+//  then it allocates nine 16-byte { prev, next, id } nodes into that
+//  circular list. Each node is inserted directly after the head (prev =
+//  head, next = the old first node, whose prev becomes the new node), so
+//  the final list order is node 8 .. node 0, with id =
+//  0x4D5308D6_0CCF0000 + i (the 64-bit value at the node's +8). The list
+//  size (obj+0x24, via F3ListSizeAdd on obj+0x0C) is incremented once per
+//  node.
+// ============================================================
+static void *CPackageManagerCtor(void *obj)
+{
+    DWORD *m = (DWORD *)obj;
+    char *c = (char *)obj;
+    F3BaseClassNonCopyableCtor(obj);
+    m[0] = (DWORD)g_CPackageManagerVtable;
+    m[1] = 0;
+    m[2] = 0;
+    void *node = LHAlloc(4);
+    if (node != 0)
+        *(void **)node = c + 0x0C;
+    else
+        node = 0;
+    m[3] = (DWORD)node;
+    DWORD *head = (DWORD *)LHAlloc(16);
+    if (head != 0)
+        head[0] = (DWORD)head;
+    if (head != (DWORD *)-1)
+        head[1] = (DWORD)head;
+    m[8] = (DWORD)head;
+    m[9] = 0;
+    m[10] = 0;
+    void *sub = LHAlloc(0xBC);
+    m[11] = (sub != 0) ? (DWORD)CPackageDataCtor(sub) : 0;
+    for (int i = 0; i < 9; i++)
+    {
+        DWORD h = m[8];
+        DWORD next = ((DWORD *)h)[1];
+        DWORD *n = (DWORD *)LHAlloc(16);
+        if (n != 0)
+            n[0] = h;
+        if (n != (DWORD *)-1)
+            n[1] = next;
+        DWORD lo = (DWORD)i + 0x0CCF0000;
+        n[2] = lo;
+        n[3] = 0x4D5308D6 + (lo < 0x0CCF0000);
+        F3ListSizeAdd(c + 0x0C, 1);
+        ((DWORD *)h)[1] = (DWORD)n;
+        ((DWORD *)n[1])[0] = (DWORD)n;
+    }
+    return obj;
+}
 static void *sub_762490(void *obj, void *a) { (void)a; return obj; }
 static void  sub_6234A0(void *obj) { (void)obj; }
 static void  sub_7672E0(void *obj) { (void)obj; }
@@ -4873,7 +5114,7 @@ signedIn:
         vfs[0] = vfs[1] = vfs[2] = 0;
         vfs[3] = 7;
         void *p48 = LHAlloc(0x30);
-        int   v39 = (p48 != 0) ? (int)sub_767360(p48) : 0;
+        int   v39 = (p48 != 0) ? (int)CPackageManagerCtor(p48) : 0;
 
         void *v40 = (void *)dw[0xAC / 4];
         if (v40 != 0)
