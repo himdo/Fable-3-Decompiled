@@ -328,17 +328,231 @@ char CManagerWin32_RunGame(void *obj, int a2, int a3, int a4, int a5, int a6,
     return 1;
 }
 
+// ============================================================
+//  Full NSystem::CManagerWin32 vtable  (??_7CManagerWin32@NSystem@@6B@)
+//
+//  The real vtable (0x01BE737C) has 14 virtual functions (slots 0..13); the
+//  derived class overrides slots 0,1,2,4,8,9,10,12,13 and inherits
+//  3,5,6,7,11 from CManagerBase (??_7CManagerBase@NSystem@@6B@, 0x01BE7340).
+//  The 48-byte object: vtable +0, CRITICAL_SECTION +8, the input-manager
+//  object +0x20, its SEH block +0x24, the stop byte +0x28, the exited byte
+//  +0x29, and the flag byte +0x2C. Slots 0/1/2/8/12 were already implemented
+//  above; the remaining slots are filled in here.
+// ============================================================
+
+// ============================================================
+//  CManagerBase_WaitForExit  (0x18F8700 - 0x18F8723)  -- slot 3 (inherited)
+//  [NOT byte-identical] placement-dependent (relative jnz/jz) and refs the
+//  Sleep IAT slot (ds:__imp_Sleep, 0x01AD503C) at its original high VA.
+//
+//  Spin-wait: while the exited byte (+0x29) is clear, break out when the stop
+//  byte (+0x28) is set, otherwise sleep 1 ms and re-check. (The exited byte is
+//  set by CManagerBase_MarkExited, slot 4.)
+// ============================================================
+static void CManagerBase_WaitForExit(void *obj)
+{
+    char *c = (char *)obj;
+    while (c[0x29] == 0)
+    {
+        if (c[0x28] != 0)
+            break;
+        Sleep(1);
+    }
+}
+
+// ============================================================
+//  CManagerBase_MarkExited  (0x18F6E20 - 0x18F6E2D)  -- slot 4
+//  [BYTE-IDENTICAL] placement-independent (no calls / relative jumps / high-VA
+//  refs). Emits the original 13 bytes exactly.
+//
+//  Sets the exited byte (+0x29) to 1 and returns whether the stop byte (+0x28)
+//  was 0 (setz AL = (c[0x28]==0)).
+// ============================================================
+char __declspec(naked) CManagerBase_MarkExited(void)
+{
+    __asm {
+        xor    eax, eax
+        cmp    byte ptr [ecx+28h], al
+        mov    byte ptr [ecx+29h], 1
+        setz   al
+        retn
+    }
+}
+
+// ============================================================
+//  CManagerBase_InputQuery2  (0x18F86F0 - 0x18F86FF)  -- slot 5 (inherited)
+//  [BYTE-IDENTICAL] placement-independent (the dispatch is an indirect `jmp`,
+//  not a relative call). Emits the original 15 bytes exactly.
+//
+//  Tail-dispatches vtable slot 2 (offset 0x08) on the +0x20 input-manager
+//  object: ecx = *(obj+0x20); if nonzero, jmp ecx->vt[2]; else return (eax is
+//  whatever it held on entry, matching the original's uninit result).
+// ============================================================
+int __declspec(naked) CManagerBase_InputQuery2(void)
+{
+    __asm {
+        mov    ecx, [ecx+20h]
+        test   ecx, ecx
+        jz     short f3_iq2_done
+        mov    eax, [ecx]
+        mov    edx, [eax+8]
+        jmp    edx
+    f3_iq2_done:
+        retn
+    }
+}
+
+// ============================================================
+//  CManagerBase_InputQuery3  (0x18F86E0 - 0x18F86EF)  -- slot 6 (inherited)
+//  [BYTE-IDENTICAL] placement-independent. Emits the original 15 bytes
+//  exactly (same shape as slot 5, but dispatches vtable slot 3, offset 0x0C).
+// ============================================================
+int __declspec(naked) CManagerBase_InputQuery3(void)
+{
+    __asm {
+        mov    ecx, [ecx+20h]
+        test   ecx, ecx
+        jz     short f3_iq3_done
+        mov    eax, [ecx]
+        mov    edx, [eax+0Ch]
+        jmp    edx
+    f3_iq3_done:
+        retn
+    }
+}
+
+// ============================================================
+//  F3Shift72Block  (sub_5CBB50 - 0x5CBB99)  -- shared 72-byte block shift
+//  [NOT byte-identical] placement-independent in logic but reimplemented in C
+//  (the original is a magic-divide + rep movsd routine). Shared by the input
+//  manager (sub_188ED40), sub_5CB620, and CManagerBase_InputAdvance38.
+//
+//  int F3Shift72Block(int from, int to, int dst)
+//
+//  Shifts the 72-byte elements in [from, to) to begin at dst (forward element
+//  copy) and returns dst + ((to - from)/72)*72 (the end of the destination
+//  region). The magic-divide by 72 in the original becomes a plain integer
+//  divide (identical for the aligned, non-negative diffs in use).
+// ============================================================
+static int F3Shift72Block(int from, int to, int dst)
+{
+    int count = (to - from) / 72;
+    int result = dst + count * 72;
+    if (from != to)
+    {
+        char *src = (char *)from;
+        char *d = (char *)dst;
+        char *end = (char *)to;
+        do
+        {
+            int i;
+            for (i = 0; i < 72; i++)
+                d[i] = src[i];
+            src += 72;
+            d += 72;
+        } while (src != end);
+    }
+    return result;
+}
+
+// ============================================================
+//  CManagerBase_InputAdvance38  (0x18F8760 - 0x18F879E)  -- slot 7 (inherited)
+//  [NOT byte-identical] placement-dependent (relative call to F3Shift72Block /
+//  the original sub_5CBB50).
+//
+//  Reads the +0x20 input-manager object; when nonzero, if its +0x34 word
+//  differs from its +0x38 word it sets +0x38 = F3Shift72Block(v2, v2, v1) --
+//  with v2 = *(obj+0x20+0x38) and v1 = *(obj+0x20+0x34) (so +0x38 := +0x34,
+//  the shift being a no-op since from == to).
+// ============================================================
+static void CManagerBase_InputAdvance38(void *obj)
+{
+    void *im = *(void **)((char *)obj + 0x20);
+    if (im != 0)
+    {
+        int v2 = *(int *)((char *)im + 0x38);
+        int v1 = *(int *)((char *)im + 0x34);
+        if (v1 != v2)
+            *(int *)((char *)im + 0x38) = F3Shift72Block(v2, v2, v1);
+    }
+}
+
+// ============================================================
+//  CManagerWin32_GetFlag  (0x18F6DB0 - 0x18F6DB4)  -- slot 9
+//  [BYTE-IDENTICAL] placement-independent. Emits the original 4 bytes exactly
+//  (mov AL, [ECX+0x2C]; retn) -- returns the flag byte at +0x2C.
+// ============================================================
+char __declspec(naked) CManagerWin32_GetFlag(void)
+{
+    __asm {
+        mov    al, [ecx+2Ch]
+        retn
+    }
+}
+
+// ============================================================
+//  CManagerWin32_SetFlag  (0x18F6CB0 - 0x18F6CBA)  -- slot 10
+//  [BYTE-IDENTICAL] placement-independent. Emits the original 10 bytes exactly
+//  (mov AL, [ESP+4]; mov [ECX+0x2C], AL; retn 4) -- stores the byte arg into
+//  the +0x2C flag and returns it.
+// ============================================================
+char __declspec(naked) CManagerWin32_SetFlag(void)
+{
+    __asm {
+        mov    al, [esp+4]
+        mov    byte ptr [ecx+2Ch], al
+        retn   4
+    }
+}
+
+// ============================================================
+//  CManagerBase_NoOpRet0  (0x55D590 - 0x55D595)  -- slot 11 (inherited)
+//  [BYTE-IDENTICAL] placement-independent. Emits the original 5 bytes exactly
+//  (xor AL, AL; retn 8) -- a two-arg virtual that always returns 0.
+// ============================================================
+char __declspec(naked) CManagerBase_NoOpRet0(void)
+{
+    __asm {
+        xor    al, al
+        retn   8
+    }
+}
+
+// ============================================================
+//  CManagerWin32_PostFlagMsg  (0x18F6CC0 - 0x18F6CD6)  -- slot 13
+//  [NOT byte-identical] placement-dependent (refs the PostMessageA IAT slot
+//  0x01AD5448 at its original high VA) and reaches GetWindow through its own
+//  vtable slot 8.
+
+//  BOOL CManagerWin32_PostFlagMsg(void *obj, unsigned char flag)
+//
+//  The 0x8003 sibling of CManagerWin32_PostMessage (slot 12, 0x8002): reaches
+//  the worker window through vtable slot 8 (GetWindow) and posts 0x8003
+//  (wParam = flag, lParam 0). Returns the PostMessageA result.
+// ============================================================
+static int CManagerWin32_PostFlagMsg(void *obj, unsigned char flag)
+{
+    void **vt = *(void ***)obj;
+    HWND hwnd = (HWND)((int (*)(void *))vt[8])(obj);   // slot 8 = GetWindow
+    return (int)PostMessageA(hwnd, 0x8003, flag, 0);
+}
+
 static void *g_CManagerWin32Vtable[16] = {
     (void *)CManagerWin32_Dtor,            // 0
     (void *)CManagerWin32_RunGame,         // 1
     (void *)CManagerWin32_StopWorker,      // 2
-    0, 0, 0, 0, 0,                         // 3..7
+    (void *)CManagerBase_WaitForExit,      // 3
+    (void *)CManagerBase_MarkExited,       // 4
+    (void *)CManagerBase_InputQuery2,      // 5
+    (void *)CManagerBase_InputQuery3,      // 6
+    (void *)CManagerBase_InputAdvance38,   // 7
     (void *)CManagerWin32_GetWindow,       // 8
-    0,                                     // 9
-    0,                                     // 10
-    0,                                     // 11
+    (void *)CManagerWin32_GetFlag,         // 9
+    (void *)CManagerWin32_SetFlag,         // 10
+    (void *)CManagerBase_NoOpRet0,         // 11
     (void *)CManagerWin32_PostMessage,     // 12
-    0, 0, 0                                // 13..15
+    (void *)CManagerWin32_PostFlagMsg,     // 13
+    0, 0                                   // 14..15 (RTTI region in the original)
 };
 
 // ============================================================
