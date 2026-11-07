@@ -2411,7 +2411,7 @@ static int IsFullScreen(void)
 }
 
 // qword_20FC928 / dword_20FC92C: the current display resolution
-// {width, height}, set by the device creation (sub_18F1B30) from the
+// {width, height}, set by the device creation (CreateXloDevice, sub_18F1B30) from the
 // display-mode record. Read by GetCurrentResolution (0x18F1100), the
 // aspect-ratio getters (sub_18F0AA0 / sub_18F1120) and the 5%/95% split
 // helper (sub_18F0AE0).

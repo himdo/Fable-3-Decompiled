@@ -389,6 +389,21 @@ static void *g_dword_1E2EEF4 = 0;
 // carries an independent mirror of this global for the XLO import paths).
 static DWORD g_dword_1E2ED80[14];
 
+// 0x1E2EDCC: device capability byte gating the render-mode-class selection
+// (GetDisplayModeClass, sub_18EFF00). Bit 2 selects class 2 vs 1; bit 4
+// selects class 4 vs 1.
+static unsigned char g_byte_1E2EDCC = 0;
+
+// 0x1E2EDB8: the 16-byte D3D9 adapter-identifier out block, filled by the
+// GetAdapterIdentifier query (CreateD3D9DisplayObject, sub_18F21A0). Its
+// second word, dword_1E2EDBC (0x1E2EDBC) == g_dword_1E2EDB8[1], is the adapter
+// index handed to the mode-enumeration helper (sub_18F1FC0).
+static DWORD g_dword_1E2EDB8[4];   // 0x1E2EDB8 .. 0x1E2EDC7
+
+// 0x1E2EEF8: the current D3D9 adapter object (a vtable-backed pointer; also
+// read/cleared by ShutdownDevice further down).
+static DWORD g_dword_1E2EEF8 = 0;   // 0x1E2EEF8  D3D9 adapter object (vtable-backed)
+
 // 0x20FC948: the device critical section guarding the XLO device state
 // (dword_1E2EEF4 / dword_1E2ED80 / dword_1E2ED74). In the image it is
 // all-0xFF poison, as with stru_20FCA50; the game's device-subsystem init
@@ -1142,15 +1157,269 @@ static F3DisplayMode *InitDisplayMode(F3DisplayMode *dm)
 static int TrySetDisplayMode(const F3DisplayMode *dm) { (void)dm; return 0; }
 
 // ============================================================
-//  [STUB]  SetDisplayMode  (0x18F2B30 - ...)  -- set the display mode
+//  GetDisplayModeClass  (sub_18EFF00, 0x18EFF00-0x18EFF49)  -- map a
+//  render-mode-class tier (1..3) to the device-class code actually requested
+//  from the XLO device, gated by the capability byte byte_1E2EDCC.
 //
-//  int SetDisplayMode(const F3DisplayMode *dm)
+//  int GetDisplayModeClass(int tier)   -- __usercall (tier in EAX)
 //
-//  Sibling of TrySetDisplayMode (0x18F28C0) with a different request layout
-//  (refresh/bpp fields at +12..+28). Same deep display-mode subsystem; out of
-//  scope here. Returns 0 (success) so the caller skips the error path.
+//    tier 1 -> 1
+//    tier 2 -> (byte_1E2EDCC & 2) ? 2 : 1
+//    tier 3 -> (byte_1E2EDCC & 4) ? 4 : 1
+//    else   -> 0x80000000
+//
+//  [NOT byte-identical] refs the high-VA global byte_1E2EDCC. The __usercall
+//  (arg in EAX) collapses to a plain int arg here.
 // ============================================================
-static int SetDisplayMode(const F3DisplayMode *dm) { (void)dm; return 0; }
+static int GetDisplayModeClass(int tier)
+{
+    if (tier == 1)
+        return 1;
+    if (tier == 2)
+        return (g_byte_1E2EDCC & 2) ? 2 : 1;
+    if (tier == 3)
+        return (g_byte_1E2EDCC & 4) ? 4 : 1;
+    return 0x80000000;
+}
+
+// d3d9.dll import (bound through the generated d3d9.lib): the D3D9 factory
+// the original pulls to (re)create the adapter object. Returns an
+// IDirect3D9* (a vtable-backed object) or NULL.
+extern "C" void *Direct3DCreate9(UINT SDKVersion);
+
+// ============================================================
+//  [STUB]  F3EnumAdapterModes  (sub_18F1FC0)  -- enumerate the selected
+//  adapter's display modes into a heap list
+//
+//  void *F3EnumAdapterModes(void *container, DWORD adapterId, int flags)
+//
+//  Original: thiscall (the 20-byte local `container` in ECX, adapterId and
+//  flags on the stack, caller cleans 8). Builds a per-adapter mode list from
+//  the D3D9 object (dword_1E2EEF8) using the rdata adapter table at
+//  unk_1BD3020 and returns the list head. The D3D9/XLO enumeration is out of
+//  scope; the container is left unpopulated so the caller's free is a no-op.
+// ============================================================
+static void *F3EnumAdapterModes(void *container, DWORD adapterId, int flags)
+{
+    (void)container; (void)adapterId; (void)flags;
+    return 0;
+}
+
+// ============================================================
+//  [STUB]  F3ReserveModeList  (sub_563AE0)  -- size the shared mode buffer
+//  to hold the enumerated-mode list
+//
+//  void F3ReserveModeList(void *list)
+//
+//  Original: stdcall (list pointer on the stack); grows the shared mode
+//  buffer (dword_20FC978 / dword_20FC97C / dword_20FC980) to fit the list's
+//  element count (list+8 .. list+12). Out of scope here (no-op).
+// ============================================================
+static void F3ReserveModeList(void *list) { (void)list; }
+
+// ============================================================
+//  [STUB]  F3DestroyModeListContainer  (sub_563770)  -- destroy the local
+//  20-byte mode-list container built by F3EnumAdapterModes
+//
+//  void F3DestroyModeListContainer(void *container)
+//
+//  Original: thiscall (container in ECX); releases container[2] through the
+//  operator-delete thunk and zeroes words 2..4. Out of scope here (no-op).
+// ============================================================
+static void F3DestroyModeListContainer(void *container) { (void)container; }
+
+// ============================================================
+//  [STUB]  F3InitAdapterState  (sub_18F1150)  -- initialize the adapter state
+//
+//  void F3InitAdapterState(void)
+//
+//  Original: seeds a one-word state and calls sub_1887790(dword_1E2EDBC, &w)
+//  (dword_1D9E184 = the result). Out of scope here (no-op).
+// ============================================================
+static void F3InitAdapterState(void) {}
+
+// ============================================================
+//  CreateD3D9DisplayObject  (0x18F21A0 - 0x18F230F)  -- (re)create the D3D9
+//  adapter object and query the selected adapter
+//
+//  bool CreateD3D9DisplayObject(int adapterIndex, DWORD *outBehavior, int flags)
+//      (original is a __usercall: adapterIndex in ECX, outBehavior in EDI,
+//       flags as the first stack arg; returns a bool in AL)
+//
+//  Releases any live D3D9 object (dword_1E2EEF8, vtable[2]), then loops:
+//  create a new object (Direct3DCreate9Ex(0x20) when (flags & 0x10) and the
+//  symbol resolves from d3d9.dll, else Direct3DCreate9(0x20)) and store it in
+//  dword_1E2EEF8; a NULL object breaks out (returns false). On a live object
+//  set *outBehavior = (flags & 2) ? 2 : 1, clamp adapterIndex to
+//  GetAdapterCount()-1 (vtable[4]), and run the adapter query (vtable[14],
+//  offset 0x38) into the 16-byte identifier block g_dword_1E2EDB8:
+//    - S_OK: enumerate the adapter modes (F3EnumAdapterModes / sub_18F1FC0)
+//      into a 20-byte local container, free the returned list (sub_563AE0),
+//      destroy the container (sub_563770), init the adapter state
+//      (sub_18F1150) and return true (the object is kept alive).
+//    - D3DERR_NOTAVAILABLE (0x8876086A) with (flags & 4): force *outBehavior
+//      to 2 and re-run the query once, returning whether it now succeeds
+//      (object kept alive).
+//    - otherwise: release the object (dword_1E2EEF8 = 0) and, when (flags & 1)
+//      is clear, break (return false); else Sleep(0x64) and retry.
+//
+//  [NOT byte-identical] refs the high-VA device globals dword_1E2EEF8 /
+//  g_dword_1E2EDB8 (0x01E2EEF8 / 0x01E2EDB8) and dispatches into the deep D3D9
+//  / XLO mode-enumeration subsystem (sub_18F1FC0 / sub_563AE0 / sub_563770 /
+//  sub_18F1150), which is stubbed out.
+// ============================================================
+static bool CreateD3D9DisplayObject(int adapterIndex, DWORD *outBehavior, int flags)
+{
+    // Release any live D3D9 object (vtable[2] = Release).
+    if (g_dword_1E2EEF8 != 0)
+    {
+        void **vtable = *(void ***)g_dword_1E2EEF8;
+        typedef void (__stdcall *F3D3D9ReleaseFn)(DWORD);
+        ((F3D3D9ReleaseFn)vtable[2])(g_dword_1E2EEF8);
+        g_dword_1E2EEF8 = 0;
+    }
+
+    const int useEx = (flags & 0x10) != 0;   // constant across the loop
+    for (;;)
+    {
+        DWORD d3d = 0;
+        if (useEx)
+        {
+            HMODULE h = GetModuleHandleA("d3d9.dll");
+            FARPROC p = (h != 0) ? (FARPROC)GetProcAddress(h, "Direct3DCreate9Ex") : 0;
+            if (p != 0)
+            {
+                typedef int (__stdcall *F3D3D9Create9ExFn)(UINT, void **);
+                ((F3D3D9Create9ExFn)p)(0x20u, (void **)&d3d);
+            }
+        }
+        if (d3d == 0)
+            d3d = (DWORD)Direct3DCreate9(0x20u);
+        g_dword_1E2EEF8 = d3d;
+        if (d3d == 0)
+            break;
+
+        *outBehavior = ((flags & 2) != 0) + 1;   // (flags & 2) ? 2 : 1
+
+        void **vtable = *(void ***)d3d;
+        typedef DWORD (__stdcall *F3D3D9GetCountFn)(DWORD);
+        DWORD maxAdapter = ((F3D3D9GetCountFn)vtable[4])(d3d) - 1;
+        if ((DWORD)adapterIndex >= maxAdapter)
+            adapterIndex = (int)maxAdapter;
+
+        typedef int (__stdcall *F3D3D9GetIdFn)(DWORD, int, DWORD, void *);
+        F3D3D9GetIdFn query = (F3D3D9GetIdFn)vtable[14];
+        int hr = query(d3d, adapterIndex, *outBehavior, &g_dword_1E2EDB8[0]);
+
+        if (hr == 0)   // S_OK: enumerate the modes and keep the object live.
+        {
+            DWORD modeList[5];   // the 20-byte local container (var_1C)
+            void *modes = F3EnumAdapterModes(modeList, g_dword_1E2EDB8[1], flags);
+            F3ReserveModeList(modes);
+            F3DestroyModeListContainer(modeList);
+            F3InitAdapterState();
+            return true;
+        }
+        if (hr == 0x8876086A /* D3DERR_NOTAVAILABLE */ && (flags & 4) != 0)
+        {
+            // Retry the query once with behavior 2 (object kept live).
+            *outBehavior = 2;
+            return (query(d3d, adapterIndex, 2, &g_dword_1E2EDB8[0]) == 0);
+        }
+        // Other failure: release the object, then retry after a short sleep
+        // when (flags & 1) is set, else give up.
+        typedef void (__stdcall *F3D3D9ReleaseFn2)(DWORD);
+        ((F3D3D9ReleaseFn2)vtable[2])(d3d);
+        g_dword_1E2EEF8 = 0;
+        if ((flags & 1) == 0)
+            break;
+        Sleep(0x64u);
+    }
+    return false;
+}
+
+// ============================================================
+//  [STUB]  BuildXloDeviceFromRequest  (sub_18F1B30 + its query/pick helpers,
+//  0x18F1B30-0x18F1E60)  -- build the XLO device from the display-mode request
+//
+//  int BuildXloDeviceFromRequest(const F3DisplayMode *dm)   -- 1 = success
+//
+//  Original (only reached once CreateD3D9DisplayObject has produced a live
+//  D3D9 object in dword_1E2EEF8): query the adapter's display-mode descriptor
+//  (device vtable slot 8, offset 0x20) into a 16-byte out block, walk the
+//  texture-source-descriptor table (dword_1D9AF60, 0x70-byte rows) for the row
+//  whose key matches the descriptor, pick the closest matching mode
+//  (sub_18F05D0), assemble the 56-byte display-mode request, and build the
+//  device (sub_18F1B30) -- returning its build status. The D3D9 / XLO
+//  device-rebuild subsystem is out of scope. Returns 1 (build succeeded).
+// ============================================================
+static int BuildXloDeviceFromRequest(const F3DisplayMode *dm)
+{
+    (void)dm;
+    return 1;
+}
+
+// ============================================================
+//  SetDisplayMode  (0x18F2B30 - 0x18F2D66)  -- set the display mode
+//
+//  int SetDisplayMode(const F3DisplayMode *dm)   -- 0 = success, nonzero = error
+//
+//  Original semantics (nested under the device CS stru_20FC948 already held by
+//  the caller): if the device object (dword_1E2EEF4) is present, copy the
+//  56-byte caps block (dword_1E2ED80), overwrite width/height from the request,
+//  force caps[8]=1 and caps[12]=0, and set the render-mode class (caps[13])
+//  from byte 20 / dword 24 via GetDisplayModeClass (sub_18EFF00), or
+//  0x80000000 when byte 20 is 0; reset the XLO device (ResetXloDevice) and
+//  return 0 on success, or restore the original caps (second ResetXloDevice)
+//  and return 1, or return 2 if both fail. If the device is absent, create the
+//  D3D9 device object (CreateD3D9DisplayObject / sub_18F21A0); on success build
+//  the device from the request's picked mode (BuildXloDeviceFromRequest /
+//  sub_18F1B30) and return its build status, else return 1 (no device).
+//
+//  [NOT byte-identical] refs the high-VA device globals and the deep D3D9 / XLO
+//  device-rebuild subsystem, which is stubbed out.
+// ============================================================
+static int SetDisplayMode(const F3DisplayMode *dm)
+{
+    F3EnterDisplayCs();
+    if (g_dword_1E2EEF4 != 0)
+    {
+        // Device present: rebuild the XLO device with the requested size and
+        // render-mode class, restoring the original caps if that fails.
+        DWORD caps[14];
+        memcpy(caps, g_dword_1E2ED80, sizeof(caps));
+        caps[0]  = (DWORD)dm->width;             // byte offset 0
+        caps[1]  = (DWORD)dm->height;            // byte offset 4
+        caps[8]  = 1;                            // byte offset 32
+        caps[12] = 0;                            // byte offset 48
+        caps[13] = (dm->f20 != 0) ? (DWORD)GetDisplayModeClass(dm->f24)
+                                  : 0x80000000;   // byte offset 52
+        if (ResetXloDevice(caps) != 0)
+        {
+            LeaveCriticalSection(&g_stru_20FC948);
+            return 0;
+        }
+        if (ResetXloDevice(g_dword_1E2ED80) != 0)
+        {
+            LeaveCriticalSection(&g_stru_20FC948);
+            return 1;
+        }
+        LeaveCriticalSection(&g_stru_20FC948);
+        return 2;
+    }
+    else
+    {
+        // No device yet: create the D3D9 object and, on success, build the
+        // device from the request. Without a live D3D9 object this reports the
+        // "no device" status (1).
+        int v5 = 1;
+        DWORD behavior = 1;   // the original seeds the out behavior to 1
+        if (CreateD3D9DisplayObject(dm->f00, &behavior, dm->f28) != 0)
+            v5 = (BuildXloDeviceFromRequest(dm) == 0);
+        LeaveCriticalSection(&g_stru_20FC948);
+        return v5;
+    }
+}
 
 // ============================================================
 //  ResizeWorkerWindow  (0x18F6A70 - 0x18F6B77)  -- resize the main window so
@@ -1392,10 +1661,6 @@ static void PumpWorkerMessages(CWorkerWin32 *obj)
     // Exits holding the worker CS (one reference).
 }
 
-//  0x1E2EEF8: device object (vtable-backed). Declared here with the other
-//  device-shutdown globals above.
-static DWORD g_dword_1E2EEF8 = 0;   // 0x1E2EEF8  device object (vtable-backed)
-
 // ============================================================
 //  nvapi.dll interface subsystem state (0x1E2C / 0x1D94)  -- the init
 //  (sub_17D1D10) loads nvapi.dll, takes nvapi_QueryInterface, and resolves the
@@ -1551,7 +1816,7 @@ static DWORD g_dword_2075F10 = 0;
 
 // 0x2075F00: the pending device flush-request object -- a 20-byte struct
 // (three floats, a wrapped NVAPI resource at +12, three flag bytes at
-// +16..18). Set by the device init (sub_18F1B30), freed by DestroyDevice.
+// +16..18). Set by the device init (CreateXloDevice, sub_18F1B30), freed by DestroyDevice.
 static void *g_dword_2075F00 = 0;
 
 // 0x2075F14: a vtable-backed device object released by ReleaseDeviceObjects.
@@ -1943,7 +2208,7 @@ static int ReleaseDeviceObjects(void)
 //  the stack) to destroy it, and clear the pointer. Returns the vtable[2]
 //  result (0 when no device is set; the original returns a stale EAX in that
 //  case). Called from ShutdownDevice and at the top of the device init
-//  (sub_18F1B30) to destroy any previous device.
+//  (CreateXloDevice, sub_18F1B30) to destroy any previous device.
 // ============================================================
 static int DestroyDevice(void)
 {
