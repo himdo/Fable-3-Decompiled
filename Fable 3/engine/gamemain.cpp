@@ -60,8 +60,8 @@ static void *g_off_1D8C854 = 0;    // 0x1D8C854
 // Global "this" objects the frontend dispatches through (0x1DBD048 / 0x1DBD9E8).
 // The callees (stubs) never dereference them, so a zeroed block stands in.
 static int   g_unk_1DBD048[8] = { 0 };   // 0x1DBD048
-// 0x1DBD9E8: the frontend object.  The original constructor (sub_18C46E0,
-// thiscall + retn 8, invoked at registration by sub_1A5C6A0) stores a
+// 0x1DBD9E8: the frontend object.  The original constructor (EventObjCtor,
+// 0x18C46E0, thiscall + retn 8, invoked at registration by sub_1A5C6A0) stores a
 // CreateEventA handle at +0x80; WaitForEvent / SetFrontendEvent / the
 // CloseHandle sibling all read that slot.  It is not created in this build,
 // so the 0x84-byte block stays zeroed: SetEvent(0) is a no-op failure and
@@ -4530,9 +4530,177 @@ static void VfsWorkerCallbackRegister(void *pair, int index)
     VfsWorkerAddCallback(g_dword_1DDC9C8[index * 7], g_dword_1DDC9DC[index * 7], pair);
 }
 
-// AudioEngineFaderCtor  (0x14843C0)  -- [STUB] the 976-byte CEngine / CEngineFader
-//  CMap build; returns its (ECX) argument.
-static void *AudioEngineFaderCtor(void *obj) { return obj; }
+// ============================================================
+//  CEngineFader (the 976-byte NLHAudio::NFramework::CEngineFader) and the
+//  small container helpers its constructor drives.
+// ============================================================
+//  CCharStringCtor  (0x1488CC0 / 0x14761A0 / 0x1489000)  -- thiscall + retn 8.
+//  Builds a 32-byte LHString::CCharString at obj: a 4-byte heap owner node
+//  (holding a back-pointer to obj) into obj+0x00, and a `capacity`-byte heap
+//  buffer whose three leading words are self-linked (an empty circular list)
+//  with a 0x01/0x01 flag pair at its tail (byte capacity-4 / capacity-3),
+//  stored into obj+0x18 (count obj+0x1C = 0).  `capacity` is 0x18 (24) for the
+//  0x1488CC0 variant, 0x1C (28) for 0x14761A0, 0x2C (44) for 0x1489000.
+//  [NOT byte-identical] two relative LHAlloc calls; the OOM branch is
+//  replicated (the unguarded tail writes deref the buffer, as the original).
+static void *CCharStringCtor(void *obj, unsigned capacity)
+{
+    DWORD *o = (DWORD *)obj;
+    void *node = LHAlloc(4);
+    if (node) *(DWORD *)node = (DWORD)obj;
+    o[0] = (DWORD)node;
+    DWORD *buf = (DWORD *)LHAlloc(capacity);
+    if (buf) { buf[0] = 0; buf[1] = 0; buf[2] = 0; }
+    BYTE *b = (BYTE *)buf;
+    b[capacity - 3] = 0;
+    b[capacity - 4] = 1;
+    o[6] = (DWORD)buf;               // obj + 0x18
+    b[capacity - 3] = 1;
+    buf[1] = (DWORD)buf;
+    buf[0] = (DWORD)buf;
+    buf[2] = (DWORD)buf;
+    o[7] = 0;                         // obj + 0x1C
+    return obj;
+}
+
+//  CCharStringTripleCtor  (0x1474D30)  -- thiscall.  The +0x60 member block of
+//  CEngineFader: three 28-byte CCharStrings at base+0x00/+0x20/+0x40, then a
+//  zero dword at base+0x60 and a zero byte at base+0x64.
+static void *CCharStringTripleCtor(void *base)
+{
+    char *b = (char *)base;
+    CCharStringCtor(b + 0x00, 0x1C);   // 0x14761A0
+    CCharStringCtor(b + 0x20, 0x1C);
+    CCharStringCtor(b + 0x40, 0x1C);
+    *(DWORD *)(b + 0x60) = 0;
+    *(BYTE  *)(b + 0x64) = 0;
+    return base;
+}
+
+//  CMapBaseCtor  (0x150C5A0)  -- thiscall.  The NSupport::Containers::Intrusive
+//  CMap base: two 20-byte heap nodes (5 words each) built into a circular
+//  2-node list.  node1 = {node1,node1,node1,0,0}; node2 = {node1,node1,node1,0,0};
+//  this[0] = node2, this[1] = node1.  [NOT byte-identical] two LHAlloc calls.
+static void *CMapBaseCtor(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    DWORD *n1 = (DWORD *)LHAlloc(20);
+    if (n1) { n1[0] = 0; n1[1] = 0; n1[2] = 0; n1[4] = 0; }
+    o[1] = (DWORD)n1;
+    n1[2] = (DWORD)n1;
+    n1[1] = n1[2];
+    n1[0] = n1[1];
+    n1[3] = 0;
+    n1[4] = 0;
+    DWORD *n2 = (DWORD *)LHAlloc(20);
+    if (n2) { n2[0] = 0; n2[1] = 0; n2[2] = 0; n2[4] = 0; }
+    o[0] = (DWORD)n2;
+    n2[1] = (DWORD)n1;
+    n2[0] = n2[1];
+    n2[2] = n2[0];
+    n2[3] = 0;
+    n2[4] = 0;
+    return obj;
+}
+
+//  AudioFloatBlockInit  (0x150E180)  -- thiscall.  Fills the 476-byte (0x1DC,
+//  words 0..118) float-parameter block at obj+0x118: words 0..4 = 0, then a run
+//  of float pairs alternating {1.0,1.0}/{0,0} from word 5 through word 118
+//  (word 1AE4618 = 0x3F800000 = 1.0f is the constant).
+static void *AudioFloatBlockInit(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    const DWORD one = 0x3F800000;    // 1.0f
+    o[0] = o[1] = o[2] = o[3] = o[4] = 0;
+    o[5] = one;  o[6] = one;
+    o[7] = 0;    o[8] = 0;
+    o[9] = one;  o[10] = one;
+    o[11] = 0;   o[12] = 0;
+    o[13] = one; o[14] = one;
+    o[15] = 0;   o[16] = 0;
+    o[17] = one; o[18] = one;
+    // the original's second loop (its first zero loop over words 19..68 is
+    // subsumed by this one, which covers the full 19..118 range):
+    for (int j = 0; j < 25; ++j) {
+        int base = 22 + j * 4;
+        o[base - 1] = one;
+        o[base]     = one;
+        o[base - 3] = 0;
+        o[base - 2] = 0;
+    }
+    return obj;
+}
+
+//  EventObjCtor  (0x18C46E0)  -- thiscall + retn 8.  The 0x84-byte Win32 event
+//  wrapper: obj+0x00 (byte) = 0, obj+0x80 = CreateEventA(NULL, manualReset==1,
+//  initialState!=0, NULL).  [NOT byte-identical] the CreateEventA IAT slot is
+//  called directly rather than at its original high VA.
+static void *EventObjCtor(void *obj, int manualReset, int initialState)
+{
+    BYTE *o = (BYTE *)obj;
+    o[0] = 0;
+    *(HANDLE *)(o + 0x80) = CreateEventA(NULL, (manualReset == 1) ? 1 : 0,
+                                         (initialState != 0) ? 1 : 0, NULL);
+    return obj;
+}
+
+//  ResetEventObj  (0x18C4550)  -- thiscall.  ResetEvent on the handle at
+//  obj+0x80.  [NOT byte-identical] the ResetEvent IAT slot is called directly.
+static BOOL ResetEventObj(void *obj)
+{
+    return ResetEvent(*(HANDLE *)((char *)obj + 0x80));
+}
+
+//  SIMDVectorInit3  (0x147F6B0)  -- stdcall (retn 0x0C).  Writes three 16-byte
+//  (float4) vectors: a1 = {0,0,0,0}, a2 = {0,1.0,0,0}, a3 = {0,0,1.0,0}.
+static void SIMDVectorInit3(void *a1, void *a2, void *a3)
+{
+    float *v1 = (float *)a1;
+    float *v2 = (float *)a2;
+    float *v3 = (float *)a3;
+    v1[0] = v1[1] = v1[2] = v1[3] = 0.0f;
+    v2[0] = 0.0f; v2[1] = 1.0f; v2[2] = 0.0f; v2[3] = 0.0f;
+    v3[0] = 0.0f; v3[1] = 0.0f; v3[2] = 1.0f; v3[3] = 0.0f;
+}
+
+//  AudioEngineFaderCtor  (0x14843C0 - 0x14844FD)  -- thiscall.  Constructs the
+//  976-byte (0x3D0) CEngineFader: six 32-byte CCharStrings (three 24-byte, then
+//  the +0x60 triple of 28-byte strings + 0x1C=0 at +0xC0/+0xC4), the
+//  CMap<CEngineFader, CCharString, GetName, 8, CCompareNoCase> at +0xCC (CBase
+//  vtable, CMap data, CMap vtable, bucket[8]=0), a 44-byte CCharString at +0xF8,
+//  the 476-byte float block at +0x118, the CMap<CDataObjectHolder, GetThis, 0>
+//  at +0x2F4, the 1.0f scalar at +0x330, the -1/0 pair at +0x334/+0x338, the
+//  0x84-byte event wrapper at +0x33C, the two zero bytes at +0x3C0/+0x3C1, the
+//  three float4 vectors at +0x300/+0x310/+0x320, and finally a ResetEvent of the
+//  wrapper.  Returns obj.  [NOT byte-identical] nine relative E8 calls plus the
+//  high-VA CBase/CMap vftables (0x1B70xxx) and the 1.0f global (dword_1AE4618).
+static void *AudioEngineFaderCtor(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    char *b = (char *)obj;
+    CCharStringCtor(b + 0x00, 0x18);              // 0x1488CC0
+    CCharStringCtor(b + 0x20, 0x18);
+    CCharStringCtor(b + 0x40, 0x18);
+    CCharStringTripleCtor(b + 0x60);              // 0x1474D30
+    o[0xCC / 4] = 0x1B70958;                         // CBase<CEngineFader> vftable
+    CMapBaseCtor(b + 0xD0);                        // 0x150C5A0
+    o[0xCC / 4] = 0x1B70AE4;                         // CMap<CEngineFader> vftable
+    for (int i = 0xD8 / 4; i <= 0xF4 / 4; ++i) o[i] = 0;   // bucket[8] = 0
+    CCharStringCtor(b + 0xF8, 0x2C);              // 0x1489000
+    AudioFloatBlockInit(b + 0x118);               // 0x150E180
+    o[0x2F4 / 4] = 0x1B70984;                        // CBase<CDataObjectHolder> vftable
+    CMapBaseCtor(b + 0x2F8);                       // 0x150C5A0
+    *(float *)(b + 0x330) = 1.0f;                  // movss dword_1AE4618
+    o[0x2F4 / 4] = 0x1B70BCC;                        // CMap<CDataObjectHolder> vftable
+    o[0x334 / 4] = 0xFFFFFFFF;                       // +0x334 = -1
+    o[0x338 / 4] = 0;                                 // +0x338 = 0
+    EventObjCtor(b + 0x33C, 1, 0);                 // 0x18C46E0
+    *(BYTE *)(b + 0x3C0) = 0;
+    *(BYTE *)(b + 0x3C1) = 0;
+    SIMDVectorInit3(b + 0x300, b + 0x310, b + 0x320);  // 0x147F6B0
+    ResetEventObj(b + 0x33C);                      // 0x18C4550
+    return obj;
+}
 
 // ProcessDelegateDtor  (0x146DFA0 - 0x146DFA7)  -- the CProcessDelegateThiscall
 //  deleter (sub_14833E0, a remaining deep stub); returns 0.
@@ -5688,7 +5856,8 @@ static int WaitForEvent(void *obj, int dwMilliseconds, int bAlertable)
 }
 //  SetFrontendEvent  (0x18C4540 - 0x18C454E)  -- thiscall sibling of
 //  WaitForEvent: signal the event stored at obj+0x80 of the frontend object
-//  (the sub_18C46E0 constructor's CreateEventA handle; 0 in this build, so
+//  (the EventObjCtor (0x18C46E0) constructor's CreateEventA handle; 0 in this
+//  build, so
 //  SetEvent fails quietly).  The tail jump of RunGameLoop (0x619D70) lands
 //  here with the frontend object (dword_1DBD9E8) in ECX.  [NOT byte-
 //  identical] the original calls the SetEvent IAT slot at its original high
