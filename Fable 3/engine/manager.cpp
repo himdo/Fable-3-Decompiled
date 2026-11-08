@@ -285,7 +285,7 @@ static void *CInputManagerDxCtor(void *obj, void *hinst, int *flags, int *res,
 //  (device, 1)), signals the worker's event2 (+0x120), and returns 1.
 // ============================================================
 char CManagerWin32_RunGame(void *obj, int a2, int a3, int a4, int a5, int a6,
-                           int a7, int a8, F3SharedBuffer *a9)
+                           int a7, int a8, F3SharedBuffer **a9)
 {
     (void)a7;   // not forwarded to the worker's run step
     if (!CWorkerWin32_RunGame(GetWorker(), a2, a3, a4, a5, a6, a8, a9))

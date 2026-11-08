@@ -575,7 +575,7 @@ static void InitAccessibilitySettings(void)
 //  free function (worker as the first parameter).
 //
 //  char CWorkerWin32_RunGame(CWorkerWin32 *worker, int a2, int a3, int a4,
-//                            int a5, int a6, int a8, F3SharedBuffer *a9)
+//                            int a5, int a6, int a8, F3SharedBuffer **a9)
 //
 //  Under the worker CS: stores the parsed start-up parameters in the
 //  worker's display-mode / requested-size fields (+0x240 a2, +0x244 a3,
@@ -592,7 +592,7 @@ static void InitAccessibilitySettings(void)
 //  global is live; the standalone test has no worker).
 // ============================================================
 char CWorkerWin32_RunGame(void *worker, int a2, int a3, int a4, int a5, int a6,
-                          int a8, F3SharedBuffer *wideSlot)
+                          int a8, F3SharedBuffer **wideSlot)
 {
     if (worker == 0)
         return 0;
@@ -608,7 +608,7 @@ char CWorkerWin32_RunGame(void *worker, int a2, int a3, int a4, int a5, int a6,
     *(int *)(c + 0x250) = a8;     // +0x250
 
     F3SharedBuffer *local = 0;
-    AnsiFromWideSlot(wideSlot, &local);   // 0x19FFAB0
+    AnsiFromWideSlot(wideSlot, &local);   // 0x19FFAB0 (wideSlot = pointer to the wide slot)
     CopySharedSlot((F3SharedBuffer **)(c + 0x254), &local);   // 0x1A01270
     if (local != 0)   // release the temporary local slot
     {

@@ -91,7 +91,7 @@ void *GetWorker(void);
 // 0x18F7C50 - the worker's "run the game" step (called by the manager's run
 // dispatch, CManagerWin32_RunGame). See worker.cpp.
 char CWorkerWin32_RunGame(void *worker, int a2, int a3, int a4, int a5,
-                          int a6, int a8, F3SharedBuffer *wideSlot);
+                          int a6, int a8, F3SharedBuffer **wideSlot);
 
 // 0x188EC90 - find the active input device on the input manager's device
 // list (obj +12 / +16); returns the first device whose vtable[1] returns 3.

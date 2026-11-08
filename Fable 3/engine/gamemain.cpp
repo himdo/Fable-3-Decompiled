@@ -2033,7 +2033,7 @@ static F3SharedBuffer ** RefCwdSlot(F3SharedBuffer **slot)
 //  allocator, SetSharedSlot and the game-heap free) plus the high-VA heap
 //  table (dword_2075B24).
 //
-//  F3SharedBuffer ** AnsiFromWideSlot(F3SharedBuffer *wide, F3SharedBuffer **out)
+//  F3SharedBuffer ** AnsiFromWideSlot(F3SharedBuffer **wide, F3SharedBuffer **out)
 //
 //  Build a fresh ANSI block holding the low byte of each wide code unit of
 //  the source wide block (null-terminated, length + 1 bytes) and store it in
@@ -2041,10 +2041,14 @@ static F3SharedBuffer ** RefCwdSlot(F3SharedBuffer **slot)
 //  On allocation failure the out slot is still set through SetSharedSlot with
 //  no source (the slot is nulled, g_Addend bumped, no block).
 // ============================================================
-F3SharedBuffer ** AnsiFromWideSlot(F3SharedBuffer *wide, F3SharedBuffer **out)
+F3SharedBuffer ** AnsiFromWideSlot(F3SharedBuffer **wide, F3SharedBuffer **out)
 {
-    unsigned int len  = (wide != 0) ? wide->length : 0;
-    const char *data  = (wide != 0) ? wide->data : 0;
+    // `wide` is a pointer to the F3SharedBuffer slot (matches the original, which
+    // loads the control block with `mov eax, [esi]` and then `mov eax, [eax+4]`
+    // for the length). Dereference once to reach the control block.
+    F3SharedBuffer *blk = (wide != 0) ? *wide : 0;
+    unsigned int len    = (blk != 0) ? blk->length : 0;
+    const char *data    = (blk != 0) ? blk->data : 0;
     char *buf = (char *)LHAlloc(len + 1);
 
     if (buf != 0)
@@ -2197,7 +2201,7 @@ static int CreatePathTree(F3SharedBuffer **pathSlot)
     F3SharedBuffer *cwdRef  = 0;            // the CWD wide block reference
     F3SharedBuffer *ansiCwd = 0;            // the ANSI copy of the CWD
     RefCwdSlot(&cwdRef);                    // sub_18AEE10
-    AnsiFromWideSlot(cwdRef, &ansiCwd);     // sub_19FFAB0
+    AnsiFromWideSlot(&cwdRef, &ansiCwd);     // sub_19FFAB0
     if (cwdRef != 0)
     {
         if (InterlockedDecrement(&cwdRef->refcount) <= 0)

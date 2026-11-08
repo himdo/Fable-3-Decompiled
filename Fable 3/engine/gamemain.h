@@ -50,6 +50,6 @@ F3SharedBuffer **CopySharedSlot(F3SharedBuffer **thisSlot, F3SharedBuffer **srcS
 
 // 0x19FFAB0 - build a fresh ANSI slot from the low byte of each wide code
 // unit of the source wide block and store it in the out slot.
-F3SharedBuffer **AnsiFromWideSlot(F3SharedBuffer *wide, F3SharedBuffer **out);
+F3SharedBuffer **AnsiFromWideSlot(F3SharedBuffer **wide, F3SharedBuffer **out);
 
 #endif  // F3_GAMEMAIN_H
