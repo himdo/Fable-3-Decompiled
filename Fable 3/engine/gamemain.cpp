@@ -17,6 +17,7 @@
 #include "xlive.h"                // the xlive.dll (XLiveAPI) import declarations
 
 #include <windows.h>
+#include <objbase.h>              // CoInitializeEx / CoCreateInstance (the LHVFS COM bring-up)
 #include <process.h>              // _beginthread / _getdrive / _chdrive
 #include <wchar.h>                // _wgetcwd
 #include <string.h>
@@ -4150,13 +4151,561 @@ static void *VfsDescDefaultCtor(void *obj)
     return obj;
 }
 
-// CreateVirtualFilesystem  (0x145DD80 - 0x145DECE)  -- COM-backed virtual
-//  filesystem bring-up for a 80-byte VFS descriptor.  Remaining stub:
-//  the COM instance path (CoCreateInstance over the 0x1DDC7E0 cluster +
-//  the 0x145EC90 / 0x145EF80 / 0x1460650 / 0x146DEC0 / 0x146F1xx VFS
-//  builders) is not implemented in this build, so it reports failure
-//  (0) exactly as the original does when the descriptor object is null.
-static int CreateVirtualFilesystem(void *desc) { (void)desc; return 0; }
+// ============================================================
+//  CreateVirtualFilesystem  (0x145DD80 - 0x145DECE)  -- bring up the
+//  COM-backed virtual filesystem (LHVFS) for the 80-byte VFS descriptor
+//
+//  int CreateVirtualFilesystem(void *desc)   -- cdecl, one stack pointer.
+//  The original also captures ECX on entry into a BYREF slot (seeded with the
+//  register, then used only as the out-pointer for the fallback-VFS object --
+//  it is overwritten by CreateFallbackVfs before it is ever read, so no
+//  caller-supplied register value is needed here).
+//
+//  1.  One-shot: if the VFS is already initialised (byte_1DDC7E0) return 0.
+//  2.  On first use, CoInitializeEx(0, 0) and CoCreateInstance over the
+//      system Core Audio MMDeviceEnumerator CLSID / IMMDeviceEnumerator IID;
+//      on success drive the two interface methods on the created object
+//      (slot 4 = GetDefaultAudioInterface into the 0x1DDC7EC buffer, slot 6
+//      = RegisterEndpointNotificationCallback with the 0x1D6A768 client).
+//      ppv is kept globally (released elsewhere).
+//  3.  If the descriptor's +0x00 object (the archive manager) is null, report
+//      "Virtual filesystem can not be null" via SetSaveGamePath and return 0.
+//  4.  Otherwise: clamp the descriptor (+0x04 -> 1 if 0, +0x08 -> 31 if >=32),
+//      copy-assign it into the global descriptor (VfsDescAssign), build the
+//      CFallbackVFS object (CreateFallbackVfs), install it into dword_1DDC7F4
+//      (releasing the old one), and run the VFS initialisation
+//      (InitVirtualFileSystem).  On success, install the 4-byte refcount
+//      wrapper (VfsRefCountCtor) at dword_1DDC7E4, register the VFS provider
+//      groups, mark byte_1DDC7E0 = 1 and return 1.
+//  [NOT byte-identical] placement-dependent (relative calls to the VFS
+//  callees, the LHAlloc / CoInitializeEx / CoCreateInstance IAT thunks) and
+//  refs the high-VA globals (the byte_1DDC7E0 cluster, dword_1D6A720, the
+//  CLSID/IID, off_1D6A768).
+// ============================================================
+
+// The audio-fallback VFS COM + global cluster (original addresses kept in
+// comments).  The LHVFS audio virtual filesystem backs onto the *system* Core
+// Audio COM server: the CLSID / IID are the Windows MMDeviceEnumerator /
+// IMMDeviceEnumerator pair, so CoCreateInstance succeeds on a normal machine.
+static const CLSID g_rclsid_1D6A6F0 = { 0xBCDE0395, 0xE52F, 0x467C,
+    { 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E } };   // 0x1D6A6F0: MMDeviceEnumerator CLSID
+static const IID   g_riid_1D6A700  = { 0xA95664D2, 0x9614, 0x4F35,
+    { 0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6 } };    // 0x1D6A700: IMMDeviceEnumerator IID
+static BYTE  g_byte_1DDC7E0 = 0;      // 0x1DDC7E0: VFS initialised flag
+static DWORD g_dword_1DDC7E4 = 0;     // 0x1DDC7E4: 4-byte refcount wrapper
+static void *g_ppv_1DDC7E8 = 0;       // 0x1DDC7E8: the IMMDeviceEnumerator (ppv)
+static BYTE  g_unk_1DDC7EC[16] = { 0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF };   // 0x1DDC7EC: GetDefaultAudioInterface out buffer
+static F3SharedBuffer *g_dword_1DDC7F0 = 0;   // 0x1DDC7F0: "cannot be null" msg slot
+static DWORD g_dword_1DDC7F4 = 0;     // 0x1DDC7F4: installed fallback-VFS object
+// A safe no-op IMMNotificationClient: the real client the game registers with
+// the enumerator (vtable 0x01B6F408) is not implemented in this build, so its
+// first field is a live no-op vtable.  RegisterEndpointNotificationCallback
+// AddRefs it (and any audio-event callback resolves to safe code), so the
+// first field of the object (the vtable) must be a mapped address, not
+// 0x01B6F408.  Each method is a plain __stdcall entry with the exact parameter
+// arity so it cleans the right number of stack bytes.
+struct F3AudioPropKey { int d1; short d2, d3; char d4[8]; int d5; };   // 20-byte PROPERTYKEY (by value)
+static long __stdcall F3AudioNotifQI(void *self, const void *riid, void **ppv) { (void)self; (void)riid; if (ppv) *ppv = 0; return (long)0x80004002; }
+static long __stdcall F3AudioNotifAddRef(void *self)   { return 1; }
+static long __stdcall F3AudioNotifRelease(void *self)  { return 1; }
+static long __stdcall F3AudioNotifStateChanged(void *self, void *id, unsigned st) { return 0; }
+static long __stdcall F3AudioNotifAdded(void *self, void *id)   { return 0; }
+static long __stdcall F3AudioNotifRemoved(void *self, void *id) { return 0; }
+static long __stdcall F3AudioNotifDefaultFlow(void *self, unsigned a, unsigned b, void *c) { return 0; }
+static long __stdcall F3AudioNotifDefaultRole(void *self, unsigned a, unsigned b, void *c) { return 0; }
+static long __stdcall F3AudioNotifPropertyChanged(void *self, void *id, F3AudioPropKey key) { return 0; }
+static const void *F3AudioNotifVtable[] = {
+    (const void *)F3AudioNotifQI, (const void *)F3AudioNotifAddRef,
+    (const void *)F3AudioNotifRelease, (const void *)F3AudioNotifStateChanged,
+    (const void *)F3AudioNotifAdded, (const void *)F3AudioNotifRemoved,
+    (const void *)F3AudioNotifDefaultFlow, (const void *)F3AudioNotifDefaultRole,
+    (const void *)F3AudioNotifPropertyChanged
+};
+static void *g_off_1D6A768 = (void *)F3AudioNotifVtable;   // 0x1D6A768: the IMMNotificationClient (vtable = first field)
+// The global 80-byte VFS descriptor (0x1D6A720), default-initialised exactly
+// like VfsDescDefaultCtor, plus d[18] = 0x01B6F408 and d[19] = 0.
+static DWORD g_dword_1D6A720[20] = { 0, 0x32, 0, 0x6000, 3, 0x2000000, 0x42, 6,
+    0x8000, 0x40000, 0x48, 0x0A, 0, 0, 2, 0, 1, 0, 0x01B6F408, 0 };
+
+
+// VfsDescAssign  (0x145EC90 - 0x145ED25)  -- copy-assign an 80-byte VFS
+//  descriptor (thiscall + retn 4: this in ECX, the source on the stack).
+//  Releases the source's +0x00 object (vtable slot 1) and the destination's
+//  +0x00 object (vtable slot 2), then copies d[0..14], the 0x3C byte, and
+//  d[16..17].  Returns this.
+static void *VfsDescAssign(void *obj, void *src)
+{
+    DWORD *o = (DWORD *)obj;
+    DWORD *s = (DWORD *)src;
+    int i;
+    if (s[0] != 0) F3CallVtable((void *)s[0], 1);
+    if (o[0] != 0) F3CallVtable((void *)o[0], 2);
+    for (i = 0; i <= 14; ++i) o[i] = s[i];     // dwords 0x00..0x38
+    ((BYTE *)obj)[0x3C] = ((BYTE *)src)[0x3C]; // the 0x3C byte
+    o[0x40 / 4] = s[0x40 / 4];                  // d[16]
+    o[0x44 / 4] = s[0x44 / 4];                  // d[17]
+    return obj;
+}
+
+// VirtualFileSystemCtor  (0x18A98F0 - 0x18A9961)  -- construct the 88-byte
+//  LHVFS::CVirtualFileSystem object (thiscall in ECX).  Installs the
+//  CAddRelQueryImp / CVirtualFileSystem vtables, initialises the critical
+//  section at +8, and builds the two 20-byte intrusive list heads at +0x20 /
+//  +0x38 (each with a 4-byte heap back-pointer).  Returns this.
+static void *VirtualFileSystemCtor(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    BYTE  *b = (BYTE *)obj;
+    o[0] = 0x1BF77B4;   // &LHCOMUtils::CAddRelQueryImp<IVirtualFileSystem,...>::vftable
+    o[1] = 0;
+    InitializeCriticalSection((LPCRITICAL_SECTION)((char *)obj + 8));
+    o[0] = 0x1BF7778;   // &LHVFS::CVirtualFileSystem::vftable
+    DWORD *n1 = (DWORD *)((char *)obj + 0x20);
+    void *h1 = LHAlloc(4); if (h1 != 0) *(void **)h1 = n1;
+    n1[0x00 / 4] = (DWORD)h1;
+    n1[0x0C / 4] = 0; n1[0x10 / 4] = 0; n1[0x14 / 4] = 0;
+    DWORD *n2 = (DWORD *)((char *)obj + 0x38);
+    void *h2 = LHAlloc(4); if (h2 != 0) *(void **)h2 = n2;
+    n2[0x00 / 4] = (DWORD)h2;
+    n2[0x0C / 4] = 0; n2[0x10 / 4] = 0; n2[0x14 / 4] = 0;
+    b[0x51] = 0;
+    b[0x50] = 1;
+    return obj;
+}
+
+// CreateFallbackVfs  (0x145EF80 - 0x145EFC8)  -- allocate (LHAlloc 88) and
+//  construct the NLHAudio::CFallbackVFS object, storing its pointer at *out.
+//  Sets the +0x54 slot to archiveObj (taking a reference: vtable slot 1 on
+//  archiveObj when non-null), then takes a reference on the new object
+//  (vtable slot 1).  Returns out.
+static void *CreateFallbackVfs(void *out, DWORD archiveObj)
+{
+    void *obj = LHAlloc(0x58);   // 88
+    if (obj != 0) {
+        VirtualFileSystemCtor(obj);                       // 0x18A98F0
+        *(void **)obj = (void *)0x1B6F390;                // &NLHAudio::CFallbackVFS::vftable
+        *(DWORD *)((char *)obj + 0x54) = archiveObj;
+        if (archiveObj != 0) F3CallVtable((void *)archiveObj, 1);
+    }
+    *(void **)out = obj;
+    if (obj != 0) F3CallVtable(obj, 1);
+    return out;
+}
+
+// VfsComponentMapCtor  (0x14B2460)  -- remaining stub: the three NSupport
+//  intrusive CMap containers (the 48-byte wrapper built by VfsRefCountCtor).
+//  Not implemented in this build; returns its (ECX) argument unchanged.
+static void *VfsComponentMapCtor(void *obj) { return obj; }
+
+// VfsRefCountCtor  (0x146DEC0 - 0x146DEEC)  -- construct the 4-byte VFS
+//  refcount wrapper (thiscall in ECX): *this = 0, then LHAlloc(48) and build
+//  the component map (VfsComponentMapCtor) into the slot (0 on failure).
+static void *VfsRefCountCtor(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    o[0] = 0;
+    void *mem = LHAlloc(0x30);   // 48
+    o[0] = (mem != 0) ? (DWORD)VfsComponentMapCtor(mem) : 0;
+    return obj;
+}
+
+// ============================================================
+//  InitVirtualFileSystem  (0x1460650 - 0x1460701)  -- the LHVFS audio
+//  virtual-filesystem bring-up that CreateVirtualFilesystem runs after the
+//  fallback VFS is published (reached only when the descriptor's +0x00 archive
+//  slot is non-null).  It is a one-time (g_byte_1DDC828) chain that, in order:
+//    1. brings up the 7-thread worker pool       (VfsWorkerPoolInit,        0x1476B50)
+//    2. initialises the small allocation cache   (VfsAllocCacheInit,        0x14743F0)
+//    3. identity-probes the descriptor cache     (VfsAllocCacheIdentity,    0x146D870,
+//       + the concurrency reader-writer-lock init, VfsCacheQueryInit        0x146D8E0 -> 0x14972C0)
+//    4. builds the audio process delegate        (AudioProcessDelegateInit, 0x147A750)
+//    5. runs the two provider capability queries (VfsQueryProviderPair,     0x1477990)
+//    6. allocates + builds the 16-byte CProcessDelegateThiscall object into
+//       g_dword_1DDC820, builds the 80/4096 main allocation cache into
+//       g_unk_1DDC830, and registers the {vtable, VfsGetQueryTable} pair with
+//       worker slot 0 (VfsWorkerCallbackRegister,                          0x1476D00)
+//  returning 1 (success) only when every step succeeds; 0 otherwise (and on a
+//  repeat call, g_byte_1DDC828 already set).  desc[1]/desc[2] (the descriptor's
+//  +0x04/+0x08) are the worker count / ideal-processor affinity.
+//
+//  [NOT byte-identical] placement-dependent: ten relative E8 calls (the worker-
+//  pool / allocation-cache / process-delegate / provider-query / query-table
+//  subsystem callees + the LHAlloc IAT thunk) and the high-VA globals
+//  g_byte_1DDC828 / g_dword_1DDC820 / g_unk_1DDC830 / g_off_1D6A80C.
+//
+//  The deep leaves of the audio/VFS subsystem (the engine fader CMap, the
+//  provider buffer allocation, the query-table build / drain, the worker
+//  add-callback) are documented stubs returning their fresh-state success
+//  values, matching the original's happy path when given a valid VFS descriptor.
+
+// ---- audio/VFS bring-up globals (original BSS addresses kept) ----
+static const DWORD kCProcessDelegateThiscallVftable = 0x01B6FCC0;  // ??_7 CProcessDelegateThiscall<CEngine>::`vftable'
+static const DWORD kCProcessDelegateStaticVftable   = 0x01B6F768;  // ??_7 CProcessDelegateStatic::`vftable'
+
+static BYTE  g_byte_1DDC828 = 0;              // 0x1DDC828: InitVirtualFileSystem done flag
+static DWORD g_dword_1DDC820 = 0;             // 0x1DDC820: the CProcessDelegateThiscall object (16 bytes)
+static DWORD g_dword_1DDC824 = 0;             // 0x1DDC824: query-table mode (2 = drain)
+static BYTE  g_unk_1DDC830[28];               // 0x1DDC830: the main (80/4096) allocation-cache object
+static DWORD g_off_1D6A80C[2] = { kCProcessDelegateStaticVftable, 0 };  // 0x1D6A80C: {vtable, VfsGetQueryTable}
+static DWORD g_off_1D6E9C8[2] = { kCProcessDelegateStaticVftable, 0 };  // 0x1D6E9C8: {vtable, AudioProcessDelegateTick}
+
+// worker-pool / allocation-cache state (BSS, zero-initialised here)
+static BYTE  g_byte_1DDC9C0 = 0;              // 0x1DDC9C0: worker pool initialised
+static BYTE  g_byte_1DDC9C1 = 0;              // 0x1DDC9C1: worker pool high-bit
+static DWORD g_dword_1DDCB50 = 0;             // 0x1DDCB50: pool worker count (desc[1])
+static DWORD g_unk_1DDCB38[7 * 9];            // 0x1DDCB38: the seven 36-byte worker objects
+static DWORD g_dword_1DDC9C8[7 * 7];          // 0x1DDC9C8: per-worker callback-list head
+static DWORD g_dword_1DDC9DC[7 * 7];          // 0x1DDC9DC: per-worker callback-list data
+static BYTE  g_byte_1DDC94C = 0;              // 0x1DDC94C: small (48/2048) allocation-cache init flag
+static BYTE  g_unk_1DDC950[28];               // 0x1DDC950: the 48/2048 allocation-cache object
+static DWORD g_dword_1DDCCD0 = 0;             // 0x1DDCCD0: the audio-engine object (340 bytes)
+static BYTE  g_unk_1DDCC40[72];               // 0x1DDCC40: provider query cache #1
+static BYTE  g_unk_1DDCC88[72];               // 0x1DDCC88: provider query cache #2
+static DWORD g_dword_1DDCD74 = 0;             // 0x1DDCD74: the concurrency reader-writer-lock object
+
+// GetVfsDesc  (0x145DAF0 - 0x145DAF5)  -- return the global 80-byte VFS descriptor.
+static DWORD *GetVfsDesc(void) { return g_dword_1D6A720; }
+
+// VfsWorkerCtor  (0x18C5A60 - 0x18C5A89)  -- start one worker: mark the +0x0C
+//  state byte 1 (2 on the sub_18C59D0 failure).  [STUB] the thread-spawn callee
+//  sub_18C59D0 is unimplemented, treated as success.
+static int VfsWorkerCtor(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    if (o[0x0C / 4] == 1) return 0;
+    o[0x0C / 4] = 1;
+    return 1;
+}
+
+// VfsWorkerSetAffinity  (0x18C5970 - 0x18C597D)  -- SetThreadIdealProcessor on
+//  the worker's +0x04 thread handle (0 pre-spawn), so this is a no-op here.
+static DWORD VfsWorkerSetAffinity(void *obj, DWORD proc)
+{
+    DWORD *o = (DWORD *)obj;
+    return SetThreadIdealProcessor((HANDLE)o[0x04 / 4], proc);
+}
+
+// VfsWorkerPoolInit  (0x1476B50 - 0x1476BA8)  -- bring up the 7-thread VFS
+//  worker pool (one-time, g_byte_1DDC9C0).  Seeds g_dword_1DDCB50 = a2, builds
+//  the seven 36-byte workers (g_unk_1DDCB38 + i*0x24, +0x14 = i) each via
+//  VfsWorkerCtor + VfsWorkerSetAffinity(dwIdealProcessor), sets the flag and
+//  returns 1; returns 0 when already initialised.
+static int VfsWorkerPoolInit(DWORD dwIdealProcessor, int a2)
+{
+    if (g_byte_1DDC9C0 != 0)
+        return 0;
+    g_byte_1DDC9C1 = 0;
+    g_dword_1DDCB50 = (DWORD)a2;
+    for (int i = 0; i < 7; ++i) {
+        DWORD *w = &g_unk_1DDCB38[i * 9];
+        w[0x14 / 4] = i;                          // +0x14: the worker index
+        VfsWorkerCtor(w);                         // 0x18C5A60
+        VfsWorkerSetAffinity(w, dwIdealProcessor); // 0x18C5970
+    }
+    g_byte_1DDC9C0 = 1;
+    return 1;
+}
+
+// VfsAllocCacheBlockCtor  (0x14741A0 - 0x147421A)  -- [STUB] build the per-
+//  block metadata for one allocation-cache block; returns its (ECX) argument.
+static void *VfsAllocCacheBlockCtor(void *obj) { return obj; }
+
+// VfsAllocCacheCtor  (0x1473CF0 - 0x1473D64)  -- the 28-byte LHVFS allocation-
+//  cache constructor (thiscall, retn 8: obj in ECX, a2/a3 on the stack).  No-op
+//  (returns 0) when the +0x18 init flag is already set; otherwise records the
+//  capacity (a3) at +0x10 and element size (a2+4) at +0x14, allocates the
+//  contiguous block (a3*(a2+4)+272 + a2+4 bytes) into +0x00/+0x08, then the
+//  268-byte control block (VfsAllocCacheBlockCtor over block+(a2+4)); a null
+//  control block is tolerated (set to 0).  Sets the +0x18 flag and returns 1.
+static int VfsAllocCacheCtor(void *obj, int a2, int a3)
+{
+    DWORD *o = (DWORD *)obj;
+    if (o[0x18 / 4] != 0)
+        return 0;
+    o[0x10 / 4] = a3;
+    int blockSize = a3 * (a2 + 4) + 272;
+    o[0x14 / 4] = a2 + 4;
+    void *block = LHAlloc(blockSize + a2 + 4);
+    o[0] = (DWORD)block;
+    o[2] = (DWORD)block;
+    void *cache = LHAlloc(268);
+    o[1] = (cache != 0) ? (DWORD)VfsAllocCacheBlockCtor((char *)block + (a2 + 4)) : 0;
+    o[0x18 / 4] = 1;
+    return 1;
+}
+
+// VfsAllocCacheInit  (0x14743F0 - 0x1474418)  -- one-time (g_byte_1DDC94C) init
+//  of the small 48/2048 allocation cache (g_unk_1DDC950); returns 1 on the first
+//  successful build, 0 otherwise.
+static int VfsAllocCacheInit(void)
+{
+    if (g_byte_1DDC94C != 0)
+        return 0;
+    if (VfsAllocCacheCtor(g_unk_1DDC950, 48, 2048) == 0)
+        return 0;
+    g_byte_1DDC94C = 1;
+    return 1;
+}
+
+// VfsAllocCacheIdentity  (0x146D870 - 0x146D872)  -- identity thiscall.
+static void *VfsAllocCacheIdentity(void *obj) { return obj; }
+
+// VfsCacheQueryImpl  (0x14972C0 - 0x149731C)  -- one-time (g_dword_1DDCD74)
+//  concurrency init: the 8-byte Concurrency reader-writer lock + the 56-byte
+//  query state.  [STUB] the lock / state builders (sub_148D220 / sub_1496E90)
+//  are unimplemented, treated as their success values.
+static int VfsCacheQueryImpl(void)
+{
+    if (g_dword_1DDCD74 != 0)
+        return 0;
+    void *lock = LHAlloc(8);              // the Concurrency RWLock (8 bytes)
+    (void)lock;                           // sub_148D220 (bind lock) -- stub, success
+    void *q = LHAlloc(56);                // the 56-byte query state
+    g_dword_1DDCD74 = (q != 0) ? (DWORD)q : 0;   // sub_1496E90 (identity) -- stub
+    return 1;
+}
+
+// VfsCacheQueryInit  (0x146D8E0 - 0x146D8E7)  -- the retn-4 wrapper around
+//  VfsCacheQueryImpl (the (ECX) argument is unused).
+static int VfsCacheQueryInit(int unused) { (void)unused; return VfsCacheQueryImpl(); }
+
+// VfsProviderAlloc  (0x1477DA0)  -- [STUB] allocate the provider query buffer;
+//  returns a fresh block (non-null) so the query ctor takes its success path.
+static DWORD VfsProviderAlloc(int totalBytes, int count, int a3, int a4, int a5)
+{
+    (void)count; (void)a3; (void)a4; (void)a5;
+    return (DWORD)LHAlloc(totalBytes > 0 ? (unsigned int)totalBytes : 1u);
+}
+
+// VfsProviderQueryCtor  (0x14778E0 - 0x147794A)  -- the 72-byte provider-
+//  capability query cache (thiscall, retn 8).  No-op (0) when the +0x44 flag is
+//  set; otherwise records the descriptor dimension at +0x04/+0x08, allocates the
+//  32-byte provider buffer (VfsProviderAlloc over the descriptor's +0x3C byte),
+//  and sets the +0x44 flag + returns 1.
+static int VfsProviderQueryCtor(void *obj, int a2, int a3)
+{
+    DWORD *o = (DWORD *)obj;
+    if (o[0x44 / 4] != 0)
+        return 0;
+    o[1] = a3;
+    o[2] = a3;
+    DWORD *v5 = GetVfsDesc();
+    void *p = LHAlloc(32) ? (void *)VfsProviderAlloc(a3 * a2, a2, 1, (int)((BYTE *)v5)[60], 0) : 0;
+    o[0] = (DWORD)p;
+    if (p == 0)
+        return 0;
+    o[0x44 / 4] = 1;
+    return 1;
+}
+
+// VfsQueryProviderPair  (0x1477990 - 0x14779C8)  -- run the two provider
+//  capability queries over the descriptor's (+0x20,+0x28) and (+0x24,+0x2C)
+//  dimension pairs (into g_unk_1DDCC40 / g_unk_1DDCC88); returns the AND of the
+//  two results.
+static int VfsQueryProviderPair(void)
+{
+    DWORD *v0 = GetVfsDesc();
+    int r1 = VfsProviderQueryCtor(g_unk_1DDCC40, v0[8], v0[10]);
+    if (r1 != 0)
+        return VfsProviderQueryCtor(g_unk_1DDCC88, v0[9], v0[11]) != 0;
+    return r1;
+}
+
+// VfsWorkerAddCallback  (0x1477840)  -- [STUB] append a callback to a worker's
+//  list (the 12-byte node + the 0x1477720 spin); no-op here.
+static void VfsWorkerAddCallback(int worker, int data, void *fn) { (void)worker; (void)data; (void)fn; }
+
+// VfsWorkerCallbackRegister  (0x1476D00 - 0x1476D5D)  -- register an 8-byte
+//  {vtable, function} callback pair with worker slot `index` (0..6) under that
+//  worker's critical section (sub_1A22480/sub_1A22460 over stru_1DDCA90 +
+//  index*24) and its per-worker list (g_dword_1DDC9C8 / g_dword_1DDC9DC).
+//  No-op for index >= 7; the add is the VfsWorkerAddCallback stub above (the CS
+//  enter/leave wraps it but is omitted -- the workers are not spawned in this
+//  build, so their CS blocks are uninitialised BSS).
+static void VfsWorkerCallbackRegister(void *pair, int index)
+{
+    if (index < 0 || index >= 7)
+        return;
+    VfsWorkerAddCallback(g_dword_1DDC9C8[index * 7], g_dword_1DDC9DC[index * 7], pair);
+}
+
+// AudioEngineFaderCtor  (0x14843C0)  -- [STUB] the 976-byte CEngine / CEngineFader
+//  CMap build; returns its (ECX) argument.
+static void *AudioEngineFaderCtor(void *obj) { return obj; }
+
+// ProcessDelegateDtor  (0x146DFA0 - 0x146DFA7)  -- the CProcessDelegateThiscall
+//  deleter (sub_14833E0, a remaining deep stub); returns 0.
+static int ProcessDelegateDtor(void *obj) { (void)obj; return 0; }
+
+// CProcessDelegateThiscallCtor  (0x146E220 - 0x146E275)  -- the 16-byte
+//  CProcessDelegateThiscall<CEngine> constructor (thiscall).  Installs its
+//  vtable, zeroes +0x04/+0x08/+0x0C, allocates the 976-byte engine
+//  (AudioEngineFaderCtor) into +0x0C (0 on OOM), sets +0x04 = this and
+//  +0x08 = ProcessDelegateDtor, registers this with worker slot 0, returns this.
+static void *CProcessDelegateThiscallCtor(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    o[0] = kCProcessDelegateThiscallVftable;
+    o[1] = 0;
+    o[2] = 0;
+    o[3] = 0;
+    void *mem = LHAlloc(976);
+    DWORD sub = (mem != 0) ? (DWORD)AudioEngineFaderCtor(mem) : 0;
+    o[3] = sub;
+    o[1] = (DWORD)obj;
+    o[2] = (DWORD)ProcessDelegateDtor;
+    VfsWorkerCallbackRegister(obj, 0);   // 0x1476D00
+    return obj;
+}
+
+// AudioEngineCtor  (0x1479440)  -- [STUB] the 340-byte audio engine build (six
+//  node lists + the query ring); returns its (ECX) argument.
+static void *AudioEngineCtor(void *obj, int a2, int a3, int a4)
+{
+    (void)a2; (void)a3; (void)a4;
+    return obj;
+}
+
+// AudioProcessDelegateTick  (0x147A740 - 0x147A74B)  -- the registered audio
+//  process tick (the deep sub_146D930/sub_1478F20/sub_1478820/... no-op chain).
+static int AudioProcessDelegateTick(void) { return 0; }
+
+// AudioFrameworkInit  (0x150D180)  -- one-time audio framework bring-up [STUB];
+//  the two VfsWorkerCallbackRegister registrations into slots 1/2 are no-ops in
+//  this build.
+static int AudioFrameworkInit(void) { return 1; }
+
+// AudioProcessDelegateInit  (0x147A750 - 0x147A7AC)  -- build the audio process
+//  delegate: AudioFrameworkInit, then LHAlloc(340) + AudioEngineCtor(desc[+0x04],
+//  desc[+0x18], desc[+0x1C]) into g_dword_1DDCCD0 (0 on OOM), register the
+//  {vtable, AudioProcessDelegateTick} pair into worker slot 0; returns the
+//  (void) registration (0).
+static int AudioProcessDelegateInit(void)
+{
+    DWORD *v0 = GetVfsDesc();
+    AudioFrameworkInit();                    // 0x150D180
+    void *mem = LHAlloc(340);
+    g_dword_1DDCCD0 = (mem != 0) ? (DWORD)AudioEngineCtor(mem, v0[1], v0[6], v0[7]) : 0;
+    g_off_1D6E9C8[1] = (DWORD)AudioProcessDelegateTick;   // 0x1D6E9CC
+    VfsWorkerCallbackRegister(g_off_1D6E9C8, 0);         // 0x1476D00
+    return 0;
+}
+
+// VfsQueryTableBuild  (0x1473E70)  -- [STUB] build the query table (drain the
+//  pending ring into the cache under the +0x34 CS); void.
+static void VfsQueryTableBuild(void *obj, int timeout) { (void)obj; (void)timeout; }
+
+// VfsQueryTableDrain  (0x1474320)  -- [STUB] drain one pending query (the ring
+//  index + the InterlockedExchangeAdd + SetFrontendEvent); returns 1.
+static int VfsQueryTableDrain(void *obj, int elem) { (void)obj; (void)elem; return 1; }
+
+// VfsGetQueryTable  (0x1460210 - 0x1474011)  -- the VFS query-table getter
+//  registered as the worker-slot-0 callback.  In drain mode (g_dword_1DDC824 ==
+//  2) it walks the cache's +0x10C counter, draining pending queries
+//  (VfsQueryTableDrain) until caught up; otherwise it (re)builds the table via
+//  VfsQueryTableBuild over the descriptor's +0x04 count.  Returns the result
+//  pointer (the cache's +0x10C in drain mode; void/0 otherwise).
+static DWORD *VfsGetQueryTable(void)
+{
+    if (g_dword_1DDC824 == 2) {
+        void *cachePtr = *(void **)((char *)g_unk_1DDC830 + 4);   // 0x1DDC834
+        DWORD *cache = (DWORD *)cachePtr;                          // *(0x1DDC834)
+        DWORD *result = (DWORD *)((char *)cache + 0x10C);
+        while (cache != 0 &&
+               *(DWORD *)((char *)cache + 0x10C) > *(DWORD *)((char *)g_unk_1DDC830 + 0x14)) {
+            VfsQueryTableDrain(cachePtr, *(DWORD *)((char *)g_unk_1DDC830 + 0x14));
+        }
+        return result;
+    }
+    DWORD *v0 = GetVfsDesc();
+    VfsQueryTableBuild(g_unk_1DDC830, v0[1]);
+    return 0;
+}
+
+// InitVirtualFileSystem  (0x1460650 - 0x1460701)  -- see the header above.
+static int InitVirtualFileSystem(void *descIn)
+{
+    DWORD *desc = (DWORD *)descIn;
+    if (g_byte_1DDC828 != 0)
+        return 0;
+    if (VfsWorkerPoolInit(desc[2], desc[1]) == 0)              // 0x1476B50
+        return 0;
+    if (VfsAllocCacheInit() == 0)                              // 0x14743F0
+        return 0;
+    DWORD slot = 0;                                             // the [esp-4] BYREF slot
+    void *probe = VfsAllocCacheIdentity((char *)&slot + 3);     // 0x146D870 (identity)
+    if (VfsCacheQueryInit((int)probe) == 0)                    // 0x146D8E0
+        return 0;
+    AudioProcessDelegateInit();                                // 0x147A750
+    if (VfsQueryProviderPair() == 0)                           // 0x1477990
+        return 0;
+    void *p = LHAlloc(16);                                     // the 16-byte process delegate
+    g_dword_1DDC820 = (p != 0) ? (DWORD)CProcessDelegateThiscallCtor(p) : 0;  // 0x146E220
+    if (VfsAllocCacheCtor(g_unk_1DDC830, 80, 4096) == 0)       // 0x1473CF0
+        return 0;
+    g_off_1D6A80C[1] = (DWORD)VfsGetQueryTable;                // 0x1D6A810
+    VfsWorkerCallbackRegister(g_off_1D6A80C, 0);               // 0x1476D00
+    g_byte_1DDC828 = 1;
+    return 1;
+}
+
+// RegisterVfsGroup1..4  (0x146F130 / 0x146F200 / 0x146F240 / 0x146F250)  --
+//  remaining stubs: register the per-provider VFS module groups (audio /
+//  video / input / table-lookup providers) after a successful init.  Not
+//  implemented in this build (reached only on the success path).
+static int RegisterVfsGroup1(void) { return 0; }
+static int RegisterVfsGroup2(DWORD a) { (void)a; return 0; }
+static int RegisterVfsGroup3(void) { return 0; }
+static int RegisterVfsGroup4(void) { return 0; }
+
+
+// CreateVirtualFilesystem  (0x145DD80 - 0x145DECE)  -- see the header above.
+static int CreateVirtualFilesystem(void *descIn)
+{
+    DWORD *desc = (DWORD *)descIn;
+    DWORD vfsObj = 0;   // the BYREF slot the original seeds from ECX
+    if (g_byte_1DDC7E0 != 0)
+        return 0;
+    if (g_ppv_1DDC7E8 == 0) {
+        CoInitializeEx(NULL, 0);   // COINIT_APARTMENTTHREADED
+        CoCreateInstance(g_rclsid_1D6A6F0, NULL, 0x17,
+            g_riid_1D6A700, &g_ppv_1DDC7E8);   // dwClsContext 0x17 (original)
+        if (g_ppv_1DDC7E8 != 0) {
+            void **vt = (void **)(*(void **)g_ppv_1DDC7E8);
+            ((void (WINAPI *)(void *, unsigned, unsigned, void *))vt[4])(
+                g_ppv_1DDC7E8, 0, 0, g_unk_1DDC7EC);
+            ((void (WINAPI *)(void *, void *))vt[6])(
+                g_ppv_1DDC7E8, &g_off_1D6A768);
+        }
+    }
+    if (desc[0] != 0) {
+        if (desc[1] == 0) desc[1] = 1;
+        if (desc[2] >= 0x20u) desc[2] = 31;
+        VfsDescAssign(g_dword_1D6A720, desc);
+        CreateFallbackVfs(&vfsObj, g_dword_1D6A720[0]);
+        if (vfsObj != 0) F3CallVtable((void *)vfsObj, 1);
+        if (g_dword_1DDC7F4 != 0) F3CallVtable((void *)g_dword_1DDC7F4, 2);
+        g_dword_1DDC7F4 = vfsObj;
+        if (vfsObj != 0) F3CallVtable((void *)vfsObj, 2);
+        int result = InitVirtualFileSystem(desc);
+        if (result != 0) {
+            void *mem = LHAlloc(4);
+            DWORD obj = (mem != 0) ? (DWORD)VfsRefCountCtor(mem) : 0;
+            g_dword_1DDC7E4 = obj;
+            RegisterVfsGroup1();
+            RegisterVfsGroup2(g_dword_1DDC7E4);
+            RegisterVfsGroup3();
+            RegisterVfsGroup4();
+            g_byte_1DDC7E0 = 1;
+            return 1;
+        }
+        return result;
+    } else {
+        SetSaveGamePath(&g_dword_1DDC7F0, "Virtual filesystem can not be null");
+        return 0;
+    }
+}
 
 // ============================================================
 //  ManagerListCtor  (0x55B4F0 - 0x55B53A)  -- initialize the manager's
@@ -4451,7 +5000,7 @@ static void SetManagerLevel(void *obj, float level)
 //      (vtable slot 1), stash it in the descriptor's +0x00 object slot,
 //      and drop the temporary reference (vtable slot 2).
 //  3.  Create the virtual filesystem for the descriptor
-//      (CreateVirtualFilesystem, sub_145DD80 -- remaining stub).
+//      (CreateVirtualFilesystem, sub_145DD80).
 //  4.  LHAlloc(144) the manager and initialize its node list
 //      (ManagerListCtor, sub_55B4F0) -> g_dword_2075ED8 (0 on failure).
 //  5.  Initialize the manager's fields (InitManagerFields, sub_18FBBA0).
@@ -4486,7 +5035,7 @@ static int CreateHeapManager(int flag)
         F3CallVtable((void *)old, 2);                       // vtable slot 2 (release)
     d[0x44 / 4] = 1;
     d[0x48 / 4] = 0;
-    CreateVirtualFilesystem(d);       // sub_145DD80 (remaining stub -> 0)
+    CreateVirtualFilesystem(d);       // sub_145DD80
     void *mem = LHAlloc(144);
     g_dword_2075ED8 = (mem != 0) ? ManagerListCtor(mem) : 0;   // sub_55B4F0
     InitManagerFields();              // sub_18FBBA0
@@ -5417,9 +5966,9 @@ static void *ResolveDirManifest(void *out, void *dirHandle, void *extra)
     return *(void **)out;   // the resolved handle (0 until the framework lands)
 }
 
-// sub_18A9970: the 84-byte streaming manager (LHAlloc + the sub_18A98F0
-// ctor). A full page is allocated so the +0x161 flag byte the front-end
-// writes past the 84-byte object stays in the allocation.
+// sub_18A9970: the 84-byte streaming manager (LHAlloc + the VirtualFileSystemCtor
+// (0x18A98F0) ctor). A full page is allocated so the +0x161 flag byte the
+// front-end writes past the 84-byte object stays in the allocation.
 static void *CreateStreamingManager(void **out)
 {
     void *m = LHAlloc(0x300);

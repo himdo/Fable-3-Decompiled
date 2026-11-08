@@ -20,7 +20,9 @@ rem CreateD3D9DisplayObject imports Direct3DCreate9: build the d3d9 import lib
 rem too (the DLL ships in System32/SysWOW64).
 lib /nologo /machine:x86 /def:..\engine\d3d9.def /out:d3d9.lib
 if errorlevel 1 (echo LIB FAILED & popd & exit /b 1)
-link /nologo /subsystem:console /machine:x86 /out:test_engine.exe test_engine.obj engine.obj worker.obj manager.obj object_registry.obj xlo_device.obj gameengine.obj gamethread.obj gamemain.obj netinit.obj thread.obj common.obj save.obj framework.obj xlive.lib d3dx9_42.lib d3d9.lib user32.lib kernel32.lib gdi32.lib ws2_32.lib
+rem CreateVirtualFilesystem imports the real COM API: link ole32 (CoInitializeEx
+rem / CoCreateInstance over the LHVFS CLSID) just like the main Fable3 build.
+link /nologo /subsystem:console /machine:x86 /out:test_engine.exe test_engine.obj engine.obj worker.obj manager.obj object_registry.obj xlo_device.obj gameengine.obj gamethread.obj gamemain.obj netinit.obj thread.obj common.obj save.obj framework.obj xlive.lib d3dx9_42.lib d3d9.lib user32.lib kernel32.lib gdi32.lib ws2_32.lib ole32.lib
 if errorlevel 1 (echo LINK FAILED & popd & exit /b 1)
 rem The exe now really imports from the bundled XLiveAPI shim: copy
 rem xlive.dll (game dir = three levels up) next to it so the loader binds.
