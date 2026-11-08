@@ -285,6 +285,44 @@ F3SharedBuffer ** InitSharedSlot(F3SharedBuffer **obj)
 }
 
 // ============================================================
+//  RefSharedSlot  (0x1A012C0 - 0x1A012F5)  -- the ANSI shared-slot copy ctor
+//  [NOT byte-identical] placement-dependent (relative calls to the
+//  InterlockedIncrement / InterlockedDecrement IAT slots and to
+//  SharedBufferFree).
+//
+//  F3SharedBuffer ** RefSharedSlot(F3SharedBuffer **dst, F3SharedBuffer **src)
+//
+//  The copy constructor of the (ANSI) shared-slot family (the counterpart to
+//  InitSharedSlot's null-ctor, 0x1A00C30, and SetSharedSlot's assign,
+//  0x1A01CC0). __thiscall in the original (dst slot in ECX, src slot on the
+//  stack, retn 4). Nulls the destination slot, registers it in the live-slot
+//  count (g_Addend), and -- when src is a different non-empty slot -- shares
+//  its block: copies the block pointer in and increments the block's refcount
+//  (at +12). Returns the destination slot. The `*dst != 0` release branch is
+//  dead on a fresh (just-nulled) destination but kept for fidelity.
+// ============================================================
+F3SharedBuffer **RefSharedSlot(F3SharedBuffer **this_, F3SharedBuffer **src)
+{
+    *this_ = 0;
+    InterlockedIncrement(&g_Addend);
+    if (src != this_)
+    {
+        if (*this_ != 0)
+        {
+            if (InterlockedDecrement(&(*this_)->refcount) <= 0 && *this_ != 0)
+                SharedBufferFree(*this_);
+            *this_ = 0;
+        }
+        if (*src != 0)
+        {
+            *this_ = *src;
+            InterlockedIncrement(&(*this_)->refcount);
+        }
+    }
+    return this_;
+}
+
+// ============================================================
 //  ReleaseSharedSlot  (0x1A01320 - 0x1A0135D)  -- destroy a (shared) slot
 //  [NOT byte-identical] placement-dependent (relative calls to the
 //  InterlockedDecrement IAT slot and to SharedBufferFree).

@@ -1,5 +1,0 @@
-TEST: path=D:\projects\hacking\Windows\Fable 3\Fable 3 Decomp Project\Fable 3\test_out\test_engine.exe name=-=[SMS_test_engine.exe_SMS]=-
-created mapping -=[SMS_test_engine.exe_SMS]=- = 0000016C (err=0)
-before GameThread: GetWorker() = 00000000
-after GameThread: GetWorker() = 00000000
-GAME_THREAD_OK

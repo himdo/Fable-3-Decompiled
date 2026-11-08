@@ -75,4 +75,10 @@ typedef struct F3NetUserSignin
 // (0x7724BA, on a sign-in event) and the listener setup (0x772EFA).
 void CNetUserManagerRefreshSignin(void *obj);
 
+// 0x770960 - seed the global net-state factory map (0x1DC4AA4) with the four
+// net matchmaking state factories (id 2..5). Called by RunFrontEnd after
+// CreateHeapManager; a later net-state transition looks a state id up in
+// this map and calls the factory. See the implementation in netinit.cpp.
+void RegisterNetStateFactoryRegs(void);
+
 #endif  // F3_NETINIT_H

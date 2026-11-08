@@ -93,6 +93,15 @@ long ReleaseSharedSlot(F3SharedBuffer **slot);
 // refcount, frees on zero, nulls the slot, and returns the new counter value.
 long ReleaseSharedSlotWide(F3SharedBuffer **slot);
 
+// RefSharedSlot (0x1A012C0) - the ANSI shared-slot COPY constructor (the
+// counterpart to InitSharedSlot's null-ctor and SetSharedSlot's assign).
+// thiscall in the original (dst slot in ECX, src slot on the stack, retn 4);
+// declared as a plain free function to match the project convention. Nulls the
+// destination, registers it in the live-slot count (g_Addend), and when src is
+// a different non-empty slot shares its block: copies the block pointer in and
+// increments the block's refcount (at +12). Returns the destination slot.
+F3SharedBuffer **RefSharedSlot(F3SharedBuffer **this_, F3SharedBuffer **src);
+
 // SetSharedSlot (0x1A01CC0) - the general shared-slot setter (the generic core of
 // SetSaveGamePath). thiscall in the original (slot in ECX, src + size on the
 // stack, callee cleans via retn 8); declared as a plain free function here.

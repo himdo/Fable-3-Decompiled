@@ -615,3 +615,504 @@ void CNetUserManagerRefreshSignin(void *obj)
         }
     }
 }
+
+// ============================================================
+//  Net-state factory map  (std::map<int, factory>) at 0x1DC4AA4
+//
+//  The global net-state factory registry: an MSVC std::map keyed by net-state
+//  id holding a factory function pointer as the value. RegisterNetStateFactory-
+//  Regs (sub_770960, called by RunFrontEnd right after CreateHeapManager) seeds
+//  it with the four net matchmaking state factories (id 2..5); a later net-state
+//  transition looks a state id up in this map and calls the factory to build
+//  the CState object.
+//
+//  The map is a 56-byte object (0x1DC4AA4..0x1DC4AD3): a 4-byte owner tag (a
+//  heap block holding a back-pointer to the map) at +0x00, the sentinel head
+//  node at +0x18 (dword_1DC4ABC), and the node count at +0x1C (dword_1DC4AC0).
+//  Each node is 24 bytes: { next +0x00, prev +0x04, right +0x08, key +0x0C,
+//  value(factory) +0x10, color +0x14, sentinel +0x15 }. The head sentinel is
+//  color=1, sentinel=1 and self-links while the map is empty. The binary search
+//  (sub_7707E0 / sub_771120) walks from the head using the in-order next /
+//  right-child links; the nodes form a red-black tree (color 1 = black, 0 = red).
+//
+//  The original constructs this map at static init (sub_1A5F2C0:
+//  sub_770FB0(&map) + atexit(sub_1AC2DE0)); the static-initializer object at
+//  the end of this section reproduces that timing. LHAlloc is safe at static
+//  init -- it routes through the CRT process heap, which is ready before any
+//  dynamic ctor runs. The atexit teardown (sub_1AC2DE0) is not reproduced (it
+//  needs the map's erase-all, sub_771030, which is out of scope).
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc / the
+//  rotate helpers) and refs the global map at its original high VA 0x01DC4AA4.
+// ============================================================
+
+// A real node: next = LEFT child (smaller keys), prev = PARENT, right = RIGHT
+// child (larger keys). The sentinel `head` reuses the same three slots to hold
+// the tree book-keeping pointers: head->prev = the ROOT, head->next = the MIN
+// (leftmost) node, head->right = the MAX (rightmost) node; a null child of a
+// real node is a pointer back to head (the sentinel).
+typedef struct F3NetStateNode
+{
+    unsigned int  next;      // +0x00  left child (head: min node)
+    unsigned int  prev;      // +0x04  parent     (head: root node)
+    unsigned int  right;     // +0x08  right child (head: max node)
+    unsigned int  key;       // +0x0C  net-state id
+    unsigned int  value;     // +0x10  factory function pointer
+    unsigned char color;     // +0x14  red-black color (1 = black, 0 = red)
+    unsigned char sentinel;  // +0x15  1 for the head sentinel, 0 for real nodes
+    unsigned char pad[2];    // +0x16
+} F3NetStateNode;   // 24 bytes
+
+typedef struct F3NetStateMap
+{
+    unsigned int ownerTag;   // +0x00  4-byte heap block holding a back-pointer
+    unsigned int pad[5];     // +0x04 .. +0x14
+    unsigned int head;       // +0x18  the sentinel head node
+    unsigned int count;      // +0x1C  node count
+    unsigned int tail[6];    // +0x20 .. +0x34
+} F3NetStateMap;   // 56 bytes
+
+static F3NetStateMap g_netStateMap;   // 0x1DC4AA4
+
+// F3NetStateMapCtor  (0x770FB0 - 0x77101F)  -- construct the (empty) map in place.
+static void F3NetStateMapCtor(F3NetStateMap *m)
+{
+    unsigned int *tag = (unsigned int *)LHAlloc(4);
+    if (tag != 0) *tag = (unsigned int)m;   // else tag stays 0
+    m->ownerTag = (unsigned int)tag;
+
+    F3NetStateNode *h = (F3NetStateNode *)LHAlloc(24);
+    if (h != 0) h->next = 0;
+    if (h != 0) h->prev = 0;
+    if (h != 0) h->right = 0;
+    if (h != 0) h->sentinel = 0;
+    if (h != 0) h->color = 1;
+    m->head = (unsigned int)h;
+    if (h != 0)
+    {
+        h->sentinel = 1;
+        h->prev  = (unsigned int)h;
+        h->next  = (unsigned int)h;
+        h->right = (unsigned int)h;
+    }
+    m->count = 0;
+}
+
+// F3RbRotateLeft  (0x76FEC0 - 0x770020)  -- red-black LEFT rotation around X
+// (promote X->right in place of X).
+static F3NetStateNode *F3RbRotateLeft(F3NetStateMap *m, F3NetStateNode *x)
+{
+    F3NetStateNode *y    = (F3NetStateNode *)x->right;
+    x->right             = y->next;
+    if (((F3NetStateNode *)y->next)->sentinel == 0)
+        ((F3NetStateNode *)y->next)->prev = (unsigned int)x;
+    y->prev              = x->prev;
+    F3NetStateNode *head = (F3NetStateNode *)m->head;
+    if (x == (F3NetStateNode *)head->prev)   // X is the root
+    {
+        head->prev = (unsigned int)y;
+        y->next    = (unsigned int)x;
+        x->prev    = (unsigned int)y;
+    }
+    else
+    {
+        F3NetStateNode *p = (F3NetStateNode *)x->prev;
+        if (x == (F3NetStateNode *)p->next)
+            p->next = (unsigned int)y;
+        else
+            p->right = (unsigned int)y;
+        y->next = (unsigned int)x;
+        x->prev = (unsigned int)y;
+    }
+    return y;
+}
+
+// F3RbRotateRight  (0x76FF50 - 0x76FFB6)  -- red-black RIGHT rotation around X
+// (promote X->next in place of X).
+static F3NetStateNode *F3RbRotateRight(F3NetStateMap *m, F3NetStateNode *x)
+{
+    F3NetStateNode *z    = (F3NetStateNode *)x->next;
+    x->next              = z->right;
+    F3NetStateNode *r    = (F3NetStateNode *)z->right;
+    if (r->sentinel == 0)
+        r->prev = (unsigned int)x;
+    z->prev              = x->prev;
+    F3NetStateNode *head = (F3NetStateNode *)m->head;
+    if (x == (F3NetStateNode *)head->prev)   // X is the root
+    {
+        head->prev = (unsigned int)z;
+        z->right   = (unsigned int)x;
+        x->prev    = (unsigned int)z;
+    }
+    else
+    {
+        F3NetStateNode *p = (F3NetStateNode *)x->prev;
+        if (x == (F3NetStateNode *)p->right)
+            p->right = (unsigned int)z;
+        else
+            p->next = (unsigned int)z;
+        z->right = (unsigned int)x;
+        x->prev  = (unsigned int)z;
+    }
+    return z;
+}
+
+// F3NetStateMapInsert  (0x770D60 - 0x771210)  -- insert a fresh node (key, value)
+// at the position the search found, rebalancing the red-black tree. `flag`
+// selects the link: 0 = new is prevNode's right child, 1 = new is prevNode's
+// in-order successor. `iterOut` (a { tag, node, flag } scratch) is filled with
+// { ownerTag, newNode } and `pair` = { key, value }. Returns the new node.
+static F3NetStateNode *F3NetStateMapInsert(F3NetStateMap *m, unsigned int *iterOut,
+                                           unsigned char flag, unsigned int prevNodeAddr,
+                                           const unsigned int *pair)
+{
+    F3NetStateNode *head = (F3NetStateNode *)m->head;
+    if (m->count >= 0x1FFFFFFE)   // throw std::length_error("map/set<T> too long")
+        return 0;                 // (unreachable for the four net states)
+
+    F3NetStateNode *n = (F3NetStateNode *)LHAlloc(0x18);
+    if (n != 0)
+    {
+        n->next = (unsigned int)head;
+        n->prev = prevNodeAddr;
+        n->right = (unsigned int)head;
+        n->key = pair[0];
+        n->value = pair[1];
+        n->color = 0;
+        n->sentinel = 0;
+    }
+    m->count++;
+    if (prevNodeAddr == (unsigned int)head)
+    {
+        head->prev = (unsigned int)n;
+        head->next = (unsigned int)n;
+        head->right = (unsigned int)n;
+    }
+    else if (flag != 0)
+    {
+        ((F3NetStateNode *)prevNodeAddr)->next = (unsigned int)n;
+        if (prevNodeAddr == head->next) head->next = (unsigned int)n;
+    }
+    else
+    {
+        ((F3NetStateNode *)prevNodeAddr)->right = (unsigned int)n;
+        if (prevNodeAddr == head->right) head->right = (unsigned int)n;
+    }
+
+    // Red-black rebalance (color 1 = black, 0 = red); runs only while the
+    // parent of the running node is red. Ported instruction-for-instruction
+    // from the original (the guard at 0x770EB9, the two rotation branches, and
+    // the recolor/fixup cases below).
+    F3NetStateNode *node = n;
+    F3NetStateNode *p = (F3NetStateNode *)n->prev;
+    if (p->color == 0)
+    {
+        for (;;)
+        {
+            p = (F3NetStateNode *)node->prev;
+            F3NetStateNode *g = (F3NetStateNode *)p->prev;
+            // P's sibling (the uncle): G's other child. P is G's left child
+            // (p == g->next) when the uncle is G's right child, else the uncle
+            // is G's left child (g->next). (next=left, prev=parent, right=right.)
+            F3NetStateNode *uncle =
+                (p == (F3NetStateNode *)g->next) ? (F3NetStateNode *)g->right
+                                                 : (F3NetStateNode *)g->next;
+            if (uncle->color == 0)
+            {
+                // Uncle red: recolor the node, the uncle and the grandparent,
+                // then climb to the grandparent.
+                p->color = 1;
+                uncle->color = 1;
+                g->color = 0;
+                node = g;
+            }
+            else if (p == (F3NetStateNode *)g->next)
+            {
+                if (node == (F3NetStateNode *)p->right)
+                {
+                    node = p;
+                    F3RbRotateLeft(m, node);
+                }
+                F3NetStateNode *pn = (F3NetStateNode *)node->prev;
+                pn->color = 1;
+                F3NetStateNode *gn = (F3NetStateNode *)pn->prev;
+                gn->color = 0;
+                F3RbRotateRight(m, gn);
+            }
+            else
+            {
+                if (node == (F3NetStateNode *)p->next)
+                {
+                    node = p;
+                    F3RbRotateRight(m, node);
+                }
+                F3NetStateNode *pn = (F3NetStateNode *)node->prev;
+                pn->color = 1;
+                F3NetStateNode *gp = (F3NetStateNode *)pn->prev;
+                gp->color = 0;
+                F3NetStateNode *gr  = (F3NetStateNode *)gp->right;
+                F3NetStateNode *grn = (F3NetStateNode *)gr->next;
+                gp->right = (unsigned int)grn;
+                if (grn->sentinel == 0) grn->prev = (unsigned int)gp;
+                F3NetStateNode *gpp = (F3NetStateNode *)gp->prev;
+                gr->prev = (unsigned int)gpp;
+                if (gp == (F3NetStateNode *)head->prev)      head->prev = (unsigned int)gr;
+                else if (gp == (F3NetStateNode *)gpp->next)  gpp->next  = (unsigned int)gr;
+                else                                          gpp->right = (unsigned int)gr;
+                gr->next = (unsigned int)gp;
+                gp->prev = (unsigned int)gr;
+            }
+            if (((F3NetStateNode *)node->prev)->color != 0) break;
+        }
+    }
+    ((F3NetStateNode *)head->prev)->color = 1;   // the root goes black
+    iterOut[0] = m->ownerTag;
+    iterOut[1] = (unsigned int)n;
+    return n;
+}
+
+// F3NetStateMapIteratorDec  (0x770300 - 0x770390)  -- move the iterator's node
+// to its in-order predecessor (handling the sentinel and the tree links). Only
+// reached for non-ascending lookups; not exercised by the four ascending net-
+// state inserts but ported faithfully.
+static void F3NetStateMapIteratorDec(unsigned int *iter)   // iter = { tag, node }
+{
+    F3NetStateNode *node = (F3NetStateNode *)iter[1];
+    if (node->sentinel != 0)
+    {
+        F3NetStateNode *r = (F3NetStateNode *)node->right;
+        iter[1] = (unsigned int)r;
+        if (r->sentinel != 0) return;   // _invalid_parameter_noinfo
+        return;
+    }
+    F3NetStateNode *nxt = (F3NetStateNode *)node->next;
+    if (nxt->sentinel != 0)
+    {
+        F3NetStateNode *i = (F3NetStateNode *)node->prev;
+        while (i->sentinel == 0)
+        {
+            if (iter[1] != i->right) break;
+            iter[1] = (unsigned int)i;
+            i = (F3NetStateNode *)i->prev;
+        }
+        if (((F3NetStateNode *)iter[1])->sentinel != 0) return;   // _invalid_parameter_noinfo
+        iter[1] = (unsigned int)i;
+    }
+    else
+    {
+        F3NetStateNode *j = (F3NetStateNode *)nxt->right;
+        F3NetStateNode *last = nxt;
+        while (j->sentinel == 0)
+        {
+            last = j;
+            j = (F3NetStateNode *)j->right;
+        }
+        iter[1] = (unsigned int)last;
+    }
+}
+
+// F3NetStateMapFindOrInsert  (0x771120 - 0x771210)  -- the std::map operator[]:
+// search the map for `pair[0]`; when absent, insert { key, factory } and point
+// the returned iterator at the new node (flag 1), otherwise point it at the
+// existing node (flag 0). `iterOut` is the 12-byte { tag, node, flag } result.
+static F3NetStateNode *F3NetStateMapFindOrInsert(F3NetStateMap *m, unsigned int *iterOut,
+                                                 const unsigned int *pair)
+{
+    unsigned int key = pair[0];
+    F3NetStateNode *head = (F3NetStateNode *)m->head;
+    F3NetStateNode *lastReal = head;                          // the last real node (or head)
+    F3NetStateNode *node = (F3NetStateNode *)head->prev;      // the search cursor
+    unsigned char flag = 1;
+
+    while (node->sentinel == 0)
+    {
+        if (key < node->key)
+        {
+            flag = 1;
+            lastReal = node;
+            node = (F3NetStateNode *)node->next;
+        }
+        else
+        {
+            flag = 0;
+            lastReal = node;
+            node = (F3NetStateNode *)node->right;
+        }
+    }
+
+    unsigned int localIter[3] = { m->ownerTag, (unsigned int)lastReal, 0 };   // { tag, node }
+
+    if (flag != 0)   // key < lastReal.key: the position is at / before lastReal
+    {
+        if (lastReal == (F3NetStateNode *)head->next)
+        {
+            // Empty map (or before the head): insert at the head position.
+            F3NetStateMapInsert(m, localIter, 1, (unsigned int)lastReal, pair);
+            iterOut[0] = localIter[0];
+            iterOut[1] = localIter[1];
+            iterOut[2] = 1;
+        }
+        else
+        {
+            F3NetStateMapIteratorDec(localIter);
+            if (lastReal->key < key)
+            {
+                F3NetStateMapInsert(m, localIter, flag, (unsigned int)lastReal, pair);
+                iterOut[0] = localIter[0];
+                iterOut[1] = localIter[1];
+                iterOut[2] = 1;
+            }
+            else
+            {
+                iterOut[0] = localIter[0];
+                iterOut[1] = (unsigned int)lastReal;
+                iterOut[2] = 0;
+            }
+        }
+    }
+    else   // key >= lastReal.key
+    {
+        if (lastReal->key >= key)   // found (key == lastReal.key)
+        {
+            iterOut[0] = m->ownerTag;
+            iterOut[1] = (unsigned int)lastReal;
+            iterOut[2] = 0;
+        }
+        else
+        {
+            F3NetStateMapInsert(m, localIter, flag, (unsigned int)lastReal, pair);
+            iterOut[0] = localIter[0];
+            iterOut[1] = localIter[1];
+            iterOut[2] = 1;
+        }
+    }
+    return (F3NetStateNode *)iterOut[1];
+}
+
+// ---- the four net-state factories -------------------------------------------
+//
+//  Each factory (sub_770090 / sub_7700B0 / sub_7700D0 / sub_7700F0) builds a
+//  20-byte net-state object: LHAlloc(20), a shared-slot string (the state name)
+//  referenced at +0x08 (RefSharedSlot), the CBaseState ctor (sub_138C630) at
+//  +0x00/+0x04, the +0x0C/+0x10 zeros, then the derived vtable at +0x00. The
+//  full NStateSystem::CState* vtables (and their methods) are out of scope; the
+//  placeholder vtables below give each object a valid, non-null vtable pointer.
+static void *g_CBaseStateVtable[4]                       = { 0 };
+static void *g_CStateNetMatchmakingDataVtable[8]         = { 0 };
+static void *g_CStateNetStartMatchmakingVtable[8]        = { 0 };
+static void *g_CStateNetSearchingForSessionVtable[8]     = { 0 };
+static void *g_CStateNetFailedToFindSessionVtable[8]     = { 0 };
+static void *g_CStateNetJoinSessionVtable[8]             = { 0 };
+
+// sub_770090 - build a CStateNetStartMatchmaking object.
+static void *CreateNetStartMatchmakingState(void)
+{
+    unsigned int *obj = (unsigned int *)LHAlloc(20);
+    if (obj == 0) return 0;
+    F3SharedBuffer *slot = 0;
+    SetSharedSlot(&slot, "NetStartMatchmaking", -1);
+    obj[0] = (unsigned int)&g_CBaseStateVtable;                     // +0x00
+    obj[1] = 0;                                                     // +0x04
+    RefSharedSlot((F3SharedBuffer **)&obj[2], &slot);               // +0x08
+    obj[0] = (unsigned int)&g_CStateNetMatchmakingDataVtable;       // +0x00
+    obj[3] = 0;                                                     // +0x0C
+    obj[4] = 0;                                                     // +0x10
+    ReleaseSharedSlot(&slot);
+    obj[0] = (unsigned int)&g_CStateNetStartMatchmakingVtable;      // +0x00
+    return obj;
+}
+
+// sub_7700B0 - build a CStateNetSearchingForSession object.
+static void *CreateNetSearchingForSessionState(void)
+{
+    unsigned int *obj = (unsigned int *)LHAlloc(20);
+    if (obj == 0) return 0;
+    F3SharedBuffer *slot = 0;
+    SetSharedSlot(&slot, "NetSearchingForSession", -1);
+    obj[0] = (unsigned int)&g_CBaseStateVtable;
+    obj[1] = 0;
+    RefSharedSlot((F3SharedBuffer **)&obj[2], &slot);
+    obj[0] = (unsigned int)&g_CStateNetMatchmakingDataVtable;
+    obj[3] = 0;
+    obj[4] = 0;
+    ReleaseSharedSlot(&slot);
+    obj[0] = (unsigned int)&g_CStateNetSearchingForSessionVtable;
+    return obj;
+}
+
+// sub_7700D0 - build a CStateNetFailedToFindSession object.
+static void *CreateNetFailedToFindSessionState(void)
+{
+    unsigned int *obj = (unsigned int *)LHAlloc(20);
+    if (obj == 0) return 0;
+    F3SharedBuffer *slot = 0;
+    SetSharedSlot(&slot, "NetFailedToFindSession", -1);
+    obj[0] = (unsigned int)&g_CBaseStateVtable;
+    obj[1] = 0;
+    RefSharedSlot((F3SharedBuffer **)&obj[2], &slot);
+    obj[0] = (unsigned int)&g_CStateNetMatchmakingDataVtable;
+    obj[3] = 0;
+    obj[4] = 0;
+    ReleaseSharedSlot(&slot);
+    obj[0] = (unsigned int)&g_CStateNetFailedToFindSessionVtable;
+    return obj;
+}
+
+// sub_7700F0 - build a CStateNetJoinSession object.
+static void *CreateNetJoinSessionState(void)
+{
+    unsigned int *obj = (unsigned int *)LHAlloc(20);
+    if (obj == 0) return 0;
+    F3SharedBuffer *slot = 0;
+    SetSharedSlot(&slot, "NetJoinSession", -1);
+    obj[0] = (unsigned int)&g_CBaseStateVtable;
+    obj[1] = 0;
+    RefSharedSlot((F3SharedBuffer **)&obj[2], &slot);
+    obj[0] = (unsigned int)&g_CStateNetMatchmakingDataVtable;
+    obj[3] = 0;
+    obj[4] = 0;
+    ReleaseSharedSlot(&slot);
+    obj[0] = (unsigned int)&g_CStateNetJoinSessionVtable;
+    return obj;
+}
+
+// ============================================================
+//  RegisterNetStateFactoryRegs  (0x770960 - 0x7709F3)  -- seed the global
+//  net-state factory map with the four net matchmaking state factories.
+//
+//  void RegisterNetStateFactoryRegs(void)   -- cdecl, no args
+//
+//  Registers { 2 -> CStateNetStartMatchmaking, 3 -> CStateNetSearchingFor-
+//  Session, 4 -> CStateNetFailedToFindSession, 5 -> CStateNetJoinSession } into
+//  g_netStateMap (0x1DC4AA4) via F3NetStateMapFindOrInsert (sub_771120), reusing
+//  a single 12-byte iterator out buffer and a { id, factory } pair, exactly as
+//  the original. Sole caller: RunFrontEnd (0x61D269), right after
+//  CreateHeapManager and before the engine's member-0x98 sorted map is built.
+//  [NOT byte-identical] placement-dependent (relative calls to the four
+//  factories and to F3NetStateMapFindOrInsert) and refs the global map and the
+//  factory VAs at their original high addresses.
+// ============================================================
+void RegisterNetStateFactoryRegs(void)
+{
+    unsigned int iter[3] = { 0, 0, 0 };   // the 12-byte iterator out buffer
+    unsigned int pair[2];                 // { id, factory }
+
+    pair[0] = 2; pair[1] = (unsigned int)CreateNetStartMatchmakingState;
+    F3NetStateMapFindOrInsert(&g_netStateMap, iter, pair);
+    pair[0] = 3; pair[1] = (unsigned int)CreateNetSearchingForSessionState;
+    F3NetStateMapFindOrInsert(&g_netStateMap, iter, pair);
+    pair[0] = 4; pair[1] = (unsigned int)CreateNetFailedToFindSessionState;
+    F3NetStateMapFindOrInsert(&g_netStateMap, iter, pair);
+    pair[0] = 5; pair[1] = (unsigned int)CreateNetJoinSessionState;
+    F3NetStateMapFindOrInsert(&g_netStateMap, iter, pair);
+}
+
+// Static initializer: construct the global net-state factory map at startup
+// (reproducing the original's sub_1A5F2C0 static ctor timing). Runs before
+// WinMain; LHAlloc is safe at this point (CRT process heap, ready pre-ctor).
+namespace {
+struct F3NetStateMapInit
+{
+    F3NetStateMapInit() { F3NetStateMapCtor(&g_netStateMap); }
+};
+F3NetStateMapInit g_f3NetStateMapInit;
+}

@@ -5218,7 +5218,6 @@ static int CreateHeapManager(int flag)
     return r;
 }
 static void  nullsub_7(void) {}
-static void  sub_770960(void) {}
 static void  sub_620F30(void *obj) { (void)obj; }
 // ============================================================
 //  SortedMapHeadInit  (0x579280 - 0x5792C4)  -- initialize the embedded
@@ -6792,7 +6791,7 @@ signedIn:
         InitFrontendData(obj, 0, 0, XUserGetSigninState(0), (int)(DWORD)obj);
         CreateHeapManager(g_byte_1DBD030 != 0);
         nullsub_7();
-        sub_770960();
+        RegisterNetStateFactoryRegs();
 
         const char *cmd = GetCommandLineA();
         g_byte_1DBD034 = (strstr(cmd, "WaitBeforeEnteringFrontEnd") != 0);
