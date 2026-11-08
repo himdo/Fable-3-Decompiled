@@ -49,6 +49,8 @@ static BYTE  g_byte_1DBD030 = 0;   // 0x1DBD030
 static BYTE  g_byte_1DBD034 = 0;   // 0x1DBD034: WaitBeforeEnteringFrontEnd on the command line
 static BYTE  g_byte_1DBD03E = 0;   // 0x1DBD03E
 static BYTE  g_byte_1DBD01F = 0;   // 0x1DBD01F
+static BYTE  g_byte_1DBD02A = 0;   // 0x1DBD02A: run-from-disk flag (data/streaming.bnk or FakeRunFromDVD)
+static F3SharedBuffer *g_unk_1DBDA78 = 0;   // 0x1DBDA78: build-version content slot
 static BYTE  g_byte_2075F07 = 0;   // 0x2075F07
 static BYTE  g_byte_2075F4E = 1;   // 0x2075F4E: path-normalize enable flag
 // Function-pointer slots published by the frontend (0x1D8C850 / 0x1D8C854).
@@ -67,6 +69,7 @@ static int   g_unk_1DBD9E8[33] = { 0 };  // 0x1DBD9E8 (0x84 bytes)
 // Placeholder vtables for the two file objects created on the frontend.
 static void *g_CDiskFileWin32Vtable[4] = { 0 };
 static void *g_CAFileVtable[4]         = { 0 };
+static void *g_CLegacyFileVtable[4]    = { 0 };
 
 // ============================================================
 //  xlive.dll / steam_api imports
@@ -4069,12 +4072,430 @@ static void RunGameLoop(void *unused)
     SetFrontendEvent(g_unk_1DBD9E8);
 }
 static void  sub_61C320(void *p) { (void)p; }                     // _beginthread entry (no-op)
-// sub_6A66C0 is the canonical GetNetManager (netinit.cpp / netinit.h).
-static int   sub_6A6960(int a) { (void)a; return 0; }
+// sub_6A66C0 is the canonical GetNetManager (netinit.cpp / netinit.h);
+// sub_6A6960 is the canonical CNetManagerGetUserManager (netinit.cpp).
 static int   sub_6A69A0(int a) { (void)a; return 0; }
-static void  sub_772190(int a) { (void)a; }
-static void  sub_61B090(void *obj) { (void)obj; }
-static void  sub_18FBD00(int a) { (void)a; }
+// sub_772190 is now CNetUserManagerRefreshSignin (netinit.cpp).
+static void *g_dword_2075ED8 = 0;   // 0x2075ED8: the 144-byte manager object
+static CRITICAL_SECTION g_cs_20FC8AC;   // 0x20FC8AC: the manager critical section (zeroed)
+//  Lazy-init the manager critical section.  The original relies on stru_20FC8AC
+//  being initialised at startup; here we InitialiseCriticalSection on first use.
+static CRITICAL_SECTION *MgrCs(void)
+{
+    static int inited = 0;
+    if (!inited) { InitializeCriticalSection(&g_cs_20FC8AC); inited = 1; }
+    return &g_cs_20FC8AC;
+}
+static F3SharedBuffer **GetArchiveSlot(F3SharedBuffer **out);   // sub_180AC90 (defined below)
+
+// The manager / VFS / player objects in this build never carry a real
+// vtable (their +0x00 slot is 0), so these dispatchers only execute against
+// a live object. They model the original's `mov ecx,[obj]; mov edx,[ecx+4*slot];
+// push obj; call edx` -- a thiscall to vtable[slot] with the object as the
+// single stack argument.
+static inline void F3CallVtable(void *obj, int slot)
+{
+    void **vt = (void **)(*(void **)obj);
+    ((void(__thiscall *)(void *))(void *)vt[slot])(obj);
+}
+static inline int F3CallVtableRet(void *obj, int slot)
+{
+    void **vt = (void **)(*(void **)obj);
+    return ((int(__thiscall *)(void *))(void *)vt[slot])(obj);
+}
+// ============================================================
+//  VfsDescDefaultCtor  (0x145DC20 - 0x145DC8A)  -- the virtual
+//  filesystem descriptor default constructor
+//
+//  void *VfsDescDefaultCtor(void *obj)   -- thiscall in ECX
+//
+//  Fills the 72-byte VFS descriptor record (obj) with the default field
+//  values, read straight from the original byte stream:
+//    +0x00 = 0            +0x14 = offset unk_2000000 (descriptor vtable)
+//    +0x04 = 50 (0x32)    +0x18 = 66 (0x42)
+//    +0x08 = 0            +0x1C = 6
+//    +0x0C = 0x6000       +0x20 = 0x8000
+//    +0x10 = 3            +0x24 = 72 (0x48)
+//                         +0x28 = 0x40000
+//                         +0x2C = 10 (0x0A)
+//                         +0x30 = 0
+//                         +0x34 = 0
+//                         +0x38 = 2
+//                         +0x3C = 0 (byte)
+//                         +0x40 = 1
+//                         +0x44 = 0
+//  Three other call sites (0x14835F5 / 0x1516646) use the same defaults.
+static void *VfsDescDefaultCtor(void *obj)
+{
+    DWORD *d = (DWORD *)obj;
+    BYTE  *b = (BYTE *)obj;
+    d[0x00 / 4] = 0;
+    d[0x04 / 4] = 50;               // 0x32
+    d[0x08 / 4] = 0;
+    d[0x0C / 4] = 0x6000;
+    d[0x10 / 4] = 3;
+    d[0x14 / 4] = 0x2000000;        // offset unk_2000000: descriptor vtable
+    d[0x18 / 4] = 66;               // 0x42
+    d[0x1C / 4] = 6;
+    d[0x20 / 4] = 0x8000;
+    d[0x24 / 4] = 72;               // 0x48
+    d[0x28 / 4] = 0x40000;
+    d[0x2C / 4] = 10;               // 0x0A
+    d[0x30 / 4] = 0;
+    d[0x34 / 4] = 0;
+    d[0x38 / 4] = 2;
+    b[0x3C] = 0;                    // byte at +0x3C
+    d[0x40 / 4] = 1;
+    d[0x44 / 4] = 0;
+    return obj;
+}
+
+// CreateVirtualFilesystem  (0x145DD80 - 0x145DECE)  -- COM-backed virtual
+//  filesystem bring-up for a 80-byte VFS descriptor.  Remaining stub:
+//  the COM instance path (CoCreateInstance over the 0x1DDC7E0 cluster +
+//  the 0x145EC90 / 0x145EF80 / 0x1460650 / 0x146DEC0 / 0x146F1xx VFS
+//  builders) is not implemented in this build, so it reports failure
+//  (0) exactly as the original does when the descriptor object is null.
+static int CreateVirtualFilesystem(void *desc) { (void)desc; return 0; }
+
+// ============================================================
+//  ManagerListCtor  (0x55B4F0 - 0x55B53A)  -- initialize the manager's
+//  head node list (the 144-byte manager object built by CreateHeapManager)
+//
+//  void *ManagerListCtor(void *obj)   -- usercall: the object comes in ESI
+//
+//  +0x00 heap node: LHAlloc(4), *node = obj (0 on allocation failure);
+//  +0x14 head: LHAlloc(12), head[0] = head[1] = head (self-linked empty
+//  list); +0x18 count 0; +0x28 / +0x2C 0. Returns obj.
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc).
+static void *ManagerListCtor(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    void *node = LHAlloc(4);
+    if (node != 0)
+        *(void **)node = obj;
+    o[0x00 / 4] = (DWORD)node;   // the heap node (0 on failure)
+    void *head = LHAlloc(12);
+    if (head != 0)
+        *(void **)head = head;
+    if (head != 0)
+        *(void **)((char *)head + 4) = head;
+    o[0x14 / 4] = (DWORD)head;
+    o[0x18 / 4] = 0;
+    o[0x28 / 4] = 0;
+    o[0x2C / 4] = 0;
+    return obj;
+}
+
+// SoundByteCtor  (0x145D500 - 0x145D503)  -- the 1-byte sound-system
+//  object's null constructor: thiscall, `mov eax, ecx; retn`. Returns this.
+static void *SoundByteCtor(void *obj) { return obj; }
+
+// CreateMusicManager  (0x18F93E0 - 0x18F94F7)  -- the 552-byte (0x228)
+//  NSound music manager ctor (usercall EDI): +0x1C count 7, the 72-byte
+//  7-entry controller table (sub_401620), the CFMVMusicController /
+//  CGuideMusicController slots, and the five 116-byte music controllers.
+//  Remaining stub: the NSound controller objects are not implemented in
+//  this build, so the record is zeroed and obj is returned (the original
+//  returns the ctor result stored at +0x20 by CreateHeapManager).
+static void *CreateMusicManager(void *obj)
+{
+    memset(obj, 0, 0x228);
+    return obj;
+}
+
+// Vec4Set  (0x415350 - 0x41537C)  -- store one SSE vector: the SSE thiscall
+//  `*this = {x, y, z, 0.0f}` for the 16-byte vector slot in ECX.
+static void Vec4Set(void *out, float x, float y, float z)
+{
+    float *v = (float *)out;
+    v[0] = x;
+    v[1] = y;
+    v[2] = z;
+    v[3] = 0.0f;
+}
+
+// QuerySoundSystem  (0x145DD40 - 0x145DD54)  -- the sound-system query
+//  (calls sub_146EAA0 on the sound object, returns the object back). The
+//  audio subsystem is a remaining stub in this build, so it reports no
+//  sound object (0).
+static void *QuerySoundSystem(void *soundObj, void **out)
+{
+    (void)soundObj;
+    if (out) *out = 0;   // no sound slot while the audio subsystem is stubbed
+    return 0;
+}
+
+// ============================================================
+//  CSoundPlayerCtor  (0x18FA020 - 0x18FA0EE)  -- the 80-byte
+//  NSound::CSoundPlayer constructor (usercall ESI, one &vec4 on the stack,
+//  `retn 4`)
+//
+//  +0x00 the NSound::CSoundPlayer vtable (0 until NSound lands), +0x10..
+//  +0x1C the four vec4 words, +0x20..+0x2C 0, +0x30 a 4-byte heap node
+//  (*node = +0x30), +0x34 a 24-byte self-linked head, +0x38 0. The +0x20/
+//  +0x24 sound slot pair is then (re)bound from QuerySoundSystem on the
+//  manager's +0x1C object; while that is stubbed to 0 the pair stays 0
+//  (the original would bind the live sound slot here).
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc /
+//  QuerySoundSystem) and the NSound::CSoundPlayer vtable refs high-VA data.
+static void *CSoundPlayerCtor(void *obj, const float *vec)
+{
+    DWORD *o = (DWORD *)obj;
+    o[0x00 / 4] = 0;   // &NSound::CSoundPlayer::`vftable' (0 until NSound lands)
+    o[0x20 / 4] = 0;
+    o[0x24 / 4] = 0;
+    o[0x28 / 4] = 0;
+    o[0x2C / 4] = 0;
+    void *node = LHAlloc(4);
+    if (node != 0)
+        *(void **)node = (char *)obj + 0x30;
+    o[0x30 / 4] = (DWORD)node;
+    void *head = LHAlloc(24);
+    if (head != 0)
+        *(void **)head = head;
+    if (head != 0)
+        *(void **)((char *)head + 4) = head;
+    o[0x44 / 4] = (DWORD)head;
+    o[0x48 / 4] = 0;
+    o[0x10 / 4] = (DWORD)vec[0];
+    o[0x14 / 4] = (DWORD)vec[1];
+    o[0x18 / 4] = (DWORD)vec[2];
+    o[0x1C / 4] = (DWORD)vec[3];
+    void *slot = 0;
+    void *r = QuerySoundSystem(*(void **)((char *)g_dword_2075ED8 + 0x1C), &slot);
+    if (r != 0 && r != (char *)obj + 0x20)
+    {
+        void *r1 = *(void **)((char *)r + 4);
+        if (r1 != 0)
+            F3CallVtable(r1, 0);                          // release the previous slot object
+        if (o[0x24 / 4] != 0)
+            F3CallVtable((void *)o[0x24 / 4], 1);
+        o[0x20 / 4] = (DWORD)*(void **)r;
+        o[0x24 / 4] = (DWORD)*(void **)((char *)r + 4);
+        if (slot != 0)
+            F3CallVtable(slot, 1);
+    }
+    return obj;
+}
+
+// ============================================================
+//  RegisterManagerPlayer  (0x18FB9B0 - 0x18FBA1F)  -- build the 80-byte
+//  NSound::CSoundPlayer for a vec4 and register it at the head of the
+//  manager's 12-byte-node list (thiscall, one &vec4 on the stack)
+//
+//  void *RegisterManagerPlayer(void *mgr, const float *vec)
+//
+//  Under the manager critical section (stru_20FC8AC): allocate the player
+//  (CSoundPlayerCtor), allocate a 12-byte node {head, old first, player},
+//  increment the list count at mgr+0x18 (sub_55BC70, "list<T> too long" at
+//  0x3FFFFFFF), and link the node in front of the old first (head[1] =
+//  node, oldFirst[0] = node). Returns the new first node's value -- the
+//  player (the original's sub_55B6D0 returns &firstNode[2], whose word is
+//  the value; a null / empty list would trip __invalid_parameter_noinfo).
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc /
+//  CSoundPlayerCtor / the KERNEL32 IAT) and refs the high-VA critical
+//  section stru_20FC8AC (0x020FC8AC).
+static void *RegisterManagerPlayer(void *mgr, const float *vec)
+{
+    EnterCriticalSection(MgrCs());
+    void *player = 0;
+    void *mem = LHAlloc(80);
+    if (mem != 0)
+        player = CSoundPlayerCtor(mem, vec);
+    DWORD *head = *(DWORD **)((char *)mgr + 0x14);
+    DWORD oldFirst = head[1];
+    DWORD *node = (DWORD *)LHAlloc(12);
+    if (node != 0)
+    {
+        node[0] = (DWORD)head;
+        node[1] = oldFirst;
+        node[2] = (DWORD)player;
+    }
+    unsigned *count = (unsigned *)((char *)mgr + 0x18);   // sub_55BC70
+    if (0x3FFFFFFFu - *count < 1u)
+        throw std::length_error("list<T> too long");
+    *count += 1u;
+    head[1] = (DWORD)node;
+    if (oldFirst != 0)
+        *(DWORD *)oldFirst = (DWORD)node;
+    LeaveCriticalSection(MgrCs());
+    return player;   // *(firstNode + 8)
+}
+
+// ============================================================
+//  InitManagerFields  (0x18FBBA0 - 0x18FBCF5)  -- the 144-byte manager's
+//  field initializer (reads the manager global, no arguments in the original)
+//
+//  void InitManagerFields(void)   -- reads g_dword_2075ED8 into ESI (ESI
+//  survives into the callees in the original, i.e. it is the implicit this)
+//
+//  +0x1C: the 1-byte sound-system object (LHAlloc(1) + SoundByteCtor, 0 on
+//  failure); +0x20: the 552-byte music manager (LHAlloc(0x228) +
+//  CreateMusicManager, 0 on failure); +0x24: the vec4 {0,0,0,0} player
+//  (RegisterManagerPlayer); +0x2C: the previous slot object released
+//  (vtable slot 1) then 0; +0x28: 0; +0x30 the {0,1,0,0} axis, +0x40 the
+//  {0,0,1,0} axis, +0x50 the {0,0,0,0} vec, +0x60..+0x7C the 1.0f scalars,
+//  +0x78 / +0x79 0 bytes, +0x80 2, +0x84 / +0x88 0. The +0x6C level is left
+//  1.0f here -- SetManagerLevel (sub_18FAA00) writes 0.9f right after.
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc and
+//  the manager callees) and refs the high-VA global g_dword_2075ED8
+//  (0x02075ED8) + the high-VA critical section stru_20FC8AC.
+static void InitManagerFields(void)
+{
+    void *g = g_dword_2075ED8;
+    void *mem = LHAlloc(1);
+    void *sound = (mem != 0) ? SoundByteCtor(mem) : 0;
+    *(void **)((char *)g + 0x1C) = sound;
+    void *m2 = LHAlloc(0x228);
+    void *music = (m2 != 0) ? CreateMusicManager(m2) : 0;
+    *(void **)((char *)g + 0x20) = music;
+    float v0[4];
+    Vec4Set(v0, 0.0f, 0.0f, 0.0f);
+    *(void **)((char *)g + 0x24) = RegisterManagerPlayer(g, v0);
+    void *old2C = *(void **)((char *)g + 0x2C);
+    if (old2C != 0)
+        F3CallVtable(old2C, 1);
+    *(void **)((char *)g + 0x2C) = 0;
+    *(void **)((char *)g + 0x28) = 0;
+    float va[4], vb[4], vc[4];
+    Vec4Set(va, 0.0f, 1.0f, 0.0f);
+    memcpy((char *)g + 0x30, va, 16);
+    Vec4Set(vb, 0.0f, 0.0f, 1.0f);
+    memcpy((char *)g + 0x40, vb, 16);
+    Vec4Set(vc, 0.0f, 0.0f, 0.0f);
+    memcpy((char *)g + 0x50, vc, 16);
+    *(float *)((char *)g + 0x60) = 1.0f;
+    *(float *)((char *)g + 0x64) = 1.0f;
+    *(float *)((char *)g + 0x68) = 1.0f;
+    *(float *)((char *)g + 0x6C) = 1.0f;
+    *(float *)((char *)g + 0x70) = 1.0f;
+    *(float *)((char *)g + 0x74) = 1.0f;
+    *(float *)((char *)g + 0x7C) = 1.0f;
+    *(BYTE *)((char *)g + 0x78) = 0;
+    *(BYTE *)((char *)g + 0x79) = 0;
+    *(DWORD *)((char *)g + 0x80) = 2;
+    *(DWORD *)((char *)g + 0x84) = 0;
+    *(DWORD *)((char *)g + 0x88) = 0;
+}
+
+// SetFadeRate  (0x469ED0 - 0x469EFC)  -- audio fade request (forwards to
+//  sub_40DFC0). The audio subsystem is a remaining stub in this build.
+static int SetFadeRate(float, float) { return 0; }
+
+// SoundSetChannelLevel  (0x145D810 - 0x145D828)  -- audio channel level
+//  setter (forwards to sub_14610F0). Remaining stub in this build.
+static int SoundSetChannelLevel(int, float, int) { return 0; }
+
+// ============================================================
+//  ApplyManagerFadeRates  (0x18FA8C0 - 0x18FA996)  -- the manager's
+//  fade-rate recompute (usercall: the manager in ESI)
+//
+//  void ApplyManagerFadeRates(void *obj)
+//
+//  Under the manager critical section (stru_20FC8AC): for the two level
+//  scalars at +0x70 and +0x6C, rate = (1.0 - level) * -60.0 / 20.0 (double
+//  arithmetic, float rate argument) -> SetFadeRate(10.0f, rate); then
+//  SoundSetChannelLevel(2, 100.0f, 0) (the trivial sub_145D7C0 / nullsub_124
+//  stack-byte touchups are side-effect free and omitted). [NOT
+//  byte-identical] placement-dependent (relative calls to the audio stubs /
+//  the KERNEL32 IAT) and refs the high-VA critical section stru_20FC8AC.
+static void ApplyManagerFadeRates(void *obj)
+{
+    EnterCriticalSection(MgrCs());
+    double r1 = (1.0 - (double)*(float *)((char *)obj + 0x70)) * -60.0;
+    SetFadeRate(10.0f, (float)(r1 / 20.0));
+    double r2 = (1.0 - (double)*(float *)((char *)obj + 0x6C)) * -60.0;
+    SetFadeRate(10.0f, (float)(r2 / 20.0));
+    SoundSetChannelLevel(2, 100.0f, 0);
+    LeaveCriticalSection(MgrCs());
+}
+
+// ============================================================
+//  SetManagerLevel  (0x18FAA00 - 0x18FAA59)  -- clamp + store the manager's
+//  level scalar (thiscall + `retn 4` in the original: the manager in ECX,
+//  one float on the stack)
+//
+//  void SetManagerLevel(void *obj, float level)
+//
+//  Under the manager critical section (stru_20FC8AC): clamp level to
+//  [0.0f, 1.0f] (NaN passes the comparisons through unchanged), store it
+//  at +0x6C, and recompute the fade rates (ApplyManagerFadeRates). [NOT
+//  byte-identical] placement-dependent (relative calls to the KERNEL32 IAT /
+//  ApplyManagerFadeRates) and refs the high-VA critical section stru_20FC8AC.
+static void SetManagerLevel(void *obj, float level)
+{
+    EnterCriticalSection(MgrCs());
+    if (level < 0.0f)
+        level = 0.0f;
+    else if (level > 1.0f)
+        level = 1.0f;
+    *(float *)((char *)obj + 0x6C) = level;
+    ApplyManagerFadeRates(obj);
+    LeaveCriticalSection(MgrCs());
+}
+
+// ============================================================
+//  CreateHeapManager  (0x18FBD00 - 0x18FBE09)  -- (re)build the global 144-
+//  byte manager object (g_dword_2075ED8, GetHeapManager) and re-create the
+//  virtual filesystem
+//
+//  int CreateHeapManager(int flag)   -- cdecl, one byte on the stack
+//
+//  1.  Build the 80-byte VFS descriptor on the stack (VfsDescDefaultCtor,
+//      sub_145DC20) with the overrides +0x08 = 5, +0x14 = the descriptor
+//      vtable (unk_2000000), +0x24 = 0x38000, +0x2C = 8, +0x38 = 2, +0x3C
+//      = the flag byte, +0x44 = 1, +0x48 = 0.
+//  2.  Take the archive manager out of its slot (GetArchiveSlot, sub_180AC90
+//      -- the dword_1E2D864 slot with a vtable-slot-1 reference), close it
+//      (vtable slot 1), stash it in the descriptor's +0x00 object slot,
+//      and drop the temporary reference (vtable slot 2).
+//  3.  Create the virtual filesystem for the descriptor
+//      (CreateVirtualFilesystem, sub_145DD80 -- remaining stub).
+//  4.  LHAlloc(144) the manager and initialize its node list
+//      (ManagerListCtor, sub_55B4F0) -> g_dword_2075ED8 (0 on failure).
+//  5.  Initialize the manager's fields (InitManagerFields, sub_18FBBA0).
+//  6.  Set the level scalar to 0.9f (SetManagerLevel, sub_18FAA00 -- the
+//      original loads flt_1BD7E48, 0x01BD7E48).
+//  Returns the vtable-slot-2 release result of the descriptor's +0x00 slot
+//  (sub_145DC90; 0 while the archive slot is empty). Both callers
+//  (RunFrontEnd and the 0x619AE0 vtable thunk that passes g_byte_1DBD030
+//  != 0) discard the return value.
+//  [NOT byte-identical] placement-dependent (relative calls to the manager
+//  / VFS callees and the LHAlloc IAT thunk) and refs the high-VA globals
+//  g_dword_2075ED8 (0x02075ED8) and flt_1BD7E48 (0x01BD7E48).
+static int CreateHeapManager(int flag)
+{
+    DWORD d[20];   // the 80-byte VFS descriptor
+    VfsDescDefaultCtor(d);            // sub_145DC20
+    d[0x08 / 4] = 5;
+    d[0x14 / 4] = 0x2000000;          // &unk_2000000: the descriptor vtable
+    d[0x2C / 4] = 8;
+    d[0x24 / 4] = 0x38000;
+    d[0x38 / 4] = 2;
+    if (flag & 1)
+        d[0x3C / 4] = 1;   // [esp+58h+var_14] = 1: DWORD at descriptor +0x3C
+    DWORD old = 0;
+    GetArchiveSlot((F3SharedBuffer **)&old);   // sub_180AC90: the archive manager slot
+    if (old != 0)
+        F3CallVtable((void *)old, 1);                       // vtable slot 1 (close)
+    if (d[0x00 / 4] != 0)
+        F3CallVtable((void *)d[0x00 / 4], 2);
+    d[0x00 / 4] = old;
+    if (old != 0)
+        F3CallVtable((void *)old, 2);                       // vtable slot 2 (release)
+    d[0x44 / 4] = 1;
+    d[0x48 / 4] = 0;
+    CreateVirtualFilesystem(d);       // sub_145DD80 (remaining stub -> 0)
+    void *mem = LHAlloc(144);
+    g_dword_2075ED8 = (mem != 0) ? ManagerListCtor(mem) : 0;   // sub_55B4F0
+    InitManagerFields();              // sub_18FBBA0
+    SetManagerLevel(g_dword_2075ED8, 0.9f);   // sub_18FAA00 (flt_1BD7E48 = 0.9f)
+    int r = 0;
+    if (d[0x00 / 4] != 0)             // sub_145DC90: release the +0x00 slot
+        r = F3CallVtableRet((void *)d[0x00 / 4], 2);
+    return r;
+}
 static void  nullsub_7(void) {}
 static void  sub_770960(void) {}
 static void  sub_620F30(void *obj) { (void)obj; }
@@ -4729,10 +5150,14 @@ static void SetFrontendEvent(void *obj)
 }
 // 0x18FA3E0 / 0x18FA3D0: the heap-manager getters. The original sub_18FA3E0
 // takes no argument (callers push a value on the stack for a later stdcall
-// call, which the decompiler mis-attributes to it). Remaining stubs: the heap
-// manager (dword_2075ED8) is not implemented in this build, so they return 0.
-void *GetHeapManager(void) { return 0; }
-void *GetHeapManagerSlot1C(void *hm) { (void)hm; return 0; }
+// call, which the decompiler mis-attributes to it): it returns the 144-byte
+// manager object (dword_2075ED8), built by CreateHeapManager (0x18FBD00).
+// sub_18FA3D0 is the thiscall `mov eax, [ecx+1Ch]; retn` getter for the
+// manager's +0x1C slot (the 1-byte sound-system object), declared as a plain
+// free function here. [NOT byte-identical] both ref the high-VA manager
+// global (0x02075ED8).
+void *GetHeapManager(void) { return g_dword_2075ED8; }
+void *GetHeapManagerSlot1C(void *hm) { printf("TRACE GetHeapManagerSlot1C(hm=%p)\n", hm); return *(void **)((char *)hm + 0x1C); }
 // 0x145D7B0  (0x145D7B0 - 0x145D7BC)  -- SetSoundHWND: __stdcall with one
 // pushed int: store the window handle into dword_1DDC934 and return it.
 //  [NOT byte-identical] refs the high-VA global dword_1DDC934 (0x01DDC934).
@@ -4807,6 +5232,558 @@ static void  sub_18FB930(void) {}
 // F3_VT(OBJ): read OBJ's vtable (the first word) as a void ** so its slots
 // can be indexed. (OBJ is a class instance pointer.)
 #define F3_VT(OBJ) ((void **)(*(void **)(OBJ)))
+
+// ============================================================
+//  F3WString -- the 36-byte front-end wide path string (the MSVC
+//  basic_string<wchar_t, 2> layout + two extra zeroed dwords) that
+//  InitFrontendData's callees (sub_435C10 / sub_4358A0 / sub_436BA0 /
+//  sub_5AF180) operate on:
+//    +0    d0 (low word zeroed by the reset idiom)
+//    +4    SSO buffer (8 wchars) / heap pointer
+//    +20   wchar length
+//    +24   capacity ( < 8 => SSO )
+//    +28 / +32  extra zeroed words
+// ============================================================
+typedef struct F3WString
+{
+    DWORD   d0;
+    union { wchar_t buf[8]; DWORD ptr; } u;
+    DWORD   len;
+    DWORD   cap;
+    DWORD   e1, e2;
+} F3WString;
+
+static wchar_t *F3WStringData(F3WString *s)
+{
+    return (s->cap < 8) ? s->u.buf : (wchar_t *)s->u.ptr;
+}
+
+static void F3WStringReset(F3WString *s)
+{
+    s->cap = 7;
+    s->len = 0;
+    s->u.buf[0] = 0;
+    s->e1 = s->e2 = 0;
+}
+
+// the "if (cap >= 8) LHFree()" idiom -- drop the SSO string's heap buffer
+static void F3WStringFree(F3WString *s)
+{
+    if (s->cap >= 8)
+        LHFree((void *)s->u.ptr);
+}
+
+// free + reset (the balanced reuse idiom)
+static void F3WStringClear(F3WString *s)
+{
+    F3WStringFree(s);
+    F3WStringReset(s);
+}
+
+// sub_435C10 -- assign (src, len) into the string. The original's callers
+// free the previous heap buffer and reset len / cap before calling.
+static void F3WStringAssign(F3WString *s, const wchar_t *src, unsigned int len)
+{
+    if (len > 7)
+    {
+        s->u.ptr = (DWORD)LHAlloc(2 * (len + 1));
+        s->cap = len + 1;
+    }
+    else
+        s->cap = 7;
+    wchar_t *dst = F3WStringData(s);
+    for (unsigned int i = 0; i < len; i++)
+        dst[i] = src[i];
+    dst[len] = 0;
+    s->len = len;
+    s->e1 = s->e2 = 0;
+}
+
+// sub_4358A0 -- ANSI -> wide, then assign (the +28 / +32 words zeroed).
+static void F3WStringAssignAnsi(F3WString *s, const char *src)
+{
+    wchar_t dst[0x801];
+    int n = (int)mbstowcs(dst, src, 0x801);
+    if (n < 0)
+        n = 0;
+    F3WStringAssign(s, dst, (unsigned int)n);
+}
+
+// sub_436BA0 -- path normalization: the original scans case-insensitively
+// (towlower) for '/' and replaces each with '\\', then appends a trailing
+// '\\' when the path does not already end in one.
+static void F3WStringNormalize(F3WString *s)
+{
+    wchar_t *p = F3WStringData(s);
+    for (unsigned int i = 0; i < s->len; i++)
+        if (p[i] == '/')
+            p[i] = L'\\';
+    if (s->len != 0 && p[s->len - 1] != L'\\')
+    {
+        p[s->len] = L'\\';
+        s->len++;
+    }
+}
+
+// ============================================================
+//  InitFrontendData's framework callees.  The shared-slot / path / archive /
+//  file-subsystem clusters are not implemented yet, so these mirror the
+//  observable behavior (slot init / release, the Win32 probes) and stub the
+//  deep archive work.
+// ============================================================
+
+// sub_18AC3A0: the exe's directory (drive + path via _splitpath) into a
+// shared slot.
+static F3SharedBuffer **SetExeDirSlot(F3SharedBuffer **slot)
+{
+    char file[260];
+    char drive[12];
+    char dir[264];
+    char out[0x114];
+    GetModuleFileNameA(0, file, 0x104);
+    _splitpath_s(file, drive, 0x0A, dir, 0x104, 0, 0, 0, 0);
+    _snprintf(out, sizeof out, "%s%s", drive, dir);
+    return SetSharedSlot(slot, out, -1);
+}
+
+// sub_18B03A0: GetFileAttributesA test on the slot's (resolved) path:
+// 1 = existing directory, 2 = not found, 6 = exists but not a directory.
+static int ExeDirSlotIsDirectory(F3SharedBuffer *slot)
+{
+    if (slot == 0 || slot->data == 0)
+        return 2;
+    DWORD attr = GetFileAttributesA(slot->data);
+    if (attr == 0xFFFFFFFF)
+        return 2;
+    if ((attr & 0x10) != 0)
+        return 1;
+    return 6;
+}
+
+// sub_18C4270: the global current-directory string slot (dword_212304C,
+// lazy-init) with a reference. 0 until the framework is implemented.
+static F3SharedBuffer **GetCurrentDirSlot(F3SharedBuffer **out)
+{
+    *out = 0;
+    return out;
+}
+
+// sub_6199B0: the fatal-error handler -- a no-op returning 0.
+static int FrontendFatalErrorNoop(void) { return 0; }
+
+// sub_61A840: the log-error handler -- GetLastError + the "%s (%u) #%08x"
+// log message. The log framework is a remaining stub.
+static int FrontendLogError(void)
+{
+    (void)GetLastError();
+    return 0;
+}
+
+// sub_18B15C0: install the front-end error handler for a level (0 = log,
+// 1 = fatal) under the CWD object's critical section, into the level's
+// global handler slot (sub_5A9FE0).
+static int (*g_frontendErrorHandlers[2])(void) = { 0, 0 };
+static void RegisterFrontendErrorHandler(void *cwdObj, int level, int (*handler)(void))
+{
+    (void)cwdObj;
+    if (level >= 0 && level <= 1)
+        g_frontendErrorHandlers[level] = handler;
+}
+
+// sub_180B520: reserve / grow the 128 KB data region (dword_1E2D868).
+static int ReserveDataRegion(unsigned int size) { (void)size; return 0; }
+
+// sub_180AC90: the archive manager slot (dword_1E2D864) with a reference.
+static F3SharedBuffer **GetArchiveSlot(F3SharedBuffer **out)
+{
+    *out = 0;
+    return out;
+}
+
+// sub_18AB910: resolve a wide path against the CWD / archive into a fresh
+// 48-byte path handle. 0 until the archive framework is implemented.
+static void *ResolveArchivePath(void *out, F3WString *path, int a3, int a4)
+{
+    (void)path; (void)a3; (void)a4;
+    *(void **)out = 0;
+    return *(void **)out;   // the resolved handle (0 until the framework lands)
+}
+
+// sub_180A240: resolve dirHandle's "dir.manifest" directory listing.
+static void *ResolveDirManifest(void *out, void *dirHandle, void *extra)
+{
+    (void)dirHandle; (void)extra;
+    *(void **)out = 0;
+    return *(void **)out;   // the resolved handle (0 until the framework lands)
+}
+
+// sub_18A9970: the 84-byte streaming manager (LHAlloc + the sub_18A98F0
+// ctor). A full page is allocated so the +0x161 flag byte the front-end
+// writes past the 84-byte object stays in the allocation.
+static void *CreateStreamingManager(void **out)
+{
+    void *m = LHAlloc(0x300);
+    if (m != 0)
+        memset(m, 0, 0x300);
+    *out = m;
+    return m;
+}
+
+// the streaming manager's "add archive" method (vtable slot 10):
+// (this, dataHandle, namePath, 2, 1, + the four caller register args)
+static void StreamingMgrAddArchive(void *mgr, void *handle, F3WString *name,
+                                   int flags1, int flags2,
+                                   int rD, int rS, int rB, int rP)
+{
+    (void)mgr; (void)handle; (void)name;
+    (void)flags1; (void)flags2;
+    (void)rD; (void)rS; (void)rB; (void)rP;
+}
+
+// sub_1806060: look up / register the Bink bank named by nameBuf (the
+// "levels.bnk" / "streaming.bnk" rdata wide string) in the archive.
+static void *LookupBnk(void *out, void *cwdSlot, void *nameBuf, int flags)
+{
+    (void)cwdSlot; (void)nameBuf; (void)flags;
+    *(void **)out = 0;
+    return *(void **)out;   // the bank handle (0 until the framework lands)
+}
+
+// the data-file object's "register entry" method (vtable slot 10):
+// (this, resolvedHandle, nameBuf, flags1, flags2)
+static void DataFileRegisterEntry(void *file, void *handle, void *nameBuf,
+                                  int flags1, int flags2)
+{
+    (void)file; (void)handle; (void)nameBuf;
+    (void)flags1; (void)flags2;
+}
+
+// the archive manager's "add path" method (vtable slot 4):
+// (this, cwdSlot, bookPath, namePtr, flags)
+static void ArchiveMgrAddPath(void *archive, F3SharedBuffer **cwdSlot,
+                              void *bookPath, void *namePtr, int flags)
+{
+    (void)archive; (void)cwdSlot; (void)bookPath;
+    (void)namePtr; (void)flags;
+}
+
+// sub_1801C20: the global file-subsystem object (&unk_1E2D7C8, lazy-init;
+// 'this' is the handle being registered).
+static void *GetFileSubsystem(void *obj) { (void)obj; return 0; }
+
+// sub_1801890: register archiveHandle as the file subsystem's current
+// directory (next handle 0).
+static void FileSubsysRegisterDir(void *fs, void *archiveHandle, void *nextHandle)
+{
+    (void)fs; (void)archiveHandle; (void)nextHandle;
+}
+
+// sub_17FE870: the LHSFS::CLegacyFile ctor over a 16-byte block (vtable +
+// shared slot + two zeroed words). 'slot' (a2) is the caller's temporary
+// path-string shared slot, handed to the sub_17FE0A0 setup (a remaining
+// stub here).
+static void LegacyFileCtor(void *obj, F3SharedBuffer *slot, int a3, int a4)
+{
+    DWORD *b = (DWORD *)obj;
+    b[0] = (DWORD)g_CLegacyFileVtable;
+    InitSharedSlot((F3SharedBuffer **)&b[1]);
+    b[2] = 0;
+    b[3] = 0;
+    (void)slot; (void)a3; (void)a4;
+}
+
+// sub_17FDC30: does the legacy file have data (the +8 slot set)?
+static int LegacyFileHasData(const void *obj)
+{
+    return *(const DWORD *)((const char *)obj + 8) != 0;
+}
+
+// sub_61D800: copy the legacy file's content into the shared slot.
+static void CopyFileToSharedSlot(void *file, F3SharedBuffer **out)
+{
+    (void)file; (void)out;
+}
+
+// sub_17FDE60 / sub_17FDEC0: publish obj into the global slot
+// (dword_1E2D7A4 / dword_1E2D7AC; refcounted, one-time atexit registration).
+static int PublishDataObject1(void *obj) { (void)obj; return 0; }
+static int PublishDataObject2(void *obj) { (void)obj; return 0; }
+
+// sub_17FD600: resolve the slot's path ("data\\") into the global data path
+// (dword_1E2D7C4) via sub_1A01BE0.
+static long ResolveDataPathSlot(F3SharedBuffer **slot) { (void)slot; return 0; }
+
+// sub_17FD6A0: resolve the "data\\" shared slot into the object's wide path
+// globals (dword_1E2D7BC).
+static void LegacyFileSetDataPath(void *obj) { (void)obj; }
+
+// sub_17FD970: the LHSFS::CLegacyFile dtor (release +12 / +8, release the
+// shared slot, reset the vtable to LHFile::CAFile).
+static long LegacyFileDtor(void *obj)
+{
+    DWORD *b = (DWORD *)obj;
+    if (b[3] != 0 && F3_VT((void *)b[3]) != 0)
+        ((void (*)(void *))F3_VT((void *)b[3])[2])((void *)b[3]);
+    if (b[2] != 0 && F3_VT((void *)b[2]) != 0)
+        ((void (*)(void *))F3_VT((void *)b[2])[2])((void *)b[2]);
+    long r = ReleaseSharedSlot((F3SharedBuffer **)&b[1]);
+    b[0] = (DWORD)g_CAFileVtable;
+    return r;
+}
+
+// sub_61AFA0: does data/streaming.bnk exist in the "data" archive? (Builds
+// the "streaming.bnk" + "data" path strings, resolves the path, and queries
+// the handle's vtable slot 4.)
+static int DataStreamingBnkExists(void)
+{
+    F3WString bnk, dir;
+    F3WStringReset(&bnk);
+    F3WStringAssignAnsi(&bnk, "streaming.bnk");
+    F3WStringReset(&dir);
+    F3WStringAssign(&dir, L"data", 4);
+    F3WStringNormalize(&dir);
+    void *handle = 0;
+    ResolveArchivePath(&handle, &dir, 0, 0);
+    F3WStringClear(&dir);
+    int exists = 0;
+    void *result = 0;
+    if (handle != 0 && F3_VT(handle) != 0)
+        ((void (*)(void *, void *, int *, int))F3_VT(handle)[4])(handle, &result, &exists, 1);
+    if (handle != 0 && F3_VT(handle) != 0)
+        ((void (*)(void *))F3_VT(handle)[2])(handle);
+    int r = (result != 0);
+    if (result != 0)
+        ((void (*)(void *))F3_VT(result)[2])(result);
+    F3WStringClear(&bnk);
+    return r;
+}
+
+// ============================================================
+//  InitFrontendData  (0x61B090 - 0x61B66E)  -- the front-end data / streaming
+//  init (sole caller: RunFrontEnd, 0x61D1BA)
+//  [NOT byte-identical] placement-dependent (relative calls into the shared-
+//  slot / path / archive / file-subsystem framework and the Win32 imports),
+//  a usercall register-parameter hybrid, and it refs the high-VA globals
+//  g_byte_1DBD02A (0x01DBD02A) / g_unk_1DBDA78 (0x01DBDA78) and the string
+//  literals at their original rdata addresses.
+//
+//  long InitFrontendData(void *obj, int regB, int regP, int regD, int regS)
+//
+//  A usercall hybrid in the original: obj in ECX, and the caller's EBX, EBP,
+//  EDI, ESI registers thread straight through into the streaming manager's
+//  AddArchive dispatch (the four caller registers reach the method
+//  unmodified). The sole caller (RunFrontEnd, 0x61D1BA) just lets its live
+//  register values flow through: EDI = the sign-in state, ESI = obj, EBX =
+//  the caller's Sleep IAT slot, EBP = its frame pointer.
+//
+//  It brings up the front-end's file + streaming subsystem after XNA sign-in:
+//  - sets the process CWD to the exe's directory (when it is one).
+//  - g_byte_1DBD02A (the run-from-disk flag) = 1 when data/streaming.bnk
+//    exists or the command line has "FakeRunFromDVD".
+//  - installs the fatal (no-op) / log error handlers and reserves the
+//    128 KB data region.
+//  - resolves the "data" directory (re-resolving it through dir.manifest
+//    when streaming.bnk is present but not fakeDVD, and skipping the
+//    archive registration when streaming.bnk is absent and not fakeDVD),
+//    creates the 84-byte streaming manager, and registers the archive with
+//    the four caller registers.
+//  - registers the "language" data set, the two Bink banks (levels.bnk /
+//    streaming.bnk) and the "language\\en-uk\\text\\book.babel" text book.
+//  - hands the archive handle to the global file subsystem, builds the
+//    "build_version.txt" legacy file (its content copied into the
+//    g_unk_1DBDA78 slot when the data file has content), and publishes the
+//    "data\\" path globals.
+//
+//  The deep archive / streaming / file-subsystem callees are remaining
+//  stubs; the return value is the final ReleaseSharedSlot count (ignored by
+//  RunFrontEnd).
+// ============================================================
+static long InitFrontendData(void *obj, int regB, int regP, int regD, int regS)
+{
+    (void)obj;
+
+    // ---- the original's 0x74-byte stack frame (selected slots) ----
+    F3SharedBuffer *exeDir   = 0;          // the exe-directory string slot
+    F3SharedBuffer *cwdSlot  = 0;          // the current-directory slot
+    F3SharedBuffer *archive  = 0;          // the archive manager slot
+    F3WString       dataPath = { 0 };      // the 36-byte "data" path slot
+    F3WString       langSet  = { 0 };      // the 36-byte "language" name slot
+    F3WString       bookPath = { 0 };      // the 36-byte bnk / book path slot
+    F3WString       langPath = { 0 };      // the 36-byte "data\\language" path slot
+    DWORD           fileObj[4]   = { 0 };  // the 16-byte data-file object
+    F3SharedBuffer *dataHandle = 0;        // the resolved data dir / archive handle
+    F3SharedBuffer *tmpHandle  = 0;        // the re-resolve out slot
+    void           *streamMgr  = 0;        // the 84-byte streaming manager
+    DWORD           fileBlock[4] = { 0 };  // the 16-byte build_version file
+    F3SharedBuffer *fileSlot  = 0;        // the temporary path-string shared slot (v40)
+
+    // 1. SetCurrentDirectoryA to the exe's directory (when it is one).
+    SetExeDirSlot(&exeDir);
+    if (ExeDirSlotIsDirectory(exeDir) != 0)
+    {
+        const char *dir = (exeDir != 0 && exeDir->data != 0) ? exeDir->data : "";
+        SetCurrentDirectoryA(dir);
+    }
+
+    // 2. The run-from-disk flag: data/streaming.bnk present, or
+    //    "FakeRunFromDVD" on the command line.
+    int bnkExists = DataStreamingBnkExists();
+    int fakeDVD   = (strstr(GetCommandLineA(), "FakeRunFromDVD") != 0);
+    if (bnkExists != 0 || fakeDVD)
+        g_byte_1DBD02A = 1;
+
+    // 3. Error handlers + the data region + the global slots.
+    GetCurrentDirSlot(&cwdSlot);
+    RegisterFrontendErrorHandler(cwdSlot, 1, FrontendFatalErrorNoop);
+    RegisterFrontendErrorHandler(cwdSlot, 0, FrontendLogError);
+    ReserveDataRegion(0x20000);
+    GetArchiveSlot(&archive);
+
+    // 4. Resolve the "data" directory.
+    F3WStringReset(&dataPath);
+    F3WStringAssign(&dataPath, L"data", 4);
+    F3WStringNormalize(&dataPath);
+    dataHandle = (F3SharedBuffer *)ResolveArchivePath(&dataHandle, &dataPath, 0, 0);
+    F3WStringClear(&dataPath);
+
+    if (bnkExists == 0)
+    {
+        if (!fakeDVD)
+            goto dataSubsys;      // LABEL_63: skip the archive registration
+        goto registerData;        // LABEL_15
+    }
+    if (fakeDVD)
+        goto registerData;        // LABEL_15
+
+    // streaming.bnk present, not fakeDVD: resolve through dir.manifest.
+    {
+        F3WStringClear(&langSet);
+        F3WStringAssignAnsi(&langSet, "dir.manifest");
+        tmpHandle = (F3SharedBuffer *)ResolveDirManifest(&tmpHandle, dataHandle, &langSet);
+        if (tmpHandle != 0 && F3_VT(tmpHandle) != 0)
+            ((void (*)(void *))F3_VT(tmpHandle)[1])(tmpHandle);
+        if (dataHandle != 0 && F3_VT(dataHandle) != 0)
+            ((void (*)(void *))F3_VT(dataHandle)[2])(dataHandle);
+        dataHandle = tmpHandle;
+        tmpHandle  = 0;
+        F3WStringClear(&langSet);
+    }
+    goto afterArchive;
+
+registerData:
+    // LABEL_15: re-resolve the "data" archive and move the handle in.
+    {
+        F3WStringReset(&dataPath);
+        F3WStringAssign(&dataPath, L"data", 4);
+        F3WStringNormalize(&dataPath);
+        tmpHandle = (F3SharedBuffer *)ResolveArchivePath(&tmpHandle, &dataPath, 0, 0);
+        if (tmpHandle != 0 && F3_VT(tmpHandle) != 0)
+            ((void (*)(void *))F3_VT(tmpHandle)[1])(tmpHandle);
+        if (dataHandle != 0 && F3_VT(dataHandle) != 0)
+            ((void (*)(void *))F3_VT(dataHandle)[2])(dataHandle);
+        dataHandle = tmpHandle;
+        tmpHandle  = 0;
+        F3WStringClear(&dataPath);
+    }
+
+afterArchive:
+    // 5. The streaming manager + the archive registration (the four caller
+    //    registers thread through as the method's trailing args).
+    CreateStreamingManager(&streamMgr);
+    StreamingMgrAddArchive(streamMgr, dataHandle, &dataPath, 2, 1,
+                           regD, regS, regB, regP);
+    F3WStringClear(&bookPath);
+
+    // 6. The "language" name + the "data\\language" set registration.
+    F3WStringAssignAnsi(&langSet, "language");
+    F3WStringNormalize(&langSet);
+    F3WStringReset(&langPath);
+    F3WStringAssign(&langPath, L"data\\language", 13);
+    F3WStringNormalize(&langPath);
+    tmpHandle = (F3SharedBuffer *)ResolveArchivePath(&tmpHandle, &langPath, 0, 0);
+    DataFileRegisterEntry(fileObj, (tmpHandle != 0) ? (void *)tmpHandle->data : 0,
+                          &langSet.u, 2, 1);
+    if (tmpHandle != 0 && F3_VT(tmpHandle) != 0)
+        ((void (*)(void *))F3_VT(tmpHandle)[2])(tmpHandle);
+    F3WStringClear(&langSet);
+
+    // 7. The two Bink banks (levels.bnk, then streaming.bnk).
+    F3WStringAssign(&bookPath, L"levels.bnk", 10);
+    tmpHandle = (F3SharedBuffer *)LookupBnk(&tmpHandle, cwdSlot, &bookPath, 0);
+    DataFileRegisterEntry(fileObj, (tmpHandle != 0) ? (void *)tmpHandle->data : 0,
+                          &bookPath, 2, 1);
+    if (tmpHandle != 0 && F3_VT(tmpHandle) != 0)
+        ((void (*)(void *))F3_VT(tmpHandle)[2])(tmpHandle);
+    F3WStringClear(&bookPath);
+
+    F3WStringAssign(&bookPath, L"streaming.bnk", 13);
+    tmpHandle = (F3SharedBuffer *)LookupBnk(&tmpHandle, cwdSlot, &bookPath, 0);
+    DataFileRegisterEntry(fileObj, (tmpHandle != 0) ? (void *)tmpHandle->data : 0,
+                          &bookPath, 2, 0);
+    if (tmpHandle != 0 && F3_VT(tmpHandle) != 0)
+        ((void (*)(void *))F3_VT(tmpHandle)[2])(tmpHandle);
+    F3WStringClear(&bookPath);
+
+    // 8. The babel text book + the manager flag byte (the original writes
+    //    past the 84-byte allocation at manager+0x161, and clears it again
+    //    when the book string's ptr field reads 0).
+    F3WStringAssignAnsi(&bookPath, "language\\en-uk\\text\\book.babel");
+    if (streamMgr != 0)
+        ((char *)streamMgr)[0x161] = 1;
+    ArchiveMgrAddPath(archive, &cwdSlot, &bookPath, &langSet.u, 1);
+    int bookPtrWasSet = (bookPath.u.ptr != 0);
+    F3WStringClear(&bookPath);
+    if (streamMgr != 0 && !bookPtrWasSet)
+        ((char *)streamMgr)[0x161] = 0;
+
+    // The manager / handle releases (the original's order).
+    if (streamMgr != 0 && F3_VT(streamMgr) != 0)
+        ((void (*)(void *))F3_VT(streamMgr)[1])(streamMgr);
+    if (dataHandle != 0 && F3_VT(dataHandle) != 0)
+        ((void (*)(void *))F3_VT(dataHandle)[2])(dataHandle);
+    if (fileBlock[0] != 0 && F3_VT((void *)fileBlock[0]) != 0)
+        ((void (*)(void *))F3_VT((void *)fileBlock[0])[2])((void *)fileBlock[0]);
+    if (streamMgr != 0 && F3_VT(streamMgr) != 0)
+        ((void (*)(void *))F3_VT(streamMgr)[2])(streamMgr);
+
+dataSubsys:
+    // 9. The file subsystem + the build_version.txt legacy file + the
+    //    "data\\" path globals.
+    {
+        void *fs = GetFileSubsystem(dataHandle);          // sub_1801C20
+        FileSubsysRegisterDir(fs, dataHandle, 0);         // sub_1801890
+    }
+
+    // The build_version.txt file object: the caller's temporary
+    // shared slot (fileSlot) holds the path string, the 16-byte
+    // CLegacyFile (fileBlock) is constructed separately, and the slot is
+    // released afterwards.
+    SetSharedSlot(&fileSlot, "build_version.txt", -1);
+    LegacyFileCtor(fileBlock, fileSlot, 1, 2);            // sub_17FE870
+    ReleaseSharedSlot(&fileSlot);
+    if (LegacyFileHasData(fileObj) != 0)                  // sub_17FDC30(v45)
+        CopyFileToSharedSlot(fileObj, &g_unk_1DBDA78);    // sub_61D800(&unk_1DBDA78)
+    PublishDataObject1(archive);                          // sub_17FDE60(v44)
+
+    SetSharedSlot(&fileSlot, "data\\", -1);
+    ResolveDataPathSlot(&fileSlot);                       // sub_17FD600
+    ReleaseSharedSlot(&fileSlot);
+    PublishDataObject2(archive);                          // sub_17FDEC0(v44)
+
+    SetSharedSlot(&fileSlot, "data\\", -1);
+    LegacyFileSetDataPath(fileSlot);                      // sub_17FD6A0
+    ReleaseSharedSlot(&fileSlot);
+    LegacyFileDtor(fileObj);                              // sub_17FD970(v45)
+
+    // 10. Final releases (the original's order).
+    if (dataHandle != 0 && F3_VT(dataHandle) != 0)
+        ((void (*)(void *))F3_VT(dataHandle)[2])(dataHandle);
+    if (archive != 0 && F3_VT(archive) != 0)
+        ((void (*)(void *))F3_VT(archive)[2])(archive);
+    if (cwdSlot != 0 && F3_VT(cwdSlot) != 0)
+        ((void (*)(void *))F3_VT(cwdSlot)[2])(cwdSlot);
+    return ReleaseSharedSlot(&exeDir);
+}
 
 // ============================================================
 //  RunFrontEnd  (0x0061CB70 - 0x0061D7D6)  -- the game start-up / frontend
@@ -5072,13 +6049,26 @@ char RunFrontEnd(void *obj, int arg)
     }
 
 signedIn:
-    // 10. The signed-in continuation: front-end data + device construction.
+// 10. The signed-in continuation: front-end data + device construction.
     {
-        int a = (int)(DWORD)GetNetManager();
-        int b = sub_6A6960(a);
-        sub_772190(b);
-        sub_61B090(obj);
-        sub_18FBD00(g_byte_1DBD030 != 0);
+        // 0x61d1b3: CNetUserManagerRefreshSignin(CNetManagerGetUserManager(
+        // GetNetManager())) — re-read local user 0's sign-in state after the
+        // local sign-in and refresh the CNetUserManager's (+0x28) record 0.
+        // CNetManagerGetUserManager is a byte-identical naked thiscall that
+        // reads the CNetManager's +0x28 slot from ECX; a C expression cannot
+        // stage that register, so read the slot directly (identical result).
+        { 
+          void *mgr = GetNetManager();
+          void *um = (mgr != 0) ? (void *)*(DWORD *)((char *)mgr + 0x28) : 0;
+          CNetUserManagerRefreshSignin(um); 
+        }
+        // 0x61d1ba: the front-end data / streaming init.  A usercall hybrid
+        // in the original: ECX = obj, and the caller's live EBX / EBP / EDI /
+        // ESI thread into the streaming manager's AddArchive dispatch (EDI
+        // = the sign-in state, ESI = obj; EBX / EBP hold the caller's Sleep
+        // IAT slot / frame pointer -- 0 here).
+        InitFrontendData(obj, 0, 0, XUserGetSigninState(0), (int)(DWORD)obj);
+        CreateHeapManager(g_byte_1DBD030 != 0);
         nullsub_7();
         sub_770960();
 

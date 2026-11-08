@@ -35,13 +35,13 @@ F3SharedBuffer **MakeAbnormalShutdownPath(F3SharedBuffer **obj);
 // (SortedMapTreeDestroy, 0x578A40), and the owner-tag LHFree.
 void CSortedMapDtor(void *obj);
 
-// 0x18FA3E0 - the global heap-manager object getter (dword_2075ED8; takes no
-// argument in the original). Remaining stub (returns 0 until the heap
-// manager is implemented).
+// 0x18FA3E0 - the global manager object getter (dword_2075ED8; takes no
+// argument in the original). Returns the 144-byte manager object built by
+// CreateHeapManager (0x18FBD00).
 void *GetHeapManager(void);
 
-// 0x18FA3D0 - thiscall getter for the heap manager's +0x1C member. Remaining
-// stub (returns 0 until the heap manager is implemented).
+// 0x18FA3D0 - thiscall getter for the manager's +0x1C member (the 1-byte
+// sound-system object). Declared as a plain free function here.
 void *GetHeapManagerSlot1C(void *hm);
 
 // 0x1A01270 - copy-assign one shared slot onto another with refcounting

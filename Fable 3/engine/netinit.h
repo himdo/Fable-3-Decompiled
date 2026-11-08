@@ -29,6 +29,14 @@ extern DWORD g_dword_1DC2554;   // 0x1DC2554: its SEH cleanup block
 // returns g_dword_1DC2550 (0 when no net manager is installed).
 void *GetNetManager(void);
 
+// void *CNetManagerGetUserManager(void *obj)   (0x6A6960, byte-identical)
+// -- the CNetManager's +0x28 getter: returns the 60-byte CNetUserManager
+// (the XLive 4-user sign-in-state object built by CNetManagerStart via
+// LHAlloc(60) + sub_772E50; its methods are the sub_771xxx / sub_772xxx
+// cluster). ~100 call sites, all `CNetUserManager = CNetManagerGetUserManager(
+// GetNetManager())`.
+void *CNetManagerGetUserManager(void *obj);
+
 // CNetManagerShutdown (0x6A70F0 - 0x6A720C) — the 80-byte CNetManager teardown:
 // sub_6834D0(slot+0x10, 0) + LHFree(slot+0x38) up front (unconditional), then
 // sub_6A84C0 + LHFree of slot+0x34, vtable[0](slot, 1) releases of
@@ -36,5 +44,35 @@ void *GetNetManager(void);
 // slot+0x10, and vtable[0](slot, 1) releases of +0x2C/+0x24/+0x28 — every
 // slot zeroed. thiscall, no stack args.
 void CNetManagerShutdown(void *obj);
+
+// The 32-byte per-user sign-in record held in the CNetUserManager's sign-in
+// array (CNetUserManager +0x14 .. +0x18, 32-byte elements, one per local
+// user). Offsets are the ones CNetUserManagerRefreshSignin (0x772190) reads
+// and writes.
+typedef struct F3NetUserSignin
+{
+    unsigned char signState2;   // +0x00: 1 when the sign-in state == 2
+    unsigned char signState1;   // +0x01: 1 when the sign-in state == 1
+    unsigned char signFlag;     // +0x02: 1 when (sign-in flags & 2)
+    unsigned char pad3;         // +0x03
+    unsigned int  savePath;     // +0x04: F3SharedBuffer* save-game path (cleared here)
+    unsigned int  xuidHi;       // +0x08: effective XUID high (sign-in B, or A when B is 0)
+    unsigned int  xuidLo;       // +0x0C: effective XUID low
+    unsigned int  xuidA_hi;     // +0x10: XUID high from XUserGetSigninInfo(0, 2, ...)
+    unsigned int  xuidA_lo;     // +0x14: XUID low  from XUserGetSigninInfo(0, 2, ...)
+    unsigned int  xuidB_hi;     // +0x18: XUID high from XUserGetSigninInfo(0, 1, ...)
+    unsigned int  xuidB_lo;     // +0x1C: XUID low  from XUserGetSigninInfo(0, 1, ...)
+} F3NetUserSignin;   // 32 bytes
+
+// void CNetUserManagerRefreshSignin(void *obj)   (0x772190 - 0x772421, thiscall)
+//
+// Re-reads the XLive sign-in state of local user 0 (XUserGetSigninInfo with
+// WhichSignin 2 then 1) and refreshes the CNetUserManager's first (element
+// 0) 32-byte sign-in record (F3NetUserSignin): the sign-in state / flag
+// bytes, the effective + per-sign-in XUIDs, and a cleared save-game path.
+// obj = the 60-byte CNetUserManager (CNetManagerGetUserManager). Called by
+// RunFrontEnd (0x61D1B3, right after local sign-in), the XNotify pump
+// (0x7724BA, on a sign-in event) and the listener setup (0x772EFA).
+void CNetUserManagerRefreshSignin(void *obj);
 
 #endif  // F3_NETINIT_H

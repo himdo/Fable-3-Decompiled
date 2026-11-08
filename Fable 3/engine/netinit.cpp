@@ -11,6 +11,7 @@
 #include "worker.h"               // CWorkerWin32 / GetWorker / SetPreTranslate
 #include "object_registry.h"      // F3SehBlock
 #include "xlive.h"                // the xlive.dll (XLiveAPI) import declarations
+#include "save/save.h"            // SetSaveGamePath (the shared-slot string setter)
 
 #include <windows.h>
 #include <process.h>              // atexit
@@ -473,4 +474,144 @@ int InitNetworking(void)
 void *GetNetManager(void)
 {
     return (void *)g_dword_1DC2550;
+}
+
+// ============================================================
+//  CNetManagerGetUserManager  (0x6A6960 - 0x6A6964)  -- the
+//  CNetManager's +0x28 CNetUserManager getter
+//
+//  void *CNetManagerGetUserManager(void *obj)   (obj = the CNetManager)
+//
+//  thiscall getter: returns *(obj + 0x28), the 60-byte CNetUserManager
+//  (the XLive 4-user sign-in-state object; CNetManagerStart constructs it
+//  with LHAlloc(60) + sub_772E50). ~100 call sites, all of the form
+//  GetNetManager() -> this getter -> a CNetUserManager method (the
+//  sub_771xxx / sub_772xxx cluster: user sign-in / connection queries,
+//  XNotify pumping). The offset siblings (0x6A6900..0x6A69F0, two per
+//  offset) are the compiler-generated const overloads; 0x6A6960 is the
+//  live one for +0x28 (its twin 0x6A6970 is unreferenced).
+//
+//  Byte-identical: the original 4 bytes are `mov eax,[ecx+28h]; retn`
+//  (no calls, no globals, no absolute refs). `__declspec(naked)` inline
+//  asm so /Ob2 doesn't swap the out-of-line body for a 5-byte stack-
+//  argument thunk.
+// ============================================================
+__declspec(naked)
+void *CNetManagerGetUserManager(void *obj)
+{
+    __asm {
+        mov eax, [ecx+28h]
+        retn
+    }
+}
+
+// ============================================================
+//  CNetUserManagerRefreshSignin  (0x00772190 - 0x00772421)  --
+//  Re-read local user 0's XLive sign-in state and refresh the
+//  CNetUserManager's first 32-byte sign-in record
+//
+//  void CNetUserManagerRefreshSignin(void *obj)   (obj = the 60-byte
+//  CNetUserManager, the CNetManager's +0x28; thiscall in the original)
+//
+//  [NOT byte-identical] refs the xlive.dll IAT slot (XUserGetSigninInfo,
+//  ordinal 5267), calls SetSaveGamePath, and the original's MSVC
+//  prologue/epilogue (__security_check_cookie, __invalid_parameter_noinfo
+//  bounds checks) all relocate to different offsets in this build.
+//
+//  The CNetUserManager keeps its sign-in records in an array of 32-byte
+//  elements (obj+0x14 = start, obj+0x18 = end). The original MSVC build
+//  bounds-checks element 0 before every store: when (end-start) holds no
+//  full 32-byte element it calls __invalid_parameter_noinfo and keeps
+//  going. The CNetUserManager always holds the 4-user array, so the check
+//  always passes; it is reproduced here as a single up-front guard.
+//
+//  XUserGetSigninInfo's sign-in buffer, first 16 bytes used (the original
+//  zeroes a 32-byte local before the calls):
+//      +0  XUID high     +4  XUID low
+//      +8  flags  (bit 1 -> record+0x02)
+//      +12 state  (== 1 / == 2 -> record+0x01 / +0x00)
+//
+//  Behavior (user index 0 throughout):
+//    1. XUserGetSigninInfo(0, 2, info). When it fails (nonzero return),
+//       the record is cleared: the state / flag bytes and all XUID words
+//       zeroed, and the save-game path slot assigned the empty string.
+//       The original passes byte_1BCE523 (a zeroed .rdata region read as
+//       an empty string); either way SetSaveGamePath releases the previous
+//       block and stores null.
+//    2. On success:
+//         record+0x10 / +0x14 <- info's XUID;
+//         the save-game path slot <- the empty string (the original's
+//         16-byte zeroed stack buffer);
+//         signState2 = (state == 2), signState1 = (state == 1),
+//         signFlag   = (flags & 2) != 0;
+//         when XUserGetSigninInfo(0, 1, info) succeeds, record+0x18 /
+//         +0x1C <- that call's XUID;
+//         record+0x08 / +0x0C <- (the +0x18/+0x1C XUID nonzero) ? it :
+//         (the +0x10/+0x14 XUID).
+//
+//  Callers: RunFrontEnd (0x61D1B3: right after the local user signs in,
+//  CNetUserManagerRefreshSignin(CNetManagerGetUserManager(GetNetManager()))),
+//  the XNotify sign-in pump (0x7724BA, event type 10) and the listener
+//  setup tail call (0x772EFA, sub_772ED0).
+// ============================================================
+void CNetUserManagerRefreshSignin(void *obj)
+{
+    // The original unconditionally dereferences the CNetUserManager that
+    // CNetManagerStart (0x6A6DB0) constructs (LHAlloc(60) + sub_772E50,
+    // published at the CNetManager's +0x28). In this build CNetManagerStart
+    // is a remaining stub, so the user manager is absent (the slot stays 0)
+    // and the object is null; the original would fault reading +0x14/+0x18
+    // in that case, so an absent manager is treated as a no-op.
+    if (obj == 0)
+        return;
+
+    unsigned char *o = (unsigned char *)obj;
+    unsigned int  start = *(unsigned int *)(o + 0x14);   // sign-in array start
+    unsigned int  end   = *(unsigned int *)(o + 0x18);   // sign-in array end
+    F3NetUserSignin *rec = (F3NetUserSignin *)start;     // element 0
+
+    // The 16-byte sign-in buffer XUserGetSigninInfo fills (zeroed up front,
+    // as the original does).
+    unsigned int info[4] = { 0, 0, 0, 0 };
+
+    // The original's per-store element-0 bounds check ((end-start) >> 5 must
+    // be nonzero, else __invalid_parameter_noinfo). Guarded once here; the
+    // 4-user array is always present, so this never fires.
+    if (((end - start) >> 5) == 0)
+        return;
+
+    if (XUserGetSigninInfo(0, 2, info) != 0)
+    {
+        // No sign-in info (or error): clear the record.
+        rec->signState2 = 0;                     // +0x00
+        rec->signState1 = 0;                     // +0x01
+        rec->xuidHi     = 0;  rec->xuidLo     = 0;   // +0x08 / +0x0C
+        rec->xuidB_hi   = 0;  rec->xuidB_lo   = 0;   // +0x18 / +0x1C
+        rec->xuidA_hi   = 0;  rec->xuidA_lo   = 0;   // +0x10 / +0x14
+        SetSaveGamePath((F3SharedBuffer **)&rec->savePath, "");   // +0x04 <- empty
+        rec->signFlag   = 0;                     // +0x02
+    }
+    else
+    {
+        rec->xuidA_hi = info[0];                 // +0x10 <- info XUID high
+        rec->xuidA_lo = info[1];                 // +0x14 <- info XUID low
+        SetSaveGamePath((F3SharedBuffer **)&rec->savePath, "");   // +0x04 <- empty
+        rec->signState2 = (info[3] == 2);        // +0x00
+        rec->signState1 = (info[3] == 1);        // +0x01
+        rec->signFlag   = (info[2] & 2) != 0;    // +0x02
+
+        if (XUserGetSigninInfo(0, 1, info) == 0) {
+            rec->xuidB_hi = info[0];             // +0x18 <- previous XUID high
+            rec->xuidB_lo = info[1];             // +0x1C <- previous XUID low
+        }
+
+        if ((rec->xuidB_hi | rec->xuidB_lo) != 0) {
+            rec->xuidHi = rec->xuidB_hi;         // +0x08
+            rec->xuidLo = rec->xuidB_lo;         // +0x0C
+        }
+        else {
+            rec->xuidHi = rec->xuidA_hi;         // +0x08
+            rec->xuidLo = rec->xuidA_lo;         // +0x0C
+        }
+    }
 }

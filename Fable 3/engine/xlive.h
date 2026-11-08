@@ -33,6 +33,10 @@ int   __stdcall XNotifyGetNext(int hListener, int dwFlags,
                      void *pExtendedData, void *pNotificationData);
 // XUserGetSigninState    ordinal 5262  stdcall @4
 int   __stdcall XUserGetSigninState(int dwUser);
+// XUserGetSigninInfo     ordinal 5267  stdcall @12
+// The sign-in buffer out-parameter is at least 16 bytes: { XUID hi, XUID lo,
+// flags, state } (see F3NetUserSignin / CNetUserManagerRefreshSignin).
+int   __stdcall XUserGetSigninInfo(int dwUser, int whichSignin, void *pSigninInfo);
 // XShowSigninUI          ordinal 5260  stdcall @8
 int   __stdcall XShowSigninUI(int dwUser, int dwMessage);
 // XShowGuideUI           ordinal 5215  stdcall @4

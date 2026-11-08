@@ -3,6 +3,7 @@ EXPORTS
     XNotifyCreateListener@8 @5270
     XNotifyGetNext@16 @651
     XUserGetSigninState@4 @5262
+    XUserGetSigninInfo@12 @5267
     XShowSigninUI@8 @5260
     XShowGuideUI@4 @5215
     XShowMessageBoxUI@36 @5266
