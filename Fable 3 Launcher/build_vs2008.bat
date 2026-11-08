@@ -29,6 +29,10 @@ set "PATH=%V90BIN%;%PATH%"
 
 rem ---- compiler flags: Release x86, static CRT, LTCG, C++ ----
 set "CLFLAGS=/nologo /c /O2 /Ob2 /Oi /DNDEBUG /DWIN32 /D_WINDOWS /W3 /EHsc /GS /MT /GL /Z7 /Fds"
+rem ---- same flags WITHOUT /GL: emits a native (machine-code) main.obj that
+rem      objdiff can disassemble. /GL would emit an LTCG/MSObj-IR .obj instead,
+rem      which objdiff cannot read. ----
+set "CLFLAGS_NOGL=/nologo /c /O2 /Ob2 /Oi /DNDEBUG /DWIN32 /D_WINDOWS /W3 /EHsc /GS /MT /Z7 /Fds"
 rem ---- linker flags: LTCG, GUI, x86, base 0x400000 ----
 set "LNKFLAGS=/nologo /LTCG /subsystem:windows /machine:x86 /base:0x400000 /DYNAMICBASE /NXCOMPAT"
 
@@ -81,8 +85,18 @@ echo === patch .rsrc section to match original (byte-level) ===
 python ..\..\patch_rsrc.py FableLauncher.exe "%ORIG%"
 if errorlevel 1 (echo PATCH FAILED & popd & popd & exit /b 1)
 
+echo.
+echo === cl (x86, no /GL): main_objdiff.obj (native, for objdiff) ===
+cl %CLFLAGS_NOGL% /Fomain_objdiff.obj ..\..\main.cpp
+if errorlevel 1 (echo OBJDIFF-COMPILE FAILED & popd & popd & exit /b 1)
+
 popd
 popd
+
+echo.
+echo === generate objdiff.json ===
+python "%~dp0gen_objdiff.py" || echo (objdiff.json NOT generated - see errors above)
+
 echo.
 echo === BUILD OK: %~dp0%OUTREL%\FableLauncher.exe ===
 exit /b 0

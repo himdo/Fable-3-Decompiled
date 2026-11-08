@@ -1,0 +1,452 @@
+[
+{
+"name": "?sub_401010@@YAPAXPAXD@Z",
+"rva": 4112,
+"size": 36
+},
+{
+"name": "?sub_4010C0@@YGPAXPAXH@Z",
+"rva": 4288,
+"size": 134
+},
+{
+"name": "?sub_401150@@YGXPAX@Z",
+"rva": 4432,
+"size": 210
+},
+{
+"name": "?sub_4012B0@@YAXPAX@Z",
+"rva": 4784,
+"size": 39
+},
+{
+"name": "?sub_4012E0@@YIHH@Z",
+"rva": 4832,
+"size": 58
+},
+{
+"name": "?sub_401320@@YAXXZ",
+"rva": 4896,
+"size": 7
+},
+{
+"name": "?sub_4013B0@@YAPAXPAXD@Z",
+"rva": 5040,
+"size": 31
+},
+{
+"name": "?sub_4013D0@@YAHH@Z",
+"rva": 5072,
+"size": 69
+},
+{
+"name": "?sub_401420@@YAHPAH0@Z",
+"rva": 5152,
+"size": 253
+},
+{
+"name": "?sub_401520@@YAHHG_W@Z",
+"rva": 5408,
+"size": 33
+},
+{
+"name": "?sub_401550@@YAPB_WHPA_W0PAG@Z",
+"rva": 5456,
+"size": 30
+},
+{
+"name": "?sub_401570@@YAPAGPAXHPAG1@Z",
+"rva": 5488,
+"size": 56
+},
+{
+"name": "?sub_4015B0@@YAPAGPAXHPAG1@Z",
+"rva": 5552,
+"size": 56
+},
+{
+"name": "?sub_4015F0@@YA_WH_W@Z",
+"rva": 5616,
+"size": 20
+},
+{
+"name": "?sub_401610@@YAPA_WPADPA_W1@Z",
+"rva": 5648,
+"size": 49
+},
+{
+"name": "?sub_401650@@YA_WH_W@Z",
+"rva": 5712,
+"size": 20
+},
+{
+"name": "?sub_401670@@YAPA_WPADPA_W1@Z",
+"rva": 5744,
+"size": 49
+},
+{
+"name": "?sub_4016B0@@YAHHD@Z",
+"rva": 5808,
+"size": 67
+},
+{
+"name": "?sub_401700@@YAHPAXHHH@Z",
+"rva": 5888,
+"size": 34
+},
+{
+"name": "?sub_401730@@YAPAEHPAE0PAGH@Z",
+"rva": 5936,
+"size": 114
+},
+{
+"name": "?sub_4017B0@@YADH_WD@Z",
+"rva": 6064,
+"size": 79
+},
+{
+"name": "?sub_401800@@YAHPAXHHHH@Z",
+"rva": 6144,
+"size": 41
+},
+{
+"name": "?sub_401830@@YAPA_WPADPA_W1D0I@Z",
+"rva": 6192,
+"size": 133
+},
+{
+"name": "?sub_4018C0@@YAPAXPAXD@Z",
+"rva": 6336,
+"size": 55
+},
+{
+"name": "?sub_401900@@YAHPAPAX@Z",
+"rva": 6400,
+"size": 50
+},
+{
+"name": "?sub_401A60@@YAPAKHHPAK@Z",
+"rva": 6752,
+"size": 46
+},
+{
+"name": "?sub_401A90@@YAXPAK@Z",
+"rva": 6800,
+"size": 124
+},
+{
+"name": "?sub_401B10@@YAPAPAXPAPAXD@Z",
+"rva": 6928,
+"size": 71
+},
+{
+"name": "?sub_401B80@@YAPAKPAKD@Z",
+"rva": 7040,
+"size": 40
+},
+{
+"name": "?sub_401E90@@YAHPAK@Z",
+"rva": 7824,
+"size": 15
+},
+{
+"name": "?sub_401EA0@@YAXPAX@Z",
+"rva": 7840,
+"size": 112
+},
+{
+"name": "?sub_401F10@@YGHH@Z",
+"rva": 7952,
+"size": 8
+},
+{
+"name": "?sub_401F20@@YAHXZ",
+"rva": 7968,
+"size": 6
+},
+{
+"name": "?sub_401F30@@YAHPAPAK@Z",
+"rva": 7984,
+"size": 44
+},
+{
+"name": "?sub_401F60@@YAHPAXHH@Z",
+"rva": 8032,
+"size": 22
+},
+{
+"name": "?sub_402120@@YAPAXPAXHH@Z",
+"rva": 8480,
+"size": 5
+},
+{
+"name": "?sub_402130@@YAHXZ",
+"rva": 8496,
+"size": 3
+},
+{
+"name": "?sub_4022D0@@YAXPAX@Z",
+"rva": 8912,
+"size": 102
+},
+{
+"name": "?sub_402550@@YAHHG@Z",
+"rva": 9552,
+"size": 93
+},
+{
+"name": "?sub_4025B0@@YAGH@Z",
+"rva": 9648,
+"size": 104
+},
+{
+"name": "?sub_402620@@YAPAHHPAHHHD@Z",
+"rva": 9760,
+"size": 363
+},
+{
+"name": "?sub_402790@@YAPAHHPAHHHHHHHD@Z",
+"rva": 10128,
+"size": 218
+},
+{
+"name": "?sub_4028A0@@YAPADPADD@Z",
+"rva": 10400,
+"size": 57
+},
+{
+"name": "?sub_4028E0@@YAPAHPAHD@Z",
+"rva": 10464,
+"size": 98
+},
+{
+"name": "?sub_402950@@YAPADPADD@Z",
+"rva": 10576,
+"size": 57
+},
+{
+"name": "?sub_402990@@YAPAXPAXD@Z",
+"rva": 10640,
+"size": 30
+},
+{
+"name": "?sub_4029F0@@YAPADPADD@Z",
+"rva": 10736,
+"size": 85
+},
+{
+"name": "?sub_402A50@@YAPAXPAXD@Z",
+"rva": 10832,
+"size": 30
+},
+{
+"name": "?sub_402B80@@YAXPAKDI@Z",
+"rva": 11136,
+"size": 74
+},
+{
+"name": "?sub_402BD0@@YAHH@Z",
+"rva": 11216,
+"size": 17
+},
+{
+"name": "?sub_402BF0@@YAHH@Z",
+"rva": 11248,
+"size": 17
+},
+{
+"name": "?sub_402E10@@YIPAXI@Z",
+"rva": 11792,
+"size": 81
+},
+{
+"name": "?sub_403050@@YAPAKPAKII@Z",
+"rva": 12368,
+"size": 131
+},
+{
+"name": "?sub_4031E0@@YGPAKPAK@Z",
+"rva": 12768,
+"size": 241
+},
+{
+"name": "?sub_403300@@YAPAEHII@Z",
+"rva": 13056,
+"size": 366
+},
+{
+"name": "?sub_4035D0@@YGPAXPAD@Z",
+"rva": 13776,
+"size": 85
+},
+{
+"name": "?sub_4036E0@@YAPAKIIPAK@Z",
+"rva": 14048,
+"size": 143
+},
+{
+"name": "?sub_4037D0@@YGPAGPAKIH@Z",
+"rva": 14288,
+"size": 374
+},
+{
+"name": "?sub_403950@@YAHPAH@Z",
+"rva": 14672,
+"size": 321
+},
+{
+"name": "?sub_404010@@YAPAXPAX0@Z",
+"rva": 16400,
+"size": 25
+},
+{
+"name": "?sub_404030@@YAHIPAKI@Z",
+"rva": 16432,
+"size": 105
+},
+{
+"name": "?sub_401000@@YAXPAX@Z",
+"rva": 4096,
+"size": 11
+},
+{
+"name": "?sub_401F80@@YAHPAPBXPADHH@Z",
+"rva": 8064,
+"size": 170
+},
+{
+"name": "?sub_402030@@YAHPAPBQAXPADH@Z",
+"rva": 8240,
+"size": 163
+},
+{
+"name": "?sub_4021F0@@YAHPAK@Z",
+"rva": 8688,
+"size": 129
+},
+{
+"name": "?sub_402340@@YAGHG@Z",
+"rva": 9024,
+"size": 515
+},
+{
+"name": "?sub_4029B0@@YAPAKPAKD@Z",
+"rva": 10672,
+"size": 53
+},
+{
+"name": "?sub_402A70@@YAHHPAKIPAD@Z",
+"rva": 10864,
+"size": 218
+},
+{
+"name": "?sub_402F70@@YIHHHPAEPAD@Z",
+"rva": 12144,
+"size": 214
+},
+{
+"name": "?sub_403630@@YAHPAXH@Z",
+"rva": 13872,
+"size": 175
+},
+{
+"name": "?sub_403770@@YAHHI@Z",
+"rva": 14192,
+"size": 92
+},
+{
+"name": "?sub_401040@@YGHHH@Z",
+"rva": 4160,
+"size": 106
+},
+{
+"name": "?sub_401230@@YAHHH@Z",
+"rva": 4656,
+"size": 113
+},
+{
+"name": "?sub_401380@@YAHHH@Z",
+"rva": 4992,
+"size": 40
+},
+{
+"name": "?sub_401B60@@YAPAKPAKPAX@Z",
+"rva": 7008,
+"size": 25
+},
+{
+"name": "?sub_401D80@@YAHHPAX@Z",
+"rva": 7552,
+"size": 57
+},
+{
+"name": "?sub_401DC0@@YAHHPAK@Z",
+"rva": 7616,
+"size": 37
+},
+{
+"name": "?sub_402B50@@YAHPAXPAD@Z",
+"rva": 11088,
+"size": 37
+},
+{
+"name": "?sub_403470@@YAHPAKHII@Z",
+"rva": 13424,
+"size": 166
+},
+{
+"name": "?sub_403520@@YAHPAEPAKI@Z",
+"rva": 13600,
+"size": 161
+},
+{
+"name": "?sub_401940@@YAXPAKDH@Z",
+"rva": 6464,
+"size": 286
+},
+{
+"name": "?sub_401E20@@YAHH@Z",
+"rva": 7712,
+"size": 86
+},
+{
+"name": "?sub_402C80@@YAHHH@Z",
+"rva": 11392,
+"size": 386
+},
+{
+"name": "?sub_402E70@@YAHHH@Z",
+"rva": 11888,
+"size": 134
+},
+{
+"name": "?sub_4030E0@@YAHPAH@Z",
+"rva": 12512,
+"size": 91
+},
+{
+"name": "?sub_403140@@YGPAKPAKH@Z",
+"rva": 12608,
+"size": 151
+},
+{
+"name": "?sub_402280@@YAHHH@Z",
+"rva": 8832,
+"size": 26
+},
+{
+"name": "?sub_402C10@@YGPAKPAKH@Z",
+"rva": 11280,
+"size": 106
+},
+{
+"name": "?sub_402F00@@YGHH@Z",
+"rva": 12032,
+"size": 112
+},
+{
+"name": "?sub_402150@@YGPAKPAK@Z",
+"rva": 8528,
+"size": 151
+}
+]

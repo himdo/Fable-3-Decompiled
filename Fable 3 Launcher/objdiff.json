@@ -1,0 +1,31 @@
+{
+  "$schema": "https://raw.githubusercontent.com/encounter/objdiff/main/config.schema.json",
+  "build_base": false,
+  "build_target": false,
+  "watch_patterns": [
+    "*.c",
+    "*.cc",
+    "*.cpp",
+    "*.h",
+    "*.hpp",
+    "*.rc",
+    "*.py"
+  ],
+  "ignore_patterns": [
+    "Release/**/*",
+    "Debug/**/*",
+    "orig/**/*",
+    "res/**/*",
+    "*.json"
+  ],
+  "units": [
+    {
+      "name": "main (obj)",
+      "target_path": "orig/main.obj",
+      "base_path": "Release/Win32/main_objdiff.obj",
+      "metadata": {
+        "source_path": "main.cpp"
+      }
+    }
+  ]
+}

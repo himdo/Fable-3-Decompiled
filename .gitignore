@@ -49,4 +49,7 @@ node_modules/
 # *.nam
 # *.til
 
+# Project exes that do not need to be committed
 *.dll
+*.exe
+*.txt

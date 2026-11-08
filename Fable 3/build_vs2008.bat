@@ -34,6 +34,8 @@ set "PATH=%V90BIN%;%PATH%"
 rem ---- compiler flags: Release x86, static CRT, LTCG, C++ ----
 rem /I ..\..  adds the project root so modules include each other root-relative
 set "CLFLAGS=/nologo /c /I ..\.. /O2 /Ob2 /Oi /DNDEBUG /DWIN32 /D_WINDOWS /W3 /EHsc /GS /MT /GL /Z7 /Fds"
+rem ---- objdiff base objects: same flags WITHOUT /GL (native machine code, not LTCG IR) ----
+set "CLFLAGS_NOGL=/nologo /c /I ..\.. /O2 /Ob2 /Oi /DNDEBUG /DWIN32 /D_WINDOWS /W3 /EHsc /GS /MT /Z7 /Fds"
 rem ---- linker flags: LTCG, GUI, x86, base 0x400000 ----
 set "LNKFLAGS=/nologo /LTCG /subsystem:windows /machine:x86 /base:0x400000 /DYNAMICBASE /NXCOMPAT"
 
@@ -124,8 +126,33 @@ if exist ..\..\patch_rsrc.py (
     if errorlevel 1 (echo PATCH FAILED & popd & popd & exit /b 1)
 )
 
+rem ---- objdiff base objects: a second, no-/GL compile of every source ----
+rem The /GL objects above hold MSObj (LTCG) IR, which objdiff cannot read. A
+rem parallel compile without /GL emits native machine-code objects (one per
+rem source) named <name>_objdiff.obj. The /GL objects (main.obj, ...) are
+rem left intact for the linker; these *_objdiff.obj are base objects only.
+echo.
+echo === cl, x86, no /GL (objdiff base objects) ===
+rem NOTE: %%~nG is expanded per-iteration (unlike a set var inside the loop body,
+rem which is expanded once at parse time), so /Fo gets the right name each pass.
+for %%F in (%SRCS%) do (
+    for %%G in ("%%F") do (
+        cl %CLFLAGS_NOGL% /Fo"%%~nG_objdiff.obj" "%%F"
+        if errorlevel 1 (echo OBJDIFF COMPILE FAILED: %%F & popd & popd & exit /b 1)
+    )
+)
+
 popd
 popd
+
+rem ---- objdiff config: build the synthesized target + objdiff.json ----
+if exist "%~dp0gen_objdiff.py" (
+    echo.
+    echo === gen objdiff.json ===
+    python "%~dp0gen_objdiff.py"
+    if errorlevel 1 (echo GEN OBJDIFF FAILED & exit /b 1)
+)
+
 echo.
 echo === BUILD OK: %~dp0%OUTREL%\Fable3.exe ===
 exit /b 0

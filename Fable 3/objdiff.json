@@ -1,0 +1,47 @@
+{
+  "$schema": "https://raw.githubusercontent.com/encounter/objdiff/main/config.schema.json",
+  "build_base": false,
+  "build_target": false,
+  "watch_patterns": [
+    "*.c",
+    "*.cc",
+    "*.cpp",
+    "*.h",
+    "*.hpp",
+    "*.rc",
+    "*.py"
+  ],
+  "ignore_patterns": [
+    "Release/**/*",
+    "Debug/**/*",
+    "orig/**/*",
+    "res/**/*",
+    "*.json"
+  ],
+  "units": [
+    {
+      "name": "gamemain",
+      "target_path": "orig/main.obj",
+      "base_path": "Release/Win32/gamemain_objdiff.obj",
+      "metadata": {
+        "source_path": "engine/gamemain.cpp"
+      }
+    },
+    {
+      "name": "gamethread",
+      "target_path": "orig/main.obj",
+      "base_path": "Release/Win32/gamethread_objdiff.obj",
+      "metadata": {
+        "source_path": "engine/gamethread.cpp"
+      }
+    },
+    {
+      "name": "worker",
+      "target_path": "orig/main.obj",
+      "base_path": "Release/Win32/worker_objdiff.obj",
+      "metadata": {
+        "source_path": "engine/worker.cpp"
+      }
+    }
+  ]
+}

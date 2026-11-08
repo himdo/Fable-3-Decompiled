@@ -1,0 +1,356 @@
+[
+{
+"name": "?sub_1A046D0@@YAPAUF3CsurfaceSlot@@PAU1@PBU1@H@Z",
+"rva": 23086800,
+"size": 141,
+"source": "gamemain"
+},
+{
+"name": "?sub_18D02E0@@YAHXZ",
+"rva": 21824224,
+"size": 120,
+"source": "gamemain"
+},
+{
+"name": "?sub_18DDDB0@@YAXXZ",
+"rva": 21880240,
+"size": 66,
+"source": "gamemain"
+},
+{
+"name": "?sub_18CB6A0@@YAXXZ",
+"rva": 21804704,
+"size": 719,
+"source": "gamemain"
+},
+{
+"name": "?sub_18F0460@@YANXZ",
+"rva": 21955680,
+"size": 80,
+"source": "gamemain"
+},
+{
+"name": "?sub_61C320@@YAXPAX@Z",
+"rva": 2212640,
+"size": 513,
+"source": "gamemain"
+},
+{
+"name": "?sub_6A69A0@@YAHH@Z",
+"rva": 2779552,
+"size": 4,
+"source": "gamemain"
+},
+{
+"name": "?sub_620F30@@YAXPAX@Z",
+"rva": 2232112,
+"size": 53,
+"source": "gamemain"
+},
+{
+"name": "?sub_719770@@YAXXZ",
+"rva": 3250032,
+"size": 651,
+"source": "gamemain"
+},
+{
+"name": "?sub_1801C20@@YAHXZ",
+"rva": 20978720,
+"size": 80,
+"source": "gamemain"
+},
+{
+"name": "?sub_4358A0@@YAXPAXPBD@Z",
+"rva": 219296,
+"size": 157,
+"source": "gamemain"
+},
+{
+"name": "?sub_1801580@@YAXPAX0@Z",
+"rva": 20977024,
+"size": 159,
+"source": "gamemain"
+},
+{
+"name": "?sub_762490@@YAPAXPAX0@Z",
+"rva": 3548304,
+"size": 102,
+"source": "gamemain"
+},
+{
+"name": "?sub_6234A0@@YAXPAX@Z",
+"rva": 2241696,
+"size": 211,
+"source": "gamemain"
+},
+{
+"name": "?sub_7672E0@@YAXPAX@Z",
+"rva": 3568352,
+"size": 12,
+"source": "gamemain"
+},
+{
+"name": "?sub_760FA0@@YAHPAX@Z",
+"rva": 3542944,
+"size": 4,
+"source": "gamemain"
+},
+{
+"name": "?sub_72EDF0@@YAXPAXH@Z",
+"rva": 3337712,
+"size": 122,
+"source": "gamemain"
+},
+{
+"name": "?sub_61A470@@YAXPAXH@Z",
+"rva": 2204784,
+"size": 353,
+"source": "gamemain"
+},
+{
+"name": "?sub_754DE0@@YAPAXPAX@Z",
+"rva": 3493344,
+"size": 722,
+"source": "gamemain"
+},
+{
+"name": "?sub_627690@@YAXPAX@Z",
+"rva": 2258576,
+"size": 651,
+"source": "gamemain"
+},
+{
+"name": "?sub_619990@@YAXXZ",
+"rva": 2202000,
+"size": 5,
+"source": "gamemain"
+},
+{
+"name": "?sub_6199A0@@YAXXZ",
+"rva": 2202016,
+"size": 5,
+"source": "gamemain"
+},
+{
+"name": "?sub_18FA3F0@@YAXXZ",
+"rva": 21996528,
+"size": 61,
+"source": "gamemain"
+},
+{
+"name": "?sub_741E50@@YAXH@Z",
+"rva": 3415632,
+"size": 203,
+"source": "gamemain"
+},
+{
+"name": "?sub_61A330@@YAXXZ",
+"rva": 2204464,
+"size": 215,
+"source": "gamemain"
+},
+{
+"name": "?sub_619DE0@@YAXXZ",
+"rva": 2203104,
+"size": 529,
+"source": "gamemain"
+},
+{
+"name": "?sub_6199C0@@YAXXZ",
+"rva": 2202048,
+"size": 161,
+"source": "gamemain"
+},
+{
+"name": "?sub_619A70@@YAXXZ",
+"rva": 2202224,
+"size": 31,
+"source": "gamemain"
+},
+{
+"name": "?sub_18F6C90@@YAXPAX0@Z",
+"rva": 21982352,
+"size": 13,
+"source": "gamemain"
+},
+{
+"name": "?sub_18F6C80@@YAXPAX0@Z",
+"rva": 21982336,
+"size": 13,
+"source": "gamemain"
+},
+{
+"name": "?sub_18F6C70@@YAXPAX0@Z",
+"rva": 21982320,
+"size": 13,
+"source": "gamemain"
+},
+{
+"name": "?sub_18F6C60@@YAXPAX0@Z",
+"rva": 21982304,
+"size": 13,
+"source": "gamemain"
+},
+{
+"name": "?sub_402F00@@YAXPAXPBDH@Z",
+"rva": 12032,
+"size": 214,
+"source": "gamemain"
+},
+{
+"name": "?sub_18013B0@@YAPAXPAX00@Z",
+"rva": 20976560,
+"size": 22,
+"source": "gamemain"
+},
+{
+"name": "?sub_18E8CD0@@YAXXZ",
+"rva": 21925072,
+"size": 97,
+"source": "gamemain"
+},
+{
+"name": "?sub_18E8960@@YAHHH@Z",
+"rva": 21924192,
+"size": 6,
+"source": "gamemain"
+},
+{
+"name": "?sub_18E8D50@@YAXPAXH@Z",
+"rva": 21925200,
+"size": 8,
+"source": "gamemain"
+},
+{
+"name": "?sub_18E7180@@YAXXZ",
+"rva": 21918080,
+"size": 8,
+"source": "gamemain"
+},
+{
+"name": "?sub_18E84C0@@YAXXZ",
+"rva": 21923008,
+"size": 52,
+"source": "gamemain"
+},
+{
+"name": "?sub_7330F0@@YAPAXPAX@Z",
+"rva": 3354864,
+"size": 104,
+"source": "gamemain"
+},
+{
+"name": "?sub_72FB30@@YAPAXPAX@Z",
+"rva": 3341104,
+"size": 85,
+"source": "gamemain"
+},
+{
+"name": "?sub_72FB10@@YAXPAX000@Z",
+"rva": 3341072,
+"size": 27,
+"source": "gamemain"
+},
+{
+"name": "?sub_70DDB0@@YAXH@Z",
+"rva": 3202480,
+"size": 267,
+"source": "gamemain"
+},
+{
+"name": "?sub_18F0180@@YAXXZ",
+"rva": 21954944,
+"size": 11,
+"source": "gamemain"
+},
+{
+"name": "?sub_72FAE0@@YAXPAX@Z",
+"rva": 3341024,
+"size": 8,
+"source": "gamemain"
+},
+{
+"name": "?sub_61BFE0@@YAXPAXH@Z",
+"rva": 2211808,
+"size": 153,
+"source": "gamemain"
+},
+{
+"name": "?sub_61A5E0@@YAXPAX@Z",
+"rva": 2205152,
+"size": 470,
+"source": "gamemain"
+},
+{
+"name": "?sub_731B80@@YAPAXPAX@Z",
+"rva": 3349376,
+"size": 25,
+"source": "gamemain"
+},
+{
+"name": "?sub_712430@@YAPAXPAX@Z",
+"rva": 3220528,
+"size": 63,
+"source": "gamemain"
+},
+{
+"name": "?sub_18FB930@@YAXXZ",
+"rva": 22001968,
+"size": 124,
+"source": "gamemain"
+},
+{
+"name": "?sub_718C50@@YAXXZ",
+"rva": 3247184,
+"size": 10,
+"source": "gamethread"
+},
+{
+"name": "?sub_1926120@@YAHXZ",
+"rva": 22176032,
+"size": 5,
+"source": "gamethread"
+},
+{
+"name": "?sub_6AA2C0@@YAXPAX@Z",
+"rva": 2794176,
+"size": 44,
+"source": "gamethread"
+},
+{
+"name": "?sub_6281B0@@YAXH@Z",
+"rva": 2261424,
+"size": 5,
+"source": "gamethread"
+},
+{
+"name": "?sub_717AB0@@YAXXZ",
+"rva": 3242672,
+"size": 55,
+"source": "gamethread"
+},
+{
+"name": "?sub_72F8E0@@YAHPAX@Z",
+"rva": 3340512,
+"size": 10,
+"source": "gamethread"
+},
+{
+"name": "?sub_72F7E0@@YAXPAX@Z",
+"rva": 3340256,
+"size": 8,
+"source": "gamethread"
+},
+{
+"name": "?sub_72F7D0@@YAXPAX@Z",
+"rva": 3340240,
+"size": 5,
+"source": "gamethread"
+},
+{
+"name": "?sub_18F0850@@YAHXZ",
+"rva": 21956688,
+"size": 119,
+"source": "worker"
+}
+]
