@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include "gamemain.h"
 #include "common/common.h"        // LHAlloc / LHFree / InitSharedSlot / ReleaseSharedSlot
+#include "gameengine.h"           // GetGameEngine (sub_619A90)
 #include "manager.h"              // GetManager
 #include "netinit.h"              // InitNetworking
 #include "save/save.h"            // SetSaveGamePath (the shared-slot string setter)
@@ -5218,7 +5219,35 @@ static int CreateHeapManager(int flag)
     return r;
 }
 static void  nullsub_7(void) {}
-static void  sub_620F30(void *obj) { (void)obj; }
+// ============================================================
+//  CGameEngineClearNodeList  (0x620F30 - 0x620F65)  -- clear the
+//  CGameEngine's main node list
+//  [NOT byte-identical] placement-dependent (relative E8 call to LHFree).
+//
+//  void *CGameEngineClearNodeList(void *obj)   -- thiscall: obj in ECX
+//
+//  Resets the engine object's main node list (head block at +0x14, node
+//  count at +0x18) to empty: captures the first node, re-links the
+//  sentinel (head.next = head.prev = head), zeroes the count, then
+//  LHFrees every list node in the cycle (the sentinel itself is kept).
+//  Returns the sentinel (the caller discards it).
+// ============================================================
+static void *CGameEngineClearNodeList(void *obj)
+{
+    char *base = (char *)obj;
+    void *head = *(void **)(base + 0x14);
+    void *node = *(void **)head;
+    *(void **)head               = head;
+    *(void **)((char *)head + 4) = head;
+    *(void **)(base + 0x18) = 0;
+    while (node != head)
+    {
+        void *next = *(void **)node;
+        LHFree(node);
+        node = next;
+    }
+    return head;
+}
 // ============================================================
 //  SortedMapHeadInit  (0x579280 - 0x5792C4)  -- initialize the embedded
 //  sorted node list of a sorted-map object (head node at obj+0x18, node
@@ -5559,8 +5588,1047 @@ void CSortedMapDtor(void *obj)
     SortedMapTreeDestroy(obj);
     LHFree(*(void **)m);
 }
-static void  sub_719770(void) {}
-static int   sub_1801C20(void) { return 0; }
+// ============================================================
+//  InitLipCultures  (sub_719770, 0x719770 - 0x7199FB)  -- the lip-sync
+//  culture / component system init, called once by RunFrontEnd right after
+//  the engine member 0x98 sorted map is built.
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  SetSharedSlot / MakeSettingsFilePath / GetSlotString /
+//  ReleaseSharedSlot / LHAlloc / LHFree / memset / GetGameEngine / the
+//  remaining lip-culture stubs) and refs the culture global cluster
+//  (0x1DC2744 .. 0x1DC2804) and the "cultures_win32.txt" / "\\cultures.txt"
+//  / "text" / "\\" rdata strings at their original high VAs.
+//
+//  long InitLipCultures(void)   -- original: cdecl, plain `retn`
+//
+//  1. Touches the current game engine (GetGameEngine, sub_619A90, result
+//     discarded), publishes the LHAlloc / LHFree pair into the heap-function
+//     globals (dword_1DC2808 / 0x1DC280C; the original stores offsets of the
+//     j_LHAlloc_1 / j_LHFree_3 jump thunks that forward to LHAlloc / LHFree),
+//     releases the leftover "lip%u" strings (ReleaseLipCultures), installs the pair
+//     with the lip library (SetLipMemAllocators, dword_1E2C6FC / 0x1E2C700), and
+//     lazily initializes the lip runtime (InitLipRuntime, sub_17CA130).
+//  2. Loads the culture list file: settings-path base slot (dword_1DC2744)
+//     + "\" via MakeSettingsFilePath, concatenated with the
+//     "cultures_win32.txt" name slot (sub_1A02260 = the 2-source path concat
+//     over a fresh slot), loaded through sub_17CC7C0 (XLipCultures file
+//     load); on failure retries with "\\cultures.txt" (each failure touches
+//     GetLastError, as the original does through its EDX IAT slot).
+//  3. Registers the base path as the default lip component (CreateLipFSRoot,
+//     sub_17BEE80) and
+//     the seven {name, .., resolved path} component slots (dword_1DC2748,
+//     five DWORDs per slot) through RegisterLipComponent, runs the
+//     component bring-up
+//     (sub_17BF770), then resolves each slot's relative path into its +0x0C
+//     slot (sub_717D60).
+//  4. Rebuilds the culture-string array: frees the old block
+//     (dword_1DC27EC), count = sub_17C0610(0) (dword_1DC27F0),
+//     LHAlloc(96 * count, the original's `mul` overflow folds to -1), then
+//     per 96-byte entry fills the 85-byte name (sub_17C0680), the culture id
+//     (sub_17CC320) at +88, and records the "text" culture index in
+//     dword_1DC27F4. (With the count-0 stub sub_17C0610 the per-entry loop
+//     is dead in this build.)
+//  5. Zeros byte_1DC2804, registers the speech / lipsync banks
+//     (sub_718690), and releases the two scratch slots (the final release
+//     result is the return value).
+// ============================================================
+
+// 0x1DC2744 -- the culture-path base shared slot (the settings directory).
+static DWORD g_dword_1DC2744 = 0;
+// 0x1DC2748 -- the seven lip component slots, five DWORDs each (the +0 slot
+// is the component name, the +0x0C slot receives the resolved path).
+static DWORD g_dword_1DC2748[35] = { 0 };
+// 0x1DC27EC -- the 96-byte-per-entry culture name array (LHAlloc'd).
+static DWORD g_dword_1DC27EC = 0;
+// 0x1DC27F0 -- the culture count.
+static DWORD g_dword_1DC27F0 = 0;
+// 0x1DC27F4 -- the "text" culture index.
+static DWORD g_dword_1DC27F4 = 0;
+// 0x1DC27F8 -- the count of registered "lip%u" culture file entries (only
+// ReleaseLipCultures (sub_718140) touches it; it image-initializes to 0 and
+// the lip library bumps it as it registers the "lip%u" file names).
+static DWORD g_dword_1DC27F8 = 0;
+// 0x1DC2808 / 0x1DC280C -- the heap function pointers (LHAlloc / LHFree;
+// the original stores the j_LHAlloc_1 / j_LHFree_3 thunks).
+static DWORD g_dword_1DC2808 = 0;
+static DWORD g_dword_1DC280C = 0;
+// 0x1DC2804 -- the lip runtime "initialized" flag byte (zeroed by
+// InitLipCultures; sub_17CA130's byte_1E2C6B4 is the counterpart in the
+// lip-library module).
+static BYTE  g_byte_1DC2804 = 0;
+
+// Remaining lip-library / lip-culture stubs (all in the 0x17Bxxx-0x17Dxxx
+// lip-module range; the deep XLipComponent / XLipCultures internals are out
+// of scope, so each degrades to its observable no-op / failure path):
+
+// GetFileSubsystem (sub_1801C20, defined below in the file-subsystem
+// cluster) is used by ReleaseLipCultures before its definition.
+static void *GetFileSubsystem(void *obj);
+
+// ============================================================
+//  F3AString -- the 28-byte front-end ANSI string (the sub_402F00 family,
+//  the MSVC basic_string<char, 16-byte-SSO> layout) that ReleaseLipCultures
+//  builds on the stack to name each "lip%u" entry:
+//    +0    d0 (untouched by assign / dtor)
+//    +4    SSO buffer (16 chars) / heap pointer
+//    +20   char length
+//    +24   capacity ( < 16 => SSO )
+// ============================================================
+typedef struct F3AString
+{
+    DWORD   d0;
+    union { char buf[16]; DWORD ptr; } u;
+    DWORD   len;
+    DWORD   cap;
+} F3AString;
+
+// default SSO ctor (the original zeroes the capacity, length and buffer[0],
+// leaving d0 as-is): cap = 15, len = 0, buffer[0] = 0.
+static void F3AStringReset(F3AString *s)
+{
+    s->cap = 15;
+    s->len = 0;
+    s->u.buf[0] = 0;
+}
+
+// sub_402F00 (0x402F00 - 0x402F70) -- basic_string<char>::assign(src, len):
+// thiscall, returns the string.  "lip%u" is always short (< 16 chars) so the
+// SSO path is taken (no heap buffer); the general heap-growth path is
+// mirrored for completeness.
+static F3AString *F3AStringAssign(F3AString *s, const char *src, unsigned int len)
+{
+    if (src == 0)
+        return s;                       // (Source == null path)
+    if (len > 15) {
+        s->u.ptr = (DWORD)LHAlloc(len + 1);
+        s->cap = len + 1;
+    } else
+        s->cap = 15;
+    char *dst = (s->cap < 16) ? s->u.buf : (char *)s->u.ptr;
+    for (unsigned int i = 0; i < len; i++)
+        dst[i] = src[i];
+    dst[len] = 0;
+    s->len = len;
+    return s;
+}
+
+// the "if (cap >= 16) LHFree(heap ptr)" dtor idiom.
+static void F3AStringFree(F3AString *s)
+{
+    if (s->cap >= 0x10)
+        LHFree((void *)s->u.ptr);
+}
+
+// sub_1801700 (0x1801700 - 0x18017B0) -- the file-subsystem collection's
+// "erase by name" method: thiscall + `retn 4` (the collection fs in ECX, the
+// F3AString key on the stack).  Looks the name up (sub_1802EC0) and, when
+// found, erases the entry and releases the held handle.  The erase body is
+// unimplemented in this build, so it degrades to a safe no-op (the
+// collection g_fileSubsys is constructed by GetFileSubsystem but no entries
+// are ever registered into it here).
+static void FileSubsysErase(void *fs, F3AString *name)
+{
+    (void)fs; (void)name;
+}
+
+// ============================================================
+//  ReleaseLipCultures  (sub_718140, 0x718140 - 0x7181EC)  -- release the
+//  leftover "lip%u" culture file entries (the dword_1DC27F8 count), called
+//  at the start of InitLipCultures and by the lip-teardown drivers to drop
+//  the "lip0" .. "lip(N-1)" names from the file subsystem before the culture
+//  set is rebuilt.
+//  [NOT byte-identical] placement-dependent (relative calls to sprintf_s /
+//  sub_402F00 / sub_1801C20 / sub_1801700 / LHFree / __security_check_cookie)
+//  and refs the high-VA counter global dword_1DC27F8 (0x01DC27F8) and the
+//  "lip%u" rdata format string at its original VA.
+//
+//  int ReleaseLipCultures(void)   -- original: cdecl, plain `retn`
+//
+//  For i = count down to 1 (count = dword_1DC27F8):
+//    1. Build the 28-byte stack F3AString (default SSO ctor).
+//    2. sprintf_s(Buffer, 10, "lip%u", i) and assign it (sub_402F00, SSO).
+//    3. fs = GetFileSubsystem(&str) (sub_1801C20 -> &g_fileSubsys).
+//    4. FileSubsysErase(fs, &str) (sub_1801700, thiscall + retn 4).
+//    5. Free the string's heap buffer (dead while cap < 16, i.e. always).
+//    6. Decrement the counter.
+//  Returns the final counter value (0 once the loop drains it).
+// ============================================================
+static int ReleaseLipCultures(void)
+{
+    char Buffer[12];                    // sprintf_s scratch (BufferCount = 10)
+    int count = (int)g_dword_1DC27F8;
+    while (count > 0)
+    {
+        F3AString str;
+        F3AStringReset(&str);           // default SSO ctor
+        sprintf_s(Buffer, 10, "lip%u", (unsigned)count);
+        F3AStringAssign(&str, Buffer, (unsigned int)strlen(Buffer));  // sub_402F00
+        void *fs = GetFileSubsystem(&str);             // sub_1801C20
+        FileSubsysErase(fs, &str);                     // sub_1801700
+        F3AStringFree(&str);                           // string dtor
+        --count;
+        g_dword_1DC27F8 = (DWORD)count;
+    }
+    return (int)g_dword_1DC27F8;
+}
+// 0x1E2C6FC / 0x1E2C700 -- the XLipMem custom heap-function pointers, set by
+// SetLipMemAllocators (sub_17D0330) from the LHAlloc / LHFree pair and read
+// by the lip-mem alloc (sub_17D0350) / free (sub_17D0440) before their
+// malloc / free fallbacks.
+static DWORD g_dword_1E2C6FC = 0;
+static DWORD g_dword_1E2C700 = 0;
+
+//  SetLipMemAllocators  (0x17D0330 - 0x17D0346)  -- install the XLipMem
+//  alloc / free function pair and return the alloc pointer.  The lip-mem
+//  alloc (sub_17D0350) / free (sub_17D0440) dispatch through these before
+//  falling back to malloc / free; InitLipCultures installs the LHAlloc /
+//  LHFree pair.  cdecl, two DWORDs, returns a1.
+//  [NOT byte-identical] placement-dependent: the original stores through
+//  the absolute data addresses 0x1E2C6FC / 0x1E2C700 (A3 / 89 0D), which in
+//  this build are the static g_dword_1E2C6FC / g_dword_1E2C700 globals at
+//  linker-assigned addresses (deferred PE placement).
+static int SetLipMemAllocators(int allocFn, int freeFn)
+{
+    g_dword_1E2C6FC = (DWORD)allocFn;
+    g_dword_1E2C700 = (DWORD)freeFn;
+    return allocFn;
+}
+// ============================================================
+//  0x1BC1D48 -- the rdata default table handed to the lip-culture params
+//  object's ctor: two zero DWORDs (an empty wide string); "Parameter
+//  can't be NULL" and the XLipCultures.cpp assert format strings follow at
+//  +8 in the original image.
+static const DWORD g_unk_1BC1D48[2] = { 0, 0 };
+// 0x1E2C6B4 -- the lip-runtime "initialized" flag byte (set by
+// InitLipRuntime, sub_17CA130; cleared by the lip-runtime release
+// sub_17CA260; read as the init gate by the whole 0x17Bxxx-0x17Dxxx lip
+// library).  Note: distinct from the engine-side g_byte_1DC2804 flag.
+static BYTE g_byte_1E2C6B4 = 0;
+// 0x1E2C6D0 -- the 32-byte XLipCultures default-params object (LHAlloc'd by
+// InitLipRuntime; 0 until it is).
+static DWORD g_dword_1E2C6D0 = 0;
+
+// sub_17D0350 (0x17D0350 - 0x17D043D) -- the XLipMem allocator
+// (XLipMem.cpp): the embedded scratch pool (dword_1E2C6F0 / 0x1E2C6F4 /
+// 0x1E2C6F8 -- image-initializes to 0 and is never armed in this build),
+// then the alloc function installed by SetLipMemAllocators (dword_1E2C6FC,
+// LHAlloc), then the malloc fallback.  The on-failure dispatch switches on
+// the first culture-class id (1 = DebugBreak, 2 = assert, 3 = throw
+// "Memory allocation failed!"); id 0 (the value in this build) is a no-op,
+// and the failure is only reachable if the installed allocator / malloc
+// return null.
+//  [NOT byte-identical] placement-dependent (relative calls through the
+//  absolute function-pointer globals + the IAT slots _malloc_1 /
+//  __imp_DebugBreak / __CxxThrowException) and refs the high-VA globals
+//  dword_1E2C6F0..0x1E2C6FC at their original VAs.
+static void *LipMemAlloc(unsigned int size)
+{
+    void *p = 0;
+    if (g_dword_1E2C6FC != 0)
+        p = ((void *(*)(unsigned int))(size_t)g_dword_1E2C6FC)(size);
+    else
+        p = malloc(size);
+    if (p == 0)
+        F3InvalidParam();             // the failure dispatch (id 0 -> no-op)
+    return p;
+}
+// sub_17D0440 (0x17D0440 - 0x17D049A) -- the XLipMem free (XLipMem.cpp):
+// null block is an assert (no-op here); the scratch-pool path is dead; then
+// the free function installed at dword_1E2C700 (LHFree) with the free()
+// fallback.
+//  [NOT byte-identical] placement-dependent (the relative call through the
+//  absolute function-pointer globals + the _free IAT slot) and refs the
+//  high-VA globals dword_1E2C700 / 0x1E2C6F0 at their original VAs.
+static void LipMemFree(void *p)
+{
+    if (p == 0) { F3InvalidParam(); return; }   // (the assert path, no-op)
+    if (g_dword_1E2C700 != 0)
+        ((void (*)(void *))(size_t)g_dword_1E2C700)(p);
+    else
+        free(p);
+}
+
+// The 24-byte lip DWORD vector (the MSVC STL vector<T> over the XLipMem
+// allocator): three leading allocator-wrapper DWORDs (zero image-
+// initialized), then begin / end / alloc-end.  Size = (end - begin) / 4.
+typedef struct LipDwordVec
+{
+    DWORD   alloc0;          // +0x00 allocator wrapper (zero)
+    DWORD   alloc1;          // +0x04
+    DWORD   alloc2;          // +0x08
+    DWORD  *begin;           // +0x0C
+    DWORD  *end;             // +0x10
+    DWORD  *allocEnd;        // +0x14
+} LipDwordVec;
+// 0x1E2C6B8 -- the global culture-class-id vector (built to {0, 2, 3, 6,
+// 15, 5} by InitLipRuntime; read by the lip-component / lip-mem module).
+static LipDwordVec g_unk_1E2C6B8 = { 0, 0, 0, NULL, NULL, NULL };
+
+// sub_17C2B10 (0x17C2B10 - 0x17C2B2A) -- the vector size: (end - begin) / 4.
+static unsigned int LipDwordVecSize(const LipDwordVec *v)
+{
+    return (unsigned int)((char *)v->end - (char *)v->begin) >> 2;
+}
+// sub_17CA660 (0x17CA660 - 0x17CA71D) -- vector resize to `n` elements,
+// default-filling the new elements (thiscall): the grow path (sub_17CA8C0)
+// allocates a fresh buffer through the lip allocator (sub_17CAE20 =
+// LipMemAlloc(4 * newCap), newCap = max(oldCap + oldCap/2, size + add),
+// the std::length_error overflow guard against the allocator's max_size is
+// dead), moves the old elements (sub_17CAD30), default-fills the added ones
+// (sub_17CAD60), and frees the old buffer (sub_17CAE40 = LipMemFree); the
+// shrink path (sub_17CA820) compacts the last `n` elements to the front.
+//  [NOT byte-identical] placement-dependent (relative calls to the lip
+//  allocator / memmove / length_error throw helpers) and refs the
+//  high-VA vector global 0x1E2C6B8.
+static void LipDwordVecResize(LipDwordVec *v, unsigned int n, DWORD fill)
+{
+    unsigned int old = LipDwordVecSize(v);
+    if (n <= old)
+    {
+        for (unsigned int i = 0; i < n; i++)
+            v->begin[i] = v->begin[old - n + i];
+        v->end = v->begin + n;
+        return;
+    }
+    unsigned int cap = (unsigned int)((char *)v->allocEnd - (char *)v->begin) >> 2;
+    unsigned int newCap = cap + (cap >> 1);
+    if (newCap < old + (n - old))
+        newCap = n;
+    DWORD *nb = (DWORD *)LipMemAlloc(4 * newCap);
+    for (unsigned int i = 0; i < old; i++)
+        nb[i] = v->begin[i];
+    for (unsigned int i = old; i < n; i++)
+        nb[i] = fill;
+    if (v->begin != 0)
+        LipMemFree(v->begin);
+    v->begin = nb;
+    v->end = nb + n;
+    v->allocEnd = nb + newCap;
+}
+// sub_17C1D70 (0x17C1D70 - 0x17C1D9F) -- vector element pointer (thiscall):
+// __invalid_parameter_noinfo() when index >= size, else begin + index.
+static DWORD *LipDwordVecAt(LipDwordVec *v, unsigned int index)
+{
+    if (index >= LipDwordVecSize(v))
+    {
+        F3InvalidParam();             // original: _invalid_parameter_noinfo
+        return 0;
+    }
+    return v->begin + index;
+}
+// sub_17CB6F0 (0x17CB6F0 - 0x17CB717) -- the 32-byte XLipCultures params
+// object ctor (thiscall + `retn 8`): runs sub_17B8EF0, which touches an MSVC
+// runtime debug flag, resets the object's 28-byte string to the 16-byte SSO
+// (capacity 15, length 0 -- sub_17B9270) and assigns it from `src` (sub_17B9240
+// via the string-length + assign helpers).  Against the rdata default table
+// (g_unk_1BC1D48, 8 zero bytes = an empty wide string) the assign copies
+// nothing, so the object ends with the empty-SSO string; then the culture
+// count WORD at +0x1C is set to `count`.  Returns the object.  Layout:
+// +0x00 d0 (untouched), +0x04 SSO buffer / heap ptr, +0x14 length, +0x18
+// capacity, +0x1C culture count (WORD; compared against a freshly loaded
+// culture file's count in sub_17CC7C0).
+static DWORD *LipCultureParamsCtor(DWORD *obj, const DWORD *defaultTable, unsigned short count)
+{
+    (void)defaultTable;
+    obj[1] = 0;                        // SSO buffer / heap ptr (+0x04), empty
+    obj[5] = 0;                        // string length (+0x14)
+    obj[6] = 15;                       // string capacity = 15 (SSO) (+0x18)
+    *(unsigned short *)&obj[7] = count;    // culture count (+0x1C)
+    return obj;
+}
+
+// ============================================================
+//  InitLipRuntime  (sub_17CA130, 0x17CA130 - 0x17CA256)  -- the lazy lip
+//  culture runtime init (XLipCultures.cpp), called once from
+//  InitLipCultures (sub_719770) after the LHAlloc / LHFree pair is
+//  installed with the lip library (SetLipMemAllocators).
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  LipCultureParamsCtor / LipDwordVecResize / LipDwordVecAt, the IAT / jump
+//  thunks __imp_SetLastError / j_LHAlloc, and the SEH
+//  ___CxxFrameHandler3_0 landing pad) and refs the high-VA globals
+//  byte_1E2C6B4 (0x01E2C6B4), unk_1E2C6B8 (0x01E2C6B8) and dword_1E2C6D0
+//  (0x01E2C6D0) plus the rdata table 0x1BC1D48 at their original VAs.
+//
+//  void InitLipRuntime(void)   -- original: cdecl, plain `retn`
+//
+//  Gated by the init flag byte_1E2C6B4: on re-entry it sets the last error
+//  to 0x4DF (1247) and returns.  First call:
+//    1. SetLastError(0).
+//    2. LHAlloc's the 32-byte default-params object and constructs it from
+//       the rdata table g_unk_1BC1D48 with culture count 0 (0 on allocation
+//       failure), publishing it into dword_1E2C6D0.
+//    3. Resizes the culture-class-id vector unk_1E2C6B8 to 6 elements
+//       (LipDwordVecResize, through the lip allocator) and stores the six
+//       class ids {0, 2, 3, 6, 15, 5} into indices 0..5 (LipDwordVecAt).
+//    4. Sets byte_1E2C6B4 = 1.
+//  The original wraps the body in an SEH frame whose handler frees the
+//  32-byte block (allocator table +16 slot, sub_401090) if the body throws
+//  (e.g. std::length_error from the vector grow); that path is unreachable
+//  in this build (the lip allocator only ever returns null, never throws).
+// ============================================================
+static void InitLipRuntime(void)
+{
+    if (g_byte_1E2C6B4 == 1)
+    {
+        SetLastError(0x4DF);          // already initialized
+        return;
+    }
+    SetLastError(0);
+    DWORD *block = (DWORD *)LHAlloc(32);
+    DWORD *params = (block != 0) ? LipCultureParamsCtor(block, g_unk_1BC1D48, 0) : 0;
+    g_dword_1E2C6D0 = (DWORD)params;
+    LipDwordVecResize(&g_unk_1E2C6B8, 6, 0);
+    *LipDwordVecAt(&g_unk_1E2C6B8, 0) = 0;
+    *LipDwordVecAt(&g_unk_1E2C6B8, 1) = 2;
+    *LipDwordVecAt(&g_unk_1E2C6B8, 2) = 3;
+    *LipDwordVecAt(&g_unk_1E2C6B8, 3) = 6;
+    *LipDwordVecAt(&g_unk_1E2C6B8, 4) = 15;
+    *LipDwordVecAt(&g_unk_1E2C6B8, 5) = 5;
+    g_byte_1E2C6B4 = 1;
+}
+// sub_1A02260 (0x1A02260 - 0x1A02292) -- the 2-source shared-slot path
+// concat: zero dst, ref (CopySharedSlot) src1, append src2 (sub_1A01940);
+// returns the dst slot address.
+static int * sub_1A02260(int *a1, int *a2, const char ***a3)
+{ (void)a2; (void)a3; *a1 = 0; return a1; }
+// sub_17CC7C0 (0x17CC7C0 - 0x17CC931) -- XLipCultures load-from-file
+// (the cultures_win32.txt / cultures.txt parser); unimplemented stub
+// degrades to the failure path (-1, as with a missing file).
+static int   sub_17CC7C0(const char *fileName) { (void)fileName; return -1; }
+// sub_17D04A0 (0x17D04A0 - 0x17D056F) -- the lip library's assert report
+// (XLipCultures.cpp): formats "Assert failed. File: %s. Line: %d. Condition:
+// %s", reports it (sub_17D0610), then DebugBreak (class id 1) or throws
+// "XLipAssert hit!" (id 3) per the first culture-class id (LipDwordVecAt
+// (dword_1E2C6B8, 0)).  Class id 0 (the value InitLipRuntime installs) is
+// report-only, so every lip assert in this build degrades to this no-op.
+static void XLipAssert(const char *condition) { (void)condition; }
+
+// sub_17C47E0 (0x17C47E0 - 0x17C4842) -- delete the char at `pos` out of the
+// `size`-char string at `base`: memmove_s the tail (size - offset) bytes one
+// slot left (a zeroed terminator when pos is the last char), returning the
+// base (0 on a memmove_s failure).  The return value is discarded by the
+// only caller.
+static void LipPathRemoveChar(char *base, int size, char *pos)
+{
+    int srcSize = size - (int)(pos - base);
+    if (srcSize != 0)
+        (void)memmove_s(pos, srcSize + 1, pos + 1, srcSize);
+    else
+        *pos = 0;
+}
+
+// ============================================================
+//  NormalizeLipPath  (sub_17C08D0, 0x17C08D0 - 0x17C0A0C)  -- in-place lip
+//  path normalization (XLipComponent.cpp), used by CreateLipFSRoot before
+//  the XLipFSRoot is constructed.
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  XLipAssert / _strlen / __strlwr_s / j__strstr / LipPathRemoveChar /
+//  j__strchr / the __security_check_cookie landing pad).
+//
+//  void *NormalizeLipPath(char *path)   -- original: cdecl, plain `retn`
+//
+//  Asserts pszPath != NULL (line 784) and cchPath > 0 (line 788),
+//  lower-cases the string in place (_strlwr_s), skips past a "X:\" drive
+//  prefix, then walks the rest: every run of consecutive backslashes is
+//  deleted in place (LipPathRemoveChar, the length tracked down), a single
+//  backslash is kept and skipped over, until the terminator.  A trailing
+//  backslash is stripped (set to 0).
+// ============================================================
+static void *NormalizeLipPath(char *path)
+{
+    if (path == NULL)
+        XLipAssert("pszPath");                    // line 784
+    int len = (int)strlen(path);
+    if (len <= 0)
+        XLipAssert("cchPath > 0");                // line 788
+    _strlwr_s(path, (unsigned)(len + 1));
+    char *walk = strstr(path, ":\\");
+    walk = (walk != NULL) ? walk + 2 : path;
+    char *result = walk;
+    while (walk != NULL)
+    {
+        result = walk;
+        if (*walk == 0)
+            break;
+        if (*walk == '\\')
+        {
+            while (*walk == '\\')
+            {
+                LipPathRemoveChar(path, len, walk);
+                --len;
+            }
+            ++walk;
+        }
+        else
+        {
+            result = strchr(walk, '\\');
+            walk = result;
+            if (result != NULL)
+                ++walk;
+        }
+    }
+    if (path[len - 1] == '\\')
+    {
+        --len;
+        path[len] = 0;
+    }
+    return result;
+}
+
+// ============================================================
+//  XLipFSRoot -- the 0x110-byte lip file-system root object
+//  (XLipComponent.cpp):
+//    +0x00  vtable (XLipFSRoot::`vftable', 0x1BC446C)
+//    +0x04  "XLIPFSRT" tag (8 bytes)
+//    +0x0C  path (char[0x104])
+// ============================================================
+typedef struct XLipFSRoot
+{
+    void   *vtable;             // +0x00
+    char    tag[8];             // +0x04 "XLIPFSRT"
+    char    path[0x104];        // +0x0C
+} XLipFSRoot;
+// a vtable slot (thiscall, one stack arg).
+typedef void (__thiscall *XLipFSRootVfn)(void *obj, int arg);
+
+static void *GetXLipFSRootVtable(void);
+
+// sub_17D1A10 (0x17D1A10 - 0x17D1A3C) -- the XLipFSRoot deleting destructor
+// (vtable slot 7; thiscall + `retn 4`, the freeIt flag on the stack): the
+// dtor body (sub_17D1A40, re-stores the XLipFSRoot vtable) runs, then
+// LipMemFree (via sub_17D1860) frees the block when freeIt & 1, and the
+// object is returned.
+//  [NOT byte-identical] placement-dependent (relative call to LipMemFree).
+//  __declspec(naked) so it matches the original's thiscall + `retn 4` frame
+//  when dispatched through the vtable slot.
+static __declspec(naked) void *XLipFSRootDtor(void *obj, char freeIt)
+{
+    __asm
+    {
+        push  ecx                            ; stack: [esp]=obj, [esp+4]=freeIt
+        call  GetXLipFSRootVtable            ; [esp]=ret, [esp+4]=obj, [esp+8]=freeIt
+        mov   ecx, [esp + 4]                 ; obj
+        mov   [ecx], eax                     ; dtor body (sub_17D1A40): obj+0 <- vtable
+        mov   eax, [esp + 8]                 ; freeIt
+        and   eax, 1
+        test  eax, eax
+        jz    L_xlipfsrootdtor_skip
+        push  ecx                            ; obj
+        call  LipMemFree
+        add   esp, 4
+L_xlipfsrootdtor_skip:
+        pop   ecx
+        ret   4
+    }
+}
+
+// XLipFSRoot::`vftable' (0x1BC446C, 8 slots).  Slot 7 is the deleting
+// destructor (sub_17D1A10); slots 0..6 (the IXLipRoot overrides,
+// sub_17D0930 .. sub_17D16F0) are unimplemented and never dispatched in
+// this build, so they are zero placeholders.
+static void *g_XLipFSRootVtable[8] = { 0, 0, 0, 0, 0, 0, 0, (void *)XLipFSRootDtor };
+static void *GetXLipFSRootVtable(void) { return g_XLipFSRootVtable; }
+
+// sub_17D08C0 (0x17D08C0 - 0x17D090C) -- the XLipFSRoot ctor (thiscall +
+// `retn 4`, Source on the stack): the IXLipRoot base ctor (sub_17D18A0,
+// overwritten immediately), the path copy (sub_62A3D0 = strcpy_s(dst, 0x104,
+// src)) into +0x0C, and the "XLIPFSRT" tag memcpy_s into +0x04.
+// Returns the object.
+static XLipFSRoot *XLipFSRootCtor(XLipFSRoot *obj, const char *source)
+{
+    obj->vtable = g_XLipFSRootVtable;
+    strcpy_s(obj->path, 0x104, source);
+    memcpy_s(obj->tag, 8, "XLIPFSRT", 8);
+    return obj;
+}
+
+// sub_17BF110 (0x17BF110 - 0x17BF32D) -- [STUB] bring up the XLipFSRoot:
+// the root query (sub_17C0A10), the virtual slot 5 (sub_17D1680), the
+// culture-class registration (sub_17C13C0 / sub_17C1250 over the class-id
+// vector element 2), the path build (module / culture directory + "\"), and
+// the culture-file load (sub_17CC7C0): 1 on success (including a missing
+// file, ERROR_FILE_NOT_FOUND 2 / ERROR_PATH_NOT_FOUND 3), 0 otherwise.
+// Unimplemented in this build; it degrades to the failure path (return 0),
+// so the caller tears the root down through vtable slot 7.
+static int InitLipFSRoot(void *root) { (void)root; return 0; }
+
+// ============================================================
+//  CreateLipFSRoot  (sub_17BEE80, 0x17BEE80 - 0x17BF102)  -- create the lip
+//  file-system root (the 0x110-byte XLipFSRoot) for the given directory path
+//  (XLipComponent.cpp) and bring it up; on success 1 is returned, on any
+//  failure the root is torn down through its vtable slot 7 deleting
+//  destructor and 0 is returned.
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  NormalizeLipPath / LipMemAlloc / XLipFSRootCtor / InitLipFSRoot, the
+//  vtable-slot-7 dispatch, and the IAT thunks _strlen / _strcpy_s /
+//  __imp_SetLastError / __security_check_cookie) and reads the high-VA
+//  init-flag global byte_1E2C6B4 (0x01E2C6B4).
+//
+//  int CreateLipFSRoot(const char *path)   -- original: cdecl, plain `retn`
+//  (the original's parameter is a non-const char *; the value is only read)
+//
+//  Gated by the lip-runtime init flag byte_1E2C6B4 (SetLastError(0x15) and
+//  return 0 when unset).  Asserts path != NULL (line 26, SetLastError(0x57)),
+//  strlen(path) > 0 (line 37) and < 0x104 (line 38), falling out with
+//  SetLastError(0xA1) when the gate fails; copies into a 0x104-byte stack
+//  buffer with strcpy_s (line 52, SetLastError(0x54F) on failure),
+//  normalizes it (NormalizeLipPath), LipMemAlloc's the 0x110-byte block
+//  (sub_17D1840; NULL when the allocator fails), constructs the XLipFSRoot
+//  in it (XLipFSRootCtor), and brings it up (InitLipFSRoot, sub_17BF110
+//  [STUB]): 1 on success; when the ctor yields NULL (line 60,
+//  SetLastError(0xE)) or the bring-up fails, vtable slot 7
+//  (XLipFSRootDtor) frees the block and 0 is returned.  The original's SEH
+//  frame frees the block (LipMemFree, sub_17D1860) when the body throws;
+//  that path is unreachable in this build (the lip allocator never throws).
+// ============================================================
+static int CreateLipFSRoot(const char *path)
+{
+    char destination[0x104];
+
+    if (g_byte_1E2C6B4 == 0)
+    {
+        SetLastError(0x15);
+        return 0;
+    }
+    if (path == NULL)
+    {
+        XLipAssert("pcszPath");                  // line 26
+        SetLastError(0x57);
+        return 0;
+    }
+    {
+        size_t len = strlen(path);
+        if (len == 0)
+            XLipAssert("len > 0");               // line 37
+        if (len >= 0x104)
+            XLipAssert("len < MAX_PATH");        // line 38
+        if (!(len > 0 && len < 0x104))
+        {
+            SetLastError(0xA1);
+            return 0;
+        }
+        if (strcpy_s(destination, 0x104, path) != 0)
+        {
+            XLipAssert("(ret==0) && \"failed to copy path to internal buffer\"");
+            SetLastError(0x54F);
+            return 0;
+        }
+    }
+    (void)NormalizeLipPath(destination);          // sub_17C08D0
+    void *block = LipMemAlloc(0x110);             // sub_17D1840
+    XLipFSRoot *root = (block != NULL) ? XLipFSRootCtor((XLipFSRoot *)block, destination) : NULL;
+    if (root == NULL)
+    {
+        XLipAssert("pRoot != NULL");             // line 60
+        SetLastError(0xE);
+        return 0;
+    }
+    if (InitLipFSRoot(root) != 0)                 // sub_17BF110
+        return 1;
+    (*((XLipFSRootVfn **)root->vtable))[7](root, 1);   // vtable slot 7
+    return 0;
+}
+// ============================================================
+//  XLipComponent -- the 0x50-byte lip component object
+//  (XLipComponent.cpp), registered by RegisterLipComponent into the global
+//  registry vector (unk_1E2C69C):
+//    +0x00  name (28-byte basic_string<char>, the F3AString layout)
+//    +0x1C  path (28-byte basic_string<char>, the F3AString layout)
+//    +0x38  subobject (24-byte vector-like, zeroed begin / end / alloc-end)
+// ============================================================
+typedef struct XLipComponent
+{
+    F3AString name;              // +0x00
+    F3AString path;              // +0x1C
+    char      subobject[0x18];   // +0x38 (task_continuation_context-like)
+} XLipComponent;                 // 0x50 bytes total
+
+// 0x1E2C69C -- the global lip-component registry vector (the 24-byte
+// LipDwordVec of component pointers); grows as RegisterLipComponent pushes
+// each registered component in.
+static LipDwordVec g_unk_1E2C69C = { 0, 0, 0, NULL, NULL, NULL };
+
+// sub_17C1BD0 (0x17C1BD0 - 0x17C1BFA) -- the vector capacity: (allocEnd -
+// begin) / 4 (0 when begin is null).
+static unsigned int LipCompRegCap(const LipDwordVec *v)
+{
+    return (v->begin != NULL)
+           ? (unsigned int)((char *)v->allocEnd - (char *)v->begin) >> 2
+           : 0;
+}
+// sub_17C1A60 (0x17C1A60 - 0x17C1B3B) -- reserve: grow the capacity to at
+// least `n` elements, keeping the size (the length_error overflow guard is
+// dead against the lip allocator).
+static void LipCompRegReserve(LipDwordVec *v, unsigned int n)
+{
+    if (LipCompRegCap(v) >= n)
+        return;
+    unsigned int size = LipDwordVecSize(v);
+    DWORD *nb = (DWORD *)LipMemAlloc(4 * n);
+    for (unsigned int i = 0; i < size; i++)
+        nb[i] = v->begin[i];
+    if (v->begin != NULL)
+        LipMemFree(v->begin);
+    v->begin    = nb;
+    v->end      = nb + size;
+    v->allocEnd = nb + n;
+}
+// sub_17C1C10 (0x17C1C10 - 0x17C1C7C) -- push_back: grow the capacity when
+// size == capacity, copy the element, and advance the end.
+static void LipCompRegPush(LipDwordVec *v, DWORD value)
+{
+    unsigned int size = LipDwordVecSize(v);
+    if (size >= LipCompRegCap(v))
+    {
+        unsigned int newCap = LipCompRegCap(v);
+        newCap = (newCap < 4) ? 4 : newCap + (newCap >> 1);
+        if (newCap <= size)
+            newCap = size + 1;
+        DWORD *nb = (DWORD *)LipMemAlloc(4 * newCap);
+        for (unsigned int i = 0; i < size; i++)
+            nb[i] = v->begin[i];
+        if (v->begin != NULL)
+            LipMemFree(v->begin);
+        v->begin    = nb;
+        v->allocEnd = nb + newCap;
+    }
+    v->begin[size] = value;
+    v->end = v->begin + size + 1;
+}
+
+// The 28-byte lip basic_string<char> (the F3AString layout): the C string of
+// the value (the SSO buffer when capacity < 16, else the heap pointer).
+static const char *XLipStrCstr(const F3AString *s)
+{
+    return (s->cap < 0x10) ? s->u.buf : (char *)s->u.ptr;
+}
+// sub_17B8EF0 (0x17B8EF0 - 0x17B906E) -- the 28-byte basic_string<char>
+// assign from a C string (thiscall + retn 4): the SSO buffer (capacity 15)
+// when the length is < 16, else a LipMemAlloc'd heap buffer (capacity length
+// + 1); the old heap buffer is freed when the SSO state changes.
+static void XLipStrAssign(F3AString *s, const char *src)
+{
+    unsigned int len = (unsigned int)strlen(src);
+    char *dst;
+    if (len < 0x10)
+    {
+        if (s->cap >= 0x10)
+            LipMemFree((void *)s->u.ptr);
+        s->cap = 15;
+        dst = s->u.buf;
+    }
+    else
+    {
+        void *nb = LipMemAlloc(len + 1);
+        if (s->cap >= 0x10)
+            LipMemFree((void *)s->u.ptr);
+        s->u.ptr = (DWORD)nb;
+        s->cap = len + 1;
+        dst = (char *)s->u.ptr;
+    }
+    memcpy(dst, src, len + 1);
+    s->len = len;
+}
+
+// sub_17C65E0 (0x17C65E0 - 0x17C6654) -- the 0x50-byte lip component ctor
+// (thiscall + retn 8): assigns the name string (+0x00) from the original
+// name and the path string (+0x1C) from the normalized path, then constructs
+// the +0x38 subobject (sub_17C6720 -> sub_17C68E0, a 24-byte vector-like
+// object, zeroed begin / end / alloc-end).  Returns the object.
+static XLipComponent *XLipComponentCtor(XLipComponent *obj, const char *name, const char *path)
+{
+    memset(obj, 0, sizeof(*obj));
+    XLipStrAssign(&obj->name, name);
+    XLipStrAssign(&obj->path, path);
+    return obj;
+}
+// sub_17C0B00 (0x17C0B00 - 0x17C0C0A) -- find the registered lip component
+// whose name string equals `name` (iterating the registry vector and
+// comparing each component's +0x00 name string via std::string::compare);
+// the component pointer on a match, 0 otherwise.  Asserts name != NULL
+// (line 866).
+static void *FindLipComponentByName(const char *name)
+{
+    if (name == NULL)
+        XLipAssert("pcszName");
+    if (name == NULL)
+        return NULL;
+    const LipDwordVec *reg = &g_unk_1E2C69C;
+    for (unsigned int i = 0; i < LipDwordVecSize(reg); i++)
+    {
+        const XLipComponent *comp = (const XLipComponent *)reg->begin[i];
+        if (strcmp(XLipStrCstr(&comp->name), name) == 0)
+            return (void *)comp;
+    }
+    return NULL;
+}
+// sub_17C0BB0 (0x17C0BB0 - 0x17C0C59) -- find the registered lip component
+// whose path string equals `path` (the +0x1C path string); the component
+// pointer on a match, 0 otherwise.  Asserts path != NULL (line 879).
+static void *FindLipComponentByPath(const char *path)
+{
+    if (path == NULL)
+        XLipAssert("pcszPath");
+    if (path == NULL)
+        return NULL;
+    const LipDwordVec *reg = &g_unk_1E2C69C;
+    for (unsigned int i = 0; i < LipDwordVecSize(reg); i++)
+    {
+        const XLipComponent *comp = (const XLipComponent *)reg->begin[i];
+        if (strcmp(XLipStrCstr(&comp->path), path) == 0)
+            return (void *)comp;
+    }
+    return NULL;
+}
+// sub_17D0570 (0x17D0570 - 0x17D0600) -- the XLipDebug.cpp formatted
+// message: vswprintf_s into a 1024-wchar buffer, then sub_17D0610 (a no-op
+// in this build).  The formatted output is never observable, so it degrades
+// to a no-op.
+static int XLipDebugMessage(const wchar_t *format, ...)
+{
+    (void)format;
+    return 0;
+}
+
+// ============================================================
+//  RegisterLipComponent  (sub_17BF400, 0x17BF400 - 0x17BF76A)  -- register
+//  a named lip component with a relative path (XLipComponent.cpp): validate
+//  the name and the path, reject a duplicate name or path (ERROR_ALREADY_
+//  EXISTS, 0xB7), normalize the path, construct the 0x50-byte component, and
+//  push it into the global registry vector (unk_1E2C69C).
+//  [NOT byte-identical] placement-dependent (relative calls to XLipAssert /
+//  _strlen / FindLipComponentByName / XLipDebugMessage / _strcpy_s /
+//  NormalizeLipPath / FindLipComponentByPath / j__strchr / j__strstr /
+//  LipMemAlloc / XLipComponentCtor / the registry vector helpers, and the
+//  IAT thunks __imp_SetLastError / __security_check_cookie) and refs the
+//  high-VA init-flag global byte_1E2C6B4 (0x01E2C6B4), the registry vector
+//  unk_1E2C69C (0x01E2C69C), the class-id vector dword_1E2C6B8 (0x01E2C6B8),
+//  and the "The component with name ..." / "There is already a component
+//  registered against: ..." rdata strings at their original VAs.
+//
+//  int RegisterLipComponent(const char *pcszName, const char *pcszPath)
+//  -- original: cdecl, plain `retn` (the original's parameters are
+//  non-const char *; the name value is only read)
+//
+//  Gated by the init flag byte_1E2C6B4 (SetLastError(0x15), return 0 when
+//  unset).  Asserts pcszName != NULL (line 0xB5) and pcszPath != NULL
+//  (line 0xB6), falling out with SetLastError(0x57) when either is null;
+//  asserts strlen(pcszName) > 0 (line 0xC0), falling out with
+//  SetLastError(0x57).  When the name is already registered
+//  (FindLipComponentByName) it reports "The component with name \"%S\" is
+//  already registered" and returns 0 (SetLastError 0xB7).  Asserts
+//  strlen(pcszPath) > 0 (line 0xD5) and < MAX_PATH (line 0xDC), falling out
+//  with SetLastError(0xA1); copies the path into a 0x104-byte buffer
+//  (_strcpy_s), normalizes it (NormalizeLipPath), and, when the normalized
+//  path is already registered (FindLipComponentByPath), reports "There is
+//  already a component registered against: %S" and returns 0 (SetLastError
+//  0xB7).  When the path has a '*' wildcard it must also contain "*."
+//  (SetLastError(0xA1), return 0 otherwise).  On success it LipMemAlloc's the
+//  0x50-byte component (XLipComponentCtor with the original name + the
+//  normalized path; a null ctor yields SetLastError(0xE), return 0), seeds
+//  the registry capacity from the class-id vector element 3 when empty
+//  (LipCompRegReserve), pushes the component (LipCompRegPush), and returns 1.
+// ============================================================
+static int RegisterLipComponent(const char *pcszName, const char *pcszPath)
+{
+    char path[0x104];
+
+    if (g_byte_1E2C6B4 == 0)
+    {
+        SetLastError(0x15);
+        return 0;
+    }
+    if (pcszName == NULL)
+        XLipAssert("pcszName");                       // line 0xB5
+    if (pcszPath == NULL)
+        XLipAssert("pcszPath");                       // line 0xB6
+    if (pcszName == NULL || pcszPath == NULL)
+    {
+        SetLastError(0x57);
+        return 0;
+    }
+    {
+        int nameLen = (int)strlen(pcszName);
+        if (nameLen <= 0)
+            XLipAssert("len > 0 && \"component name can't be an empty string\"");
+        if (nameLen <= 0)
+        {
+            SetLastError(0x57);
+            return 0;
+        }
+    }
+    if (FindLipComponentByName(pcszName) != NULL)
+    {
+        XLipDebugMessage(L"The component with name \"%S\" is already registered", pcszName);
+        SetLastError(0xB7);
+        return 0;
+    }
+    {
+        int pathLen = (int)strlen(pcszPath);
+        if (pathLen <= 0)
+            XLipAssert("len > 0 && \"component relative path can't be an empty string\"");
+        if (pathLen <= 0)
+        {
+            SetLastError(0xA1);
+            return 0;
+        }
+        if (pathLen >= 260)
+            XLipAssert("len < MAX_PATH && \"component relative path length should be < MAX_PATH\"");
+        if (pathLen >= 260)
+        {
+            SetLastError(0xA1);
+            return 0;
+        }
+    }
+    (void)strcpy_s(path, 0x104, pcszPath);
+    (void)NormalizeLipPath(path);
+    if (FindLipComponentByPath(path) != NULL)
+    {
+        XLipDebugMessage(L"There is already a component registered against: %S", path);
+        SetLastError(0xB7);
+        return 0;
+    }
+    if (!(strchr(path, '*') == NULL || strstr(path, "*.") != NULL))
+    {
+        SetLastError(0xA1);
+        return 0;
+    }
+    void *block = LipMemAlloc(0x50);
+    XLipComponent *comp =
+        (block != NULL) ? XLipComponentCtor((XLipComponent *)block, pcszName, path) : NULL;
+    if (comp == NULL)
+        XLipAssert("pComponent != NULL");
+    if (comp == NULL)
+    {
+        SetLastError(0xE);
+        return 0;
+    }
+    if (LipCompRegCap(&g_unk_1E2C69C) == 0)
+        LipCompRegReserve(&g_unk_1E2C69C, *LipDwordVecAt(&g_unk_1E2C6B8, 3));
+    LipCompRegPush(&g_unk_1E2C69C, (DWORD)comp);
+    return 1;
+}
+// sub_17BF770 (0x17BF770 - 0x17BFC20) -- the lip component bring-up over the
+// registered components.
+static void  sub_17BF770(void) {}
+// sub_717D60 (0x717D60 - 0x717DF2) -- resolve a
+// component slot's relative path (sub_17C0360 against the registered
+// component + CWD) and copy it into the out slot; 1 on success, 0 if the
+// path did not resolve.
+static char  sub_717D60(void *a1, int *a2) { (void)a1; (void)a2; return 0; }
+// sub_17BFC20 (0x17BFC20 - 0x17BFF58) -- bounded strcpy into an 85-byte
+// destination (the "text" name copy); 0 on success.
+static int   sub_17BFC20(const char *src, char *dst, int size)
+{ (void)src; (void)dst; (void)size; return 0; }
+// sub_17C0610 (0x17C0610 - 0x17C0674) -- number of registered lip cultures
+// (sub_17B3DC0 over the culture table at 0x1E2C680 for a1 = 0).
+static int   sub_17C0610(int a1) { (void)a1; return 0; }
+// sub_17C0680 (0x17C0680 - 0x17C08D0) -- copy culture a2's 85-byte name into
+// Destination (FindLipComponentByName lookup + the name at +56).
+static int   sub_17C0680(int a1, int a2, char *dst, int size)
+{ (void)a1; (void)a2; (void)dst; (void)size; return -1; }
+// sub_17CC320 (0x17CC320 - 0x17CC4E2) -- XLipCultures name -> culture id
+// (lower-cased lookup through sub_17CD070; case 1 = the id at +28).
+static int   sub_17CC320(char *s, int a2) { (void)s; (void)a2; return 0; }
+// sub_718690 (0x718690 - 0x718BCC) -- register the speech / speechdoc /
+// lipsync .bnk / .adb banks ("speech", "speechdoc", "lipsync" paths).
+static int   sub_718690(void) { return 0; }
+// sub_719540 (0x719540 - 0x719765) -- post-load culture bookkeeping over the
+// loaded culture set (the name slot + out flag byte).
+static char  sub_719540(void *a1, char *a2) { (void)a1; (void)a2; return 0; }
+
+static long InitLipCultures(void)
+{
+    F3SharedBuffer *cultureName = 0;   // "cultures_win32.txt" name slot (v23)
+    F3SharedBuffer *path        = 0;   // settings dir + "\" (v19)
+    F3SharedBuffer *fullPath    = 0;   // path + culture name (v20)
+    F3SharedBuffer *textSlot    = 0;   // the "text" culture name slot (v21)
+    char            textFlag    = 0;   // sub_719540's out flag (v22)
+
+    (void)GetGameEngine();             // sub_619A90, result discarded
+    g_dword_1DC2808 = (DWORD)(void (*)(void))LHAlloc;   // j_LHAlloc_1
+    g_dword_1DC280C = (DWORD)(void (*)(void))LHFree;    // j_LHFree_3
+    ReleaseLipCultures();
+    SetLipMemAllocators((int)g_dword_1DC2808, (int)g_dword_1DC280C);
+    InitLipRuntime();
+
+    SetSharedSlot(&cultureName, "cultures_win32.txt", -1);
+    MakeSettingsFilePath(&path, (F3SharedBuffer **)&g_dword_1DC2744, "\\");
+    sub_1A02260((int *)&fullPath, (int *)&path, (const char ***)&cultureName);
+    int rc = sub_17CC7C0(GetSlotString(&fullPath));
+    ReleaseSharedSlot(&fullPath);
+    ReleaseSharedSlot(&path);
+    if (rc < 0)
+    {
+        (void)GetLastError();
+        MakeSettingsFilePath(&path, (F3SharedBuffer **)&g_dword_1DC2744, "\\cultures.txt");
+        rc = sub_17CC7C0(GetSlotString(&path));
+        ReleaseSharedSlot(&path);
+        if (rc < 0)
+            (void)GetLastError();
+    }
+
+    CreateLipFSRoot(GetSlotString((F3SharedBuffer **)&g_dword_1DC2744));
+
+    F3SharedBuffer **comp = (F3SharedBuffer **)&g_dword_1DC2748;
+    int i;
+    for (i = 7; i != 0; --i)
+    {
+        const char *name = GetSlotString(comp);
+        RegisterLipComponent(name, name);
+        comp += 5;
+    }
+    sub_17BF770();
+    F3SharedBuffer **slot = (F3SharedBuffer **)&g_dword_1DC2748;
+    for (i = 7; i != 0; --i)
+    {
+        sub_717D60((void *)slot, (int *)(slot + 3));
+        slot += 5;
+    }
+
+    if (g_dword_1DC27EC != 0)
+    {
+        LHFree((void *)g_dword_1DC27EC);
+        g_dword_1DC27EC = 0;
+    }
+    g_dword_1DC27F0 = 0;
+    g_dword_1DC27F4 = 0;
+    g_dword_1DC27F0 = (DWORD)sub_17C0610(0);
+    {
+        unsigned long long n = 96ULL * g_dword_1DC27F0;   // `mul`, overflow -> -1
+        unsigned size = (n > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : (unsigned)n;
+        g_dword_1DC27EC = (DWORD)LHAlloc(size);
+    }
+
+    char name[85];
+    memset(name, 0, sizeof(name));   // original: memset(0x54) + the 0x54 byte
+    sub_17BFC20("text", name, 0x55);
+    SetSharedSlot(&textSlot, name, -1);
+    sub_719540(&textSlot, &textFlag);
+
+    unsigned count = 0;
+    if (g_dword_1DC27F0 != 0)
+    {
+        int off = 0;
+        do
+        {
+            char *entry = (char *)(DWORD)g_dword_1DC27EC + off;
+            sub_17C0680(0, (int)count, entry, 0x55);
+            *(DWORD *)(entry + 88) = (DWORD)sub_17CC320(entry, 1);
+            if (strcmp(entry, GetSlotString(&textSlot)) == 0)
+                g_dword_1DC27F4 = count;
+            ++count;
+            off += 96;
+        }
+        while (count < g_dword_1DC27F0);
+    }
+
+    g_byte_1DC2804 = 0;
+    sub_718690();
+    ReleaseSharedSlot(&textSlot);
+    return ReleaseSharedSlot(&cultureName);
+}
+
 static void  sub_4358A0(void *obj, const char *name) { (void)obj; (void)name; }
 static void  sub_1801580(void *obj, void *str) { (void)obj; (void)str; }
 // Placeholder vtables for the frontend's stub-constructed engine members.
@@ -6114,10 +7182,29 @@ static void RegisterFrontendErrorHandler(void *cwdObj, int level, int (*handler)
 // sub_180B520: reserve / grow the 128 KB data region (dword_1E2D868).
 static int ReserveDataRegion(unsigned int size) { (void)size; return 0; }
 
-// sub_180AC90: the archive manager slot (dword_1E2D864) with a reference.
+// ============================================================
+//  File-subsystem (LHSFS) globals -- the embedded global object at
+//  0x1E2D7C8 and the word globals that sit around it.
+// ============================================================
+// 0x1E2D7C8 -- the embedded global file-subsystem object (0x8C bytes,
+// image-initialized to 0; the init-flag word at 0x1E2D854 sits right after
+// it).
+static DWORD g_fileSubsys[0x23];
+// 0x1E2D854 -- the file-subsystem init flag (bit 0 = constructed).
+static DWORD g_dword_1E2D854 = 0;
+// 0x1E2D864 -- the archive-manager handle slot: the file subsystem is
+// constructed around it. 0 here while the archive framework is stubbed.
+static void *g_dword_1E2D864 = 0;
+
+// sub_180AC90 (0x180AC90 - 0x180ACAC): the archive manager slot (the
+// dword_1E2D864 handle) with a reference: *out = the slot handle (AddRef'd
+// through vtable slot 1 when non-null); returns the out slot.
 static F3SharedBuffer **GetArchiveSlot(F3SharedBuffer **out)
 {
-    *out = 0;
+    F3SharedBuffer *h = (F3SharedBuffer *)g_dword_1E2D864;
+    *out = h;
+    if (h != 0)
+        F3CallVtable(h, 1);           // vtable slot 1 (AddRef)
     return out;
 }
 
@@ -6188,15 +7275,491 @@ static void ArchiveMgrAddPath(void *archive, F3SharedBuffer **cwdSlot,
     (void)namePtr; (void)flags;
 }
 
-// sub_1801C20: the global file-subsystem object (&unk_1E2D7C8, lazy-init;
-// 'this' is the handle being registered).
-static void *GetFileSubsystem(void *obj) { (void)obj; return 0; }
+// ============================================================
+//  The file subsystem (LHSFS) -- the embedded 0x8C-byte global object at
+//  0x1E2D7C8, its lazy ctor, the atexit destructor, and the provider
+//  registration cluster.
+// ============================================================
 
-// sub_1801890: register archiveHandle as the file subsystem's current
-// directory (next handle 0).
-static void FileSubsysRegisterDir(void *fs, void *archiveHandle, void *nextHandle)
+// sub_1812C10 / sub_18120A0 / sub_1812410 / sub_1812C30 / sub_1812350 /
+// sub_1813030 -- the six registered file-provider ctors ("Group" / "Bank" /
+// "Win32" / "Composite" / "Ref" / "Switch"). The LHSFS provider framework is
+// unimplemented in this build, so each ctor degrades to a null-returning
+// no-op.
+static void *FileProviderGroupCtor     (void) { return 0; }   // sub_1812C10
+static void *FileProviderBankCtor      (void) { return 0; }   // sub_18120A0
+static void *FileProviderWin32Ctor     (void) { return 0; }   // sub_1812410
+static void *FileProviderCompositeCtor (void) { return 0; }   // sub_1812C30
+static void *FileProviderRefCtor       (void) { return 0; }   // sub_1812350
+static void *FileProviderSwitchCtor    (void) { return 0; }   // sub_1813030
+
+// sub_1817B50 (0x1817B50 - 0x1817D14) -- look up (creating when absent) the
+// file-provider registration node for a name and return a pointer to its
+// ctor function slot. The provider table is unimplemented in this build, so
+// the lookup degrades to a fixed slot the ctor pointer is written into
+// (invisible in this build otherwise).
+static DWORD g_fileProviderCtorSlot = 0;
+static DWORD *FileProviderCtorSlot(F3AString *name)
 {
-    (void)fs; (void)archiveHandle; (void)nextHandle;
+    (void)name;
+    return &g_fileProviderCtorSlot;
+}
+
+// sub_181D270 (0x181D270) -- register the config node under its name; returns
+// a pointer to the stored-node slot. Unimplemented: a fixed slot.
+static DWORD g_vfsCfgNodeSlot = 0;
+static DWORD *VfsCfgNodeNameSlot(F3AString *name)
+{
+    (void)name;
+    return &g_vfsCfgNodeSlot;
+}
+
+// sub_18194C0 (0x18194C0 - 0x18194EC) -- the 64-byte VFS config-node object
+// ctor (the sub_181BA00 / sub_181BA80 node-slot inits). Unimplemented in
+// this build: the block stays zeroed.
+static void *VfsCfgNodeResCtor(void *obj)
+{
+    memset(obj, 0, 0x40);
+    return obj;
+}
+
+// sub_1819600 (0x1819600 - 0x18196A2) -- init a 64-byte VFS config node as a
+// "group" node: the LHVFS::VFSConfigNodes::CConfigNode vtable (0x1BC840C),
+// the 28-byte embedded name string at +4 (empty, SSO cap 15), the handle at
+// +0x20, then the CGroupNode vtable (0x1BC8420) re-stored, a 4-byte heap
+// wrapper at +0x24 (pointing at the member slot), three zeroed words at
+// +0x30, the flag byte at +0x3C, and -- when the handle is non-null and the
+// name non-empty -- the node registered under its name (sub_181D270). The
+// node vtables are unimplemented in this build, so a placeholder no-release
+// vtable is stored instead.
+static void *g_VfsCfgNodeVtable[2] = { (void *)F3StubRelease, 0 };
+static void *VfsCfgGroupNodeInit(void *obj, F3AString *name, void *handle, int flag)
+{
+    BYTE *b = (BYTE *)obj;
+    DWORD *o = (DWORD *)obj;
+    o[0] = (DWORD)g_VfsCfgNodeVtable;       // the CConfigNode vtable (0x1BC840C)
+    b[8] = 0;                               // the embedded name string's SSO buffer[0]
+    o[0x18 / 4] = 0;                        // name len
+    o[0x1C / 4] = 15;                       // name cap (SSO)
+    o[0x20 / 4] = (DWORD)handle;
+    o[0] = (DWORD)g_VfsCfgNodeVtable;       // re-stored as the CGroupNode vtable
+    void *w = LHAlloc(4);
+    if (w != 0)
+        *(void **)w = (void *)(b + 0x24);
+    o[0x24 / 4] = (DWORD)w;
+    o[0x30 / 4] = 0;
+    o[0x34 / 4] = 0;
+    o[0x38 / 4] = 0;
+    b[60] = (BYTE)flag;
+    if (handle != 0 && name->len != 0)
+        *VfsCfgNodeNameSlot(name) = (DWORD)obj;   // sub_181D270
+    return obj;
+}
+
+// sub_1803190 / sub_1815470 / sub_18154F0 (0x1803190 - 0x1803202, 0x1815470
+// - 0x1815518, 0x18154F0 - 0x1815598) -- the shared member-slot initializer
+// (usercall thiscall + retn 8; the two stack args are a spilled handle copy
+// and go unused). Allocates a 4-byte heap wrapper holding the member-slot
+// pointer (slot[0]) and a 48- or 72-byte sub-object (slot[6]) whose header
+// words all point at itself, byte 44 = 1, byte 45 = 1 (the 72-byte variant
+// uses bytes 68/69); slot[7] = 0.
+static void FileSubsysSubObjInit(void *slot, unsigned int size)
+{
+    void *w = LHAlloc(4);
+    if (w != 0)
+        *(void **)w = slot;
+    *(void **)slot = w;
+    void *o = LHAlloc(size);
+    if (o != 0)
+        memset(o, 0, 12);
+    BYTE *b = (BYTE *)o;
+    b[size - 3] = 0;
+    b[size - 4] = 1;
+    *(void **)((char *)slot + 24) = o;
+    if (o != 0)
+    {
+        b[size - 3] = 1;
+        *(void **)o = o;
+        *(void **)((char *)o + 4) = o;
+        *(void **)((char *)o + 8) = o;
+    }
+    *(void **)((char *)slot + 28) = 0;
+}
+
+// sub_18134F0 (0x18134F0 - 0x1813754) -- the file-subsystem object ctor
+// (thiscall + retn 4; the archive handle is the spilled stack arg): the
+// 4-byte wrapper + 48-byte sub-object init (sub_1815470) over the +0x00
+// member, the 64-byte config-node resource (sub_18194C0) at +0x20, the
+// wrapper + 72-byte sub-object init (sub_18154F0) over the +0x24 member,
+// +0x44 = 0, the archive handle at +0x48 (AddRef'd through vtable slot 1),
+// the empty-name "group" node registration (sub_1819600, result into +0x44),
+// then the six named file-provider registrations (sub_1817B50): Group /
+// Bank / Win32 / Composite / Ref / Switch.
+static void *FileSubsysCtorBody(void *obj, void *handle)
+{
+    DWORD *o = (DWORD *)obj;
+    FileSubsysSubObjInit(obj, 48);                      // sub_1815470
+    void *res = 0;
+    void *resMem = LHAlloc(0x40);
+    if (resMem != 0)
+        res = VfsCfgNodeResCtor(resMem);                // sub_18194C0
+    o[0x20 / 4] = (DWORD)res;
+    FileSubsysSubObjInit((char *)obj + 0x24, 72);       // sub_18154F0
+    o[0x44 / 4] = 0;
+    o[0x48 / 4] = (DWORD)handle;
+    if (handle != 0)
+        F3CallVtable(handle, 1);                        // vtable slot 1 (AddRef)
+    void *node = 0;
+    void *nodeMem = LHAlloc(0x40);
+    if (nodeMem != 0)
+    {
+        F3AString s;
+        F3AStringReset(&s);
+        F3AStringAssign(&s, "", 0);                     // byte_1BCE523, len 0
+        node = VfsCfgGroupNodeInit(nodeMem, &s, res, 1);    // sub_1819600
+    }
+    o[0x44 / 4] = (DWORD)node;
+    struct { const char *name; unsigned int len; void *ctor; } providers[] =
+    {
+        { "Group",     5, (void *)FileProviderGroupCtor },
+        { "Bank",      4, (void *)FileProviderBankCtor },
+        { "Win32",     5, (void *)FileProviderWin32Ctor },
+        { "Composite", 9, (void *)FileProviderCompositeCtor },
+        { "Ref",       3, (void *)FileProviderRefCtor },
+        { "Switch",    6, (void *)FileProviderSwitchCtor },
+    };
+    for (int i = 0; i < 6; i++)
+    {
+        F3AString n;
+        F3AStringReset(&n);
+        F3AStringAssign(&n, providers[i].name, providers[i].len);
+        *FileProviderCtorSlot(&n) = (DWORD)providers[i].ctor;    // sub_1817B50
+        F3AStringFree(&n);
+    }
+    return obj;
+}
+
+// sub_1801A30 (0x1801A30 - 0x1801A95) -- the file-subsystem object ctor
+// (thiscall + retn 4; the archive handle is the spilled stack arg): builds
+// the object (FileSubsysCtorBody, sub_18134F0), the 4-byte heap wrapper at
+// +0x4C (pointing at the member slot), three zeroed words at +0x58, the
+// wrapper + 48-byte sub-object init (sub_1803190) over the +0x64 member,
+// +0x84 = 0, and holds the archive handle at +0x88 (AddRef'd through vtable
+// slot 1).
+static void *FileSubsysCtor(void *obj, void *handle)
+{
+    DWORD *o = (DWORD *)obj;
+    FileSubsysCtorBody(obj, handle);                    // sub_18134F0
+    void *w = LHAlloc(4);
+    if (w != 0)
+        *(void **)w = (void *)((char *)obj + 0x4C);
+    o[0x4C / 4] = (DWORD)w;
+    o[0x58 / 4] = 0;
+    o[0x5C / 4] = 0;
+    o[0x60 / 4] = 0;
+    FileSubsysSubObjInit((char *)obj + 0x64, 48);       // sub_1803190
+    o[0x84 / 4] = 0;
+    o[0x88 / 4] = (DWORD)handle;
+    if (handle != 0)
+        F3CallVtable(handle, 1);                        // vtable slot 1 (AddRef)
+    return obj;
+}
+
+// sub_18030E0 (0x18030E0 - 0x18030F1) -- release every object pointer in
+// the range [begin, end): each non-null entry through its vtable slot 2.
+static void FileSubsysReleaseRange(void *begin, void *end)
+{
+    for (void **p = (void **)begin; p != (void **)end; p++)
+        if (*p != 0)
+            F3CallVtable(*p, 2);
+}
+
+// sub_1817FE0 (0x1817FE0) -- the 64-byte VFS config-node dtor. Unimplemented
+// in this build: no-op.
+static void VfsCfgNodeDtor(void *node) { (void)node; }
+// sub_1803BE0 (0x1804620's +0x64-member reset, 0x1803BE0 - 0x1804058) --
+// re-link the sub-object list to empty and release the dropped entries.
+// Unimplemented in this build: no-op.
+static void FileSubsysSubObjReset64(void *local, void *w, void *o, void *w2, void *o2)
+{ (void)local; (void)w; (void)o; (void)w2; (void)o2; }
+// sub_1816500 (0x1816500) -- the 72-byte sub-object list reset (+0x24
+// member). Unimplemented in this build: no-op.
+static void FileSubsysSubObjReset72(void *local, void *w, void *o, void *w2, void *o2)
+{ (void)local; (void)w; (void)o; (void)w2; (void)o2; }
+// sub_18171D0 (0x18171D0) -- the 48-byte sub-object list reset (+0x00
+// member). Unimplemented in this build: no-op.
+static void FileSubsysSubObjReset48(void *local, void *w, void *o, void *w2, void *o2)
+{ (void)local; (void)w; (void)o; (void)w2; (void)o2; }
+
+// sub_1813900 (0x1813900 - 0x18139AC) -- the file-subsystem dtor body:
+// release the +0x44 group node through its vtable slot 0 (one arg, freeIt =
+// 1), the +0x20 64-byte config-node resource (sub_1817FE0 + LHFree), and
+// the +0x48 archive handle (vtable slot 2), then tear down the +0x24
+// (sub_1816500) and +0x00 (sub_18171D0) sub-object pairs (list reset, LHFree
+// the sub-object, zero the slot words, LHFree the wrapper).
+static int FileSubsysDtorBody(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    void *group = (void *)o[0x44 / 4];
+    if (group != 0)
+        ((void (*)(void *, int))F3_VT(group)[0])(group, 1);
+    void *res = (void *)o[0x20 / 4];
+    if (res != 0)
+    {
+        VfsCfgNodeDtor(res);                            // sub_1817FE0
+        LHFree(res);
+    }
+    void *handle = (void *)o[0x48 / 4];
+    if (handle != 0)
+        F3CallVtable(handle, 2);                        // vtable slot 2 (Release)
+    char tmp[8];
+    FileSubsysSubObjReset72(tmp,
+        (void *)o[0x24 / 4], *(void **)o[0x3C / 4],
+        (void *)o[0x24 / 4], (void *)o[0x3C / 4]);      // sub_1816500
+    LHFree((void *)o[0x3C / 4]);                        // the 72-byte sub-object
+    o[0x3C / 4] = 0;
+    o[0x40 / 4] = 0;
+    LHFree((void *)o[0x24 / 4]);                        // the 4-byte wrapper
+    FileSubsysSubObjReset48(tmp,
+        (void *)o[0x00 / 4], *(void **)o[0x00 / 4],
+        (void *)o[0x00 / 4], (void *)o[0x18 / 4]);      // sub_18171D0
+    LHFree((void *)o[0x18 / 4]);                        // the 48-byte sub-object
+    o[0x18 / 4] = 0;
+    o[0x1C / 4] = 0;
+    LHFree((void *)o[0x00 / 4]);                        // the 4-byte wrapper
+    return 0;                                           // the LHFree result
+}
+
+// sub_1804620 (0x1804620 - 0x18046C5) -- the file-subsystem object dtor:
+// release the +0x88 and +0x84 held handles (vtable slot 2), tear down the
+// +0x64 member (sub_1803BE0 list reset, LHFree the 48-byte sub-object at
+// +0x7C, zero +0x7C / +0x80, LHFree the wrapper at +0x64), tear down the
+// +0x4C member (the +0x58 object range released through sub_18030E0, LHFree
+// +0x58, zero +0x58 .. +0x60, LHFree the wrapper at +0x4C), then tail-call
+// the dtor body (sub_1813900).
+static int FileSubsysDtor(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    void *h1 = (void *)o[0x88 / 4];
+    if (h1 != 0)
+        F3CallVtable(h1, 2);                            // vtable slot 2 (Release)
+    void *h2 = (void *)o[0x84 / 4];
+    if (h2 != 0)
+        F3CallVtable(h2, 2);
+    char tmp[8];
+    FileSubsysSubObjReset64(tmp,
+        (void *)o[0x64 / 4], *(void **)o[0x7C / 4],
+        (void *)o[0x64 / 4], (void *)o[0x7C / 4]);      // sub_1803BE0
+    LHFree((void *)o[0x7C / 4]);                        // the 48-byte sub-object
+    o[0x7C / 4] = 0;
+    o[0x80 / 4] = 0;
+    LHFree((void *)o[0x64 / 4]);                        // the 4-byte wrapper
+    void *m58 = (void *)o[0x58 / 4];
+    if (m58 != 0)
+    {
+        FileSubsysReleaseRange(m58, (void *)o[0x5C / 4]);   // sub_18030E0
+        LHFree(m58);
+    }
+    o[0x58 / 4] = 0;
+    o[0x5C / 4] = 0;
+    o[0x60 / 4] = 0;
+    LHFree((void *)o[0x4C / 4]);                        // the 4-byte wrapper
+    return FileSubsysDtorBody(obj);                     // sub_1813900 (tail call)
+}
+
+// sub_1AD3940 (0x1AD3940 - 0x1AD394A) -- the atexit handler: destruct the
+// global file-subsystem object (sub_1804620).
+static void FileSubsysAtExit(void)
+{
+    FileSubsysDtor(g_fileSubsys);
+}
+
+//  GetFileSubsystem  (0x1801C20 - 0x1801C70)  -- the global file-subsystem
+//  singleton getter (thiscall; the handle in ECX is spilled to the stack and
+//  never read): on the first call it sets the 0x1E2D854 init flag, takes the
+//  archive manager out of its slot (GetArchiveSlot, sub_180AC90 -- AddRef'd),
+//  constructs the 0x8C-byte global object around it (FileSubsysCtor,
+//  sub_1801A30), drops the temporary reference (vtable slot 2), and
+//  registers the atexit destructor (sub_1AD3940 -> FileSubsysDtor). Always
+//  returns the address of the global object (&unk_1E2D7C8).
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  GetArchiveSlot / FileSubsysCtor / the atexit IAT thunk / the vtable
+//  release) and refs the high-VA globals g_dword_1E2D854 / g_dword_1E2D864
+//  and the embedded g_fileSubsys object at their original addresses.
+static void *GetFileSubsystem(void *obj)
+{
+    (void)obj;                     // the original spills it but never reads it
+    if ((g_dword_1E2D854 & 1) == 0)
+    {
+        g_dword_1E2D854 |= 1;
+        void *handle = 0;
+        GetArchiveSlot((F3SharedBuffer **)&handle);     // sub_180AC90
+        FileSubsysCtor(g_fileSubsys, handle);           // sub_1801A30
+        if (handle != 0)
+            F3CallVtable(handle, 2);                    // vtable slot 2 (Release)
+        atexit(FileSubsysAtExit);
+    }
+    return g_fileSubsys;
+}
+
+// sub_18A9970 (0x18A9970 - 0x18A99A0) -- allocate (LHAlloc 0x54) and
+// construct the 84-byte streaming manager (VirtualFileSystemCtor, 0x18A98F0),
+// store it in *out (AddRef'd through vtable slot 1) and return out.  The
+// 0x54 size here is the raw ctor's allocation (distinct from the full-page
+// CreateStreamingManager the front-end uses so the +0x161 flag stays in the
+// allocation).
+static void *CreateStreamingManager84(void **out)
+{
+    void *m = LHAlloc(0x54);
+    if (m != 0)
+        m = VirtualFileSystemCtor(m);                       // 0x18A98F0
+    *out = m;
+    if (m != 0)
+        ((void (*)(void *))F3_VT(m)[1])(m);                 // vtable slot 1 (AddRef)
+    return out;
+}
+
+// sub_5AF290 (0x5AF290 - 0x5AF2D7) -- re-initialise the 28-byte path
+// descriptor to the "Source" wide string (cap = 7, len = 0, buf[0] = 0, then
+// the wide-string assign + finalize, sub_435C10 / sub_436BA0).  Only used on
+// the a3 != 0 branch of FileSubsysRegisterDir (dead in this build); the wide
+// "Source" assign / finalize are remaining no-op stubs.
+static void F3DescInitSource(F3AString *desc)
+{
+    desc->d0 = 0;
+    desc->u.buf[0] = 0;
+    desc->len = 0;
+    desc->cap = 7;
+    // sub_435C10(desc, L"Source", L"Source", wcslen) + sub_436BA0(desc).
+}
+
+// sub_18013D0 (0x18013D0 - 0x18014EA) -- build the combined dir node for the
+// file subsystem's current directory (thiscall + retn 8; *out is the result
+// slot, a2 / a3 the two handles).  a2 == 0 -> *out = 0; a3 == 0 -> AddRef a2
+// and *out = a2; otherwise build a fresh 84-byte streaming manager (sub_18A9970)
+// and register both handles into it through vtable slot 10 (re-initialising the
+// 28-byte descriptor between the two), then AddRef / store / Release.  Only
+// reached when the archive framework lands (a2 is 0 in this build).
+static void *FileSubsysBuildDirNode(void **out, void *a2, void *a3)
+{
+    *out = 0;
+    if (a2 == 0)
+        return out;
+    if (a3 == 0)
+    {
+        ((void (*)(void *))F3_VT(a2)[1])(a2);               // vtable slot 1 (AddRef)
+        if (*out != 0)
+            ((void (*)(void *))F3_VT(*out)[2])(*out);       // release old (dead)
+        *out = a2;
+        return out;
+    }
+    void *mgr = a2;
+    CreateStreamingManager84(&mgr);                         // sub_18A9970
+    F3AString desc;
+    desc.d0 = 0; desc.u.buf[0] = 0; desc.len = 0; desc.cap = 7;
+    ((void (__thiscall *)(void *, void *, F3AString *, int, int))
+        F3_VT(mgr)[10])(mgr, a2, &desc, 2, 1);
+    if (desc.cap >= 8)
+        LHFree((void *)desc.u.ptr);
+    desc.d0 = 0; desc.u.buf[0] = 0; desc.len = 0; desc.cap = 7;
+    ((void (__thiscall *)(void *, void *, F3AString *, int, int))
+        F3_VT(mgr)[10])(mgr, a3, &desc, 2, 1);
+    if (desc.cap >= 8)
+        LHFree((void *)desc.u.ptr);
+    ((void (*)(void *))F3_VT(mgr)[1])(mgr);                 // vtable slot 1 (AddRef)
+    if (*out != 0)
+        ((void (*)(void *))F3_VT(*out)[2])(*out);           // release old (dead)
+    *out = mgr;
+    ((void (*)(void *))F3_VT(mgr)[2])(mgr);                 // vtable slot 2 (Release)
+    return out;
+}
+
+// sub_1803F80 (0x1803F80 - 0x180402F) -- grow the file-subsystem dir-handle
+// vector and append the new handle (the std::vector grow path, the sub_18039B0
+// insert underneath).  The vector at obj+0x4C is empty in this build (its begin
+// / end / capacity-end words all image-initialize to 0), so the append always
+// takes this grow path; it is only ever reached when the archive framework
+// lands, so it is left as a safe no-op stub.
+static void FileSubsysVecGrow(void *vec, void *out8, void *wrapper,
+                              void *end, void **value)
+{
+    (void)vec; (void)out8; (void)wrapper; (void)end; (void)value;
+}
+
+// sub_18041D0 (0x18041D0 - 0x1804244) -- append a dir-handle reference to the
+// file-subsystem's dir-handle vector at obj+0x4C (thiscall + retn 4).  begin
+// (+0x0C) / end (+0x10) / capacity-end (+0x14): when the current element count
+// (end - begin) >> 2 is within capacity, copy *value into the next slot and
+// AddRef it through vtable slot 1, then advance end; otherwise take the grow
+// path (sub_1803F80, a no-op stub in this build).  Shared by four file
+// subsystem registration methods.
+static void FileSubsysAppendDirNode(void *vec, void **value)
+{
+    DWORD *v = (DWORD *)vec;
+    DWORD begin = v[0x0C / 4];
+    DWORD capacity = (begin != 0) ? ((v[0x14 / 4] - begin) >> 2) : 0;
+    DWORD end = v[0x10 / 4];
+    if ((int)((end - begin) >> 2) >= (int)capacity)
+        FileSubsysVecGrow(vec, 0, (void *)v[0], (void *)end, value);
+    else
+    {
+        if (end != 0)
+        {
+            void *h = *value;
+            *(void **)end = h;
+            if (h != 0)
+                ((void (*)(void *))F3_VT(h)[1])(h);        // vtable slot 1 (AddRef)
+        }
+        end += 4;
+        v[0x10 / 4] = end;
+    }
+}
+
+// sub_1801890 (0x1801890 - 0x1801990) -- register archiveHandle as the file
+// subsystem's current directory (thiscall + retn 8; obj in ECX, the two handles
+// on the stack).  a2 (the "data" archive handle) is 0 in this build, so the
+// body is skipped (the original's `test ebx,ebx; jz` straight to the epilogue).
+//  Faithful body: resolve a2's path through the +0x88 provider (vtable slot 10)
+// freeing the descriptor's heap buffer when capacity >= 8, unregister the old
+// dir (slot 11 on the provider), and -- when a3 is set -- re-init the descriptor
+// to the "Source" wide string (sub_5AF290), register a3 (slot 10, flag 3),
+// AddRef a3 and Release the old dir handle; store a3 at +0x84, build the
+// combined dir node (sub_18013D0), append it to the +0x4C dir-handle vector
+// (sub_18041D0), and Release the combined node.
+//  [NOT byte-identical] placement-dependent (relative calls to LHFree /
+//  sub_5AF290 / sub_18013D0 / sub_18041D0) and refs the high-VA "Source" wide
+//  string (word_1BDFD50, 0x01BDFD50).
+static void FileSubsysRegisterDir(void *obj, void *a2, void *a3)
+{
+    if (a2 == 0)
+        return;
+    void *provider = *(void **)((char *)obj + 0x88);
+    F3AString desc;
+    desc.d0 = 0; desc.u.buf[0] = 0; desc.len = 0; desc.cap = 7;
+    ((void (__thiscall *)(void *, void *, F3AString *, int, int))
+        F3_VT(provider)[10])(provider, a2, &desc, 2, 1);
+    if (desc.cap >= 8)
+        LHFree((void *)desc.u.ptr);
+    void *oldDir = *(void **)((char *)obj + 0x84);
+    if (oldDir != 0)
+        ((void (__thiscall *)(void *, void *))F3_VT(provider)[11])(provider, oldDir);
+    if (a3 != 0)
+    {
+        F3DescInitSource(&desc);                            // sub_5AF290
+        ((void (__thiscall *)(void *, void *, F3AString *, int, int))
+            F3_VT(provider)[10])(provider, a3, &desc, 3, 1);
+        if (desc.cap >= 8)
+            LHFree((void *)desc.u.ptr);
+        ((void (*)(void *))F3_VT(a3)[1])(a3);               // vtable slot 1 (AddRef)
+    }
+    if (oldDir != 0)
+        ((void (*)(void *))F3_VT(oldDir)[2])(oldDir);       // vtable slot 2 (Release)
+    *(void **)((char *)obj + 0x84) = a3;
+    void *node = a2;
+    FileSubsysBuildDirNode(&node, a2, a3);                  // sub_18013D0
+    FileSubsysAppendDirNode((char *)obj + 0x4C, &node);     // sub_18041D0
+    if (node != 0)
+        ((void (*)(void *))F3_VT(node)[2])(node);           // vtable slot 2 (Release)
 }
 
 // sub_17FE870: the LHSFS::CLegacyFile ctor over a 16-byte block (vtable +
@@ -6796,7 +8359,7 @@ signedIn:
         const char *cmd = GetCommandLineA();
         g_byte_1DBD034 = (strstr(cmd, "WaitBeforeEnteringFrontEnd") != 0);
         base[0x24] = 0;
-        sub_620F30(obj);
+        CGameEngineClearNodeList(obj);
 
         // Copy the node-list pointers (heapNode -> +0x1C, listFirst -> +0x20).
         int heapNode  = (int)dw[0];
@@ -6814,8 +8377,8 @@ signedIn:
         }
         dw[0x98 / 4] = (DWORD)v35;
 
-        sub_719770();
-        v164 = sub_1801C20();
+        InitLipCultures();
+        v164 = (int)GetFileSubsystem(0);             // sub_1801C20 (obj unused)
         sub_4358A0(&v81[0], "startup.vfsconfig");
         memset(vfs, 0, sizeof(vfs));
         sub_1801580((void *)v164, &v81[0]);

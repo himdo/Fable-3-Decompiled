@@ -751,7 +751,7 @@ static void  EngineTimeReset(void) { }                                    // sub
 static void  EngineTimeWaitIdle(void) { }                                 // sub_18E7710
 static void  EngineQueueDrain(void) { }                                   // sub_18E7830
 static void  EngineServiceStop(void) { }                                  // sub_18E8B70
-// sub_718C50 (sub_718140 + sub_17CA260) and the sub_1926120 -> sub_1922420
+// sub_718C50 (ReleaseLipCultures (sub_718140) + sub_17CA260) and the sub_1926120 -> sub_1922420
 // thunk: engine-subsystem stops (remaining stubs).
 static void  sub_718C50(void) { }
 static int   sub_1926120(void) { return 0; }

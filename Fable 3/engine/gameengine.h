@@ -116,4 +116,8 @@ void *CGameEngineCtor(void *obj);
 // CGameEngineDestroy.
 void SetGameEngineInstance(void *obj);
 
+// sub_619A90 (0x619A90 - 0x619A96) -- the current game engine getter.
+// Returns the instance published into dword_1DBD9DC (0 or the engine).
+void *GetGameEngine(void);
+
 #endif  // F3_GAMEENGINE_H

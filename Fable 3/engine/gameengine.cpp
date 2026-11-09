@@ -135,6 +135,19 @@ void SetGameEngineInstance(void *obj)
     g_GameEngine = obj;
 }
 
+//  GetGameEngine  (sub_619A90, 0x619A90 - 0x619A96)  -- the current game
+//  engine getter.
+//
+//  void *GetGameEngine(void)   -- original: cdecl, plain `retn`
+//
+//  Returns g_GameEngine (dword_1DBD9DC, published by CGameEngineCtor /
+//  SetGameEngineInstance and cleared by CGameEngineDestroy). RunFrontEnd's
+//  InitLipCultures callee touches it once with the result discarded.
+void *GetGameEngine(void)
+{
+    return g_GameEngine;
+}
+
 // ============================================================
 //  CGameEngineCtor  (0x61C530 - 0x61C66C)  -- construct the game engine
 //  [NOT byte-identical] placement-dependent (relative calls to LHAlloc,
