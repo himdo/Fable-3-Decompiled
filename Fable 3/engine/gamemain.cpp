@@ -21,7 +21,9 @@
 #include <objbase.h>              // CoInitializeEx / CoCreateInstance (the LHVFS COM bring-up)
 #include <process.h>              // _beginthread / _getdrive / _chdrive
 #include <wchar.h>                // _wgetcwd
+#include <stdarg.h>               // va_list / va_start / vswprintf_s (XLipDebugMessage)
 #include <string.h>
+#include <wctype.h>               // iswspace (the XLipCultures line trim)
 #include <mbstring.h>             // _mbscmp
 #include <math.h>                 // fabsf
 #include <direct.h>               // _chdir / _mkdir
@@ -5611,8 +5613,8 @@ void CSortedMapDtor(void *obj)
 //  2. Loads the culture list file: settings-path base slot (dword_1DC2744)
 //     + "\" via MakeSettingsFilePath, concatenated with the
 //     "cultures_win32.txt" name slot (sub_1A02260 = the 2-source path concat
-//     over a fresh slot), loaded through sub_17CC7C0 (XLipCultures file
-//     load); on failure retries with "\\cultures.txt" (each failure touches
+//     over a fresh slot), loaded through XLipLoadCultures (sub_17CC7C0);
+//     on failure retries with "\\cultures.txt" (each failure touches
 //     GetLastError, as the original does through its EDX IAT slot).
 //  3. Registers the base path as the default lip component (CreateLipFSRoot,
 //     sub_17BEE80) and
@@ -5916,24 +5918,28 @@ static DWORD *LipDwordVecAt(LipDwordVec *v, unsigned int index)
     }
     return v->begin + index;
 }
+// the 28-byte lip basic_string<char> assign, defined further down in the
+// XLipComponent cluster (sub_17B8EF0 / sub_17B9240 family).
+static void XLipStrAssign(F3AString *s, const char *src);
 // sub_17CB6F0 (0x17CB6F0 - 0x17CB717) -- the 32-byte XLipCultures params
-// object ctor (thiscall + `retn 8`): runs sub_17B8EF0, which touches an MSVC
-// runtime debug flag, resets the object's 28-byte string to the 16-byte SSO
-// (capacity 15, length 0 -- sub_17B9270) and assigns it from `src` (sub_17B9240
-// via the string-length + assign helpers).  Against the rdata default table
-// (g_unk_1BC1D48, 8 zero bytes = an empty wide string) the assign copies
-// nothing, so the object ends with the empty-SSO string; then the culture
-// count WORD at +0x1C is set to `count`.  Returns the object.  Layout:
+// object ctor (thiscall + `retn 8`): runs sub_17B8EF0, which resets the
+// object's 28-byte string to the 16-byte SSO (capacity 15, length 0 --
+// sub_17B9270) and assigns it from `src` (sub_17B9240 via the
+// string-length + assign helpers): the source-name string.  Then the
+// version WORD at +0x1C is set to `count`.  Returns the object.  Layout:
 // +0x00 d0 (untouched), +0x04 SSO buffer / heap ptr, +0x14 length, +0x18
-// capacity, +0x1C culture count (WORD; compared against a freshly loaded
-// culture file's count in sub_17CC7C0).
-static DWORD *LipCultureParamsCtor(DWORD *obj, const DWORD *defaultTable, unsigned short count)
+// capacity, +0x1C version (WORD; XLipLoadCultures compares a freshly loaded
+// culture file's version against the installed object's).  `src` is the
+// empty rdata default table g_unk_1BC1D48 in InitLipRuntime (the assign
+// copies nothing) and the culture file name in XLipLoadCultures.
+static DWORD *LipCultureParamsCtor(DWORD *obj, const char *src, unsigned short count)
 {
-    (void)defaultTable;
-    obj[1] = 0;                        // SSO buffer / heap ptr (+0x04), empty
-    obj[5] = 0;                        // string length (+0x14)
-    obj[6] = 15;                       // string capacity = 15 (SSO) (+0x18)
-    *(unsigned short *)&obj[7] = count;    // culture count (+0x1C)
+    F3AString *s = (F3AString *)obj;
+    s->u.ptr = 0;                      // SSO buffer / heap ptr (+0x04), empty
+    s->len = 0;                        // string length (+0x14)
+    s->cap = 15;                       // string capacity = 15 (SSO) (+0x18)
+    XLipStrAssign(s, src);             // sub_17B9240: assign the source string
+    *(unsigned short *)&obj[7] = count;    // version WORD (+0x1C)
     return obj;
 }
 
@@ -5975,7 +5981,7 @@ static void InitLipRuntime(void)
     }
     SetLastError(0);
     DWORD *block = (DWORD *)LHAlloc(32);
-    DWORD *params = (block != 0) ? LipCultureParamsCtor(block, g_unk_1BC1D48, 0) : 0;
+    DWORD *params = (block != 0) ? LipCultureParamsCtor(block, (const char *)g_unk_1BC1D48, 0) : 0;
     g_dword_1E2C6D0 = (DWORD)params;
     LipDwordVecResize(&g_unk_1E2C6B8, 6, 0);
     *LipDwordVecAt(&g_unk_1E2C6B8, 0) = 0;
@@ -5991,13 +5997,818 @@ static void InitLipRuntime(void)
 // returns the dst slot address.
 static int * sub_1A02260(int *a1, int *a2, const char ***a3)
 { (void)a2; (void)a3; *a1 = 0; return a1; }
-// sub_17CC7C0 (0x17CC7C0 - 0x17CC931) -- XLipCultures load-from-file
-// (the cultures_win32.txt / cultures.txt parser); unimplemented stub
-// degrades to the failure path (-1, as with a missing file).
-static int   sub_17CC7C0(const char *fileName) { (void)fileName; return -1; }
+// ============================================================
+//  XLipCultures load-from-file cluster (XLipCultures.cpp): the culture
+//  list object (unk_1E2C6D4 / unk_1E2C6D8), the two culture maps
+//  (unk_1E2C620 / unk_1E2C640), the 0x58-byte culture-definition info
+//  objects, the culture-file line reader (sub_17CEC00) and its two line
+//  callbacks, and XLipLoadCultures (sub_17CC7C0) itself.
+// ============================================================
+// the lip formatted-message helper (0x17D0570) and the lip assert reporter
+// (0x17D04A0), both defined further down.
+static int XLipDebugMessage(const wchar_t *format, ...);
+static void XLipAssert(const char *condition);
+// 0x1E2C6D4 -- the XLipPtrVector<_tagXLIPCULTUREINFO> object (XLipCultures.
+// cpp global): vtable at +0x00 (??_7?$XLipPtrVector@U_tagXLIPCULTUREINFO@@@@
+// 6B@, set by the .CRT$Xu static ctor sub_1AA6400 -> sub_17CFF60; the slots
+// are unimplemented and never dispatched in this build), then the 24-byte
+// culture-definitions vector (unk_1E2C6D8) at +0x04.  Elements are pointers
+// to the 0x58-byte culture-definition info objects.
+static void *g_XLipPtrVectorVtable[8] = { 0 };
+static DWORD g_unk_1E2C6D4[7] = { (DWORD)g_XLipPtrVectorVtable, 0, 0, 0, 0, 0, 0 };
+// the 24-byte vector part of the object (begin / end / alloc-end at +0x0C /
+// +0x10 / +0x14 of the vector, i.e. g_unk_1E2C6D4[1..6]).
+static LipDwordVec *LipCultureListVec(void) { return (LipDwordVec *)&g_unk_1E2C6D4[1]; }
+// 0x1E2C620 / 0x1E2C640 -- the two 32-byte STL culture maps (WORD id ->
+// object pointer), constructed empty at process start by the .CRT$Xu static
+// ctors (sub_1AA6340 -> sub_17BC0D0) and destroyed at exit (sub_1AD37A0 /
+// sub_1AD3800).  The 32-byte layout: 16 bytes of _Rbtree header / allocator
+// wrapper, the _Myinfo head-node pointer at +0x18, the _Mycount at +0x1C.
+// The head node's left / right slots sit at info +4 / info +8; an empty map
+// points both at info itself.  This build starts the maps in the constructed-
+// empty state (zero-initialized statics) and nothing ever inserts into them
+// (the only inserter, the culture-definition line callback, finds nothing to
+// insert under), so they stay empty.
+typedef struct XLipMap
+{
+    DWORD   rbt[4];         // +0x00 _Rbtree header (cmpfn / head / ...)
+    DWORD   alloc[3];       // +0x0C node-allocator wrapper
+    DWORD  *info;           // +0x18 _Myinfo (the head-node block)
+    DWORD   count;          // +0x1C _Mycount
+} XLipMap;
+static char  g_xlipLangMapInfo[0x40] = { 0 };   // head node for the 0x1E2C620 map
+static XLipMap g_unk_1E2C620 = { { 0 }, { 0 }, (DWORD *)g_xlipLangMapInfo, 0 };
+static char  g_xlipCulMapInfo[0x40] = { 0 };    // head node for the 0x1E2C640 map
+static XLipMap g_unk_1E2C640 = { { 0 }, { 0 }, (DWORD *)g_xlipCulMapInfo, 0 };
+// 0x1BC33F4 -- the rdata L"null" default name (off_1D94004) used as the
+// source name when a culture-definition line has no source field.
+static const wchar_t g_xlipNullName[] = L"null";
+
+// sub_17CF280 (0x17CF280 - 0x17CF36D) -- in-place wide-string whitespace
+// trim (the XLip line trim): skip leading iswspace characters (the original
+// tests each character through its local _putwchar wrapper, 0x17CA530, which
+// is a plain _iswspace call), scan back from the end past trailing
+// whitespace, NUL-terminate, and shift the result to the front.  An all-
+// whitespace (or empty) string is left empty.  cdecl, one arg.
+static void XLipTrimWide(wchar_t *s)
+{
+    wchar_t *p;
+    wchar_t *q;
+    if (s == NULL)
+        return;
+    p = s;
+    while (iswspace(*p) != 0)
+        ++p;
+    if (*p != 0)
+    {
+        q = p + wcslen(p) - 1;
+        while (iswspace(*q) != 0)
+            --q;
+        if (q < p)
+            XLipAssert("pEnd >= pStart");           // XLip_x.h line 119
+        q[1] = 0;
+        if (p > s)
+        {
+            wchar_t *end = q + 1;
+            while (p <= end)
+                *s++ = *p++;
+        }
+    }
+    else
+    {
+        *s = 0;
+    }
+}
+// sub_17B8F30 (0x17B8F30 - 0x17B8F47) -- the 28-byte lip basic_string<char>
+// dtor (thiscall): frees the heap buffer when the capacity says heap (>= 16),
+// then resets to the empty SSO state (capacity 15, length 0, buffer[0] = 0).
+static void XLipStrDtor(F3AString *s)
+{
+    if (s->cap >= 16)
+        LipMemFree((void *)s->u.ptr);
+    s->cap = 15;
+    s->len = 0;
+    s->u.buf[0] = 0;
+}
+// sub_17B8EC0 (0x17B8EC0 - 0x17B8EF0) -- the 28-byte lip basic_string<char>
+// reset to empty SSO (the flag = 0 form of sub_17B9270): writes the SSO
+// sentinel (capacity 15), length 0, buffer[0] = 0 without reading the old
+// capacity, so it is safe on a freshly-allocated (uninitialized) block.
+static void XLipStrReset(F3AString *s)
+{
+    s->cap = 15;
+    s->len = 0;
+    s->u.buf[0] = 0;
+}
+// The 28-byte lip basic_string<wchar_t> (the same d0 / buffer / len / cap
+// layout as F3AString, but 16 bytes of SSO buffer = 8 wchars and SSO
+// capacity 7 -- sub_17CB950 resets it to cap 7 and goes heap at cap >= 8).
+typedef struct W3AString
+{
+    DWORD   d0;
+    union { wchar_t buf[8]; DWORD ptr; } u;
+    DWORD   len;
+    DWORD   cap;
+} W3AString;
+// sub_17CB950 (0x17CB950 - 0x17CB9C6; the char = 1 / size = 0 reset form
+// is sub_17CB930, 0x17CB930 - 0x17CB947) -- the 28-byte lip wstring dtor:
+// free the heap buffer when
+// cap >= 8, then cap = 7, length 0, buffer[0] = 0.
+static void W3AStringDtor(W3AString *s)
+{
+    if (s->cap >= 8)
+        LipMemFree((void *)s->u.ptr);
+    s->cap = 7;
+    s->len = 0;
+    s->u.buf[0] = 0;
+}
+// the 28-byte lip wstring reset to empty SSO (the flag = 0 form of
+// sub_17CB950): writes the SSO sentinel (capacity 7), length 0, buffer[0]
+// = 0 without reading the old capacity, so it is safe on a freshly-allocated
+// (uninitialized) block.
+static void W3AStringReset(W3AString *s)
+{
+    s->cap = 7;
+    s->len = 0;
+    s->u.buf[0] = 0;
+}
+// std::wstring::assign(const wchar_t *) (0x17CF9F0) -- the 28-byte lip
+// wstring assign: SSO buffer when the length is < 8, else a LipMemAlloc'd
+// heap buffer (the old one freed on a state change).
+static void W3AStringAssign(W3AString *s, const wchar_t *src)
+{
+    unsigned int len = (unsigned int)wcslen(src);
+    if (len < 8)
+    {
+        if (s->cap >= 8)
+            LipMemFree((void *)s->u.ptr);
+        s->cap = 7;
+        memcpy(s->u.buf, src, (len + 1) * 2);
+    }
+    else
+    {
+        void *nb = LipMemAlloc((len + 1) * 2);
+        if (s->cap >= 8)
+            LipMemFree((void *)s->u.ptr);
+        s->u.ptr = (DWORD)nb;
+        s->cap = len;
+        memcpy((void *)s->u.ptr, src, (len + 1) * 2);
+    }
+    s->len = len;
+}
+// The 0x58-byte culture-definition info object (_tagXLIPCULTUREINFO):
+//    +0x00  name     (28-byte basic_string<char>; the culture name)
+//    +0x1C  language (28-byte basic_string<wchar_t>; the language name)
+//    +0x38  source   (28-byte basic_string<char>; the source / parent name)
+//    +0x54  version  (WORD)
+typedef struct XLipCultureInfo
+{
+    F3AString name;
+    W3AString language;
+    F3AString source;
+    unsigned short version;
+    unsigned short pad;
+} XLipCultureInfo;                 // 0x58 bytes
+// sub_17CF840 (0x17CF840 - 0x17CF967) -- the culture-definition info ctor
+// (thiscall + `retn 10h`): resets the name string (+0x00), constructs and
+// assigns the wide language string (+0x1C) from `language`, resets the
+// source string (+0x38), stores the version WORD at +0x54, then
+// WideCharToMultiByte's `name` and `source` into an 85-byte stack buffer
+// (asserting the count is > 0, XLipCultures.h lines 93 / 98) and assigns
+// each (sub_17CF990 = sub_17B9240).  Returns the object.
+static XLipCultureInfo *XLipCultureInfoCtor(XLipCultureInfo *obj,
+                                            const wchar_t *name,
+                                            const wchar_t *language,
+                                            const wchar_t *source,
+                                            unsigned short version)
+{
+    CHAR mb[88];
+    XLipStrReset(&obj->name);                    // sub_17B8EC0: reset +0x00
+    W3AStringReset(&obj->language);              // the +0x1C wstring reset
+    W3AStringAssign(&obj->language, language);   // (sub_17CF9B0: reset + assign)
+    XLipStrReset(&obj->source);                  // sub_17B8EC0: reset +0x38
+    obj->version = version;                      // +0x54
+    if (WideCharToMultiByte(0, 0, name, -1, mb, 85, NULL, NULL) <= 0)
+        XLipAssert("iRet > 0");                  // XLipCultures.h line 93
+    XLipStrAssign((F3AString *)&obj->name, mb);  // sub_17CF990
+    if (WideCharToMultiByte(0, 0, source, -1, mb, 85, NULL, NULL) <= 0)
+        XLipAssert("iRet > 0");                  // XLipCultures.h line 98
+    XLipStrAssign(&obj->source, mb);             // sub_17CF990
+    return obj;
+}
+// sub_17CB870 (0x17CB870 - 0x17CB89C) -- the culture-definition info deleting
+// destructor (thiscall + `retn 4`): the dtor body (sub_17CB8C0: the source
+// string at +0x38, the wide language string at +0x1C, the name string at
+// +0x00) then LipMemFree (sub_17CB8A0) when freeIt & 1.
+static void XLipCultureInfoDtorFree(XLipCultureInfo *obj)
+{
+    XLipStrDtor(&obj->source);            // +0x38 (sub_17B8F30)
+    W3AStringDtor(&obj->language);        // +0x1C (sub_17CB930)
+    XLipStrDtor((F3AString *)&obj->name); // +0x00 (sub_17B8F30)
+    LipMemFree(obj);                      // sub_17CB8A0
+}
+// sub_17CD320 (0x17CD320 - 0x17CD354) -- the culture-list vector capacity:
+// (allocEnd - begin) / 4 (0 when begin is null).
+static unsigned int LipCultureListCap(const LipDwordVec *v)
+{
+    return (v->begin != NULL)
+           ? (unsigned int)((char *)v->allocEnd - (char *)v->begin) >> 2
+           : 0;
+}
+// sub_17CD570 (0x17CD570 - 0x17CD58A) -- the culture-list vector size:
+// (end - begin) / 4.
+static unsigned int LipCultureListSize(const LipDwordVec *v)
+{
+    return (unsigned int)((char *)v->end - (char *)v->begin) >> 2;
+}
+// sub_17CD1B0 (0x17CD1B0 - 0x17CD319) -- reserve `n` elements: when the
+// capacity is smaller, LipMemAlloc(4 * n) (sub_17CD6F0), move the current
+// elements, free the old buffer, and reset begin / end / alloc-end.
+static void LipCultureListReserve(LipDwordVec *v, unsigned int n)
+{
+    unsigned int size;
+    DWORD *nb;
+    if (LipCultureListCap(v) >= n)
+        return;
+    size = LipCultureListSize(v);
+    nb = (DWORD *)LipMemAlloc(4 * n);    // sub_17CD6F0
+    for (unsigned int i = 0; i < size; i++)
+        nb[i] = v->begin[i];
+    if (v->begin != NULL)
+        LipMemFree(v->begin);
+    v->begin    = nb;
+    v->end      = nb + size;
+    v->allocEnd = nb + n;
+}
+// sub_17CD360 (0x17CD360 - 0x17CD3D3) -- push_back: grow to exactly size + 1
+// when size == capacity (sub_17CD630), store the element, advance end.
+static void LipCultureListPush(LipDwordVec *v, DWORD value)
+{
+    unsigned int size = LipCultureListSize(v);
+    if (size >= LipCultureListCap(v))
+    {
+        DWORD *nb = (DWORD *)LipMemAlloc(4 * (size + 1));
+        for (unsigned int i = 0; i < size; i++)
+            nb[i] = v->begin[i];
+        if (v->begin != NULL)
+            LipMemFree(v->begin);
+        v->begin    = nb;
+        v->end      = nb + size;
+        v->allocEnd = nb + size + 1;
+    }
+    v->begin[size] = value;
+    v->end = v->begin + size + 1;
+}
+// sub_17CB740 (0x17CB740 - 0x17CB7FC) -- clear the culture-definitions list
+// (thiscall + `retn 4`, the XLipPtrVector<_tagXLIPCULTUREINFO> object in ECX
+// with the 24-byte vector at +4): walks the vector from begin to end; when
+// freeFlag is set, frees each element's 0x58-byte block through the deleting
+// destructor (sub_17CBBA0 lookup + sub_17CB870), then erases the element
+// (sub_17CBAC0: the tail shifts down one slot, end shrinks) until the vector
+// is empty.
+//  [NOT byte-identical] placement-dependent (relative calls to the iterator /
+//  erase / deleting-destructor helpers) and refs the high-VA culture list
+//  object 0x1E2C6D4 at its original VA.
+static void XLipClearCultureList(void *obj, char freeFlag)
+{
+    LipDwordVec *vec = (LipDwordVec *)((char *)obj + 4);
+    for (DWORD *pos = vec->begin; pos < vec->end;)
+    {
+        if (freeFlag)
+        {
+            DWORD block = *pos;
+            if (block != 0)
+                XLipCultureInfoDtorFree((XLipCultureInfo *)(void *)block);   // sub_17CB870
+        }
+        if (pos + 1 < vec->end)
+            memmove_s(pos, (char *)vec->end - (char *)(pos + 1), pos + 1,
+                      (char *)vec->end - (char *)(pos + 1));
+        vec->end = vec->end - 1;
+    }
+}
+// sub_17BE8F0 (0x17BE8F0 - 0x17BE948) -- the culture-map clear (thiscall on
+// the 32-byte map): recursively destroys the tree nodes (sub_17BE990 over
+// the head node's left child; a no-op for the empty maps this build keeps),
+// then resets the head node's left / right slots to the _Myinfo pointer and
+// the count to 0 (the right slot is stored twice).
+//  [NOT byte-identical] placement-dependent (relative calls to the node /
+//  slot helpers) and refs the high-VA map globals at their original VAs.
+static void XLipMapClear(XLipMap *map)
+{
+    DWORD *info = map->info;
+    // (sub_17BE990's node destroy walk stops at the sentinel for the empty
+    // maps this build keeps -- nothing ever inserts into them.)
+    info[1] = (DWORD)info;          // head node left  -> info (empty tree)
+    map->count = 0;
+    info[2] = (DWORD)info;          // head node right -> info
+    info[2] = (DWORD)info;          // (the original stores this slot twice)
+}
+// ============================================================
+//  XLipReadCultureFile  (sub_17CEC00, 0x17CEC00 - 0x17CF274)  -- the
+//  culture-file line reader (XLipCultures.cpp): open `fileName` for read,
+//  check the 2-byte coding word when `coding` is nonzero (0xFFFE for
+//  culture files), then read 256-byte (128-wchar) chunks, tokenize each
+//  chunk on "\n\r" (wcstok_s, a fresh context per chunk), append each token
+//  to a 1026-wchar line buffer (wcscat_s, capped at 0x400 words; a token
+//  that runs into the buffer's 0xFFFF sentinel -- an overlong line -- defers
+//  its callback to the next chunk) and hand each line to `lineCb(line,
+//  pvInfo)`.  A callback that fails with last error 0x10D2 (4306) means
+//  "skip this line" (not counted, not an error); any other failure (and a
+//  missing file, a bad magic, an odd-length read, or a read failure) makes
+//  the whole read fail.  Returns the number of lines the callback accepted
+//  (>= 0) or -1 on failure.
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  XLipAssert / XLipDebugMessage / wcstok_s / wcscat_s / wcslen and the SEH
+//  ___CxxFrameHandler3_0 landing pad) and refs the high-VA init-flag global
+//  byte_1E2C6B4 (0x01E2C6B4) plus the CreateFileA / ReadFile IAT slots.
+//
+//  int XLipReadCultureFile(const char *fileName, unsigned short coding,
+//                          int (*lineCb)(wchar_t *, int), int pvInfo)
+//  -- original: cdecl, plain `retn`
+// ============================================================
+static int XLipReadCultureFile(const char *fileName, unsigned short coding,
+                               int (*lineCb)(wchar_t *, int), int pvInfo)
+{
+    HANDLE file;
+    int count = 0;
+    int failed = 0;
+    int nearEnd = 0;
+    wchar_t line[1026];
+    wchar_t buffer[134];
+    wchar_t delim[4];
+    wchar_t *context = NULL;
+    errno_t appendErr = 0;
+
+    if (g_byte_1E2C6B4 == 0)
+    {
+        SetLastError(0x15);
+        return -1;
+    }
+    if (fileName == NULL)
+    {
+        XLipAssert("pcszFileName");             // XLip_x.h line 142
+        SetLastError(0x57);
+        return -1;
+    }
+    file = CreateFileA(fileName, 0x80000000, 1, NULL, 3, 0x8000080, NULL);
+    // the XLipAutoResource handle wrapper (sub_17B8640 ctor): the invalid
+    // handle fails the read; the dtor (sub_17B8670 -> sub_17D0620) closes
+    // the handle when it is neither 0 nor INVALID_HANDLE_VALUE.
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        failed = 1;
+        goto cleanup;
+    }
+    if (coding != 0)
+    {
+        unsigned char magic[2];
+        DWORD got = 0;
+        if (!ReadFile(file, &magic[0], 1, &got, NULL))
+        {
+            XLipDebugMessage(L"Can't read from file %S", fileName);
+            failed = 1;
+            goto cleanup;
+        }
+        if (got != 1)
+        {
+            XLipDebugMessage(L"Can't read enough data from file %S", fileName);
+            SetLastError(0xB);
+            failed = 1;
+            goto cleanup;
+        }
+        if (!ReadFile(file, &magic[1], 1, &got, NULL))
+        {
+            XLipDebugMessage(L"Can't read from file %S", fileName);
+            failed = 1;
+            goto cleanup;
+        }
+        if (got != 1)
+        {
+            XLipDebugMessage(L"Can't read enough data from file %S", fileName);
+            SetLastError(0xB);
+            failed = 1;
+            goto cleanup;
+        }
+        if ((unsigned short)(magic[1] | (magic[0] << 8)) != coding)
+        {
+            XLipDebugMessage(L"File is not on the expected coding (%04x != %04x)",
+                             (unsigned)coding, (unsigned)(magic[1] | (magic[0] << 8)));
+            SetLastError(0xB);
+            failed = 1;
+            goto cleanup;
+        }
+    }
+    line[0] = 0;
+    buffer[128] = 0;                             // the long-line NUL sentinel
+    buffer[129] = 0xFFFF;                        // the overlong-line marker
+    while (nearEnd == 0 && failed == 0)
+    {
+        DWORD got = 0;
+        if (!ReadFile(file, buffer, 256, &got, NULL))
+        {
+            XLipDebugMessage(L"Can't read from file %S", fileName);
+            failed = 1;
+            break;
+        }
+        if (got == 0)
+        {
+            if (line[0] != 0)
+            {
+                if (lineCb(line, pvInfo) != 0)
+                    ++count;
+                else if (GetLastError() != 0x10D2)
+                    failed = 1;
+            }
+            break;
+        }
+        if (got % 2 != 0)
+        {
+            XLipDebugMessage(L"Bad file format (alignment) in file %S", fileName);
+            SetLastError(0xB);
+            failed = 1;
+            break;
+        }
+        if (got < 256)
+        {
+            nearEnd = 1;
+            buffer[got >> 1] = 0;
+        }
+        wcscpy(delim, L"\n\r");
+        if ((buffer[0] == 0 || buffer[0] == 10 || buffer[0] == 13) && line[0] != 0)
+        {
+            int flushResult = lineCb(line, pvInfo);
+            if (flushResult != 0)
+                ++count;
+            else if (GetLastError() != 0x10D2)
+                failed = 1;                       // falls through to the token loop
+            // clear the buffer on success or a 0x10D2 skip (the original's LABEL_44);
+            // a hard error leaves the stale buffer in place and errors out.
+            if (flushResult != 0 || GetLastError() == 0x10D2)
+                line[0] = 0;
+        }
+        for (wchar_t *token = wcstok_s(buffer, delim, &context); token != NULL;
+             token = wcstok_s(NULL, delim, &context))
+        {
+            appendErr = wcscat_s(line, 0x400, token);   // sub_17CA590
+            if (appendErr != 0)
+            {
+                XLipDebugMessage(L"Can't append file line, errno = %u", (unsigned)appendErr);
+                SetLastError(0x54F);
+                failed = 1;
+                break;
+            }
+            if (nearEnd == 0)
+            {
+                size_t len = wcslen(token);
+                if (token[len + 1] == 0xFFFF)     // overlong line: defer to the next chunk
+                    break;
+            }
+            if (lineCb(line, pvInfo) != 0)
+                ++count;
+            else if (GetLastError() != 0x10D2)
+            {
+                failed = 1;
+                break;
+            }
+            line[0] = 0;
+        }
+    }
+cleanup:
+    if (file != 0 && file != INVALID_HANDLE_VALUE)   // the handle wrapper dtor
+        CloseHandle(file);
+    if (failed != 0)
+        return -1;
+    return count;
+}
+// ============================================================
+//  XLipParseVersionLine  (sub_17CC940, 0x17CC940 - 0x17CCAAF)  -- the
+//  culture-file "version=NNNN" line callback (XLipCultures.cpp line 235).
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  XLipAssert / XLipDebugMessage / XLipTrimWide / wcstok_s / _wcsicmp /
+//  wcstoul and the SEH ___CxxFrameHandler3_0 landing pad).
+//
+//  int XLipParseVersionLine(wchar_t *line, int pvInfo)   -- cdecl, `retn`
+//
+//  Asserts line != NULL && pvInfo != 0 (line 235, SetLastError(0x57) and 0
+//  when either is null); trims the line, and an empty or ';' comment line is
+//  skipped (SetLastError(0x10D2), 0).  Splits on "="; a missing key or value
+//  is skipped (0x10D2, 0).  When the trimmed key is "version" (case-
+//  insensitive), the trimmed value is wcstoul'd: 0 or > 0xFFFF is reported
+//  ("Invalid version found in culture file: %S", SetLastError(0xB), 0),
+//  otherwise it is stored as the version WORD at pvInfo + 28 (the fresh
+//  params object's +0x1C).  Returns 1 for a processed line.
+// ============================================================
+static int XLipParseVersionLine(wchar_t *line, int pvInfo)
+{
+    wchar_t *context = NULL;
+    wchar_t delim[4];
+    wchar_t *key;
+    wchar_t *value;
+    unsigned int version;
+
+    if (line == NULL || pvInfo == 0)
+        XLipAssert("pwszLine && pvInfo");         // XLipCultures.cpp line 235
+    if (line == NULL || pvInfo == 0)
+    {
+        SetLastError(0x57);
+        return 0;
+    }
+    XLipTrimWide(line);
+    if (line[0] == 0 || line[0] == 59)
+    {
+        SetLastError(0x10D2);
+        return 0;
+    }
+    wcscpy(delim, L"=");
+    key = wcstok_s(line, delim, &context);
+    value = wcstok_s(NULL, delim, &context);
+    if (key == NULL || value == NULL)
+    {
+        SetLastError(0x10D2);
+        return 0;
+    }
+    XLipTrimWide(key);
+    XLipTrimWide(value);
+    if (_wcsicmp(L"version", key) == 0)
+    {
+        version = wcstoul(value, NULL, 0);
+        if (version == 0 || version > 0xFFFF)
+        {
+            XLipDebugMessage(L"Invalid version found in culture file: %S", value);
+            SetLastError(0xB);
+            return 0;
+        }
+        *(unsigned short *)(pvInfo + 28) = (unsigned short)version;
+    }
+    return 1;
+}
+// ============================================================
+//  XLipParseCultureDefLine  (sub_17CCAB0, 0x17CCAB0 - 0x17CD061)  -- the
+//  culture-definition line callback (XLipCultures.cpp line 298): "cultureId,
+//  languageId, name, language, source[, version]".  [NOT byte-identical]
+//  placement-dependent (relative calls to XLipAssert / XLipDebugMessage /
+//  XLipTrimWide / wcstok_s / _wcslwr_s / wcschr / wcstoul / the reserve /
+//  push helpers / XLipCultureInfoCtor, the WideCharToMultiByte IAT slot, and
+//  the SEH ___CxxFrameHandler3_0 landing pad) and refs the high-VA globals
+//  byte_1E2C6B4 / unk_1E2C6B8 / unk_1E2C620 / unk_1E2C640 / unk_1E2C6D8 and
+//  the rdata L"null" (0x1BC33F4) at their original VAs.
+//
+//  int XLipParseCultureDefLine(wchar_t *line, int pvInfo)   -- cdecl, plain
+//  `retn 8` (the reader's pvInfo is always 0 for this callback; the original
+//  does not use it, but the reader passes both arguments through the
+//  callback type)
+//  (the reader's pvInfo is always 0 for this callback; the original does not
+//  use it)
+//
+//  Asserts line != NULL (line 298, SetLastError(0x57) and 0); trims the
+//  line, and an empty, "version..." or ';' comment line is skipped
+//  (SetLastError(0x10D2), 0).  Splits on "," / tab: the first two fields are
+//  wcstoul'd (the culture / language ids, 0 when absent), the third is the
+//  culture name (lower-cased in place; a '.' or '\' in it is an error,
+//  "Invalid character found on culture name: %s", SetLastError(0xB), 0),
+//  the fourth is the language name, the fifth the source name (empty or
+//  missing = the rdata L"null"), and an optional sixth is the version
+//  (wcstoul'd; 0 or >= 0xFFFF asserts line 410 and fails with "Bad format
+//  on culture definition string: %s", SetLastError(0xB), 0).  The "register
+//  this culture name under the culture / language id" chain (sub_17B44E0 /
+//  sub_17B4510 map find + sub_17CD3E0 / sub_17CF990 insert, through the
+//  maps at unk_1E2C620 / unk_1E2C640) only runs when the find hits -- the
+//  maps stay empty in this build (nothing inserts), so the chain is dead.
+//  Then: the culture list is reserved to the class-id vector's element 4
+//  (15) when its capacity is 0, a 0x58-byte block is LipMemAlloc'd and
+//  constructed (XLipCultureInfoCtor), and pushed into the list
+//  (unk_1E2C6D8).  Returns 1.
+// ============================================================
+static int XLipParseCultureDefLine(wchar_t *line, int pvInfo)
+{
+    wchar_t *context = NULL;
+    (void)pvInfo;
+    wchar_t delim[4];
+    wchar_t *name;
+    wchar_t *language;
+    wchar_t *source;
+    unsigned int cultureId = 0;
+    unsigned int languageId = 0;
+    unsigned short version = 1;
+    unsigned int tokenVersion;
+    size_t len;
+    int ret;
+    CHAR mb[88];
+
+    if (line == NULL)
+    {
+        XLipAssert("pwszLine");                   // XLipCultures.cpp line 298
+        SetLastError(0x57);
+        return 0;
+    }
+    XLipTrimWide(line);
+    if (line[0] == 0 || line[0] == 59 || wcsncmp(L"version", line, 7) == 0)
+    {
+        SetLastError(0x10D2);
+        return 0;
+    }
+    wcscpy(delim, L",\t");
+    {
+        wchar_t *token = wcstok_s(line, delim, &context);
+        if (token != NULL)
+            cultureId = wcstoul(token, NULL, 0);
+        token = wcstok_s(NULL, delim, &context);
+        if (token != NULL)
+            languageId = wcstoul(token, NULL, 0);
+    }
+    (void)cultureId; (void)languageId;    // (the map-find chain, dead below)
+    name = wcstok_s(NULL, delim, &context);
+    language = wcstok_s(NULL, delim, &context);
+    if (name == NULL || language == 0)
+    {
+        XLipDebugMessage(L"Bad format on culture definition string: %s", line);
+        SetLastError(0xB);
+        return 0;
+    }
+    len = wcslen(name);
+    ret = _wcslwr_s(name, len + 1);
+    if (ret != 0)
+        XLipAssert("ret==0");                   // XLipCultures.cpp line 359
+    if (wcschr(name, 46) != NULL)               // '.'
+    {
+        XLipDebugMessage(L"Invalid character found on culture name: %s", name);
+        SetLastError(0xB);
+        return 0;
+    }
+    if (wcschr(name, 92) != NULL)               // '\\'
+    {
+        XLipDebugMessage(L"Invalid character found on culture name: %s", name);
+        SetLastError(0xB);
+        return 0;
+    }
+    if (WideCharToMultiByte(0, 0, name, -1, mb, 85, NULL, NULL) <= 0)
+        XLipAssert("iRet > 0");                 // XLipCultures.cpp line 384
+    // (The "register under culture id / language id" chain -- the unk_1E2C620
+    // / unk_1E2C640 map finds + sub_17CD3E0 / sub_17CF990 inserts -- runs
+    // only on a hit; the maps are empty in this build, so it is dead.)
+    source = wcstok_s(NULL, delim, &context);
+    if (source != NULL)
+    {
+        len = wcslen(source);
+        ret = _wcslwr_s(source, len + 1);
+        if (ret != 0)
+            XLipAssert("ret==0");               // line 399
+        if (ret != 0)
+        {
+            SetLastError(0x54F);
+            return 0;
+        }
+        {
+            wchar_t *token = wcstok_s(NULL, delim, &context);
+            if (token != NULL)
+            {
+                tokenVersion = wcstoul(token, NULL, 0);
+                if (tokenVersion == 0 || tokenVersion >= 0xFFFF)
+                    XLipAssert("ulVersion!=0 && ulVersion < XLIPLANGUAGE_MAXVERSION");
+                if (tokenVersion == 0 || tokenVersion >= 0xFFFF)
+                {
+                    XLipDebugMessage(L"Bad format on culture definition string: %s", line);
+                    SetLastError(0xB);
+                    return 0;
+                }
+                version = (unsigned short)tokenVersion;
+            }
+        }
+    }
+    if (source == NULL || source[0] == 0)
+        source = (wchar_t *)g_xlipNullName;     // off_1D94004 (0x1BC33F4)
+    if (LipCultureListCap(LipCultureListVec()) == 0)
+        LipCultureListReserve(LipCultureListVec(), *LipDwordVecAt(&g_unk_1E2C6B8, 4));
+    {
+        void *block = LipMemAlloc(0x58);        // sub_17CF970
+        XLipCultureInfo *info = (block != NULL)
+            ? XLipCultureInfoCtor((XLipCultureInfo *)block, name, language, source, version)
+            : NULL;
+        LipCultureListPush(LipCultureListVec(), (DWORD)info);    // sub_17CD360
+    }
+    return 1;
+}
+// sub_17CD150 (0x17CD150 - 0x17CD169) -- install a freshly loaded params
+// object's source-name string into the installed global (thiscall + `retn 4`,
+// the global params object at dword_1E2C6D0 in ECX, the fresh object on the
+// stack): basic_string::assign (sub_17B3D30 -> sub_17B9DD0(this, src, 0,
+// -1)) -- copy the whole source string (SSO or heap, reserving / growing the
+// destination heap buffer when the length is >= 16; the original keeps a
+// heap buffer when shrinking below 16, so the destination never re-enters
+// SSO).  Returns 1.
+//  [NOT byte-identical] placement-dependent (relative calls to the string
+//  assign / reserve / setlen helpers) and refs the high-VA global params
+//  object pointer 0x1E2C6D0 at its original VA.
+static int XLipCultureParamsInstall(void *obj, const void *src)
+{
+    F3AString *dst = (F3AString *)obj;
+    const F3AString *s = (const F3AString *)src;
+    const char *data = (s->cap < 16) ? s->u.buf : (const char *)s->u.ptr;
+    unsigned int len = s->len;
+    if (len >= 16)                          // reserve (sub_17B9E90)
+    {
+        if (dst->cap < 16)
+        {
+            dst->u.ptr = (DWORD)LipMemAlloc(len + 1);
+            dst->cap = len + 1;
+        }
+        else if (dst->cap < len + 1)
+        {
+            LipMemFree((void *)dst->u.ptr);
+            dst->u.ptr = (DWORD)LipMemAlloc(len + 1);
+            dst->cap = len + 1;
+        }
+    }
+    {
+        char *d = (dst->cap < 16) ? dst->u.buf : (char *)dst->u.ptr;
+        memcpy(d, data, len);
+        d[len] = 0;                         // setlen (sub_17B96E0)
+    }
+    dst->len = len;
+    return 1;
+}
+// sub_17CA610 (0x17CA610 - 0x17CA63C) -- the 32-byte params object deleting
+// destructor (thiscall + `retn 4`): the 28-byte string dtor (sub_17CA640 ->
+// sub_17B8F30), then LHFree (sub_401090) when freeIt & 1.
+static void XLipCultureParamsDtor(void *obj, char freeIt)
+{
+    XLipStrDtor((F3AString *)obj);
+    if (freeIt & 1)
+        LHFree(obj);
+}
+// ============================================================
+//  XLipLoadCultures  (sub_17CC7C0, 0x17CC7C0 - 0x17CC931)  -- load the
+//  lip-sync culture set from a culture file (XLipCultures.cpp; the
+//  XLipLoadCultures API of the xlip library).
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc /
+//  LipCultureParamsCtor / XLipReadCultureFile / XLipClearCultureList /
+//  XLipMapClear / XLipCultureParamsInstall / XLipCultureParamsDtor, the
+//  sub_17CC940 / sub_17CCAB0 callback addresses, and the SEH
+//  ___CxxFrameHandler3_0 landing pad) and refs the high-VA init-flag global
+//  byte_1E2C6B4 (0x01E2C6B4), the installed params object pointer
+//  dword_1E2C6D0 (0x01E2C6D0), and the culture map / list globals
+//  (0x1E2C620 / 0x1E2C640 / 0x1E2C6D4) at their original VAs.
+//
+//  int XLipLoadCultures(const char *fileName)   -- original: cdecl, plain
+//                                                 `retn`
+//
+//  Gated by the init flag byte_1E2C6B4 (SetLastError(0x15), -1 when unset);
+//  a null file name is SetLastError(0x57), -1.  LHAlloc's a fresh 32-byte
+//  params object and constructs it from the file name with the version WORD
+//  at +0x1C = 1 (LipCultureParamsCtor); parses the file's lines with the
+//  version-line callback (XLipParseVersionLine), which updates that WORD
+//  from the file's "version=NNNN" line.  When the fresh object's version is
+//  newer than the installed global's (dword_1E2C6D0 + 0x1C), it clears the
+//  culture list (XLipClearCultureList, the XLipPtrVector at unk_1E2C6D4)
+//  and the two culture maps (XLipMapClear, unk_1E2C620 / unk_1E2C640),
+//  re-parses the file with the culture-definition-line callback
+//  (XLipParseCultureDefLine), and, when at least one line was parsed, stores
+//  the new version WORD and source-name string into the installed global
+//  params object (XLipCultureParamsInstall).  The fresh 32-byte block is
+//  always freed through the deleting destructor (XLipCultureParamsDtor).
+//  Returns the line reader's count (>= 0) or -1 on failure.  The original
+//  derefs the fresh object unconditionally after LHAlloc (a null allocation
+//  is not handled); the reimplementation keeps that behavior.
+// ============================================================
+static int XLipLoadCultures(const char *fileName)
+{
+    int result;
+    DWORD *info;
+
+    if (g_byte_1E2C6B4 == 0)
+    {
+        SetLastError(0x15);
+        return -1;
+    }
+    if (fileName == NULL)
+    {
+        SetLastError(0x57);
+        return -1;
+    }
+    {
+        DWORD *block = (DWORD *)LHAlloc(32);   // j_LHAlloc
+        info = (block != 0) ? LipCultureParamsCtor(block, fileName, 1) : 0;
+    }
+    result = XLipReadCultureFile(fileName, 0xFFFE, XLipParseVersionLine, (int)info);
+    if (*(unsigned short *)((char *)info + 28) > *(unsigned short *)((char *)g_dword_1E2C6D0 + 28))
+    {
+        XLipClearCultureList((void *)g_unk_1E2C6D4, 1);
+        XLipMapClear(&g_unk_1E2C620);
+        XLipMapClear(&g_unk_1E2C640);
+        result = XLipReadCultureFile(fileName, 0xFFFE, XLipParseCultureDefLine, 0);
+        if (result > 0)
+        {
+            *(unsigned short *)((char *)g_dword_1E2C6D0 + 28) = *(unsigned short *)((char *)info + 28);
+            XLipCultureParamsInstall((void *)g_dword_1E2C6D0, info);
+        }
+    }
+    if (info != 0)
+        XLipCultureParamsDtor(info, 1);
+    return result;
+}
 // sub_17D04A0 (0x17D04A0 - 0x17D056F) -- the lip library's assert report
 // (XLipCultures.cpp): formats "Assert failed. File: %s. Line: %d. Condition:
-// %s", reports it (sub_17D0610), then DebugBreak (class id 1) or throws
+// %s", reports it (XLipDebugMessageSink), then DebugBreak (class id 1) or throws
 // "XLipAssert hit!" (id 3) per the first culture-class id (LipDwordVecAt
 // (dword_1E2C6B8, 0)).  Class id 0 (the value InitLipRuntime installs) is
 // report-only, so every lip assert in this build degrades to this no-op.
@@ -6146,7 +6957,7 @@ static XLipFSRoot *XLipFSRootCtor(XLipFSRoot *obj, const char *source)
 // the root query (sub_17C0A10), the virtual slot 5 (sub_17D1680), the
 // culture-class registration (sub_17C13C0 / sub_17C1250 over the class-id
 // vector element 2), the path build (module / culture directory + "\"), and
-// the culture-file load (sub_17CC7C0): 1 on success (including a missing
+// the culture-file load (XLipLoadCultures, sub_17CC7C0): 1 on success (including a missing
 // file, ERROR_FILE_NOT_FOUND 2 / ERROR_PATH_NOT_FOUND 3), 0 otherwise.
 // Unimplemented in this build; it degrades to the failure path (return 0),
 // so the caller tears the root down through vtable slot 7.
@@ -6380,14 +7191,35 @@ static void *FindLipComponentByPath(const char *path)
     }
     return NULL;
 }
-// sub_17D0570 (0x17D0570 - 0x17D0600) -- the XLipDebug.cpp formatted
-// message: vswprintf_s into a 1024-wchar buffer, then sub_17D0610 (a no-op
-// in this build).  The formatted output is never observable, so it degrades
-// to a no-op.
+// XLipDebugMessageSink  (sub_17D0610, 0x17D0610 - 0x17D0615)  -- the lip debug-message sink: a 5-byte
+// no-op (push ebp / mov ebp,esp / pop ebp / retn).  It receives a fully-formatted
+// wide string (from XLipAssert / XLipDebugMessage / the cultures loader) and would
+// emit it; in this build it discards the message, so lip debug output is never
+// observable.  Byte-identical to the original.
+static void XLipDebugMessageSink(const wchar_t *message) { (void)message; }
+// XLipDebugMessage (0x17D0570 - 0x17D0602) -- the XLipDebug.cpp formatted
+// message: assert pcwszFormat != NULL (line 65), vswprintf_s the varargs into a
+// 1024-wchar buffer, then hand the buffer (or the raw format on a failed/zero
+// format) to the no-op sink.  Returns the value the no-op sink leaves in EAX
+// (the vswprintf_s count on success, the format pointer on failure); no caller
+// uses it.
+// [NOT byte-identical] placement-dependent (relative calls to XLipAssert /
+// _vswprintf_s / the sink / the __security_check_cookie landing pad, plus the
+// high-VA rdata refs to the assert file/line/condition strings).
 static int XLipDebugMessage(const wchar_t *format, ...)
 {
-    (void)format;
-    return 0;
+    va_list va;
+    va_start(va, format);
+    if (format == NULL)
+        XLipAssert("pcwszFormat");          // line 65: the format must be non-null
+    wchar_t buffer[1024];
+    int result = vswprintf_s(buffer, 1024, format, va);
+    if (result <= 0) {
+        XLipDebugMessageSink(format);       // emit the raw format (no-op)
+        return (int)(size_t)format;         // EAX the sink leaves = the format ptr
+    }
+    XLipDebugMessageSink(buffer);           // emit the formatted buffer (no-op)
+    return result;                          // EAX the sink leaves = the count
 }
 
 // ============================================================
@@ -6555,14 +7387,14 @@ static long InitLipCultures(void)
     SetSharedSlot(&cultureName, "cultures_win32.txt", -1);
     MakeSettingsFilePath(&path, (F3SharedBuffer **)&g_dword_1DC2744, "\\");
     sub_1A02260((int *)&fullPath, (int *)&path, (const char ***)&cultureName);
-    int rc = sub_17CC7C0(GetSlotString(&fullPath));
+    int rc = XLipLoadCultures(GetSlotString(&fullPath));
     ReleaseSharedSlot(&fullPath);
     ReleaseSharedSlot(&path);
     if (rc < 0)
     {
         (void)GetLastError();
         MakeSettingsFilePath(&path, (F3SharedBuffer **)&g_dword_1DC2744, "\\cultures.txt");
-        rc = sub_17CC7C0(GetSlotString(&path));
+        rc = XLipLoadCultures(GetSlotString(&path));
         ReleaseSharedSlot(&path);
         if (rc < 0)
             (void)GetLastError();

@@ -53,3 +53,4 @@ node_modules/
 *.dll
 *.exe
 *.txt
+build.log
