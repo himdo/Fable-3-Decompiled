@@ -48,33 +48,9 @@
 "source": "gamemain"
 },
 {
-"name": "?sub_17BFC20@@YAHPBDPADH@Z",
-"rva": 20708384,
-"size": 824,
-"source": "gamemain"
-},
-{
-"name": "?sub_17C0610@@YAHH@Z",
-"rva": 20710928,
-"size": 100,
-"source": "gamemain"
-},
-{
-"name": "?sub_17C0680@@YAHHHPADH@Z",
-"rva": 20711040,
-"size": 592,
-"source": "gamemain"
-},
-{
 "name": "?sub_17CC320@@YAHPADH@Z",
 "rva": 20759328,
 "size": 450,
-"source": "gamemain"
-},
-{
-"name": "?sub_719540@@YADPAXPAD@Z",
-"rva": 3249472,
-"size": 549,
 "source": "gamemain"
 },
 {

@@ -5623,13 +5623,18 @@ void CSortedMapDtor(void *obj)
 //     component bring-up
 //     (sub_17BF770), then resolves each slot's relative path into its +0x0C
 //     slot (ResolveLipComponentSlotPath, sub_717D60).
-//  4. Rebuilds the culture-string array: frees the old block
-//     (dword_1DC27EC), count = sub_17C0610(0) (dword_1DC27F0),
+//  4. Rebuilds the culture-string array: resolves the "text" component's
+//     language (XLipGetComponentLanguage, sub_17BFC20, into an 85-byte
+//     scratch published as a shared slot; XLipBringUpCultures, sub_719540,
+//     then applies it to the seven components),
+//     frees the old block (dword_1DC27EC), count = XLipGetCultureCount(NULL)
+//     (sub_17C0610, dword_1DC27F0),
 //     LHAlloc(96 * count, the original's `mul` overflow folds to -1), then
-//     per 96-byte entry fills the 85-byte name (sub_17C0680), the culture id
+//     per 96-byte entry fills the 85-byte name (XLipGetCultureName,
+//     sub_17C0680), the culture id
 //     (sub_17CC320) at +88, and records the "text" culture index in
-//     dword_1DC27F4. (With the count-0 stub sub_17C0610 the per-entry loop
-//     is dead in this build.)
+//     dword_1DC27F4. (With the empty registered-culture table the count is
+//     0, so the per-entry loop is dead in this build.)
 //  5. Zeros byte_1DC2804, registers the standard asset packages
 //     (RegisterStandardAssets), and releases the two scratch slots (the
 //     final release result is the return value).
@@ -6019,6 +6024,7 @@ static const wchar_t g_xlipFileCulturesH[] = L"e:\\depot\\dev\\fable3\\pcbranch\
 static const wchar_t g_xlipFileCultures[]  = L".\\XLipCultures.cpp";
 static const wchar_t g_xlipFileComponent[] = L".\\XLipComponent.cpp";
 static const wchar_t g_xlipFileDebug[]     = L".\\XLipDebug.cpp";
+static const wchar_t g_xlipFileSettings[]  = L".\\XLipSettings.cpp";
 // 0x1E2C6D4 -- the XLipPtrVector<_tagXLIPCULTUREINFO> object (XLipCultures.
 // cpp global): vtable at +0x00 (??_7?$XLipPtrVector@U_tagXLIPCULTUREINFO@@@@
 // 6B@, set by the .CRT$Xu static ctor sub_1AA6400 -> sub_17CFF60; the slots
@@ -8508,17 +8514,235 @@ static char ResolveLipComponentSlotPath(F3SharedBuffer **compSlot, F3SharedBuffe
     ReleaseSharedSlot(&temp);
     return 1;
 }
-// sub_17BFC20 (0x17BFC20 - 0x17BFF58) -- bounded strcpy into an 85-byte
-// destination (the "text" name copy); 0 on success.
-static int   sub_17BFC20(const char *src, char *dst, int size)
-{ (void)src; (void)dst; (void)size; return 0; }
-// sub_17C0610 (0x17C0610 - 0x17C0674) -- number of registered lip cultures
-// (sub_17B3DC0 over the culture table at 0x1E2C680 for a1 = 0).
-static int   sub_17C0610(int a1) { (void)a1; return 0; }
-// sub_17C0680 (0x17C0680 - 0x17C08D0) -- copy culture a2's 85-byte name into
-// Destination (FindLipComponentByName lookup + the name at +56).
-static int   sub_17C0680(int a1, int a2, char *dst, int size)
-{ (void)a1; (void)a2; (void)dst; (void)size; return -1; }
+// ============================================================
+//  XLipGetComponentLanguage  (sub_17BFC20, 0x17BFC20 - 0x17BFF58)  --
+//  resolve a registered lip component's effective language name into an
+//  output buffer (XLipComponent.cpp, lines 406-481).  The component's entry
+//  in the global component-fallback map (g_ComponentFallbacks, 0x1E2C5E0)
+//  names its fallback cultures (the 24-byte culture-index vector at the map
+//  value's +0x1C), and the first fallback whose culture resolves through the
+//  component's culture table (sub_17C0E40) is the component's language.
+//  cdecl: (pcszComponent, Destination, SizeInBytes).  Returns
+//  strlen(language) + 1 on success (query mode when Destination == NULL,
+//  else copied with _strcpy_s), -1 on failure.
+//  [NOT byte-identical] placement-dependent (relative calls to XLipAssert /
+//  FindLipComponentByName / XLipStrAssign / XLipStrDtor / _strlen /
+//  _strcpy_s and the __imp_SetLastError IAT thunk) and refs the high-VA
+//  init-flag global byte_1E2C6B4 (0x01E2C6B4), the component-fallback map
+//  (0x01E2C5E0) and the registered-culture vector (0x01E2C680).
+//
+//  Gated by the init flag byte_1E2C6B4 (SetLastError(0x15), return -1 when
+//  unset).  Asserts pcszComponent != NULL (line 406), SizeInBytes >= 0
+//  (line 413) and !(Destination == NULL && SizeInBytes > 0), falling out
+//  with SetLastError(0x57) and -1.  Looks the component up by name
+//  (FindLipComponentByName); a miss asserts (line 428) and returns -1
+//  (SetLastError(0x57)).  The component name is then copied into a 28-byte
+//  temp string (XLipStrAssign, sub_17B8EF0) and used as the key of the
+//  fallback-map lookup (sub_17C1CD0; the temp is dropped, XLipStrDtor):
+//  a miss asserts (line 442, "it != g_ComponentFallbacks.end()") and
+//  returns -1 (SetLastError(0x57)).  The found entry's culture-index vector
+//  is then walked (sub_17B8FB0 / sub_17B8FE0 / sub_17B91F0 / sub_17B91C0 /
+//  sub_17C1C90): each index names a registered culture (sub_17C16B0 over
+//  the 0x1E2C680 vector) and the culture's name string (sub_17B3D50) is
+//  resolved through the component (sub_17C0E40) until one hits; an empty
+//  walk returns -1 (SetLastError(0x490)).  The found language (asserted
+//  non-NULL, line 465) is returned as strlen + 1; when Destination is
+//  non-NULL it is copied with _strcpy_s (SetLastError(0x7A) when the buffer
+//  is too small, 0x54F when the copy fails, line 481).
+//
+//  In this build the component registry and the fallback map are both empty
+//  (the seven InitLipCultures slot names are all empty and nothing ever
+//  inserts into the map), so the FindLipComponentByName lookup always
+//  misses and the function returns -1 (SetLastError(0x57)) -- the fallback
+//  walk + copy is the remaining stub (unreached).  Replaces the sub_17BFC20
+//  no-op stub.
+// ============================================================
+static int XLipGetComponentLanguage(const char *pcszComponent, char *Destination,
+                                    int SizeInBytes)
+{
+    if (g_byte_1E2C6B4 == 0)
+    {
+        SetLastError(0x15);
+        return -1;
+    }
+    if (pcszComponent == NULL)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 406, L"pcszComponent");
+    if (SizeInBytes < 0)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 413, L"cchBuffer >= 0");
+    if ((Destination == NULL && SizeInBytes > 0) ||
+        pcszComponent == NULL || SizeInBytes < 0)
+    {
+        SetLastError(0x57);
+        return -1;
+    }
+    {
+        void *comp = FindLipComponentByName(pcszComponent);
+        if (comp == NULL)
+        {
+            XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 428, L"pComponent");
+            SetLastError(0x57);
+            return -1;
+        }
+        // The fallback-map lookup (sub_17C1CD0 over g_ComponentFallbacks,
+        // keyed by the name copied into the 28-byte temp string) always
+        // misses in this build (the map is empty and never populated), so the
+        // original's line-442 assert fires and its found == begin() check
+        // falls out with E_INVALIDARG before the fallback-language resolution
+        // walk (the culture-index vector + sub_17C0E40) is entered.
+        (void)comp;
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 442,
+                   L"it != g_ComponentFallbacks.end()");
+        SetLastError(0x57);
+        return -1;
+    }
+}
+// ============================================================
+//  XLipGetCultureCount  (sub_17C0610, 0x17C0610 - 0x17C0674)  -- the
+//  number of lip cultures in scope (XLipComponent.cpp).  cdecl:
+//  (pcszComponent).  Gated by the init flag byte_1E2C6B4 (SetLastError(0x15)
+//  and -1 when unset).  For a NULL component it counts the global
+//  registered-culture table (sub_17B3DC0 over the 24-byte vector at
+//  0x1E2C680: (end - begin) / 4); for a named component it resolves it
+//  (FindLipComponentByName) and counts the 12-byte culture-index entries of
+//  the component's +0x38 subobject (sub_17C1930: (end - begin) / 12),
+//  reporting a component miss as -1 with SetLastError(0x490).
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  FindLipComponentByName / the two vector-count methods) and refs the
+//  high-VA init-flag global byte_1E2C6B4 (0x01E2C6B4), the culture table
+//  (0x01E2C680) and the __imp_SetLastError IAT slot.
+// ============================================================
+static int XLipGetCultureCount(const char *pcszComponent)
+{
+    if (g_byte_1E2C6B4 == 0)
+    {
+        SetLastError(0x15);
+        return -1;
+    }
+    if (pcszComponent == NULL)
+        return (int)LipDwordVecSize(&g_unk_1E2C680);   // sub_17B3DC0
+    void *comp = FindLipComponentByName(pcszComponent);
+    if (comp == NULL)
+    {
+        SetLastError(0x490);
+        return -1;
+    }
+    {
+        const LipDwordVec *sub = (const LipDwordVec *)((const char *)comp + 0x38);
+        return (int)(((char *)sub->end - (char *)sub->begin) / 12);   // sub_17C1930
+    }
+}
+// ============================================================
+//  XLipGetCultureName  (sub_17C0680, 0x17C0680 - 0x17C08D0)  -- copy the
+//  name of culture `iLanguage` into `pszBuffer` (XLipComponent.cpp).
+//  cdecl: (pcszComponent, iLanguage, pszBuffer, cchBuffer).
+//
+//  Gated by the init flag byte_1E2C6B4 (SetLastError(0x15) and -1 when
+//  unset).  Asserts iLanguage >= 0 (line 681), cchBuffer >= 0 (line 689)
+//  and pszBuffer != NULL || cchBuffer == 0 (line 696), falling out with
+//  SetLastError(0x57) and -1 when any is violated.  For a NULL component
+//  the culture is the global registered-culture table (g_unk_1E2C680, the
+//  24-byte vector of XLipRegisteredCulture pointers: iLanguage >
+//  size - 1 -> SetLastError(0x585) and -1; sub_17C16B0 element access).
+//  For a named component it resolves it (FindLipComponentByName, a miss ->
+//  SetLastError(0x57) and -1), bounds iLanguage against the component's
+//  +0x38 12-byte-entry culture-index vector (sub_17C1930 count, sub_17C1950
+//  element; iLanguage > count - 1 -> SetLastError(0x585) and -1) and uses
+//  the entry's first DWORD as the index into the global table.  The
+//  resolved language-name string (the 24-byte F3AString at +0x00 of the
+//  XLipRegisteredCulture: length at +0x14, SSO/heap data at +0x04) is
+//  asserted non-NULL (line 748, no fall-out); a NULL pszBuffer returns the
+//  name length + 1, else cchBuffer <= length is a fail (SetLastError(0x7A)
+//  and -1) and the _strcpy_s copy (source through the SSO-aware sub_17B3D50
+//  data accessor, size cchBuffer) returns length + 1 on success, else the
+//  line-763 "(ret==0) && \"error copying language name\"" assert +
+//  SetLastError(0x54F) and -1.
+//
+//  [NOT byte-identical] placement-dependent (relative calls to XLipAssert /
+//  FindLipComponentByName / the sub_17B3DC0 / sub_17C1930 / sub_17C1950 /
+//  sub_17C16B0 / sub_17B3D50 vector and string helpers / _strcpy_s / the
+//  __imp_SetLastError IAT thunk) and refs the high-VA init-flag global
+//  byte_1E2C6B4 (0x01E2C6B4), the registered-culture table (0x01E2C680) and
+//  the rdata assert strings at their original VAs.
+// ============================================================
+static int XLipGetCultureName(const char *pcszComponent, int iLanguage,
+                              char *pszBuffer, int cchBuffer)
+{
+    if (g_byte_1E2C6B4 == 0)
+    {
+        SetLastError(0x15);
+        return -1;
+    }
+    if (iLanguage < 0)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 681, L"iLanguage >= 0");
+    if (iLanguage < 0)
+    {
+        SetLastError(0x57);
+        return -1;
+    }
+    if (cchBuffer < 0)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 689, L"cchBuffer >= 0");
+    if (cchBuffer < 0)
+    {
+        SetLastError(0x57);
+        return -1;
+    }
+    if (pszBuffer == NULL && cchBuffer != 0)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 696,
+                   L"pszBuffer!=NULL || cchBuffer==0");
+    if (pszBuffer == NULL && cchBuffer != 0)
+    {
+        SetLastError(0x57);
+        return -1;
+    }
+    F3AString *pLangName;
+    if (pcszComponent == NULL)
+    {
+        int count = (int)LipDwordVecSize(&g_unk_1E2C680);   // sub_17B3DC0
+        if (iLanguage > count - 1)
+        {
+            SetLastError(0x585);
+            return -1;
+        }
+        pLangName = (F3AString *)g_unk_1E2C680.begin[iLanguage];   // sub_17C16B0
+    }
+    else
+    {
+        void *comp = FindLipComponentByName(pcszComponent);
+        if (comp == NULL)
+        {
+            SetLastError(0x57);
+            return -1;
+        }
+        {
+            const LipDwordVec *sub = (const LipDwordVec *)((const char *)comp + 0x38);
+            int count = (int)((char *)sub->end - (char *)sub->begin) / 12;   // sub_17C1930
+            if (iLanguage > count - 1)
+            {
+                SetLastError(0x585);
+                return -1;
+            }
+            {
+                DWORD cultureIndex = ((const DWORD *)sub->begin)[3 * iLanguage];   // sub_17C1950
+                pLangName = (F3AString *)g_unk_1E2C680.begin[cultureIndex];        // sub_17C16B0
+            }
+        }
+    }
+    if (pLangName == NULL)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 748, L"pLangName");
+    if (pszBuffer == NULL)
+        return (int)pLangName->len + 1;               // unknown_libname_2358 (+0x14)
+    if (cchBuffer <= (int)pLangName->len)
+    {
+        SetLastError(0x7A);
+        return -1;
+    }
+    if (strcpy_s(pszBuffer, (size_t)cchBuffer, XLipStrCstr(pLangName)) == 0)   // sub_17B3D50
+        return (int)pLangName->len + 1;
+    XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 763,
+               L"(ret==0) && \"error copying language name\"");
+    SetLastError(0x54F);
+    return -1;
+}
 // sub_17CC320 (0x17CC320 - 0x17CC4E2) -- XLipCultures name -> culture id
 // (lower-cased lookup through sub_17CD070; case 1 = the id at +28).
 static int   sub_17CC320(char *s, int a2) { (void)s; (void)a2; return 0; }
@@ -8527,9 +8751,329 @@ static int   sub_17CC320(char *s, int a2) { (void)s; (void)a2; return 0; }
 // "fonts" / "videos" / "gui") into the language / VFS resource table.
 // Defined below, after the F3WString helpers it builds its temp strings with.
 static int   RegisterStandardAssets(void);
-// sub_719540 (0x719540 - 0x719765) -- post-load culture bookkeeping over the
-// loaded culture set (the name slot + out flag byte).
-static char  sub_719540(void *a1, char *a2) { (void)a1; (void)a2; return 0; }
+// ============================================================
+//  XLipBringUpCultures  (sub_719540, 0x719540 - 0x719765)  -- bring the
+//  lip cultures up across the seven registered lip components
+//  (XLipComponent.cpp):
+//
+//    1. Snapshot each component's current effective language into a
+//       24-byte shared-slot vector (XLipCollectComponentLanguages,
+//       sub_7194A0).
+//    2. For each of the seven component slots (dword_1DC2748, 0x14 bytes
+//       per slot), apply the 176-byte XLIPCOMPONENTSETTINGS block -- the
+//       component name + the language named by the culture slot argument --
+//       through XLipApplyComponentSettings (sub_17B2C30); any call that
+//       does not return 1 sets the failure flag (the return value).
+//    3. Bring the components up (XLipBringUpComponents).
+//    4. Take a second snapshot and set *changed when the two lists differ
+//       (a count mismatch, or any element pair differing under
+//       SharedSlotDiffers, sub_1A00E80).
+//    5. Tear down both vectors (the per-element ReleaseSharedSlot, the
+//       LHFree'd backing array, the 4-byte owner block) and return the
+//       failure flag.
+//
+//  char XLipBringUpCultures(F3SharedBuffer **cultureSlot, char *changed)
+//  -- original: cdecl, plain `retn` (the 0xE8 frame + the
+//  __security_cookie landing pad).
+//
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc /
+//  LHFree / GetSlotString / _strcpy_s / XLipBringUpComponents /
+//  ReleaseSharedSlot / the __security_check_cookie landing pad) and refs
+//  the high-VA seven-component slot cluster (dword_1DC2748, 0x01DC2748)
+//  plus the lip-library globals reached through the callees.
+// ============================================================
+
+// The 24-byte shared-slot vector (the sub_488910 push_back family) that
+// XLipBringUpCultures / XLipCollectComponentLanguages build on the stack:
+// +0x00 a 4-byte LHAlloc'd owner block that points back at the vector
+// itself (the grow machinery sub_489460 asserts the passed owner equals
+// vec->owner), two spare words (the original never initializes them and
+// nothing reads them), then begin / end / alloc-end over 4-byte
+// F3SharedBuffer slots.  Size = (end - begin) / 4.
+typedef struct F3SharedSlotVec
+{
+    void *              owner;
+    DWORD               spare0;
+    DWORD               spare1;
+    F3SharedBuffer    **begin;
+    F3SharedBuffer    **end;
+    F3SharedBuffer    **allocEnd;
+} F3SharedSlotVec;
+// the vector ctor (the LHAlloc(4) + self-pointer pair at the top of
+// sub_719540): begin / end / alloc-end null.
+static void SharedSlotVecInit(F3SharedSlotVec *vec)
+{
+    void *block = LHAlloc(4);
+    vec->owner  = block;
+    if (block != 0)
+        *(void **)block = vec;
+    vec->spare0   = 0;   // the original leaves +4 / +8 uninitialized
+    vec->spare1   = 0;   // (unread; zeroed for determinism)
+    vec->begin    = 0;
+    vec->end      = 0;
+    vec->allocEnd = 0;
+}
+// sub_488910 (0x488910 - 0x48896E) -- the vector push_back (thiscall +
+// retn 4): when size < capacity it refs the source slot into the next
+// element (RefSharedSlot) and advances end; when full it goes through the
+// grow helper sub_489460: a fresh LHAlloc(4 * newCap) array through the
+// element-count allocator sub_433120 (newCap = max(cap + cap/2, size + 1);
+// the length_error overflow guard is dead against the game allocator),
+// the old slots ref-copied in (sub_48C230), the new element built from the
+// source slot (sub_4895A0), the old slots released (sub_48A640), and the
+// old array freed through the allocator table (dword_2075B24 + 0x10).
+// The owner-block consistency check (arg owner != 0 && != vec->owner ->
+// _invalid_parameter_noinfo) is dead in this build (the owner always
+// matches).  [NOT byte-identical] placement-dependent (relative calls to
+// RefSharedSlot / the grow helpers).
+static void SharedSlotVecPush(F3SharedSlotVec *vec, F3SharedBuffer **src)
+{
+    unsigned int size = (unsigned int)((char *)vec->end - (char *)vec->begin) >> 2;
+    unsigned int cap = (vec->begin != 0)
+                       ? (unsigned int)((char *)vec->allocEnd - (char *)vec->begin) >> 2
+                       : 0;
+    unsigned int i;
+    if (size < cap)
+    {
+        if (vec->end != 0)
+            RefSharedSlot(vec->end, src);
+        vec->end = vec->end + 1;
+        return;
+    }
+    unsigned int newcap = cap + (cap >> 1);
+    if (newcap < size + 1)
+        newcap = size + 1;
+    F3SharedBuffer **nb = (F3SharedBuffer **)LHAlloc(4 * newcap);
+    for (i = 0; i < size; i++)
+        RefSharedSlot(&nb[i], &vec->begin[i]);
+    RefSharedSlot(&nb[size], src);
+    for (i = 0; i < size; i++)
+        ReleaseSharedSlot(&vec->begin[i]);
+    if (vec->begin != 0)
+        LHFree(vec->begin);
+    vec->begin    = nb;
+    vec->end      = nb + size + 1;
+    vec->allocEnd = nb + newcap;
+}
+// the vector teardown (the two identical inline cleanups at the end of
+// sub_719540): ReleaseSharedSlot each slot, LHFree the backing array (when
+// begin is non-null), zero the pointers, and LHFree the 4-byte owner block
+// (LHFree(0) is a no-op when the ctor's LHAlloc failed).
+static void SharedSlotVecDtor(F3SharedSlotVec *vec)
+{
+    F3SharedBuffer **slot;
+    if (vec->begin != 0)
+    {
+        for (slot = vec->begin; slot != vec->end; slot++)
+            ReleaseSharedSlot(slot);
+        LHFree(vec->begin);
+    }
+    vec->begin    = 0;
+    vec->end      = 0;
+    vec->allocEnd = 0;
+    LHFree(vec->owner);
+    vec->owner    = 0;
+}
+// XLipCollectComponentLanguages  (sub_7194A0, 0x7194A0 - 0x719540)  --
+// snapshot the current effective language of each of the seven lip
+// components into `vec` (the 24-byte shared-slot vector).  For each
+// component slot (dword_1DC2748, 0x14 bytes per slot, iterated
+// dword_1CA63C4 = 7 times per the rdata constant at 0x1CA63C4): zero an
+// 85-byte buffer (the original's memset(0x54) + the 0x54 byte), resolve the
+// component language (XLipGetComponentLanguage, sub_17BFC20); when it
+// resolves (> 0) set a fresh shared slot from the language (SetSharedSlot)
+// and push a ref of it into the vector (SharedSlotVecPush, sub_488910),
+// then drop the local ref (ReleaseSharedSlot).  cdecl: (vec).
+// [NOT byte-identical] placement-dependent (relative calls to memset /
+// GetSlotString / XLipGetComponentLanguage / SetSharedSlot / SharedSlotVecPush
+// / ReleaseSharedSlot / the __security_check_cookie landing pad) and refs
+// the high-VA seven-component slot cluster (0x01DC2748) and the component
+// count constant (0x01CA63C4).
+static void XLipCollectComponentLanguages(F3SharedSlotVec *vec)
+{
+    unsigned int i;
+    for (i = 0; i < 7; i++)   // dword_1CA63C4 (the rdata constant 7)
+    {
+        char destination[85];
+        F3SharedBuffer *slot = 0;
+        const char *name =
+            GetSlotString((F3SharedBuffer **)&g_dword_1DC2748[i * 5]);
+        memset(destination, 0, 85);
+        if (XLipGetComponentLanguage(name, destination, 0x55) > 0)
+        {
+            (void)SetSharedSlot(&slot, destination, -1);
+            SharedSlotVecPush(vec, &slot);
+            ReleaseSharedSlot(&slot);
+        }
+    }
+}
+// XLIPCOMPONENTSETTINGS -- the 176-byte (0xB0) lip component-settings block
+// (XLipSettings.cpp) that the component-settings map (unk_1E2C600, the
+// name-keyed tree whose nodes hold the 176-byte value at +28) stores per
+// component; sub_17B2F60 writes the whole block out per map entry.
+typedef struct XLipComponentSettings
+{
+    int   cbSize;          // +0x00: must be 176 (sizeof XLIPCOMPONENTSETTINGS)
+    char  name[0x55];      // +0x04: the component name (85 bytes)
+    char  language[0x57];  // +0x59: the effective language name (87 bytes)
+} XLipComponentSettings;   // 176 bytes total
+// sub_17B4270 (0x17B4270 - 0x17B465E) -- the component-settings map
+// find-or-create over unk_1E2C600 (thiscall, the 28-byte name key on the
+// stack): the tree iterator (sub_17B43F0 / sub_17B5A70 / sub_17B52B0 /
+// sub_17B5290) walks for the key; a hit returns the found node's 176-byte
+// settings value (node + 28), a miss inserts a zero-filled default value
+// (sub_17B5BE0 / sub_17B52E0) and returns it.  [remaining stub] the tree
+// internals are out of scope; the map is empty and never populated in this
+// build, and the only path that can reach it (a non-empty name for a
+// registered component) is unreached (the seven component slots are all
+// null), so the lookup models as a 0 return (the caller's memcpy_s then
+// fails into its SetLastError(0x54F) path).
+static void *XLipSettingsMapFind(F3AString *name) { (void)name; return 0; }
+// XLipApplyComponentSettings  (sub_17B2C30, 0x17B2C30 - 0x17B2DDD)  --
+// apply one XLIPCOMPONENTSETTINGS block to the component named in its +4
+// field (XLipSettings.cpp): gated by the init flag byte_1E2C6B4
+// (SetLastError(0x15), 0 when unset); asserts pSettings != NULL (line 179,
+// falling out with SetLastError(0x57)); asserts
+// pSettings->cbSize == sizeof(XLIPCOMPONENTSETTINGS) (line 187,
+// SetLastError(0x57)); an empty name falls out (SetLastError(0x57)); a
+// component miss (FindLipComponentByName) is 0 with SetLastError(0xD).
+// On success the name is copied into a 28-byte temp string (XLipStrAssign,
+// sub_17B8EF0), the map entry (XLipSettingsMapFind, sub_17B4270) is
+// memcpy_s'd with the whole cbSize block (a failure is SetLastError(0x54F),
+// 0), the component's culture list is rebuilt (sub_17B3B00 -- modeled by
+// the project's XLipUpdateComponentCultureList; only reachable on a map
+// hit, unreached in this build), the temp is dropped (XLipStrDtor,
+// sub_17B8F30), and 1 is returned.  The original's SEH frame drops the
+// temp string when the body throws; that path is unreachable in this build
+// (nothing here throws).  cdecl: (pSettings).
+// [NOT byte-identical] placement-dependent (relative calls to XLipAssert /
+// XLipStrAssign / XLipStrDtor / FindLipComponentByName / _memcpy_s /
+// sub_17B3B00, the __imp_SetLastError IAT thunk, and the
+// __security_check_cookie landing pad) and refs the high-VA init-flag
+// global byte_1E2C6B4 (0x01E2C6B4) and the settings map (0x01E2C600).
+static int XLipApplyComponentSettings(char *pSettings)
+{
+    if (g_byte_1E2C6B4 == 0)
+    {
+        SetLastError(0x15);
+        return 0;
+    }
+    if (pSettings == NULL)
+    {
+        XLipAssert(g_xlipAssertFailed, g_xlipFileSettings, 179,
+                   L"pSettings != NULL");
+        SetLastError(0x57);
+        return 0;
+    }
+    if (*(DWORD *)pSettings != 0xB0)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileSettings, 187,
+                   L"pSettings->cbSize == sizeof(XLIPCOMPONENTSETTINGS)");
+    if (*(DWORD *)pSettings != 0xB0)
+    {
+        SetLastError(0x57);
+        return 0;
+    }
+    if (pSettings[4] == 0)
+    {
+        SetLastError(0x57);
+        return 0;
+    }
+    if (FindLipComponentByName(pSettings + 4) == NULL)
+    {
+        SetLastError(0xD);
+        return 0;
+    }
+    {
+        F3AString temp;
+        XLipStrAssign(&temp, pSettings + 4);      // sub_17B8EF0
+        void *entry = XLipSettingsMapFind(&temp); // sub_17B4270
+        if (memcpy_s(entry, 0xB0, pSettings, *(DWORD *)pSettings) != 0)
+        {
+            SetLastError(0x54F);
+            XLipStrDtor(&temp);                   // sub_17B8F30
+            return 0;
+        }
+        /* sub_17B3B00: rebuild the component's culture list from this
+           settings block; unreached in this build (the map lookup above
+           never hits). */
+        (void)entry;
+        XLipStrDtor(&temp);
+        return 1;
+    }
+}
+// sub_403AF0 (0x403AF0 - 0x403B17) -- counted-buffer equality (thiscall +
+// retn 4): the +4 lengths are equal and the data strings compare equal
+// (sub_403F10: the generic byte-wise C string compare, 0 equal / -1 less /
+// 1 greater -- _strcmp semantics).
+static int SharedBufferBlocksEqual(F3SharedBuffer *a, F3SharedBuffer *b)
+{
+    return (a->length == b->length) && (strcmp(a->data, b->data) == 0);
+}
+// sub_1A00E80 (0x1A00E80 - 0x1A00EC2) -- shared-slot difference (thiscall +
+// retn 4): the two 4-byte slots differ when they hold different blocks --
+// same block: equal; either null: different; both non-null: different when
+// the block contents differ (SharedBufferBlocksEqual, sub_403AF0).
+static int SharedSlotDiffers(F3SharedBuffer **a, F3SharedBuffer **b)
+{
+    if (*a == *b)
+        return 0;
+    if (*a != 0 && *b != 0)
+        return SharedBufferBlocksEqual(*a, *b) ? 0 : 1;
+    return 1;
+}
+// XLipBringUpCultures -- see the cluster header above (sub_719540).
+static char XLipBringUpCultures(F3SharedBuffer **cultureSlot, char *changed)
+{
+    F3SharedSlotVec before, after;
+    XLipComponentSettings settings;
+    F3SharedBuffer **comp;
+    int failed = 0;
+    int i;
+
+    SharedSlotVecInit(&before);
+    XLipCollectComponentLanguages(&before);
+
+    settings.cbSize = 176;
+    (void)strcpy_s(settings.language, 0x55, GetSlotString(cultureSlot));
+    comp = (F3SharedBuffer **)&g_dword_1DC2748;
+    for (i = 7; i != 0; --i)
+    {
+        (void)strcpy_s(settings.name, 0x55, GetSlotString(comp));
+        if (XLipApplyComponentSettings((char *)&settings) != 1)
+            failed = 1;
+        comp = comp + 5;
+    }
+    XLipBringUpComponents();
+
+    SharedSlotVecInit(&after);
+    XLipCollectComponentLanguages(&after);
+
+    *changed = 0;
+    {
+        unsigned int countBefore =
+            (unsigned int)((char *)before.end - (char *)before.begin) >> 2;
+        unsigned int countAfter =
+            (unsigned int)((char *)after.end - (char *)after.begin) >> 2;
+        if (countBefore != countAfter)
+        {
+            *changed = 1;
+        }
+        else
+        {
+            for (i = 0; (unsigned int)i < countBefore; i++)
+            {
+                if (SharedSlotDiffers(&before.begin[i], &after.begin[i]) != 0)
+                {
+                    *changed = 1;
+                    break;
+                }
+            }
+        }
+    }
+    SharedSlotVecDtor(&after);
+    SharedSlotVecDtor(&before);
+    return (char)failed;
+}
 
 static long InitLipCultures(void)
 {
@@ -8537,7 +9081,7 @@ static long InitLipCultures(void)
     F3SharedBuffer *path        = 0;   // settings dir + "\" (v19)
     F3SharedBuffer *fullPath    = 0;   // path + culture name (v20)
     F3SharedBuffer *textSlot    = 0;   // the "text" culture name slot (v21)
-    char            textFlag    = 0;   // sub_719540's out flag (v22)
+    char            textFlag    = 0;   // XLipBringUpCultures's changed flag
 
     (void)GetGameEngine();             // sub_619A90, result discarded
     g_dword_1DC2808 = (DWORD)(void (*)(void))LHAlloc;   // j_LHAlloc_1
@@ -8587,7 +9131,7 @@ static long InitLipCultures(void)
     }
     g_dword_1DC27F0 = 0;
     g_dword_1DC27F4 = 0;
-    g_dword_1DC27F0 = (DWORD)sub_17C0610(0);
+    g_dword_1DC27F0 = (DWORD)XLipGetCultureCount(NULL);   // sub_17C0610
     {
         unsigned long long n = 96ULL * g_dword_1DC27F0;   // `mul`, overflow -> -1
         unsigned size = (n > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : (unsigned)n;
@@ -8596,9 +9140,9 @@ static long InitLipCultures(void)
 
     char name[85];
     memset(name, 0, sizeof(name));   // original: memset(0x54) + the 0x54 byte
-    sub_17BFC20("text", name, 0x55);
+    XLipGetComponentLanguage("text", name, 0x55);   // sub_17BFC20
     SetSharedSlot(&textSlot, name, -1);
-    sub_719540(&textSlot, &textFlag);
+    XLipBringUpCultures(&textSlot, &textFlag);   // sub_719540
 
     unsigned count = 0;
     if (g_dword_1DC27F0 != 0)
@@ -8607,7 +9151,7 @@ static long InitLipCultures(void)
         do
         {
             char *entry = (char *)(DWORD)g_dword_1DC27EC + off;
-            sub_17C0680(0, (int)count, entry, 0x55);
+            XLipGetCultureName(0, (int)count, entry, 0x55);
             *(DWORD *)(entry + 88) = (DWORD)sub_17CC320(entry, 1);
             if (strcmp(entry, GetSlotString(&textSlot)) == 0)
                 g_dword_1DC27F4 = count;
