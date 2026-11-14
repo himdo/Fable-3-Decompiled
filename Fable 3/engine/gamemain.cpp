@@ -5622,7 +5622,7 @@ void CSortedMapDtor(void *obj)
 //     five DWORDs per slot) through RegisterLipComponent, runs the
 //     component bring-up
 //     (sub_17BF770), then resolves each slot's relative path into its +0x0C
-//     slot (sub_717D60).
+//     slot (ResolveLipComponentSlotPath, sub_717D60).
 //  4. Rebuilds the culture-string array: frees the old block
 //     (dword_1DC27EC), count = sub_17C0610(0) (dword_1DC27F0),
 //     LHAlloc(96 * count, the original's `mul` overflow folds to -1), then
@@ -5630,9 +5630,9 @@ void CSortedMapDtor(void *obj)
 //     (sub_17CC320) at +88, and records the "text" culture index in
 //     dword_1DC27F4. (With the count-0 stub sub_17C0610 the per-entry loop
 //     is dead in this build.)
-//  5. Zeros byte_1DC2804, registers the speech / lipsync banks
-//     (sub_718690), and releases the two scratch slots (the final release
-//     result is the return value).
+//  5. Zeros byte_1DC2804, registers the standard asset packages
+//     (RegisterStandardAssets), and releases the two scratch slots (the
+//     final release result is the return value).
 // ============================================================
 
 // 0x1DC2744 -- the culture-path base shared slot (the settings directory).
@@ -6004,10 +6004,21 @@ static int * sub_1A02260(int *a1, int *a2, const char ***a3)
 //  objects, the culture-file line reader (sub_17CEC00) and its two line
 //  callbacks, and XLipLoadCultures (sub_17CC7C0) itself.
 // ============================================================
-// the lip formatted-message helper (0x17D0570) and the lip assert reporter
-// (0x17D04A0), both defined further down.
+// the lip formatted-message helper (0x17D0570), the lip assert reporter
+// (0x17D04A0) and the lip debug-message sink (0x17D0610), all defined
+// further down.
 static int XLipDebugMessage(const wchar_t *format, ...);
-static void XLipAssert(const char *condition);
+static void XLipAssert(const wchar_t *format, ...);
+static void XLipDebugMessageSink(const wchar_t *message);
+// the assert-report format and the file names the original bakes into every
+// XLipAssert call site (each original site pushes its own copies of these
+// wide literals; the text is identical, so the sites share these).
+static const wchar_t g_xlipAssertFailed[]  = L"Assert failed. File: %s. Line: %d. Condition: %s";
+static const wchar_t g_xlipFileXLipX[]     = L"e:\\depot\\dev\\fable3\\pcbranch\\sourcecode\\externallibs\\xlip\\lib\\XLip_x.h";
+static const wchar_t g_xlipFileCulturesH[] = L"e:\\depot\\dev\\fable3\\pcbranch\\sourcecode\\externallibs\\xlip\\lib\\XLipCultures.h";
+static const wchar_t g_xlipFileCultures[]  = L".\\XLipCultures.cpp";
+static const wchar_t g_xlipFileComponent[] = L".\\XLipComponent.cpp";
+static const wchar_t g_xlipFileDebug[]     = L".\\XLipDebug.cpp";
 // 0x1E2C6D4 -- the XLipPtrVector<_tagXLIPCULTUREINFO> object (XLipCultures.
 // cpp global): vtable at +0x00 (??_7?$XLipPtrVector@U_tagXLIPCULTUREINFO@@@@
 // 6B@, set by the .CRT$Xu static ctor sub_1AA6400 -> sub_17CFF60; the slots
@@ -6065,7 +6076,7 @@ static void XLipTrimWide(wchar_t *s)
         while (iswspace(*q) != 0)
             --q;
         if (q < p)
-            XLipAssert("pEnd >= pStart");           // XLip_x.h line 119
+            XLipAssert(g_xlipAssertFailed, g_xlipFileXLipX, 119, L"pEnd >= pStart");
         q[1] = 0;
         if (p > s)
         {
@@ -6189,10 +6200,10 @@ static XLipCultureInfo *XLipCultureInfoCtor(XLipCultureInfo *obj,
     XLipStrReset(&obj->source);                  // sub_17B8EC0: reset +0x38
     obj->version = version;                      // +0x54
     if (WideCharToMultiByte(0, 0, name, -1, mb, 85, NULL, NULL) <= 0)
-        XLipAssert("iRet > 0");                  // XLipCultures.h line 93
+        XLipAssert(g_xlipAssertFailed, g_xlipFileCulturesH, 93, L"iRet > 0");
     XLipStrAssign((F3AString *)&obj->name, mb);  // sub_17CF990
     if (WideCharToMultiByte(0, 0, source, -1, mb, 85, NULL, NULL) <= 0)
-        XLipAssert("iRet > 0");                  // XLipCultures.h line 98
+        XLipAssert(g_xlipAssertFailed, g_xlipFileCulturesH, 98, L"iRet > 0");
     XLipStrAssign(&obj->source, mb);             // sub_17CF990
     return obj;
 }
@@ -6346,7 +6357,7 @@ static int XLipReadCultureFile(const char *fileName, unsigned short coding,
     }
     if (fileName == NULL)
     {
-        XLipAssert("pcszFileName");             // XLip_x.h line 142
+        XLipAssert(g_xlipAssertFailed, g_xlipFileXLipX, 142, L"pcszFileName");
         SetLastError(0x57);
         return -1;
     }
@@ -6507,7 +6518,7 @@ static int XLipParseVersionLine(wchar_t *line, int pvInfo)
     unsigned int version;
 
     if (line == NULL || pvInfo == 0)
-        XLipAssert("pwszLine && pvInfo");         // XLipCultures.cpp line 235
+        XLipAssert(g_xlipAssertFailed, g_xlipFileCultures, 235, L"pwszLine && pvInfo");
     if (line == NULL || pvInfo == 0)
     {
         SetLastError(0x57);
@@ -6597,7 +6608,7 @@ static int XLipParseCultureDefLine(wchar_t *line, int pvInfo)
 
     if (line == NULL)
     {
-        XLipAssert("pwszLine");                   // XLipCultures.cpp line 298
+        XLipAssert(g_xlipAssertFailed, g_xlipFileCultures, 298, L"pwszLine");
         SetLastError(0x57);
         return 0;
     }
@@ -6628,7 +6639,7 @@ static int XLipParseCultureDefLine(wchar_t *line, int pvInfo)
     len = wcslen(name);
     ret = _wcslwr_s(name, len + 1);
     if (ret != 0)
-        XLipAssert("ret==0");                   // XLipCultures.cpp line 359
+        XLipAssert(g_xlipAssertFailed, g_xlipFileCultures, 359, L"ret==0");
     if (wcschr(name, 46) != NULL)               // '.'
     {
         XLipDebugMessage(L"Invalid character found on culture name: %s", name);
@@ -6642,7 +6653,7 @@ static int XLipParseCultureDefLine(wchar_t *line, int pvInfo)
         return 0;
     }
     if (WideCharToMultiByte(0, 0, name, -1, mb, 85, NULL, NULL) <= 0)
-        XLipAssert("iRet > 0");                 // XLipCultures.cpp line 384
+        XLipAssert(g_xlipAssertFailed, g_xlipFileCultures, 384, L"iRet > 0");
     // (The "register under culture id / language id" chain -- the unk_1E2C620
     // / unk_1E2C640 map finds + sub_17CD3E0 / sub_17CF990 inserts -- runs
     // only on a hit; the maps are empty in this build, so it is dead.)
@@ -6652,7 +6663,7 @@ static int XLipParseCultureDefLine(wchar_t *line, int pvInfo)
         len = wcslen(source);
         ret = _wcslwr_s(source, len + 1);
         if (ret != 0)
-            XLipAssert("ret==0");               // line 399
+            XLipAssert(g_xlipAssertFailed, g_xlipFileCultures, 399, L"ret==0");
         if (ret != 0)
         {
             SetLastError(0x54F);
@@ -6664,7 +6675,8 @@ static int XLipParseCultureDefLine(wchar_t *line, int pvInfo)
             {
                 tokenVersion = wcstoul(token, NULL, 0);
                 if (tokenVersion == 0 || tokenVersion >= 0xFFFF)
-                    XLipAssert("ulVersion!=0 && ulVersion < XLIPLANGUAGE_MAXVERSION");
+                    XLipAssert(g_xlipAssertFailed, g_xlipFileCultures, 410,
+                               L"ulVersion!=0 && ulVersion < XLIPLANGUAGE_MAXVERSION");
                 if (tokenVersion == 0 || tokenVersion >= 0xFFFF)
                 {
                     XLipDebugMessage(L"Bad format on culture definition string: %s", line);
@@ -6806,13 +6818,63 @@ static int XLipLoadCultures(const char *fileName)
         XLipCultureParamsDtor(info, 1);
     return result;
 }
-// sub_17D04A0 (0x17D04A0 - 0x17D056F) -- the lip library's assert report
-// (XLipCultures.cpp): formats "Assert failed. File: %s. Line: %d. Condition:
-// %s", reports it (XLipDebugMessageSink), then DebugBreak (class id 1) or throws
-// "XLipAssert hit!" (id 3) per the first culture-class id (LipDwordVecAt
-// (dword_1E2C6B8, 0)).  Class id 0 (the value InitLipRuntime installs) is
-// report-only, so every lip assert in this build degrades to this no-op.
-static void XLipAssert(const char *condition) { (void)condition; }
+//  XLipAssert  (sub_17D04A0, 0x17D04A0 - 0x17D056F)  -- the lip library's
+//  assert reporter (XLipDebug.cpp): vswprintf_s-formats the caller's wide
+//  "Assert failed. File: %s. Line: %d. Condition: %s" message into a
+//  1024-wchar stack buffer (falling back to the raw format when the format
+//  fails / is empty, and to the fixed L"XLipAssert hit!" text when the
+//  format itself is null) and hands it to the (no-op) XLipDebugMessageSink.
+//  Then it dispatches on the first culture-class id (LipDwordVecAt
+//  (&g_unk_1E2C6B8, 0)): 1 = DebugBreak, 3 = throw the L"XLipAssert hit!"
+//  pointer with the NULL-type __TI2PAD throwinfo (only a catch(...) handler
+//  can see it).  Class id 0 (the value InitLipRuntime installs) is
+//  report-only, so every lip assert in this build degrades to a sink no-op.
+//
+//  void XLipAssert(const wchar_t *format, ...)   -- cdecl, plain `retn`
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  _vswprintf_s / XLipDebugMessageSink / LipDwordVecAt /
+//  __security_check_cookie), plus the high-VA refs to the IAT slots
+//  __imp_DebugBreak / __CxxThrowException@8, the rdata __TI2PAD throwinfo
+//  (0x1C7C758) and the L"XLipAssert hit!" literals (0x1BC1160 / 0x1BC1180).
+static const wchar_t g_xlipAssertHit[] = L"XLipAssert hit!";   // rdata 0x1BC1160
+// the CRT throw primitive: the original stores the string pointer in a stack
+// slot and calls _CxxThrowException(slot, &__TI2PAD); __TI2PAD is the 12-byte
+// { NULL, 0, 0, NULL } throwinfo, so the exception carries no type_info.
+struct XLipThrowInfo { const void *pType; unsigned short size, padsize; void *pThrow; };
+// The CRT throw primitive is the compiler builtin `_CxxThrowException`
+// (referenced by `throw`, exported by msvcr90 as __CxxThrowException@8).
+// It is declared by the compiler itself, so no forward declaration is needed
+// (declaring it with extern "C" trips C2733); it takes the exception object
+// pointer and a built-in `_ThrowInfo *`, so the all-zero struct below is cast
+// to that type at the call.
+static void XLipAssert(const wchar_t *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    if (format != NULL)
+    {
+        wchar_t buffer[1024];
+        int count = vswprintf_s(buffer, 1024, format, args);
+        if (count > 0)
+            XLipDebugMessageSink(buffer);
+        else
+            XLipDebugMessageSink(format);          // the raw format on failure
+    }
+    else
+        XLipDebugMessageSink(g_xlipAssertHit);     // "XLipAssert hit!"
+    va_end(args);
+    {
+        DWORD classId = *LipDwordVecAt(&g_unk_1E2C6B8, 0);
+        if (classId == 1)
+            DebugBreak();
+        else if (classId == 3)
+        {
+            const wchar_t *hit = g_xlipAssertHit;
+            const XLipThrowInfo throwInfo = { NULL, 0, 0, NULL };  // __TI2PAD
+            _CxxThrowException((void *)&hit, (_ThrowInfo *)&throwInfo);
+        }
+    }
+}
 
 // sub_17C47E0 (0x17C47E0 - 0x17C4842) -- delete the char at `pos` out of the
 // `size`-char string at `base`: memmove_s the tail (size - offset) bytes one
@@ -6848,10 +6910,10 @@ static void LipPathRemoveChar(char *base, int size, char *pos)
 static void *NormalizeLipPath(char *path)
 {
     if (path == NULL)
-        XLipAssert("pszPath");                    // line 784
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 784, L"pszPath");
     int len = (int)strlen(path);
     if (len <= 0)
-        XLipAssert("cchPath > 0");                // line 788
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 788, L"cchPath > 0");
     _strlwr_s(path, (unsigned)(len + 1));
     char *walk = strstr(path, ":\\");
     walk = (walk != NULL) ? walk + 2 : path;
@@ -6903,6 +6965,8 @@ typedef struct XLipFSRoot
 typedef void (__thiscall *XLipFSRootVfn)(void *obj, int arg);
 
 static void *GetXLipFSRootVtable(void);
+// XLipFSRoot vtable slot 5 (sub_17D1680), defined below with InitLipFSRoot.
+static int XLipFSRootIsInitDirValid(void *root);
 
 // sub_17D1A10 (0x17D1A10 - 0x17D1A3C) -- the XLipFSRoot deleting destructor
 // (vtable slot 7; thiscall + `retn 4`, the freeIt flag on the stack): the
@@ -6934,10 +6998,13 @@ L_xlipfsrootdtor_skip:
 }
 
 // XLipFSRoot::`vftable' (0x1BC446C, 8 slots).  Slot 7 is the deleting
-// destructor (sub_17D1A10); slots 0..6 (the IXLipRoot overrides,
+// destructor (sub_17D1A10); slot 5 is the init-directory check
+// (XLipFSRootIsInitDirValid, sub_17D1680), dispatched by InitLipFSRoot /
+// XLipBringUpComponents; the remaining slots (the IXLipRoot overrides,
 // sub_17D0930 .. sub_17D16F0) are unimplemented and never dispatched in
 // this build, so they are zero placeholders.
-static void *g_XLipFSRootVtable[8] = { 0, 0, 0, 0, 0, 0, 0, (void *)XLipFSRootDtor };
+static void *g_XLipFSRootVtable[8] =
+    { 0, 0, 0, 0, 0, (void *)XLipFSRootIsInitDirValid, 0, (void *)XLipFSRootDtor };
 static void *GetXLipFSRootVtable(void) { return g_XLipFSRootVtable; }
 
 // sub_17D08C0 (0x17D08C0 - 0x17D090C) -- the XLipFSRoot ctor (thiscall +
@@ -6953,15 +7020,10 @@ static XLipFSRoot *XLipFSRootCtor(XLipFSRoot *obj, const char *source)
     return obj;
 }
 
-// sub_17BF110 (0x17BF110 - 0x17BF32D) -- [STUB] bring up the XLipFSRoot:
-// the root query (sub_17C0A10), the virtual slot 5 (sub_17D1680), the
-// culture-class registration (sub_17C13C0 / sub_17C1250 over the class-id
-// vector element 2), the path build (module / culture directory + "\"), and
-// the culture-file load (XLipLoadCultures, sub_17CC7C0): 1 on success (including a missing
-// file, ERROR_FILE_NOT_FOUND 2 / ERROR_PATH_NOT_FOUND 3), 0 otherwise.
-// Unimplemented in this build; it degrades to the failure path (return 0),
-// so the caller tears the root down through vtable slot 7.
-static int InitLipFSRoot(void *root) { (void)root; return 0; }
+// InitLipFSRoot (sub_17BF110, 0x17BF110 - 0x17BF32D) -- bring up the
+// XLipFSRoot (XLipComponent.cpp); defined below, after the vector / string
+// helpers and the XLipFSRootVT / g_unk_1E2C664 globals it uses.
+static int InitLipFSRoot(void *root);
 
 // ============================================================
 //  CreateLipFSRoot  (sub_17BEE80, 0x17BEE80 - 0x17BF102)  -- create the lip
@@ -7003,16 +7065,16 @@ static int CreateLipFSRoot(const char *path)
     }
     if (path == NULL)
     {
-        XLipAssert("pcszPath");                  // line 26
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 26, L"pcszPath");
         SetLastError(0x57);
         return 0;
     }
     {
         size_t len = strlen(path);
         if (len == 0)
-            XLipAssert("len > 0");               // line 37
+            XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 37, L"len > 0");
         if (len >= 0x104)
-            XLipAssert("len < MAX_PATH");        // line 38
+            XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 38, L"len < MAX_PATH");
         if (!(len > 0 && len < 0x104))
         {
             SetLastError(0xA1);
@@ -7020,7 +7082,8 @@ static int CreateLipFSRoot(const char *path)
         }
         if (strcpy_s(destination, 0x104, path) != 0)
         {
-            XLipAssert("(ret==0) && \"failed to copy path to internal buffer\"");
+            XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 52,
+                       L"(ret==0) && \"failed to copy path to internal buffer\"");
             SetLastError(0x54F);
             return 0;
         }
@@ -7030,7 +7093,7 @@ static int CreateLipFSRoot(const char *path)
     XLipFSRoot *root = (block != NULL) ? XLipFSRootCtor((XLipFSRoot *)block, destination) : NULL;
     if (root == NULL)
     {
-        XLipAssert("pRoot != NULL");             // line 60
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 60, L"pRoot != NULL");
         SetLastError(0xE);
         return 0;
     }
@@ -7161,7 +7224,7 @@ static XLipComponent *XLipComponentCtor(XLipComponent *obj, const char *name, co
 static void *FindLipComponentByName(const char *name)
 {
     if (name == NULL)
-        XLipAssert("pcszName");
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 866, L"pcszName");
     if (name == NULL)
         return NULL;
     const LipDwordVec *reg = &g_unk_1E2C69C;
@@ -7179,7 +7242,7 @@ static void *FindLipComponentByName(const char *name)
 static void *FindLipComponentByPath(const char *path)
 {
     if (path == NULL)
-        XLipAssert("pcszPath");
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 879, L"pcszPath");
     if (path == NULL)
         return NULL;
     const LipDwordVec *reg = &g_unk_1E2C69C;
@@ -7211,7 +7274,7 @@ static int XLipDebugMessage(const wchar_t *format, ...)
     va_list va;
     va_start(va, format);
     if (format == NULL)
-        XLipAssert("pcwszFormat");          // line 65: the format must be non-null
+        XLipAssert(g_xlipAssertFailed, g_xlipFileDebug, 65, L"pcwszFormat");
     wchar_t buffer[1024];
     int result = vswprintf_s(buffer, 1024, format, va);
     if (result <= 0) {
@@ -7271,9 +7334,9 @@ static int RegisterLipComponent(const char *pcszName, const char *pcszPath)
         return 0;
     }
     if (pcszName == NULL)
-        XLipAssert("pcszName");                       // line 0xB5
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 0xB5, L"pcszName");
     if (pcszPath == NULL)
-        XLipAssert("pcszPath");                       // line 0xB6
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 0xB6, L"pcszPath");
     if (pcszName == NULL || pcszPath == NULL)
     {
         SetLastError(0x57);
@@ -7282,7 +7345,8 @@ static int RegisterLipComponent(const char *pcszName, const char *pcszPath)
     {
         int nameLen = (int)strlen(pcszName);
         if (nameLen <= 0)
-            XLipAssert("len > 0 && \"component name can't be an empty string\"");
+            XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 0xC0,
+                       L"len > 0 && \"component name can't be an empty string\"");
         if (nameLen <= 0)
         {
             SetLastError(0x57);
@@ -7298,14 +7362,16 @@ static int RegisterLipComponent(const char *pcszName, const char *pcszPath)
     {
         int pathLen = (int)strlen(pcszPath);
         if (pathLen <= 0)
-            XLipAssert("len > 0 && \"component relative path can't be an empty string\"");
+            XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 0xD5,
+                       L"len > 0 && \"component relative path can't be an empty string\"");
         if (pathLen <= 0)
         {
             SetLastError(0xA1);
             return 0;
         }
         if (pathLen >= 260)
-            XLipAssert("len < MAX_PATH && \"component relative path length should be < MAX_PATH\"");
+            XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 0xDC,
+                       L"len < MAX_PATH && \"component relative path length should be < MAX_PATH\"");
         if (pathLen >= 260)
         {
             SetLastError(0xA1);
@@ -7329,7 +7395,7 @@ static int RegisterLipComponent(const char *pcszName, const char *pcszPath)
     XLipComponent *comp =
         (block != NULL) ? XLipComponentCtor((XLipComponent *)block, pcszName, path) : NULL;
     if (comp == NULL)
-        XLipAssert("pComponent != NULL");
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 0xFC, L"pComponent != NULL");
     if (comp == NULL)
     {
         SetLastError(0xE);
@@ -7340,14 +7406,1108 @@ static int RegisterLipComponent(const char *pcszName, const char *pcszPath)
     LipCompRegPush(&g_unk_1E2C69C, (DWORD)comp);
     return 1;
 }
-// sub_17BF770 (0x17BF770 - 0x17BFC20) -- the lip component bring-up over the
-// registered components.
-static void  sub_17BF770(void) {}
-// sub_717D60 (0x717D60 - 0x717DF2) -- resolve a
-// component slot's relative path (sub_17C0360 against the registered
-// component + CWD) and copy it into the out slot; 1 on success, 0 if the
-// path did not resolve.
-static char  sub_717D60(void *a1, int *a2) { (void)a1; (void)a2; return 0; }
+// ============================================================
+//  0x1E2C5C4 -- the previous-session registered-language list (XLipSettings):
+//  a 28-byte object (an untouched DWORD header at +0x00, a 24-byte vector of
+//  28-byte char-string pointers at +0x04), freed at the start of every
+//  XLipInitUILanguages.  Empty in this build.
+typedef struct XlipOldLanguageList
+{
+    DWORD       header;           // +0x00 (untouched)
+    LipDwordVec languages;        // +0x04 (28-byte char strings)
+} XlipOldLanguageList;
+static XlipOldLanguageList g_unk_1E2C5C4 = { 0, { 0, 0, 0, NULL, NULL, NULL } };
+// 0x1E2C5C8 -- the registered UI-language names (24-byte vector of 28-byte
+// char-string pointers allocated through LHAlloc by XLipAddLanguage).
+static LipDwordVec g_unk_1E2C5C8 = { 0, 0, 0, NULL, NULL, NULL };
+// 0x1E2C664 -- the registered lip file-system roots (24-byte vector of
+// XLipFSRoot pointers); XLipBringUpComponents iterates it in both passes.
+//  Empty in this build (InitLipFSRoot is implemented but unreached, since
+//  CreateLipFSRoot falls out on the empty settings path before registering).
+static LipDwordVec g_unk_1E2C664 = { 0, 0, 0, NULL, NULL, NULL };
+// 0x1E2C67C -- the in-flight PPL parallel culture-task callbacks (24-byte
+// vector of CancellationTokenCallback pointers), cancelled / cleared by
+// XLipBringUpComponents (sub_17C6B20).  Empty in this build.
+static LipDwordVec g_unk_1E2C67C = { 0, 0, 0, NULL, NULL, NULL };
+// 0x1E2C680 -- the registered cultures (24-byte vector of 60-byte
+// registered-culture objects: a 28-byte name string at +0x00, a DWORD packed
+// version ((major << 16) | minor) at +0x1C, a DWORD root index at +0x20, 24
+// PPL task bytes at +0x24).  Populated on demand by XLipGetCultureId; empty
+// in this build (pass 1 never runs).
+typedef struct XLipRegisteredCulture
+{
+    F3AString name;               // +0x00
+    DWORD     version;            // +0x1C (packed major / minor)
+    DWORD     rootIndex;          // +0x20
+    char      task[0x18];         // +0x24 (PPL task / token context)
+} XLipRegisteredCulture;          // 0x3C bytes
+static LipDwordVec g_unk_1E2C680 = { 0, 0, 0, NULL, NULL, NULL };
+// the XLipFSRoot vtable (0x1BC446C) as dispatched by
+// XLipBringUpComponents.  The project's g_XLipFSRootVtable keeps slots 0..6
+// as zero placeholders (no roots are registered in this build, so none of
+// these ever fires).
+typedef struct XLipFSRootVT
+{
+    void *vt0;                                                            // +0x00
+    int  (*getCultureName)(void *root, unsigned int index, char *name,
+                           unsigned int cchName);                         // +0x04  sub_17D0B50
+    int  (*hasCultureDir)(void *root, const char *path, const char *cultureName); // +0x08 sub_17D0F80
+    void *vt3;                                                            // +0x0C
+    int  (*readCultureVersion)(void *root, const char *cultureName,
+                               unsigned short *major, unsigned short *minor); // +0x10 sub_17D14A0
+    int  (*isInitDirValid)(void *root);                                   // +0x14  sub_17D1680
+    void *vt6;                                                            // +0x18
+    void *vt7;                                                            // +0x1C
+} XLipFSRootVT;
+
+// ---- 24-byte vector element helpers (4-byte and 12-byte elements) ----
+// reserve `n` 4-byte elements (sub_17B3FD0 / sub_17C1500 semantics): when
+// the current capacity (4-byte elements) is smaller, allocate exactly 4*n
+// bytes through LipMemAlloc, move the existing elements, free the old block
+// and rewrite the begin / end / allocEnd pointers.
+static void XLipVecReserve4(LipDwordVec *v, unsigned int n)
+{
+    unsigned int cap = (v->begin != NULL) ? (unsigned int)(v->allocEnd - v->begin) : 0;
+    if (cap >= n)
+        return;
+    {
+        DWORD *nb = (DWORD *)LipMemAlloc(4 * n);
+        unsigned int size;
+        if (nb == NULL)
+            return;
+        size = LipDwordVecSize(v);
+        if (size != 0 && v->begin != NULL)
+        {
+            memcpy(nb, v->begin, 4 * size);
+            LipMemFree(v->begin);
+        }
+        v->begin = nb;
+        v->end   = nb + size;
+        v->allocEnd = nb + n;
+    }
+}
+// reserve `n` 12-byte elements (sub_17C1760): allocate 12*n bytes, move the
+// existing 12-byte elements, free the old block.
+static void XLipVecReserve12(LipDwordVec *v, unsigned int n)
+{
+    unsigned int cap = (v->begin != NULL) ? (unsigned int)(v->allocEnd - v->begin) / 3 : 0;
+    if (cap >= n)
+        return;
+    {
+        DWORD *nb = (DWORD *)LipMemAlloc(12 * n);
+        unsigned int size;
+        if (nb == NULL)
+            return;
+        size = (unsigned int)(v->end - v->begin) / 3;
+        if (size != 0 && v->begin != NULL)
+        {
+            memcpy(nb, v->begin, 12 * size);
+            LipMemFree(v->begin);
+        }
+        v->begin = nb;
+        v->end   = nb + 3 * size;
+        v->allocEnd = nb + 3 * n;
+    }
+}
+// push a 4-byte value, growing the vector when full (sub_17B9010 /
+// sub_17C16E0 semantics).
+static void XLipVecPush4(LipDwordVec *v, DWORD value)
+{
+    unsigned int size;
+    if (v->begin == NULL)
+        XLipVecReserve4(v, 1);
+    size = LipDwordVecSize(v);
+    if (size >= (unsigned int)(v->allocEnd - v->begin))
+        XLipVecReserve4(v, 1 + 2 * size);
+    *v->end = value;
+    v->end += 1;
+}
+// append a 4-byte value only when it is not already present (sub_17B85D0,
+// the addIfAbsent helper over a 4-byte-element vector).
+static void XLipVecAddIfAbsent(LipDwordVec *v, DWORD value)
+{
+    unsigned int size = LipDwordVecSize(v);
+    unsigned int i;
+    for (i = 0; i < size; i++)
+    {
+        if (v->begin[i] == value)
+            return;
+    }
+    XLipVecPush4(v, value);
+}
+// push a 12-byte value, growing the vector when full (sub_17C1980).
+static void XLipVecPush12(LipDwordVec *v, const DWORD *src)
+{
+    unsigned int size;
+    if (v->begin == NULL)
+        XLipVecReserve12(v, 1);
+    size = (unsigned int)(v->end - v->begin) / 3;
+    if (size >= (unsigned int)(v->allocEnd - v->begin) / 3)
+        XLipVecReserve12(v, 1 + 2 * size);
+    memcpy(v->end, src, 12);
+    v->end += 3;
+}
+// erase-all (sub_17B9090 / sub_17C1A00): reset end to begin (the elements
+// are POD -- no destructors).
+static void XLipVecClear(LipDwordVec *v)
+{
+    v->end = v->begin;
+}
+
+// ============================================================
+//  XLipFSRoot vtable slot 5  (sub_17D1680, 0x17D1680 - 0x17D16EF)  -- the
+//  init-directory validity check (XLipComponent.cpp): the root's path string
+//  (root + 0x0C) must be non-empty and name an existing directory.
+//  [NOT byte-identical] placement-dependent (relative calls to the IAT
+//  thunks GetFileAttributesA / __imp_SetLastError / __security_check_cookie).
+//  int XLipFSRootIsInitDirValid(void *root)   -- original: thiscall, `retn`
+//  1 when the path is an existing directory; 0 when it is empty
+//  (SetLastError 0x139F) or not a directory (SetLastError 0x7B); when the
+//  attribute query fails the returned GetLastError is preserved and 0.
+// ============================================================
+static int XLipFSRootIsInitDirValid(void *rootObj)
+{
+    const XLipFSRoot *root = (const XLipFSRoot *)rootObj;
+    if (root->path[0] == 0)
+    {
+        SetLastError(0x139F);
+        return 0;
+    }
+    DWORD attr = GetFileAttributesA(root->path);
+    if (attr == (DWORD)-1)
+        return 0;
+    if ((attr & 0x10) != 0)                 // FILE_ATTRIBUTE_DIRECTORY
+        return 1;
+    SetLastError(0x7B);
+    return 0;
+}
+// sub_17C13C0 (0x17C13C0 - 0x17C13E8) -- the 4-byte-element vector capacity:
+// (allocEnd - begin) / 4 (0 when begin is null).
+static unsigned int XLipVecCap4(const LipDwordVec *v)
+{
+    return (v->begin != NULL) ? (unsigned int)(v->allocEnd - v->begin) : 0;
+}
+// sub_17C0A10 (0x17C0A10 - 0x17C0A3F) -- find the XLipFSRoot already present
+// in the registered-roots vector (g_unk_1E2C664); the stored element (== the
+// root pointer) on a hit, 0 otherwise (sub_17C0A50 linear scan).
+static void *XLipFindRoot(const void *root)
+{
+    const LipDwordVec *v = &g_unk_1E2C664;
+    unsigned int i;
+    for (i = 0; i < LipDwordVecSize(v); i++)
+        if (v->begin[i] == (DWORD)root)
+            return (void *)v->begin[i];
+    return 0;
+}
+// grow a 28-byte lip basic_string<char> to hold at least `newLen` chars and
+// return its writable buffer: the SSO buffer (capacity 15) when newLen < 16,
+// else a LipMemAlloc'd heap buffer; the existing characters are moved.
+static char *XLipStrEnsure(F3AString *s, unsigned int newLen)
+{
+    const char *old = XLipStrCstr(s);
+    char *buf;
+    if (newLen >= 0x10)
+    {
+        void *nb = LipMemAlloc(newLen + 1);
+        buf = (char *)nb;
+        memcpy(buf, old, s->len);
+        if (s->cap >= 0x10)
+            LipMemFree((void *)s->u.ptr);
+        s->u.ptr = (DWORD)nb;
+        s->cap = newLen + 1;
+    }
+    else
+    {
+        buf = s->u.buf;
+        s->cap = 15;
+    }
+    return buf;
+}
+// ?append@basic_string... (0x17BF223) -- append a NUL-terminated C string to
+// a 28-byte lip basic_string<char>.
+static void XLipStrAppendCstr(F3AString *s, const char *src)
+{
+    unsigned int add = (unsigned int)strlen(src);
+    char *buf = XLipStrEnsure(s, s->len + add);
+    memcpy(buf + s->len, src, add + 1);
+    s->len = s->len + add;
+}
+// sub_17C1190 (0x17C1190 - 0x17C11A8) -- append one 28-byte lip
+// basic_string<char> (the whole source) to another (sub_17C2070 with pos 0,
+// count -1).
+static void XLipStrAppendStr(F3AString *s, const F3AString *src)
+{
+    unsigned int add = src->len;
+    const char *c = XLipStrCstr(src);
+    char *buf = XLipStrEnsure(s, s->len + add);
+    memcpy(buf + s->len, c, add);
+    buf[s->len + add] = 0;
+    s->len = s->len + add;
+}
+// sub_17C1200 (0x17C1200 - 0x17C1240) -- dst = src[pos, count) (count -1 = to
+// the end): clears dst (sub_17B9270) then appends the substring
+// (sub_17B9DD0).
+static F3AString *XLipStrSubstr(F3AString *dst, const F3AString *src,
+                                unsigned int pos, int count)
+{
+    unsigned int n;
+    const char *c;
+    if (dst->cap >= 0x10)
+        LipMemFree((void *)dst->u.ptr);
+    dst->cap = 15;
+    dst->len = 0;
+    dst->u.buf[0] = 0;
+    if (pos >= src->len)
+        n = 0;
+    else
+    {
+        unsigned int rem = src->len - pos;
+        n = (count < 0) ? rem : (((unsigned int)count < rem) ? (unsigned int)count : rem);
+    }
+    c = XLipStrCstr(src) + pos;
+    if (n >= 0x10)
+    {
+        void *nb = LipMemAlloc(n + 1);
+        memcpy((char *)nb, c, n);
+        ((char *)nb)[n] = 0;
+        dst->u.ptr = (DWORD)nb;
+        dst->cap = n + 1;
+    }
+    else
+    {
+        memcpy(dst->u.buf, c, n);
+        dst->u.buf[n] = 0;
+    }
+    dst->len = n;
+    return dst;
+}
+// sub_17C11E0 (0x17C11E0 - 0x17C11F8) -- rfind a single char in a 28-byte lip
+// basic_string<char> (sub_17C2210 with pos -1); the last matching index, -1
+// when absent.
+static int XLipStrRFind(const F3AString *s, char ch)
+{
+    const char *c = XLipStrCstr(s);
+    int i = (int)s->len - 1;
+    for (; i >= 0; i--)
+        if (c[i] == ch)
+            return i;
+    return -1;
+}
+
+// ============================================================
+//  InitLipFSRoot  (sub_17BF110, 0x17BF110 - 0x17BF32D)  -- bring up the
+//  XLipFSRoot (XLipComponent.cpp), the routine CreateLipFSRoot calls after
+//  constructing the 0x110-byte root object.
+//  [NOT byte-identical] placement-dependent (relative calls to XLipAssert /
+//  XLipFindRoot / the vtable-slot-5 dispatch / XLipVecReserve4 / XLipVecPush4
+//  / the string helpers / XLipLoadCultures, the IAT thunks
+//  __imp_SetLastError / __imp_GetLastError / __security_check_cookie, and the
+//  SEH ___CxxFrameHandler3_0 landing pad) and refs the high-VA globals
+//  byte_1E2C6B4 (0x01E2C6B4), unk_1E2C6B8 (0x01E2C6B8), unk_1E2C664
+//  (0x01E2C664) and dword_1E2C6D0 (0x01E2C6D0) at their original VAs.
+//
+//  int InitLipFSRoot(void *root)   -- original: cdecl, plain `retn`
+//
+//  Gated by the init flag byte_1E2C6B4 (SetLastError(0x15), return 0 when
+//  unset).  Asserts pRoot != NULL (line 84, SetLastError(0x57)).  When the
+//  root is already in the registered-roots vector (XLipFindRoot, sub_17C0A10)
+//  it returns 1; when vtable slot 5 (XLipFSRootIsInitDirValid, sub_17D1680)
+//  says the directory is unusable it returns 0.  Otherwise it seeds the vector
+//  capacity from class-id element 2 (XLipVecReserve4, sub_17C1250) when empty,
+//  pushes the root (XLipVecPush4, sub_17C1450), builds the culture-file path
+//  as  root->path + "\" + (the culture-directory string in the default-params
+//  object after its last backslash, or the whole string when it has none),
+//  and, when that path is <= 0x104 chars, loads it (XLipLoadCultures): 1 on
+//  success (including a missing file, ERROR_FILE_NOT_FOUND 2 /
+//  ERROR_PATH_NOT_FOUND 3), 0 otherwise; when the path is too long it sets
+//  0xA1 and returns 0.
+// ============================================================
+static int InitLipFSRoot(void *rootObj)
+{
+    XLipFSRoot *root = (XLipFSRoot *)rootObj;
+    F3AString *paramsStr = (F3AString *)&g_dword_1E2C6D0;
+    F3AString path;
+    int found;
+    int rc;
+
+    if (g_byte_1E2C6B4 == 0)
+    {
+        SetLastError(0x15);
+        return 0;
+    }
+    if (root == NULL)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 84, L"pRoot");
+    if (root == NULL)
+    {
+        SetLastError(0x57);
+        return 0;
+    }
+    if (XLipFindRoot(root) != 0)
+        return 1;
+    if (((const XLipFSRootVT *)root->vtable)->isInitDirValid(root) == 0)
+        return 0;
+    if (XLipVecCap4(&g_unk_1E2C664) == 0)
+        XLipVecReserve4(&g_unk_1E2C664, *LipDwordVecAt(&g_unk_1E2C6B8, 2));
+    XLipVecPush4(&g_unk_1E2C664, (DWORD)root);
+
+    F3AStringReset(&path);
+    found = XLipStrRFind(paramsStr, '\\');
+    XLipStrAssign(&path, root->path);
+    XLipStrAppendCstr(&path, "\\");
+    if (found < 0)
+    {
+        XLipStrAppendStr(&path, paramsStr);
+    }
+    else
+    {
+        F3AString sub;
+        F3AStringReset(&sub);
+        XLipStrSubstr(&sub, paramsStr, (unsigned int)(found + 1), -1);
+        XLipStrAppendStr(&path, &sub);
+        XLipStrDtor(&sub);
+    }
+    if (path.len <= 0x104)
+    {
+        rc = XLipLoadCultures(XLipStrCstr(&path));
+        {
+            int lastErr = GetLastError();
+            int ok = (rc >= 0 || lastErr == 2 || lastErr == 3);
+            XLipStrDtor(&path);
+            return ok ? 1 : 0;
+        }
+    }
+    SetLastError(0xA1);
+    XLipStrDtor(&path);
+    return 0;
+}
+// sub_17CD070 (0x17CD070 - 0x17CD149) -- look up the culture definition
+// (an XLipCultureInfo from the parsed cultures file) by lowercased name:
+// assert non-null (XLipCultures.cpp line 448), scan the definition list
+// (g_unk_1E2C6D4) comparing each entry's name string, return the entry on
+// an exact match, otherwise log "The culture %S could not be found on the
+// culture vector" and return NULL.  cdecl, one arg.
+static XLipCultureInfo *XLipFindCultureDef(const char *pcszCulture)
+{
+    LipDwordVec *list;
+    unsigned int i;
+    if (pcszCulture == NULL)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileCultures, 448, L"pcszCulture");
+    list = LipCultureListVec();
+    for (i = 0; i < LipCultureListSize(list); i++)
+    {
+        const XLipCultureInfo *info = (const XLipCultureInfo *)list->begin[i];
+        if (strcmp(XLipStrCstr(&info->name), pcszCulture) == 0)
+            return (XLipCultureInfo *)info;
+    }
+    XLipDebugMessage(L"The culture %S could not be found on the culture vector",
+                     pcszCulture);
+    return NULL;
+}
+// sub_17C0D90 (0x17C0D90 - 0x17C0E08) -- look up the 0-based index of a
+// culture name in the registered-culture table (g_unk_1E2C680), scanning
+// each 60-byte object's name string; -1 when not present.  The name is
+// compared exactly (both sides are lowercased at the call sites).  cdecl,
+// one arg.
+static int XLipFindRegisteredCulture(const char *pcszCulture)
+{
+    unsigned int i;
+    if (pcszCulture == NULL)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 933, L"pcszCulture");
+    for (i = 0; i < LipDwordVecSize(&g_unk_1E2C680); i++)
+    {
+        const XLipRegisteredCulture *reg =
+            (const XLipRegisteredCulture *)g_unk_1E2C680.begin[i];
+        if (strcmp(XLipStrCstr(&reg->name), pcszCulture) == 0)
+            return (int)i;
+    }
+    return -1;
+}
+// sub_17CC4F0 (0x17CC4F0 - 0x17CD06D) -- fetch one field of a culture
+// definition (XLipCultures.cpp):
+//    type 1 -- the language name (the wide language string as UTF-16,
+//              size = 2 * len + 2)
+//    type 2 -- the source / parent name (narrow; -1 + SetLastError 0x10D2
+//              when the source is "null", i.e. a top-level culture)
+//    type 3 -- the defined major version (WORD, size 2)
+//  Gate on the init flag (SetLastError 0x15), assert the name is non-null
+//  and non-empty (line 92) and the buffer consistent (line 93), lowercase a
+//  copy of the name (strcpy_s / _strlwr_s, line-115 asserts), resolve it
+//  through XLipFindCultureDef (SetLastError 0x490 on a miss), copy `size`
+//  bytes into pbBuffer when one was given (SetLastError 0x7A when the buffer
+//  is too small), and return the size.  cdecl, four args.
+static int XLipGetCultureInfo(const char *pcszCultureName, unsigned int type,
+                              void *pbBuffer, unsigned int cbBuffer)
+{
+    char name[85];
+    const char *src;
+    unsigned int size;
+    XLipCultureInfo *info;
+    if (g_byte_1E2C6B4 == 0)
+    {
+        SetLastError(0x15);
+        return -1;
+    }
+    if (pcszCultureName == NULL || pcszCultureName[0] == 0)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileCultures, 92,
+                   L"pcszCultureName && pcszCultureName[0] && \"Parameter can't be NULL\"");
+    if ((pbBuffer != NULL || cbBuffer != 0)
+        && (pbBuffer == NULL || cbBuffer <= 0))
+        XLipAssert(g_xlipAssertFailed, g_xlipFileCultures, 93,
+                   L"((!pbBuffer && cbBuffer==0) || (pbBuffer && cbBuffer > 0)) && \"Buffer length must consistent\"");
+    if (pcszCultureName == NULL || pcszCultureName[0] == 0
+        || (pbBuffer != NULL && cbBuffer < 1) || (pbBuffer == NULL && cbBuffer != 0))
+    {
+        SetLastError(0x57);
+        return -1;
+    }
+    if (strcpy_s(name, 0x55, pcszCultureName) != 0)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileCultures, 115, L"ret==0");
+    if (_strlwr_s(name, 0x55) != 0)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileCultures, 115, L"ret==0");
+    info = XLipFindCultureDef(name);
+    if (info == NULL)
+    {
+        SetLastError(0x490);
+        return -1;
+    }
+    switch (type)
+    {
+    case 1:
+        src = (info->language.cap < 8)
+              ? (const char *)info->language.u.buf
+              : (const char *)info->language.u.ptr;
+        size = 2 * info->language.len + 2;
+        break;
+    case 2:
+        if (strcmp(XLipStrCstr(&info->source), "null") == 0)
+        {
+            SetLastError(0x10D2);
+            return -1;
+        }
+        src = XLipStrCstr(&info->source);
+        size = (unsigned int)strlen(src) + 1;
+        break;
+    case 3:
+        src = (const char *)&info->version;
+        size = 2;
+        break;
+    default:
+        XLipAssert(g_xlipAssertFailed, g_xlipFileCultures, 160,
+                   L"false && \"Unknown XLIPCULTUREINFOTYPE specified\"");
+        SetLastError(0x57);
+        return -1;
+    }
+    if (pbBuffer != NULL)
+    {
+        if (cbBuffer < size)
+        {
+            XLipDebugMessageSink(L"buffer too small");
+            SetLastError(0x7A);
+            return -1;
+        }
+        memcpy(pbBuffer, src, size);
+    }
+    return (int)size;
+}
+// sub_17C0C60 (0x17C0C60 - 0x17C0DAF) -- resolve a (lowercased) culture or
+// language name to its 0-based index in the registered-culture table
+// (XLipComponent.cpp): assert non-null (line 906), reserve 5 elements when
+// the table is still empty (the class-id vector element 5), and: when the
+// name is a known culture definition -- return its registered index, or
+// register it first: LipMemAlloc a 60-byte registered-culture object,
+// assign its name string, zero its version / root-index pair, push the
+// pointer into g_unk_1E2C680, and return the new (count - 1) index.  When
+// the name is not a supported culture at all, log 'The language "%S" is not
+// a supported culture' and return -1.  cdecl, one arg.
+static int XLipGetCultureId(const char *pcszLanguage)
+{
+    int j;
+    if (pcszLanguage == NULL)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 906, L"pcszLanguage");
+    if (g_unk_1E2C680.begin == NULL)
+        XLipVecReserve4(&g_unk_1E2C680, *LipDwordVecAt(&g_unk_1E2C6B8, 5));
+    if (XLipFindCultureDef(pcszLanguage) == NULL)
+    {
+        XLipDebugMessage(L"The language \"%S\" is not a supported culture",
+                         pcszLanguage);
+        return -1;
+    }
+    j = XLipFindRegisteredCulture(pcszLanguage);
+    if (j >= 0)
+        return j;
+    {
+        DWORD block = (DWORD)LipMemAlloc(sizeof(XLipRegisteredCulture));
+        if (block != NULL)
+        {
+            XLipRegisteredCulture *reg = (XLipRegisteredCulture *)block;
+            XLipStrReset(&reg->name);
+            XLipStrAssign(&reg->name, pcszLanguage);
+            reg->version = 0;
+            reg->rootIndex = 0;
+        }
+        XLipVecPush4(&g_unk_1E2C680, block);      // sub_17C16E0
+    }
+    return (int)LipDwordVecSize(&g_unk_1E2C680) - 1;
+}
+// sub_17B3570 (0x17B3570 - 0x17B3688) -- register a UI language (an already
+// lowercased narrow name) into the registered-language vector
+// (g_unk_1E2C5C8): LHAlloc a 28-byte string, assign the name, push the
+// pointer, then follow the culture-definition source chain -- when the name
+// resolves to a culture whose source is not "null" and is not already
+// registered, recurse on the source name.  cdecl, two args (the second, a
+// procedure pointer in the original, is unused here).
+static void XLipAddLanguage(const char *pcszLanguage, void *procAddress)
+{
+    LipDwordVec *list = &g_unk_1E2C5C8;
+    const XLipCultureInfo *info;
+    unsigned int i;
+    (void)procAddress;
+    for (i = 0; i < LipDwordVecSize(list); i++)
+    {
+        if (strcmp(XLipStrCstr((const F3AString *)list->begin[i]),
+                   pcszLanguage) == 0)
+            return;                     // already registered
+    }
+    {
+        F3AString *s = (F3AString *)LHAlloc(0x1C);
+        if (s == NULL)
+            return;
+        XLipStrReset(s);
+        XLipStrAssign(s, pcszLanguage);
+        XLipVecPush4(list, (DWORD)s);
+    }
+    info = XLipFindCultureDef(pcszLanguage);
+    if (info != NULL)
+    {
+        const char *source = XLipStrCstr(&info->source);
+        int haveSource = 0;
+        if (strcmp(source, "null") != 0)
+        {
+            for (i = 0; i < LipDwordVecSize(list); i++)
+            {
+                if (strcmp(XLipStrCstr((const F3AString *)list->begin[i]),
+                           source) == 0)
+                {
+                    haveSource = 1;
+                    break;
+                }
+            }
+            if (!haveSource)
+                XLipAddLanguage(source, procAddress);   // follow the chain
+        }
+    }
+}
+// sub_17B9760 (0x17B9760 - 0x17B97B8) -- free and clear the old registered-
+// language list (the vector inside g_unk_1E2C5C4 at +0x04): run the 28-byte
+// string dtor on each element (XLipStrDtor) and LHFree the block when the
+// freeIt flag is set, then reset end to begin.
+static void XLipClearLanguageList(int freeIt)
+{
+    LipDwordVec *v = &g_unk_1E2C5C4.languages;
+    unsigned int i;
+    for (i = 0; i < LipDwordVecSize(v); i++)
+    {
+        F3AString *s = (F3AString *)v->begin[i];
+        if (s != NULL && freeIt != 0)
+        {
+            XLipStrDtor(s);
+            LHFree(s);
+        }
+    }
+    XLipVecClear(v);
+}
+// sub_17B3690 (0x17B3690 - 0x17B3950) -- the Vista+ UI-language enumeration
+// (XLipSettings.cpp): resolve GetThreadPreferredUILanguages from the given
+// kernel32 handle (0 when absent), call it with dwFlags 8 into a 595-wide-
+// char buffer, walk the NUL-separated language list, convert each entry to
+// a lowercase narrow name (WideCharToMultiByte into an 85-byte buffer with
+// the line-616 assert, _strlwr_s with the line-621 assert) and register it
+// through XLipAddLanguage.  Returns 1 when the enumeration ran, 0 when the
+// function pointer is missing or the call failed.
+static int XLipRegisterThreadUILanguages(HMODULE hModule)
+{
+    typedef int (WINAPI *GetThreadPreferredUILanguagesFn)(DWORD, LPDWORD,
+                                                          LPWSTR, LPDWORD);
+    WCHAR langBuf[595];
+    DWORD cchBuffer = 595;
+    DWORD numLanguages = 0;
+    GetThreadPreferredUILanguagesFn getLangs;
+    const WCHAR *p;
+
+    getLangs = (GetThreadPreferredUILanguagesFn)GetProcAddress(
+        hModule, "GetThreadPreferredUILanguages");
+    if (getLangs == NULL)
+        return 0;
+    if (getLangs(8, &numLanguages, langBuf, &cchBuffer) == 0)
+        return 0;
+    for (p = langBuf; *p != 0; p += wcslen(p) + 1)
+    {
+        char mb[85];
+        int iRet;
+        memset(mb, 0, 85);
+        iRet = WideCharToMultiByte(0, 0, p, (int)wcslen(p), mb, 85, NULL, NULL);
+        if (iRet <= 0)
+            XLipAssert(g_xlipAssertFailed, g_xlipFileXLipX, 616, L"iRet > 0");
+        if (iRet > 0)
+        {
+            if (_strlwr_s(mb, 0x55) != 0)
+                XLipAssert(g_xlipAssertFailed, g_xlipFileXLipX, 621, L"errret == 0");
+            XLipAddLanguage(mb, getLangs);
+        }
+    }
+    return 1;
+}
+// sub_17B3950 (0x17B3950 - 0x17B3A50) -- the pre-Vista UI-language fallback
+// (XLipSettings.cpp): resolve GetUserDefaultUILanguage (0 when absent),
+// look the resulting language id up in the two 32-byte XLip maps
+// (sub_17B3860 on g_unk_1E2C640 and sub_17B38D0 on g_unk_1E2C620) and
+// register each string found.  Both maps are constructed empty in this
+// build and never receive insertions, so both lookups always miss and the
+// function returns 0 without registering anything.
+static int XLipRegisterUserUILanguages(HMODULE hModule)
+{
+    typedef WORD (WINAPI *GetUserDefaultUILanguageFn)(void);
+    GetUserDefaultUILanguageFn getUserLang = (GetUserDefaultUILanguageFn)
+        GetProcAddress(hModule, "GetUserDefaultUILanguage");
+    if (getUserLang == NULL)
+        return 0;
+    // (sub_17B3860 / sub_17B38D0 map lookups: the maps are empty in this
+    //  build, so no user language string is found.)
+    return 0;
+}
+// sub_17B3A50 (0x17B3A50 - 0x17B3BB6) -- the UI-language settings init
+// (XLipSettings.cpp): reserve 7 on the registered-language vector
+// (g_unk_1E2C5C8), free and clear the old list (g_unk_1E2C5C4), load
+// kernel32 (XLipAssert at line 717 when that fails), and -- when
+// GetThreadPreferredUILanguages is available -- register each thread
+// preferred UI language (XLipRegisterThreadUILanguages), otherwise the
+// pre-Vista fallback (XLipRegisterUserUILanguages); then always register
+// "en-uk" as the final fallback language.  cdecl, no args.
+static void XLipInitUILanguages(void)
+{
+    HMODULE hModule;
+    XLipVecReserve4(&g_unk_1E2C5C8, 7);
+    XLipClearLanguageList(1);
+    hModule = LoadLibraryW(L"kernel32.dll");
+    if (hModule == NULL)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileXLipX, 717, L"hKernel32");
+    if (hModule != NULL)
+    {
+        if (GetProcAddress(hModule, "GetThreadPreferredUILanguages") != NULL)
+            (void)XLipRegisterThreadUILanguages(hModule);
+        else
+            (void)XLipRegisterUserUILanguages(hModule);
+    }
+    XLipAddLanguage("en-uk", NULL);
+}
+// sub_17B3B00 (0x17B3B00 - 0x17B3CC0) -- rebuild one component's
+// culture-index list (the 24-byte vector at +0x38 of the XLipComponent,
+// reinterpreted here as a 4-byte-element vector): reserve the
+// registered-culture count (g_unk_1E2C680), clear the vector, then -- after
+// the g_ComponentFallbacks chain (an empty map in this build, dead here) --
+// for each registered UI language in g_unk_1E2C5C8 add its registered
+// culture index when found, and finally add every index 0 .. count-1.
+// The add is sub_17B85D0: a linear scan that appends only when the index is
+// not already present.  thiscall component + one stack arg in the original.
+static void XLipUpdateComponentCultureList(XLipComponent *comp)
+{
+    LipDwordVec *vec = (LipDwordVec *)comp->subobject;    // +0x38
+    unsigned int count;
+    unsigned int i;
+    count = LipDwordVecSize(&g_unk_1E2C680);
+    XLipVecReserve4(vec, count);        // sub_17B3FD0
+    XLipVecClear(vec);                  // sub_17B9090
+    for (i = 0; i < LipDwordVecSize(&g_unk_1E2C5C8); i++)
+    {
+        int j = XLipFindRegisteredCulture(
+            XLipStrCstr((const F3AString *)g_unk_1E2C5C8.begin[i]));
+        if (j >= 0)
+            XLipVecAddIfAbsent(vec, (DWORD)j);   // sub_17B85D0
+    }
+    for (i = 0; i < count; i++)
+        XLipVecAddIfAbsent(vec, i);              // sub_17B85D0
+}
+// sub_17B3CC0 (0x17B3CC0 - 0x17B3D18) -- run
+// XLipUpdateComponentCultureList over every registered lip component
+// (g_unk_1E2C69C).  cdecl, no args.
+static void XLipUpdateComponentCultureLists(void)
+{
+    unsigned int i;
+    for (i = 0; i < LipDwordVecSize(&g_unk_1E2C69C); i++)
+        XLipUpdateComponentCultureList(
+            (XLipComponent *)g_unk_1E2C69C.begin[i]);
+}
+// sub_17C6B20 (0x17C6B20 - 0x17C6DB0) -- cancel and clear the in-flight PPL
+// culture-task callbacks (the 24-byte vector in ecx): for each element,
+// when the freeIt flag is set and the element is non-null, run the
+// CancellationTokenCallback dtor and LipMemFree the block, then reset end to
+// begin.  thiscall, one stack arg (freeIt).  Empty in this build.
+static void XLipClearTaskVector(LipDwordVec *v, int freeIt)
+{
+    unsigned int i;
+    for (i = 0; i < LipDwordVecSize(v); i++)
+    {
+        void *cb = (void *)v->begin[i];
+        if (cb != NULL && (freeIt & 1))
+            LipMemFree(cb);
+    }
+    XLipVecClear(v);
+}
+// sub_17BF770 (0x17BF770 - 0x17BFC20) -- XLip component bring-up
+// (XLipComponent.cpp), the routine that makes the registered lip components
+// culture-ready, called from the engine after the seven RegisterLipComponent
+// calls (and again from the component-settings validator and the culture
+// switcher).  [NOT byte-identical] -- placement-dependent (relative calls
+// through the PPL template / iterator inlines, the IAT jump thunks and the
+// high-VA globals below); reimplemented for behavioral equivalence:
+//  1. Gate on the init flag: zero -- SetLastError(0x15) and return;
+//     otherwise SetLastError(0) and cancel the in-flight parallel culture
+//     tasks (XLipClearTaskVector on g_unk_1E2C67C, sub_17C6B20).
+//  2. Pass 1, over the registered roots (g_unk_1E2C664): skip a root whose
+//     vtable[5] (IsInitDirectoryValid, 0x17D1680) says the directory is
+//     unusable; enumerate its on-disk culture names through vtable[1]
+//     (GetCultureNameFromDisk, 0x17D0B50) until it stops yielding names;
+//     resolve each name through XLipGetCultureId (sub_17C0C60; -1 skips it,
+//     and a defined-but-unregistered culture gets a fresh 60-byte
+//     registered-culture object); read its on-disk version through vtable[4]
+//     (ReadCultureVersion, 0x17D14A0); when the on-disk major version
+//     matches the culture definition's major version (XLipGetCultureInfo
+//     type 3) store {packed major/minor, root index} at +0x1C of the
+//     registered-culture object, otherwise log "Found unsupported (%hu)
+//     version for culture %S".  (The version-read / definition-lookup
+//     failure branch logs "Failed to get culture supported major version
+//     for %S".)
+//  3. Pass 2, over the registered components (g_unk_1E2C69C): clear the
+//     component's +0x38 vector and reserve 5 twelve-byte slots (the class-id
+//     vector element 5), then for each registered culture (g_unk_1E2C680)
+//     find the first root (asserting pRoot != NULL, line 374) whose
+//     vtable[2] (DoesCultureDirectoryExist, 0x17D0F80) says
+//     root \ compPath \ culture exists, and push a twelve-byte PPL lambda
+//     record capturing the loop locals (the captures are stack addresses,
+//     cleared and reinterpreted as the culture-index list in step 5 before
+//     any consumer reads them).
+//  4. Initialize the UI-language settings (XLipInitUILanguages, sub_17B3A50).
+//  5. Rebuild every component's culture-index list (XLipUpdateComponent
+//     CultureLists, sub_17B3CC0).
+//  In this build the roots vector is always empty (CreateLipFSRoot falls out
+//  on the empty settings path before calling InitLipFSRoot, so no root is
+//  registered), so both passes run zero iterations and the function
+//  reduces to: cancel tasks (a no-op on the empty task vector), the UI-
+//  language registration (which pushes the OS preferred languages and
+//  "en-uk" into g_unk_1E2C5C8) and the component list rebuild (each
+//  component's +0x38 vector is cleared and stays empty -- the registered-
+//  culture table g_unk_1E2C680 is empty throughout the test).
+//  void XLipBringUpComponents(void)   -- original: cdecl, plain `retn`
+static void XLipBringUpComponents(void)
+{
+    if (g_byte_1E2C6B4 == 0)
+    {
+        SetLastError(0x15);
+        return;
+    }
+    SetLastError(0);
+    XLipClearTaskVector(&g_unk_1E2C67C, 1);           // sub_17C6B20
+
+    {
+        // Pass 1 -- roots x on-disk cultures.
+        unsigned int rootCount = LipDwordVecSize(&g_unk_1E2C664);
+        unsigned int r;
+        for (r = 0; r < rootCount; r++)
+        {
+            XLipFSRoot *pRoot = (XLipFSRoot *)g_unk_1E2C664.begin[r];
+            const XLipFSRootVT *vt = (const XLipFSRootVT *)pRoot->vtable;
+            char name[85];
+            unsigned int i;
+            if (vt->isInitDirValid(pRoot) == 0)       // vtable[5], 0x17D1680
+                continue;
+            for (i = 0; ; i++)                        // vtable[1], 0x17D0B50
+            {
+                unsigned short major = 0;
+                unsigned short minor = 0;
+                int cultureId;
+                if (vt->getCultureName(pRoot, i, name, 0x55) <= 0)
+                    break;
+                cultureId = XLipGetCultureId(name);   // sub_17C0C60
+                if (cultureId < 0)
+                    continue;
+                if (vt->readCultureVersion(pRoot, name, &major, &minor) == 0)
+                    continue;                         // vtable[4], 0x17D14A0
+                {
+                    unsigned short defVersion = 0;
+                    if (XLipGetCultureInfo(name, 3, &defVersion, 2) == 2)
+                    {
+                        if (major == defVersion)
+                        {
+                            XLipRegisteredCulture *reg =
+                                (XLipRegisteredCulture *)
+                                g_unk_1E2C680.begin[cultureId];
+                            reg->version = ((DWORD)major << 16) | minor;
+                            reg->rootIndex = (DWORD)r;
+                        }
+                        else
+                            XLipDebugMessage(
+                                L"Found unsupported (%hu) version for culture %S",
+                                (unsigned short)major, name);
+                    }
+                    else
+                        XLipDebugMessage(
+                            L"Failed to get culture supported major version for %S",
+                            name);
+                }
+            }
+        }
+    }
+    {
+        // Pass 2 -- components x registered cultures x roots.
+        unsigned int compCount = LipDwordVecSize(&g_unk_1E2C69C);
+        unsigned int c;
+        for (c = 0; c < compCount; c++)
+        {
+            const XLipComponent *comp =
+                (const XLipComponent *)g_unk_1E2C69C.begin[c];
+            LipDwordVec *vec = (LipDwordVec *)comp->subobject;   // +0x38
+            unsigned int cultureCount = LipDwordVecSize(&g_unk_1E2C680);
+            unsigned int rootCount = LipDwordVecSize(&g_unk_1E2C664);
+            unsigned int i;
+            unsigned int r;
+            XLipVecClear(vec);            // sub_17C1A00
+            XLipVecReserve12(vec, *LipDwordVecAt(&g_unk_1E2C6B8, 5)); // sub_17C1760(5)
+            for (i = 0; i < cultureCount; i++)
+            {
+                const char *cultureName = XLipStrCstr(
+                    (const F3AString *)g_unk_1E2C680.begin[i]);
+                int found = 0;
+                for (r = 0; r < rootCount && !found; r++)
+                {
+                    XLipFSRoot *pRoot = (XLipFSRoot *)g_unk_1E2C664.begin[r];
+                    const XLipFSRootVT *vt;
+                    if (pRoot == NULL)    // XLipComponent.cpp line 374
+                        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent,
+                                   374, L"pRoot != NULL");
+                    vt = (const XLipFSRootVT *)pRoot->vtable;
+                    if (vt->hasCultureDir(pRoot, XLipStrCstr(&comp->path),
+                                          cultureName) != 0)   // vtable[2], 0x17D0F80
+                    {
+                        DWORD record[3];
+                        record[0] = (DWORD)i;      // the culture index
+                        record[1] = 0;
+                        record[2] = (DWORD)r;      // the matching root index
+                        XLipVecPush12(vec, record); // sub_17C1980
+                        found = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    XLipInitUILanguages();                          // sub_17B3A50
+    XLipUpdateComponentCultureLists();              // sub_17B3CC0
+}
+// ============================================================
+//  IXLipComponent -- the 16-byte "XLIPFSCP" signature header the lip
+//  component-path resolver fills in and verifies (XLipComponent.cpp):
+//    +0x00  vtable
+//    +0x04  "XLIPFSCP" magic (8 bytes)
+//    +0x0C  path (the resolved component path string)
+// ============================================================
+typedef struct IXLipComponent
+{
+    DWORD       vtable;   // +0x00
+    char        magic[8]; // +0x04  "XLIPFSCP"
+    const char *path;     // +0x0C
+} IXLipComponent;         // 16 bytes
+
+// sub_17D06B0 (0x17D06B0 - 0x17D06B0+54) -- the IXLipComponent ctor:
+// stamps the vtable + the "XLIPFSCP" signature and clears the path.
+// [NOT byte-identical] the vtable is the high-VA XLipFSComponent vftable, left
+// zero here (nothing in this build dispatches through it); the signature and
+// path are the only members the resolver reads.
+static IXLipComponent *IXLipComponentCtor(IXLipComponent *obj)
+{
+    obj->vtable = 0;
+    memcpy(obj->magic, "XLIPFSCP", 8);
+    obj->path = NULL;
+    return obj;
+}
+
+// sub_17C66A0 (0x17C66A0 - 0x17C66A0+20) -- the IXLipComponent dtor:
+// resets the vtable (the path string is owned elsewhere and not freed here).
+// Functionally a no-op in this build (the placeholder vtable is already zero).
+static IXLipComponent *IXLipComponentDtor(IXLipComponent *obj)
+{
+    obj->vtable = 0;
+    return obj;
+}
+
+// sub_17D0850 (0x17D0850 - 0x17D0850+47) -- verify the IXLipComponent
+// signature: the first 8 bytes must be the "XLIPFSCP" magic.
+static int IXLipComponentValid(const IXLipComponent *obj)
+{
+    return (obj != NULL) && (memcmp(obj->magic, "XLIPFSCP", 8) == 0);
+}
+
+// unknown_libname_2509 (0x17D0830 - 0x17D0830+17) -- the IXLipComponent
+// path accessor: returns the resolved path string at +0x0C.
+static const char *IXLipComponentGetPath(const IXLipComponent *obj)
+{
+    return obj->path;
+}
+
+//  XLipResolveComponentBuf  (sub_17BFF60, 0x17BFF60 - 0x17BFF60+1019)  --
+//  resolve a registered lip component (by name) for a language into an output
+//  IXLipComponent buffer (XLipComponent.cpp).  cdecl: (pcszComponent,
+//  pcszLanguage, pComponentOut).  Returns non-zero on success, 0 on failure.
+//  [NOT byte-identical] placement-dependent (relative calls to FindLipComponent
+//  by name / XLipAssert / the culture-fallback map helpers / the component
+//  vtable[3] path resolver) and refs the high-VA init-flag byte_1E2C6B4 and the
+//  rdata assert strings.
+//
+//  Gated by the init flag (SetLastError(0x15), return 0 when unset).  Asserts
+//  pcszComponent != NULL (line 508) and pComponentOut != NULL (line 515),
+//  falling out with SetLastError(0x57).  Looks the component up by name
+//  (FindLipComponentByName); a miss asserts (line 523) and returns 0
+//  (SetLastError(0x57)).  A non-null language is lower-cased into a 0x55-byte
+//  scratch (line 532 / 540).  The language is then resolved: a direct
+//  culture lookup (sub_17C0E40) for a named language, else the component
+//  fallback-language map walk (sub_17B4C10 / sub_17BD1F0 / sub_17B5CC0 /
+//  sub_17C1F70 / sub_17B8FB0 / sub_17B8FE0 / sub_17B91F0 / sub_17B91C0 /
+//  sub_17C16B0 / sub_17B3D50 / sub_17C0E40).  On a resolved language the
+//  component's vtable[3] (0x17C0F60) path resolver is dispatched with
+//  (component, the component's own path string, the resolved language, the
+//  output buffer) and its result is returned; a resolution miss returns 0
+//  (SetLastError(0x490)).  In this build no component is ever registered with a
+//  non-empty name (the seven slot names are all empty), so the lookup misses
+//  and the function returns 0 -- the culture-fallback + vtable[3] dispatch is
+//  the remaining stub (unreached).
+// ============================================================
+static int XLipResolveComponentBuf(const char *pcszComponent, const char *pcszLanguage,
+                                   IXLipComponent *pComponentOut)
+{
+    if (g_byte_1E2C6B4 == 0)
+    {
+        SetLastError(0x15);
+        return 0;
+    }
+    if (pcszComponent == NULL)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 508, L"pcszComponent");
+    if (pComponentOut == NULL)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 515, L"pComponentOut");
+    if (pcszComponent == NULL || pComponentOut == NULL)
+    {
+        SetLastError(0x57);
+        return 0;
+    }
+    void *comp = FindLipComponentByName(pcszComponent);
+    if (comp == NULL)
+    {
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 523, L"pComponent");
+        SetLastError(0x57);
+        return 0;
+    }
+    // The language resolution (named-language culture lookup / the component
+    // fallback-language map walk) and the component vtable[3] path-resolver
+    // dispatch are the remaining stub: unreachable in this build because no
+    // component is registered with a non-empty name, so the lookup above always
+    // misses.  Fall out as a resolution miss.
+    (void)pcszLanguage;
+    (void)comp;
+    SetLastError(0x490);
+    return 0;
+}
+
+//  XLipResolveComponentPath  (sub_17C0360, 0x17C0360 - 0x17C0360+680)  --
+//  resolve a registered lip component's path into a C string (XLipComponent.cpp).
+//  cdecl: (pcszComponent, pcszLanguage, destination, sizeInBytes).  Constructs a
+//  temporary IXLipComponent header, resolves the component through
+//  XLipResolveComponentBuf, verifies the "XLIPFSCP" signature, and copies the
+//  resolved path into destination (bounded by sizeInBytes); returns
+//  strlen(path) + 1 on success, -1 on failure.  [NOT byte-identical]
+//  placement-dependent (relative calls to IXLipComponentCtor /
+//  XLipResolveComponentBuf / IXLipComponentValid / IXLipComponentGetPath /
+//  IXLipComponentDtor / XLipAssert / _strlen / _strcpy_s) and refs the high-VA
+//  init-flag byte_1E2C6B4 + the rdata assert strings.
+// ============================================================
+static int XLipResolveComponentPath(const char *pcszComponent, const char *pcszLanguage,
+                                    char *destination, int sizeInBytes)
+{
+    IXLipComponent comp;
+    int ret;
+    int len;
+    const char *path;
+
+    if (g_byte_1E2C6B4 == 0)
+    {
+        SetLastError(0x15);
+        return -1;
+    }
+    if (pcszComponent == NULL)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 593, L"pcszComponent");
+    if (pcszComponent == NULL)
+    {
+        SetLastError(0x57);
+        return -1;
+    }
+    (void)IXLipComponentCtor(&comp);
+    ret = XLipResolveComponentBuf(pcszComponent, pcszLanguage, &comp);
+    if (ret == 0)
+    {
+        (void)IXLipComponentDtor(&comp);
+        return -1;
+    }
+    if (!IXLipComponentValid(&comp))
+    {
+        XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 609,
+                   L"FALSE && \"failed to verify IXLipComponent signature\"");
+        SetLastError(0x70C);
+        (void)IXLipComponentDtor(&comp);
+        return -1;
+    }
+    path = IXLipComponentGetPath(&comp);
+    len = (int)strlen(path) + 1;
+    if (destination != NULL)
+    {
+        if (sizeInBytes < len)
+        {
+            SetLastError(0x7A);
+            (void)IXLipComponentDtor(&comp);
+            return -1;
+        }
+        if (strcpy_s(destination, (size_t)sizeInBytes, path) != 0)
+        {
+            XLipAssert(g_xlipAssertFailed, g_xlipFileComponent, 626, L"crterr==0");
+            SetLastError(0x54F);
+            (void)IXLipComponentDtor(&comp);
+            return -1;
+        }
+    }
+    (void)IXLipComponentDtor(&comp);
+    return len;
+}
+
+//  ResolveLipComponentSlotPath  (sub_717D60, 0x717D60 - 0x717DF2)  -- resolve a
+//  lip component slot's relative path and publish it into the out slot
+//  (XLipComponent.cpp).  cdecl: (compSlot, outSlot).  Reads the component name
+//  from compSlot (GetSlotString), resolves it to a path through
+//  XLipResolveComponentPath (a 0x104-byte scratch), and, on a positive result,
+//  builds a fresh shared slot from the path, copy-assigns it into outSlot, and
+//  releases the scratch slot.  Returns 1 on success, 0 when the path did not
+//  resolve.  [NOT byte-identical] placement-dependent (relative calls to
+//  GetSlotString / XLipResolveComponentPath / SetSharedSlot / CopySharedSlot /
+//  ReleaseSharedSlot / the __security_check_cookie landing pad) and refs the
+//  high-VA ___security_cookie global.
+// ============================================================
+static char ResolveLipComponentSlotPath(F3SharedBuffer **compSlot, F3SharedBuffer **outSlot)
+{
+    char destination[0x104];
+    F3SharedBuffer *temp = 0;
+
+    if (XLipResolveComponentPath(GetSlotString(compSlot), NULL, destination, 0x104) <= 0)
+        return 0;
+    (void)SetSharedSlot(&temp, destination, 0xFFFFFFFF);
+    CopySharedSlot(outSlot, &temp);
+    ReleaseSharedSlot(&temp);
+    return 1;
+}
 // sub_17BFC20 (0x17BFC20 - 0x17BFF58) -- bounded strcpy into an 85-byte
 // destination (the "text" name copy); 0 on success.
 static int   sub_17BFC20(const char *src, char *dst, int size)
@@ -7362,9 +8522,11 @@ static int   sub_17C0680(int a1, int a2, char *dst, int size)
 // sub_17CC320 (0x17CC320 - 0x17CC4E2) -- XLipCultures name -> culture id
 // (lower-cased lookup through sub_17CD070; case 1 = the id at +28).
 static int   sub_17CC320(char *s, int a2) { (void)s; (void)a2; return 0; }
-// sub_718690 (0x718690 - 0x718BCC) -- register the speech / speechdoc /
-// lipsync .bnk / .adb banks ("speech", "speechdoc", "lipsync" paths).
-static int   sub_718690(void) { return 0; }
+//  RegisterStandardAssets  (0x718690 - 0x718BCC)  -- register the game's
+// standard asset packages ("speech" / "speechdoc" / "lipsync" / "text" /
+// "fonts" / "videos" / "gui") into the language / VFS resource table.
+// Defined below, after the F3WString helpers it builds its temp strings with.
+static int   RegisterStandardAssets(void);
 // sub_719540 (0x719540 - 0x719765) -- post-load culture bookkeeping over the
 // loaded culture set (the name slot + out flag byte).
 static char  sub_719540(void *a1, char *a2) { (void)a1; (void)a2; return 0; }
@@ -7410,11 +8572,11 @@ static long InitLipCultures(void)
         RegisterLipComponent(name, name);
         comp += 5;
     }
-    sub_17BF770();
+    XLipBringUpComponents();
     F3SharedBuffer **slot = (F3SharedBuffer **)&g_dword_1DC2748;
     for (i = 7; i != 0; --i)
     {
-        sub_717D60((void *)slot, (int *)(slot + 3));
+        ResolveLipComponentSlotPath(slot, slot + 3);
         slot += 5;
     }
 
@@ -7456,7 +8618,7 @@ static long InitLipCultures(void)
     }
 
     g_byte_1DC2804 = 0;
-    sub_718690();
+    RegisterStandardAssets();
     ReleaseSharedSlot(&textSlot);
     return ReleaseSharedSlot(&cultureName);
 }
@@ -7944,6 +9106,71 @@ static void F3WStringNormalize(F3WString *s)
         p[s->len] = L'\\';
         s->len++;
     }
+}
+
+// sub_718250 (0x718250 - 0x718686) -- register one asset file into the
+// language / VFS resource table: a1 = the file's F3WString path, a2 = its
+// package / category name ("speech", "speechdoc", "lipsync", "text", "fonts",
+// "videos", "gui"). Its whole body (the "language\\" shared-slot lookup
+// through sub_717E00, the sub_5B20E0 / sub_180D7B0 string joins, the per-entry
+// sub_5B12A0 / sub_435B20 archive registration, and the trailing per-entry
+// frees) depends on the unimplemented shared-slot / VFS / archive helpers, so
+// it remains a no-op stub here. [remaining stub]
+static long sub_718250(F3WString *a1, const char *a2)
+{ (void)a1; (void)a2; return 0; }
+
+//  RegisterStandardAssets  (0x718690 - 0x718BCC)  -- register the game's
+// standard asset packages into the language / VFS resource table. Walks a
+// fixed list of
+// (path, package) pairs; for each it builds a temp F3WString (sub_4358A0 =
+// F3WStringAssignAnsi), registers it by package (sub_718250), then drops the
+// string's heap buffer (the "if (cap >= 8) LHFree" idiom -- every path here is
+// > 7 chars, so it is always heap-allocated and freed).
+// [NOT byte-identical] the original is 26 hand-inlined
+// (push-constant / call) blocks referencing high-VA .rdata string constants
+// and E8 calls to sub_4358A0 / sub_718250 / LHFree.
+static int RegisterStandardAssets(void)
+{
+    static const struct F3Asset { const char *path; const char *package; }
+        kAssets[] =
+    {
+        { "speech/speech.bnk",              "speech"    },
+        { "speech/speech.bnk.dat",          "speech"    },
+        { "speech/expressions.bnk",         "speech"    },
+        { "speech/expressions.bnk.dat",     "speech"    },
+        { "speechdoc/speech.adb",           "speechdoc" },
+        { "speechdoc/speech_vo.adb",        "speechdoc" },
+        { "lipsync/lipsync.bnk",            "lipsync"   },
+        { "lipsync/lipsync.bnk.dat",        "lipsync"   },
+        { "lipsync/expressions.bnk",        "lipsync"   },
+        { "lipsync/expressions.bnk.dat",    "lipsync"   },
+        { "speech/cutscenes.vfsconfig",     "speech"    },
+        { "speech/cutscenes_vo.vfsconfig",  "speech"    },
+        { "text/book.babel",                "text"      },
+        { "patch_text/book.babel",          "text"      },
+        { "fonts/gui_normal.bft",           "fonts"     },
+        { "videos/childbirth.bik",          "videos"    },
+        { "videos/fall_m.bik",              "videos"    },
+        { "videos/fall_f.bik",              "videos"    },
+        { "videos/herospire.bik",           "videos"    },
+        { "videos/historyalbion.bik",       "videos"    },
+        { "videos/marriage.bik",            "videos"    },
+        { "videos/newbeginnings.bik",       "videos"    },
+        { "gui/gui_textures.bnk",           "gui"       },
+        { "gui/gui_textures.bnk.dat",       "gui"       },
+        { "gui/gui_texture_headers.bnk",    "gui"       },
+        { "gui/gui_texture_headers.bnk.dat","gui"       },
+    };
+    const unsigned n = (unsigned)(sizeof(kAssets) / sizeof(kAssets[0]));
+    F3WString s;
+    int rc = 0;
+    for (unsigned i = 0; i < n; ++i)
+    {
+        F3WStringAssignAnsi(&s, kAssets[i].path);       // sub_4358A0
+        rc = (int)sub_718250(&s, kAssets[i].package);   // register by package
+        F3WStringFree(&s);                              // if (cap >= 8) LHFree
+    }
+    return rc;
 }
 
 // ============================================================

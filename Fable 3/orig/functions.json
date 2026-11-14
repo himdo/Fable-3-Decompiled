@@ -48,18 +48,6 @@
 "source": "gamemain"
 },
 {
-"name": "?sub_17BF770@@YAXXZ",
-"rva": 20707184,
-"size": 1200,
-"source": "gamemain"
-},
-{
-"name": "?sub_717D60@@YADPAXPAH@Z",
-"rva": 3243360,
-"size": 146,
-"source": "gamemain"
-},
-{
 "name": "?sub_17BFC20@@YAHPBDPADH@Z",
 "rva": 20708384,
 "size": 824,
@@ -81,12 +69,6 @@
 "name": "?sub_17CC320@@YAHPADH@Z",
 "rva": 20759328,
 "size": 450,
-"source": "gamemain"
-},
-{
-"name": "?sub_718690@@YAHXZ",
-"rva": 3245712,
-"size": 1340,
 "source": "gamemain"
 },
 {
@@ -333,6 +315,12 @@
 "name": "?sub_18FB930@@YAXXZ",
 "rva": 22001968,
 "size": 124,
+"source": "gamemain"
+},
+{
+"name": "?sub_718250@@YAJPAUF3WString@@PBD@Z",
+"rva": 3244624,
+"size": 1078,
 "source": "gamemain"
 },
 {
