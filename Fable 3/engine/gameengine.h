@@ -41,6 +41,13 @@ typedef struct CGameVersion
 // Compile-time check: the sub-object must be exactly 92 bytes.
 typedef char CGameVersionSizeCheck[(sizeof(CGameVersion) == 92) ? 1 : -1];
 
+// CGameVersionCtor (0x72DD10) / CGameVersionReset (0x72DC80) -- the
+// sub-object ctor / reset, implemented in gameengine.cpp. Exposed here so
+// the CVersionTable ctor (gamemain.cpp) can construct / reset the three
+// embedded CGameVersion sub-objects.
+void *CGameVersionCtor(void *obj);
+void *CGameVersionReset(void *obj);
+
 // ============================================================
 //  CGameEngine  -- the 356-byte game engine object
 //

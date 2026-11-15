@@ -5892,7 +5892,999 @@ static void *CPackageManagerCtor(void *obj)
     }
     return obj;
 }
-static void *sub_762490(void *obj, void *a) { (void)a; return obj; }
+// ============================================================
+//  CVersionTable  (sub_762490, 0x762490 - 0x76252E)  -- the 288-byte (0x120)
+//  version table: CPackageManager + three CGameVersions + summary flags
+//  [NOT byte-identical] relative calls to CGameVersionCtor /
+//  CGameVersionReset / CVersionTableRefresh.
+//
+//  The version table is built over the CPackageManager (engine+0xAC): the
+//  object holds the CPackageManager pointer at +0x00, three CGameVersion
+//  sub-objects (92 bytes each) at +0x04 / +0x60 / +0xBC, a flag byte at
+//  +0x118, an auxiliary byte at +0x119, and a 32-bit summary CRC at +0x11C.
+//
+//  RunFrontEnd swaps this object into engine+0xB0: the old table is
+//  destroyed (sub_6234A0 + LHFree) and the new one stored in its place.
+//
+//  The engine's shared-string (F3SharedBuffer) and 12-byte node-list helpers
+//  below (SharedSlotFormat / SharedSlotAppendSlot / SharedSlotConcatLiteral /
+//  SharedSlotCrc32 / F3NodeList*) and the package-entry lookup chain
+//  (PackageEntry*) are the callees of the refresh / summary path. In the
+//  test environment no packages are loaded, so every package list is empty
+//  and only the allocation / loop-break / empty-string paths execute.
+// ============================================================
+
+// The 7-word (28-byte) entry array CVersionTableRefresh / BuildSummary use:
+//   +0x00  node   4-byte heap node (2-element circular with *base)
+//   +0x14  head   12-byte self-linked sentinel {first, last}
+//   +0x18  count  number of 12-byte entry nodes (payload = package id at +8)
+typedef struct F3EntryArray
+{
+    DWORD  node;    // +0x00  4-byte heap node
+    DWORD  pad[5];  // +0x04 .. +0x13
+    DWORD  head;    // +0x14  12-byte self-linked sentinel block
+    DWORD  count;   // +0x18  entry count
+} F3EntryArray;
+
+// sub_EEB860 (0xEEB860 - 0xEEB865): the package id of an entry object
+static int PackageEntryGetId(const void *entry)
+{
+    return *(const int *)((const char *)entry + 0x14);
+}
+
+// sub_EEB880 / sub_EEB8B0 / sub_EEB980 (4 bytes each): the entry flag bytes
+static int PackageEntryGetFlag24(const void *entry)
+{
+    return *(const unsigned char *)((const char *)entry + 0x18);
+}
+static int PackageEntryGetFlag25(const void *entry)
+{
+    return *(const unsigned char *)((const char *)entry + 0x19);
+}
+static int PackageEntryGetFlag26(const void *entry)
+{
+    return *(const unsigned char *)((const char *)entry + 0x1A);
+}
+
+// sub_769250 (0x769250 - 0x7692B2): advance a 28-byte node-list iterator
+// sub_769340 (0x769340 - 0x7693A2): the twin (advances only when the node's
+//   byte+0x19 alive flag is exactly 1, otherwise a no-op)
+//
+//  void *PackageEntryAdvance(void *obj)
+//
+//  thiscall. obj is a 2-dword iterator {cursor node, current 28-byte node};
+//  the current node follows its +0x08 link (rewriting node+0 and the next
+//  node's +4 to keep the circular links consistent), or falls back to the
+//  cursor node when the link is null. [not exercised in the test -- the
+//  lists are empty]
+static void *PackageEntryAdvance(void *obj)
+{
+    DWORD *itd = (DWORD *)obj;
+    if (itd[0] != 0)
+    {
+        DWORD *cur28 = (DWORD *)itd[1];
+        if (cur28[6] != 0)
+        {
+            DWORD *next = cur28 + 2;
+            if (next != 0)
+            {
+                *cur28 = (DWORD)next;
+                next[1] = (DWORD)cur28;
+            }
+            else
+            {
+                *cur28 = (DWORD)obj;
+                next = 0;
+            }
+            itd[1] = (DWORD)next;
+        }
+    }
+    return obj;
+}
+
+static void *PackageEntryAdvanceNext(void *obj)
+{
+    DWORD *itd = (DWORD *)obj;
+    if (itd[0] != 0)
+    {
+        DWORD *cur28 = (DWORD *)itd[1];
+        if (cur28[6] == 1)
+        {
+            DWORD *next = cur28 + 2;
+            if (next != 0)
+            {
+                *cur28 = (DWORD)next;
+                next[1] = (DWORD)cur28;
+            }
+            else
+            {
+                *cur28 = (DWORD)obj;
+                next = 0;
+            }
+            itd[1] = (DWORD)next;
+        }
+    }
+    return obj;
+}
+
+// sub_489F10 (0x489F10 - 0x489F8C): add n to a 12-byte node-list count
+//
+//  int F3NodeListSizeAdd(void *obj, int n)
+//
+//  thiscall + retn 4. Throws std::length_error("list<T> too long") when the
+//  count would exceed 0x3FFFFFFF; otherwise adds n to the count word at
+//  obj+0x18 and returns n.
+static int F3NodeListSizeAdd(void *obj, int n)
+{
+    unsigned int *count = (unsigned int *)((char *)obj + 0x18);
+    if (0x3FFFFFFFu - *count < (unsigned int)n)
+    {
+        std::length_error err("list<T> too long");
+        throw err;
+    }
+    *count += (unsigned int)n;
+    return n;
+}
+
+// sub_489030 (0x489030 - 0x4890B8): unlink one 12-byte node from a list
+//
+//  void F3NodeListUnlink(void *obj, void *out2, void *head, void *cur)
+//
+//  thiscall + retn 0xC. Unlinks cur from the 12-byte circular list (the
+//  node's prev/next are re-linked), drops the node through the heap table's
+//  free slot (the original's dword_2075B24+16 thunk, LHFree here),
+//  decrements the list count at obj+0x18, and leaves {*obj, head[0]} in the
+//  2-dword out2. [not exercised in the test -- only reached when a search
+//  finds a node in a non-empty list]
+static void F3NodeListUnlink(void *obj, void *out2, void *head, void *cur)
+{
+    void *prev = *(void **)cur;
+    void *next = *(void **)((char *)cur + 4);
+    *(void **)next = prev;
+    *(void **)((char *)prev + 4) = next;
+    LHFree(cur);
+    if (obj != 0)
+        (*(unsigned int *)((char *)obj + 0x18)) -= 1;
+    if (out2 != 0)
+    {
+        *(void **)out2 = (obj != 0) ? *(void **)obj : 0;
+        ((void **)out2)[1] = (head != 0) ? *(void **)head : 0;
+    }
+}
+
+// sub_488580 (0x488580 - 0x488672): remove a payload from a node-list section
+//
+//  void F3NodeListRemove(void *obj, int *value)
+//
+//  thiscall + retn 4. Searches the 12-byte node list of the section (node
+//  slot at +0, 12-byte sentinel at +0x14) for a node whose payload (+8)
+//  equals *value and unlinks it (F3NodeListUnlink). A freshly constructed
+//  section has an empty list (sentinel self-linked), so the search breaks
+//  immediately -- the executed test path.
+static void F3NodeListRemove(void *obj, int *value)
+{
+    char *sec = (char *)obj;
+    void *node = *(void **)sec;
+    void *head = *(void **)(sec + 0x14);
+    void *cur = *(void **)head;
+    if (node != 0 && node == *(void **)sec)
+    {
+        while (cur != head)
+        {
+            if (node == 0)
+                break;
+            node = *(void **)node;
+            if (cur == *(void **)((char *)node + 0x18))
+                break;   // original: __invalid_parameter_noinfo guard
+            if (*(int *)((char *)cur + 8) == *value)
+            {
+                F3NodeListUnlink(sec, 0, head, cur);
+                cur = *(void **)((char *)cur + 4);
+            }
+            else
+            {
+                cur = *(void **)cur;
+            }
+        }
+    }
+}
+
+// sub_488FD0 (0x488FD0 - 0x489026): append a 12-byte entry node to a list
+//
+//  void F3NodeListAppend(void *obj, void *head, int *value)
+//
+//  thiscall + retn 0xC. Allocates a 12-byte node {head, last, *value} and
+//  links it in after the sentinel's last pointer (head[1] = new, last[0] =
+//  new), then bumps the count via F3NodeListSizeAdd(obj, 1).
+static void F3NodeListAppend(void *obj, void *head, int *value)
+{
+    DWORD *h = (DWORD *)head;
+    DWORD last = h[1];
+    DWORD *n = (DWORD *)LHAlloc(12);
+    if (n != 0)
+    {
+        n[0] = (DWORD)head;
+        n[1] = last;
+        n[2] = (DWORD)*value;
+    }
+    F3NodeListSizeAdd(obj, 1);
+    h[1] = (DWORD)n;
+    ((DWORD *)last)[0] = (DWORD)n;
+}
+
+// sub_72DC40 (0x72DC40 - 0x72DC46): set the CGameVersion flag byte
+static void CGameVersionSetFlag(void *obj, int flag)
+{
+    *(char *)((char *)obj + 4) = (char)flag;
+}
+
+// sub_72DC30 (0x72DC30 - 0x72DC36): read the CGameVersion flag byte
+static int CGameVersionGetFlag(const void *obj)
+{
+    return *(const char *)((const char *)obj + 4);
+}
+
+// sub_72DC20 (0x72DC20 - 0x72DC26): the third 12-byte node-list section
+static void *CGameVersionThirdSection(void *obj)
+{
+    return (char *)obj + 0x40;
+}
+
+// sub_72E460 (0x72E460 - 0x72E48A) / sub_72E490 (0x72E490 - 0x72E4BA) /
+// sub_72E4C0 (0x72E4C0 - 0x72E4EA): ensure a version-list entry
+//
+//  void CGameVersionInsertN(void *obj, int id, int doInsert)
+//
+//  thiscall + retn 8. Removes any entry whose payload is id from the
+//  section, then (when doInsert is non-zero) appends a fresh entry with
+//  that payload. Section N bases: +0x08 / +0x24 / +0x40.
+static void CGameVersionInsert1(void *obj, int id, int doInsert)
+{
+    char *sec = (char *)obj + 8;
+    F3NodeListRemove(sec, &id);
+    if (doInsert != 0)
+        F3NodeListAppend(sec, *(void **)(sec + 0x14), &id);
+}
+static void CGameVersionInsert2(void *obj, int id, int doInsert)
+{
+    char *sec = (char *)obj + 0x24;
+    F3NodeListRemove(sec, &id);
+    if (doInsert != 0)
+        F3NodeListAppend(sec, *(void **)(sec + 0x14), &id);
+}
+static void CGameVersionInsert3(void *obj, int id, int doInsert)
+{
+    char *sec = (char *)obj + 0x40;
+    F3NodeListRemove(sec, &id);
+    if (doInsert != 0)
+        F3NodeListAppend(sec, *(void **)(sec + 0x14), &id);
+}
+
+// sub_EEC760 (0xEEC760 - 0xEEC858): find an id in an entry group's sub-list
+//
+//  void *PackageEntryMatch(void *obj, void *out2, int id)
+//
+//  thiscall + retn 8. obj is an entry-group container: its 28-byte node
+//  sub-list has the 28-byte sentinel at obj+0x18 and the 4-byte node slot
+//  at obj+0x30. Walks the sub-list; each node's entry object (node+0x10)
+//  is Interlocked-refcounted through node+0x14, and when the entry's id
+//  (PackageEntryGetId) matches, {entry, ref} is stored in out2 (the match
+//  path's increment / decrement pair nets to zero, leaving the caller's
+//  one ref). A miss stores {0, 0} in out2. Returns out2.
+//  [not exercised in the test -- the sub-lists are empty]
+static void *PackageEntryMatch(void *obj, void *out2, int id)
+{
+    char *o = (char *)obj;
+    char *out = (char *)out2;
+    void *head = *(void **)(o + 0x18);
+    void *slot = *(void **)(o + 0x30);
+    void *cur = *(void **)slot;
+
+    if (head == 0 || head != slot)
+        return out2;   // original: __invalid_parameter_noinfo (a no-op here)
+
+    if (cur != slot)
+    {
+        DWORD it[2];
+        it[0] = (DWORD)slot;
+        it[1] = (DWORD)cur;
+        for (;;)
+        {
+            char *n28 = (char *)it[1];
+            void *ref = *(void **)(n28 + 0x14);
+            void *entry2 = *(void **)(n28 + 0x10);
+            if (ref != 0)
+                InterlockedIncrement((volatile LONG *)ref);
+            if (PackageEntryGetId(entry2) == id)
+            {
+                *(void **)out = entry2;
+                *(void **)(out + 4) = ref;
+                if (ref != 0)
+                {
+                    InterlockedIncrement((volatile LONG *)ref);
+                    if (InterlockedDecrement((volatile LONG *)ref) == 0)
+                    {
+                        void (*fn)(void *) = *(void (**)(void *))((char *)ref + 4);
+                        fn(*(void **)((char *)ref + 8));
+                        LHFree(ref);
+                    }
+                }
+                break;
+            }
+            if (ref != 0 && InterlockedDecrement((volatile LONG *)ref) == 0)
+            {
+                void (*fn)(void *) = *(void (**)(void *))((char *)ref + 4);
+                fn(*(void **)((char *)ref + 8));
+                LHFree(ref);
+            }
+            PackageEntryAdvanceNext(it);
+            if (it[1] == (DWORD)slot)
+                break;
+        }
+    }
+    return out2;
+}
+
+// sub_7632E0 (0x7632E0 - 0x7634F6): find an id in the CPackageData group list
+//
+//  void PackageEntryLookup(void *out2, void *container, int id)
+//
+//  stdcall + retn 0xC. container is the CPackageData+4 group list (4-byte
+//  node slot at +0, 28-byte sentinel at +0x18). Walks the group's 28-byte
+//  nodes, dispatching each group container (node+0x10) to PackageEntryMatch;
+//  a hit stores {entry, ref} in out2 (the hit path's increment / decrement
+//  pair nets to zero), a miss stores {0, 0}.
+//  [not exercised in the test -- the group list is empty]
+static void PackageEntryLookup(void *out2, void *container, int id)
+{
+    char *out = (char *)out2;
+    char *ctr = (char *)container;
+    void *node = *(void **)ctr;
+    void *head = *(void **)(ctr + 0x18);
+    void *cur = *(void **)head;
+
+    if (node == 0 || node != *(void **)ctr)
+        return;
+
+    DWORD it[2];
+    it[0] = (DWORD)node;
+    it[1] = (DWORD)cur;
+    for (;;)
+    {
+        if (cur == head)
+            break;
+        if (node == 0)
+            break;
+        node = *(void **)node;
+        if (cur == *(void **)((char *)node + 0x18))
+            break;   // original: __invalid_parameter_noinfo guard
+
+        int res[2] = { 0, 0 };
+        void *entry = *(void **)((char *)cur + 0x10);
+        if (PackageEntryMatch(entry, res, id) == res && res[0] != 0)
+        {
+            *(void **)out = *(void **)res;
+            *(void **)(out + 4) = *(void **)(res + 4);
+            if (res[1] != 0)
+            {
+                InterlockedIncrement((volatile LONG *)res[1]);
+                if (InterlockedDecrement((volatile LONG *)res[1]) == 0)
+                {
+                    void (*fn)(void *) = *(void (**)(void *))((char *)res[1] + 4);
+                    fn(*(void **)((char *)res[1] + 8));
+                    LHFree((void *)res[1]);
+                }
+            }
+            return;
+        }
+        if (res[1] != 0 && InterlockedDecrement((volatile LONG *)res[1]) == 0)
+        {
+            void (*fn)(void *) = *(void (**)(void *))((char *)res[1] + 4);
+            fn(*(void **)((char *)res[1] + 8));
+            LHFree((void *)res[1]);
+        }
+        it[0] = (DWORD)node;
+        it[1] = (DWORD)cur;
+        PackageEntryAdvance(it);
+        cur = (void *)it[1];
+    }
+    *(void **)out = 0;
+    *(void **)(out + 4) = 0;
+}
+
+// sub_763DC0 / sub_763F20 / sub_764080 (165 bytes each): the per-entry
+// flag predicates
+//
+//  int PackageEntryHasFlagN(void *obj, int id)
+//
+//  thiscall + retn 4. Looks up id in the CPackageData+4 group list
+//  (PackageEntryLookup), returns the entry's flag byte (24 / 25 / 26) when
+//  found -- 0 when not found for 24 / 25, 1 for 26 -- and releases the
+//  lookup's ref in every case.
+static int PackageEntryHasFlag24(void *obj, int id)
+{
+    int res[2] = { 0, 0 };
+    PackageEntryLookup(res, (char *)obj + 4, id);
+    int r = (res[0] != 0) ? PackageEntryGetFlag24(*(void **)res) : 0;
+    if (res[1] != 0 && InterlockedDecrement((volatile LONG *)res[1]) == 0)
+    {
+        void (*fn)(void *) = *(void (**)(void *))((char *)res[1] + 4);
+        fn(*(void **)((char *)res[1] + 8));
+        LHFree((void *)res[1]);
+    }
+    return r;
+}
+static int PackageEntryHasFlag25(void *obj, int id)
+{
+    int res[2] = { 0, 0 };
+    PackageEntryLookup(res, (char *)obj + 4, id);
+    int r = (res[0] != 0) ? PackageEntryGetFlag25(*(void **)res) : 0;
+    if (res[1] != 0 && InterlockedDecrement((volatile LONG *)res[1]) == 0)
+    {
+        void (*fn)(void *) = *(void (**)(void *))((char *)res[1] + 4);
+        fn(*(void **)((char *)res[1] + 8));
+        LHFree((void *)res[1]);
+    }
+    return r;
+}
+static int PackageEntryHasFlag26(void *obj, int id)
+{
+    int res[2] = { 0, 0 };
+    PackageEntryLookup(res, (char *)obj + 4, id);
+    int r = (res[0] != 0) ? PackageEntryGetFlag26(*(void **)res) : 1;
+    if (res[1] != 0 && InterlockedDecrement((volatile LONG *)res[1]) == 0)
+    {
+        void (*fn)(void *) = *(void (**)(void *))((char *)res[1] + 4);
+        fn(*(void **)((char *)res[1] + 8));
+        LHFree((void *)res[1]);
+    }
+    return r;
+}
+
+// sub_7646B0 / sub_7646D0 / sub_7646F0 (8 bytes each): the CPackageManager
+// wrappers -- extract the CPackageData sub-object (obj+0x2C) and forward to
+// the matching flag predicate.
+static int PackageEntryTest24(void *obj, int id)
+{
+    return PackageEntryHasFlag24(*(void **)((char *)obj + 0x2C), id);
+}
+static int PackageEntryTest25(void *obj, int id)
+{
+    return PackageEntryHasFlag25(*(void **)((char *)obj + 0x2C), id);
+}
+static int PackageEntryTest26(void *obj, int id)
+{
+    return PackageEntryHasFlag26(*(void **)((char *)obj + 0x2C), id);
+}
+
+// sub_764F60 (0x764F60 - 0x765281): flatten the CPackageData group list
+//
+//  void PackageEntryArrayBuild(void *obj, void *out)
+//
+//  thiscall + retn 4. obj is the CPackageData sub-object. out is a fresh
+//  7-word F3EntryArray: allocates the 4-byte node (out+0, a 2-element
+//  circular with out), the 12-byte self-linked sentinel (out+0x14) and the
+//  zero count (out+0x18), then walks the CPackageData+4 group list (28-byte
+//  nodes): each group container (node+0x10) owns a 28-byte sub-list (28-byte
+//  sentinel at container+0x18, 4-byte node slot at container+0x30) whose
+//  entries are refcounted through node+0x14; every sub-entry whose flag
+//  byte +0x18 is set contributes a 12-byte node {sentinel, last, id} to out
+//  (count++ via F3NodeListSizeAdd). Refs that fall to zero free the entry
+//  through its destructor thunk. [the test environment has an empty group
+//  list: only the allocations and the immediate loop break run]
+static void PackageEntryArrayBuild(void *obj, void *out)
+{
+    F3EntryArray *a = (F3EntryArray *)out;
+    void *node = LHAlloc(4);
+    if (node != 0)
+        *(void **)node = out;
+    if (node != (void *)-1)
+        a->node = (DWORD)node;
+
+    void *head = LHAlloc(12);
+    if (head != 0)
+    {
+        *(void **)head = head;
+        *(void **)((char *)head + 4) = head;
+    }
+    if (head != (void *)-1)
+    {
+        a->head = (DWORD)head;
+        a->count = 0;
+    }
+
+    void *slot = *(void **)obj;
+    void *head28 = *(void **)((char *)obj + 0x1C);
+    void *cur = *(void **)head28;
+    if (slot == 0 || slot != *(void **)obj)
+        return;
+
+    DWORD it[2];
+    it[0] = (DWORD)slot;
+    it[1] = (DWORD)cur;
+    for (;;)
+    {
+        if (cur == head28)
+            break;
+        if (slot == 0)
+            break;
+        slot = *(void **)slot;
+        if (cur == *(void **)((char *)slot + 0x18))
+            break;   // original: __invalid_parameter_noinfo guard
+
+        char *n28 = (char *)cur;
+        void *container = *(void **)(n28 + 0x10);
+        void *ref = *(void **)((char *)container + 0x14);
+        if (ref != 0)
+            InterlockedIncrement((volatile LONG *)ref);
+
+        void *subhead = *(void **)((char *)container + 0x18);
+        void *subslot = *(void **)((char *)container + 0x30);
+        if (subhead != 0 && subslot != 0 && subhead != subslot)
+        {
+            void *cur28 = *(void **)subslot;
+            if (cur28 != subslot)
+            {
+                DWORD it2[2];
+                it2[0] = (DWORD)subslot;
+                it2[1] = (DWORD)cur28;
+                for (;;)
+                {
+                    char *m28 = (char *)it2[1];
+                    void *e2 = *(void **)(m28 + 0x10);
+                    if (PackageEntryGetFlag24(e2) != 0)
+                    {
+                        int id = PackageEntryGetId(e2);
+                        F3NodeListAppend(out, (void *)a->head, &id);
+                    }
+                    void *ref2 = *(void **)(m28 + 0x14);
+                    if (ref2 != 0 && InterlockedDecrement((volatile LONG *)ref2) == 0)
+                    {
+                        void (*fn)(void *) = *(void (**)(void *))((char *)ref2 + 4);
+                        fn(*(void **)((char *)ref2 + 8));
+                        LHFree(ref2);
+                    }
+                    PackageEntryAdvanceNext(it2);
+                    if (it2[1] == (DWORD)subslot)
+                        break;
+                }
+            }
+        }
+
+        if (ref != 0 && InterlockedDecrement((volatile LONG *)ref) == 0)
+        {
+            void (*fn)(void *) = *(void (**)(void *))((char *)ref + 4);
+            fn(*(void **)((char *)ref + 8));
+            LHFree(ref);
+        }
+        it[0] = (DWORD)slot;
+        it[1] = (DWORD)cur;
+        PackageEntryAdvance(it);
+        cur = (void *)it[1];
+    }
+}
+
+// sub_7661E0 (0x7661E0 - 0x7661F4): the CPackageManager wrapper
+//
+//  void CPackageManagerCollectEntries(void *obj, void *out)
+//
+//  stdcall + retn 4. Extracts the CPackageData sub-object (obj+0x2C) and
+//  builds the entry array (PackageEntryArrayBuild).
+static void CPackageManagerCollectEntries(void *obj, void *out)
+{
+    PackageEntryArrayBuild(*(void **)((char *)obj + 0x2C), out);
+}
+
+// sub_1A01670 (0x1A01670 - 0x1A01A3C): format into a fresh shared slot
+//
+//  F3SharedBuffer **SharedSlotFormat(F3SharedBuffer **out, const char *fmt, ...)
+//
+//  cdecl. vsprintf_s's the varargs into a temporary heap buffer (a
+//  strlen(fmt) + 1032 byte allocation carrying the 56797 magic word 8 bytes
+//  before the text), then, when the format did not report truncation, builds
+//  a fresh 16-byte control block around the formatted C string (refcount 1)
+//  via SharedBufferAssign, releases the block the slot held (if any), and
+//  stores the new block in out. The temporary is freed in every case.
+//  Returns out.
+static F3SharedBuffer **SharedSlotFormat(F3SharedBuffer **out, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+
+    int flen = (int)strlen(fmt);
+    unsigned char *raw = (unsigned char *)malloc((unsigned)(flen + 1032));
+    if (raw != 0)
+    {
+        *(DWORD *)raw = 56797;
+        char *buf = (char *)(raw + 2);
+        int written = vsprintf_s(buf, (unsigned)(flen + 1024), fmt, ap);
+        if (written <= flen + 1024)
+        {
+            F3SharedBuffer *nb = 0;
+            if (buf != 0 && *buf != 0)
+            {
+                nb = (F3SharedBuffer *)LHAlloc(16);
+                if (nb != 0)
+                {
+                    nb->data = 0;
+                    nb->length = 0;
+                    nb->capacity = 0;
+                    unsigned int len = 0;
+                    while (buf[len] != 0)
+                        len++;
+                    SharedBufferAssign(nb, buf, len);
+                    nb->refcount = 1;
+                }
+            }
+            if (*out != 0)
+            {
+                if (InterlockedDecrement(&(*out)->refcount) <= 0)
+                    SharedBufferFree(*out);
+                *out = 0;
+            }
+            if (nb != 0)
+                *out = nb;
+        }
+        if (*(DWORD *)raw == 56797)
+            free(raw);
+    }
+    va_end(ap);
+    return out;
+}
+
+// sub_1A01940 (0x1A01940 - 0x1A019A1): append the src slot's string to dst
+//
+//  F3SharedBuffer **SharedSlotAppendSlot(F3SharedBuffer **dst, F3SharedBuffer **src)
+//
+//  thiscall + retn 4. When dst holds a block, DetachSharedSlot makes it
+//  private and the src slot's C string is appended (SharedBufferAppend);
+//  when dst is empty, the src block is shared (refcount++) instead. Returns
+//  dst.
+static F3SharedBuffer **SharedSlotAppendSlot(F3SharedBuffer **dst, F3SharedBuffer **src)
+{
+    if (*dst != 0)
+    {
+        DetachSharedSlot(dst);
+        const char *s = GetSlotString(src);
+        unsigned int len = 0;
+        while (s[len] != 0)
+            len++;
+        SharedBufferAppend(*dst, s, len);
+    }
+    else if (src != dst)
+    {
+        F3SharedBuffer *b = *src;
+        if (b != 0)
+        {
+            *dst = b;
+            InterlockedIncrement(&b->refcount);
+        }
+    }
+    return dst;
+}
+
+// sub_1A02200 (0x1A02200 - 0x1A02228): set dst to a literal, then append src
+//
+//  F3SharedBuffer **SharedSlotConcatLiteral(F3SharedBuffer **dst, const char *lit, F3SharedBuffer **src)
+//
+//  cdecl. SetSharedSlot(dst, lit, -1) followed by SharedSlotAppendSlot(dst,
+//  src); returns dst. (The version-table summary loop uses it to build the
+//  ",id" segments.)
+static F3SharedBuffer **SharedSlotConcatLiteral(F3SharedBuffer **dst, const char *lit, F3SharedBuffer **src)
+{
+    SetSharedSlot(dst, lit, -1);
+    SharedSlotAppendSlot(dst, src);
+    return dst;
+}
+
+// sub_1A15800 (0x1A15800 - 0x1A15855): CRC-32 of a slot's C string
+//
+//  unsigned int SharedSlotCrc32(const F3SharedBuffer **slot, unsigned int seed)
+//
+//  cdecl + retn 8. Runs the reflected CRC-32 (table at 0x1BCE700, the
+//  0xEDB88320 table transcribed below) over the slot block's C string
+//  (data / length). An empty / null slot hashes the empty string (the seed
+//  is returned unchanged).
+static const unsigned int g_CrcTable[256] =
+{
+    0x00000000, 0x77073096, 0xEE0E612C, 0x990951BA,
+    0x076DC419, 0x706AF48F, 0xE963A535, 0x9E6495A3,
+    0x0EDB8832, 0x79DCB8A4, 0xE0D5E91E, 0x97D2D988,
+    0x09B64C2B, 0x7EB17CBD, 0xE7B82D07, 0x90BF1D91,
+    0x1DB71064, 0x6AB020F2, 0xF3B97148, 0x84BE41DE,
+    0x1ADAD47D, 0x6DDDE4EB, 0xF4D4B551, 0x83D385C7,
+    0x136C9856, 0x646BA8C0, 0xFD62F97A, 0x8A65C9EC,
+    0x14015C4F, 0x63066CD9, 0xFA0F3D63, 0x8D080DF5,
+    0x3B6E20C8, 0x4C69105E, 0xD56041E4, 0xA2677172,
+    0x3C03E4D1, 0x4B04D447, 0xD20D85FD, 0xA50AB56B,
+    0x35B5A8FA, 0x42B2986C, 0xDBBBC9D6, 0xACBCF940,
+    0x32D86CE3, 0x45DF5C75, 0xDCD60DCF, 0xABD13D59,
+    0x26D930AC, 0x51DE003A, 0xC8D75180, 0xBFD06116,
+    0x21B4F4B5, 0x56B3C423, 0xCFBA9599, 0xB8BDA50F,
+    0x2802B89E, 0x5F058808, 0xC60CD9B2, 0xB10BE924,
+    0x2F6F7C87, 0x58684C11, 0xC1611DAB, 0xB6662D3D,
+    0x76DC4190, 0x01DB7106, 0x98D220BC, 0xEFD5102A,
+    0x71B18589, 0x06B6B51F, 0x9FBFE4A5, 0xE8B8D433,
+    0x7807C9A2, 0x0F00F934, 0x9609A88E, 0xE10E9818,
+    0x7F6A0DBB, 0x086D3D2D, 0x91646C97, 0xE6635C01,
+    0x6B6B51F4, 0x1C6C6162, 0x856530D8, 0xF262004E,
+    0x6C0695ED, 0x1B01A57B, 0x8208F4C1, 0xF50FC457,
+    0x65B0D9C6, 0x12B7E950, 0x8BBEB8EA, 0xFCB9887C,
+    0x62DD1DDF, 0x15DA2D49, 0x8CD37CF3, 0xFBD44C65,
+    0x4DB26158, 0x3AB551CE, 0xA3BC0074, 0xD4BB30E2,
+    0x4ADFA541, 0x3DD895D7, 0xA4D1C46D, 0xD3D6F4FB,
+    0x4369E96A, 0x346ED9FC, 0xAD678846, 0xDA60B8D0,
+    0x44042D73, 0x33031DE5, 0xAA0A4C5F, 0xDD0D7CC9,
+    0x5005713C, 0x270241AA, 0xBE0B1010, 0xC90C2086,
+    0x5768B525, 0x206F85B3, 0xB966D409, 0xCE61E49F,
+    0x5EDEF90E, 0x29D9C998, 0xB0D09822, 0xC7D7A8B4,
+    0x59B33D17, 0x2EB40D81, 0xB7BD5C3B, 0xC0BA6CAD,
+    0xEDB88320, 0x9ABFB3B6, 0x03B6E20C, 0x74B1D29A,
+    0xEAD54739, 0x9DD277AF, 0x04DB2615, 0x73DC1683,
+    0xE3630B12, 0x94643B84, 0x0D6D6A3E, 0x7A6A5AA8,
+    0xE40ECF0B, 0x9309FF9D, 0x0A00AE27, 0x7D079EB1,
+    0xF00F9344, 0x8708A3D2, 0x1E01F268, 0x6906C2FE,
+    0xF762575D, 0x806567CB, 0x196C3671, 0x6E6B06E7,
+    0xFED41B76, 0x89D32BE0, 0x10DA7A5A, 0x67DD4ACC,
+    0xF9B9DF6F, 0x8EBEEFF9, 0x17B7BE43, 0x60B08ED5,
+    0xD6D6A3E8, 0xA1D1937E, 0x38D8C2C4, 0x4FDFF252,
+    0xD1BB67F1, 0xA6BC5767, 0x3FB506DD, 0x48B2364B,
+    0xD80D2BDA, 0xAF0A1B4C, 0x36034AF6, 0x41047A60,
+    0xDF60EFC3, 0xA867DF55, 0x316E8EEF, 0x4669BE79,
+    0xCB61B38C, 0xBC66831A, 0x256FD2A0, 0x5268E236,
+    0xCC0C7795, 0xBB0B4703, 0x220216B9, 0x5505262F,
+    0xC5BA3BBE, 0xB2BD0B28, 0x2BB45A92, 0x5CB36A04,
+    0xC2D7FFA7, 0xB5D0CF31, 0x2CD99E8B, 0x5BDEAE1D,
+    0x9B64C2B0, 0xEC63F226, 0x756AA39C, 0x026D930A,
+    0x9C0906A9, 0xEB0E363F, 0x72076785, 0x05005713,
+    0x95BF4A82, 0xE2B87A14, 0x7BB12BAE, 0x0CB61B38,
+    0x92D28E9B, 0xE5D5BE0D, 0x7CDCEFB7, 0x0BDBDF21,
+    0x86D3D2D4, 0xF1D4E242, 0x68DDB3F8, 0x1FDA836E,
+    0x81BE16CD, 0xF6B9265B, 0x6FB077E1, 0x18B74777,
+    0x88085AE6, 0xFF0F6A70, 0x66063BCA, 0x11010B5C,
+    0x8F659EFF, 0xF862AE69, 0x616BFFD3, 0x166CCF45,
+    0xA00AE278, 0xD70DD2EE, 0x4E048354, 0x3903B3C2,
+    0xA7672661, 0xD06016F7, 0x4969474D, 0x3E6E77DB,
+    0xAED16A4A, 0xD9D65ADC, 0x40DF0B66, 0x37D83BF0,
+    0xA9BCAE53, 0xDEBB9EC5, 0x47B2CF7F, 0x30B5FFE9,
+    0xBDBDF21C, 0xCABAC28A, 0x53B39330, 0x24B4A3A6,
+    0xBAD03605, 0xCDD70693, 0x54DE5729, 0x23D967BF,
+    0xB3667A2E, 0xC4614AB8, 0x5D681B02, 0x2A6F2B94,
+    0xB40BBE37, 0xC30C8EA1, 0x5A05DF1B, 0x2D02EF8D,
+};
+
+static unsigned int SharedSlotCrc32(F3SharedBuffer **slot, unsigned int seed)
+{
+    const F3SharedBuffer *blk = *slot;
+    const char *s = (blk != 0) ? blk->data : "";
+    unsigned int len = (blk != 0) ? blk->length : 0;
+    unsigned int crc = seed;
+    unsigned int i = 0;
+    while (len != 0 && i < len)
+    {
+        crc = g_CrcTable[(crc ^ (unsigned char)s[i]) & 0xFFu] ^ (crc >> 8);
+        i++;
+    }
+    return crc;
+}
+
+// sub_59C860 (0x59C860 - 0x59C8EE): the 7-word entry-array ctor
+//
+//  void F3EntryArrayCtor(void *obj, void *srcSection)
+//
+//  thiscall + retn 4. Allocates the 4-byte node (obj+0, back-referencing
+//  obj), the 12-byte self-linked sentinel (obj+0x14) and the zero count
+//  (obj+0x18), then copies the source section's 12-byte payload list into
+//  the new array (sub_59DCF0: each source payload becomes a fresh 12-byte
+//  node {sentinel, last, payload} appended to the end, count++).
+//  [the test environment copies from a freshly constructed empty section --
+//  the copy loop never iterates]
+static void F3EntryArrayCtor(void *obj, void *srcSection)
+{
+    F3EntryArray *a = (F3EntryArray *)obj;
+    void *node = LHAlloc(4);
+    if (node != 0)
+        *(void **)node = obj;
+    a->node = (DWORD)node;
+
+    void *head = LHAlloc(12);
+    if (head != 0)
+    {
+        *(void **)head = head;
+        *(void **)((char *)head + 4) = head;
+    }
+    a->head = (DWORD)head;
+    a->count = 0;
+
+    void *srcHead = *(void **)((char *)srcSection + 0x14);
+    void *cur = *(void **)srcHead;
+    while (cur != srcHead)
+    {
+        int id = *(int *)((char *)cur + 8);
+        F3NodeListAppend(obj, head, &id);
+        cur = *(void **)cur;
+    }
+}
+
+// sub_762A90 (0x762A90 - 0x762E6C): the summary entry-array sort
+//
+//  void CVersionTableSortEntries(void *obj)
+//
+//  cdecl. An 884-byte binary-insertion sort over the F3EntryArray's 12-byte
+//  nodes (up to 26 buckets, moving nodes with sub_762910 and re-linking the
+//  circular list as it goes, then freeing the temporary nodes / sentinels).
+//  The summary array is empty in the test environment (count 0 < 2), so the
+//  original returns immediately; the sort body is only reachable with loaded
+//  packages.
+static void CVersionTableSortEntries(void *obj)
+{
+    if (*(unsigned int *)((char *)obj + 0x18) < 2)
+        return;
+    // [sort body omitted -- not exercised in the test environment]
+}
+
+// sub_762120 (0x762120 - 0x7622CD): build the "RequiredPackages:" summary
+//
+//  void CVersionTableBuildSummary(void *obj)
+//
+//  thiscall. Copies CV1's third 12-byte node-list section (CGameVersion+
+//  0x40, via CGameVersionThirdSection) into a temporary 7-word entry array
+//  (F3EntryArrayCtor), sorts it (CVersionTableSortEntries), and builds the
+//  shared string "RequiredPackages:<flag>[,<id>...]" -- <flag> is CV1's
+//  flag byte (CGameVersionGetFlag, 53 after refresh), one ",<id>" segment
+//  (SharedSlotConcatLiteral with "," + a "%u"-formatted id) per array entry
+//  -- then stores the CRC-32 of that string (SharedSlotCrc32, seed 0) at
+//  obj+0x11C. Every temporary slot and the array (nodes, sentinel, 4-byte
+//  node) are released on exit.
+static void CVersionTableBuildSummary(void *obj)
+{
+    char *base = (char *)obj;
+    char *cv1 = base + 4;
+
+    F3EntryArray arr;
+    F3EntryArrayCtor(&arr, CGameVersionThirdSection(cv1));
+    CVersionTableSortEntries(&arr);
+
+    F3SharedBuffer *slotStr = 0;
+    SetSharedSlot(&slotStr, "RequiredPackages:", -1);
+
+    unsigned int count = (unsigned char)CGameVersionGetFlag(cv1);
+    F3SharedBuffer *slotNum = 0;
+    InitSharedSlot(&slotNum);
+    SharedSlotFormat(&slotNum, "%u", count);
+    SharedSlotAppendSlot(&slotStr, &slotNum);
+    ReleaseSharedSlot(&slotNum);
+
+    void *head = (void *)arr.head;
+    void *cur = *(void **)head;
+    while (cur != head)
+    {
+        int id = *(int *)((char *)cur + 8);
+        F3SharedBuffer *slotId = 0;
+        InitSharedSlot(&slotId);
+        SharedSlotFormat(&slotId, "%u", id);
+        F3SharedBuffer *slotCma = 0;
+        SharedSlotConcatLiteral(&slotCma, ",", &slotId);
+        SharedSlotAppendSlot(&slotStr, &slotCma);
+        ReleaseSharedSlot(&slotCma);
+        ReleaseSharedSlot(&slotId);
+        cur = *(void **)cur;
+    }
+
+    *(DWORD *)(base + 0x11C) = SharedSlotCrc32(&slotStr, 0);
+    ReleaseSharedSlot(&slotStr);
+
+    // release the temporary array: re-link the sentinel, free each 12-byte
+    // node, then the sentinel and the 4-byte node
+    void *first = *(void **)head;
+    *(void **)head = head;
+    *(void **)((char *)head + 4) = head;
+    arr.count = 0;
+    while (first != head)
+    {
+        void *n = first;
+        first = *(void **)first;
+        LHFree(n);
+    }
+    LHFree(head);
+    LHFree((void *)arr.node);
+}
+
+// sub_7622D0 (0x7622D0 - 0x762505): refresh the version table from packages
+//
+//  int CVersionTableRefresh(void *obj)
+//
+//  thiscall. Resets CV1 (+0x04) and CV3 (+0xBC) (CGameVersionReset), sets
+//  CV1's flag to 0x35 (53) and CV3's flag to 4 (CGameVersionSetFlag),
+//  collects the package entry array from the CPackageManager
+//  (CPackageManagerCollectEntries), and for each entry id:
+//    - when the entry has flag 24 (PackageEntryTest24): re-add id to CV1's
+//      and CV3's first sections (CGameVersionInsert1)
+//    - re-add id to the second sections gated on flag 25 (CGameVersionInsert2)
+//    - re-add id to the third sections gated on flag 26 (CGameVersionInsert3)
+//  (the flag lookups are each issued twice, once per version sub-object,
+//  exactly as in the original). Then builds the summary
+//  (CVersionTableBuildSummary), sets obj+0x118 = 1, releases the temporary
+//  entry array, and returns 1. [the test environment's entry array is
+//  empty, so the per-entry loop never iterates]
+static int CVersionTableRefresh(void *obj)
+{
+    char *base = (char *)obj;
+    char *cv1 = base + 4;
+    char *cv3 = base + 0xBC;
+
+    CGameVersionReset(cv1);
+    CGameVersionReset(cv3);
+    CGameVersionSetFlag(cv1, 0x35);
+    CGameVersionSetFlag(cv3, 4);
+
+    F3EntryArray entries;
+    CPackageManagerCollectEntries(*(void **)base, &entries);
+
+    void *head = (void *)entries.head;
+    void *cur = *(void **)head;
+    while (cur != head)
+    {
+        int id = *(int *)((char *)cur + 8);
+        if (PackageEntryTest24(*(void **)base, id) != 0)
+        {
+            CGameVersionInsert1(cv1, id, 1);
+            CGameVersionInsert1(cv3, id, 1);
+        }
+        int f25 = PackageEntryTest25(*(void **)base, id);
+        CGameVersionInsert2(cv1, id, f25);
+        f25 = PackageEntryTest25(*(void **)base, id);
+        CGameVersionInsert2(cv3, id, f25);
+        int f26 = PackageEntryTest26(*(void **)base, id);
+        CGameVersionInsert3(cv1, id, f26);
+        f26 = PackageEntryTest26(*(void **)base, id);
+        CGameVersionInsert3(cv3, id, f26);
+        cur = *(void **)cur;
+    }
+
+    CVersionTableBuildSummary(base);
+    *(unsigned char *)(base + 0x118) = 1;
+
+    void *first = *(void **)head;
+    *(void **)head = head;
+    *(void **)((char *)head + 4) = head;
+    entries.count = 0;
+    while (first != head)
+    {
+        void *n = first;
+        first = *(void **)first;
+        LHFree(n);
+    }
+    LHFree(head);
+    LHFree((void *)entries.node);
+    return 1;
+}
+
+// sub_762490 (0x762490 - 0x76252E): the version-table ctor
+//
+//  void *CVersionTableCtor(void *obj, void *pkgMgr)
+//
+//  thiscall + retn 4. Stores the CPackageManager pointer at +0x00,
+//  constructs CV1 (+0x04), CV2 (+0x60) and CV3 (+0xBC) (CGameVersionCtor),
+//  zeroes +0x118 / +0x119 / +0x11C, resets CV1 / CV2 / CV3 again
+//  (CGameVersionReset -- redundant after the ctor but present in the
+//  original), then runs CVersionTableRefresh. Returns obj.
+void *CVersionTableCtor(void *obj, void *pkgMgr)
+{
+    char *base = (char *)obj;
+    *(void **)base = pkgMgr;
+    CGameVersionCtor(base + 4);
+    CGameVersionCtor(base + 0x60);
+    CGameVersionCtor(base + 0xBC);
+    *(unsigned char *)(base + 0x118) = 0;
+    *(unsigned char *)(base + 0x119) = 0;
+    *(DWORD *)(base + 0x11C) = 0;
+    CGameVersionReset(base + 4);
+    CGameVersionReset(base + 0x60);
+    CGameVersionReset(base + 0xBC);
+    CVersionTableRefresh(base);
+    return obj;
+}
 static void  sub_6234A0(void *obj) { (void)obj; }
 static void  sub_7672E0(void *obj) { (void)obj; }
 static int   sub_760FA0(void *obj) { (void)obj; return 0; }
@@ -8070,7 +9062,7 @@ signedIn:
         dw[0xAC / 4] = (DWORD)v39;
 
         void *p288 = LHAlloc(0x120);
-        int   v37 = (p288 != 0) ? (int)sub_762490(p288, (void *)dw[0xAC / 4]) : 0;
+        int   v37 = (p288 != 0) ? (int)CVersionTableCtor(p288, (void *)dw[0xAC / 4]) : 0;
 
         void *v41 = (void *)dw[0xB0 / 4];
         if (v41 != 0)

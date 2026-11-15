@@ -20,7 +20,7 @@ static void *g_CGameVersionVtable[1] = { 0 };
 //  count, and LHFrees every list node (the sentinel itself is kept). The
 //  return value (the third list's sentinel) is discarded by the sole caller.
 // ============================================================
-static void *CGameVersionReset(void *obj)
+void *CGameVersionReset(void *obj)
 {
     char *base = (char *)obj;
     int   heads[3] = { 0x1C, 0x38, 0x54 };
@@ -54,7 +54,7 @@ static void *CGameVersionReset(void *obj)
 //  12-byte self-linked sentinel block, stores it as the list head and zeroes
 //  the count. Finally runs CGameVersionReset. Returns this.
 // ============================================================
-static void *CGameVersionCtor(void *obj)
+void *CGameVersionCtor(void *obj)
 {
     char *base = (char *)obj;
     int   slots[3] = { 0x08, 0x24, 0x40 };

@@ -42,18 +42,6 @@
 "source": "gamemain"
 },
 {
-"name": "?sub_1A02260@@YAPAHPAH0PAPAPBD@Z",
-"rva": 23077472,
-"size": 50,
-"source": "gamemain"
-},
-{
-"name": "?sub_762490@@YAPAXPAX0@Z",
-"rva": 3548304,
-"size": 102,
-"source": "gamemain"
-},
-{
 "name": "?sub_6234A0@@YAXPAX@Z",
 "rva": 2241696,
 "size": 211,
@@ -334,5 +322,11 @@
 "rva": 21956688,
 "size": 119,
 "source": "worker"
+},
+{
+"name": "?sub_1A02260@@YAPAHPAH0PAPAPBD@Z",
+"rva": 23077472,
+"size": 50,
+"source": "XLip"
 }
 ]

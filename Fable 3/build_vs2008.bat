@@ -83,7 +83,7 @@ pushd "%OUTREL%" || exit /b 1
 :: Add a new module by listing its .cpp in SRCS (paths are relative to the
 :: project root; each .obj is produced in the Release/Win32 output dir and
 :: then linked below by name).
-set "SRCS=..\..\main.cpp ..\..\framework\framework.cpp ..\..\common\common.cpp ..\..\engine\engine.cpp ..\..\engine\worker.cpp ..\..\engine\manager.cpp ..\..\engine\object_registry.cpp ..\..\engine\xlo_device.cpp ..\..\engine\gameengine.cpp ..\..\engine\gamethread.cpp ..\..\engine\gamemain.cpp ..\..\engine\netinit.cpp ..\..\engine\thread.cpp ..\..\save\save.cpp"
+set "SRCS=..\..\main.cpp ..\..\framework\framework.cpp ..\..\common\common.cpp ..\..\engine\engine.cpp ..\..\engine\worker.cpp ..\..\engine\manager.cpp ..\..\engine\object_registry.cpp ..\..\engine\xlo_device.cpp ..\..\engine\gameengine.cpp ..\..\engine\gamethread.cpp ..\..\engine\gamemain.cpp ..\..\engine\XLip.cpp ..\..\engine\netinit.cpp ..\..\engine\thread.cpp ..\..\save\save.cpp"
 
 for %%F in (%SRCS%) do (
     echo.
@@ -108,7 +108,7 @@ echo === link, x86 ===
 rem .lib order: bundled third-party / DirectX import libs, then the standard
 rem Windows DLLs the original imports (kernel32 is pulled by the default CRT).
 set "IMPORT_LIBS=xlive.lib d3d9.lib dinput8.lib dsound.lib xinput1_3.lib x3daudio1_7.lib d3dx9_42.lib binkw32.lib steam_api.lib user32.lib gdi32.lib shell32.lib ole32.lib rpcrt4.lib oleaut32.lib ws2_32.lib"
-link %LNKFLAGS% /out:Fable3.exe /pdb:Fable3.pdb main.obj framework.obj common.obj engine.obj worker.obj manager.obj object_registry.obj xlo_device.obj gameengine.obj gamethread.obj gamemain.obj netinit.obj thread.obj save.obj %IMPORT_LIBS% %RRES%
+link %LNKFLAGS% /out:Fable3.exe /pdb:Fable3.pdb main.obj framework.obj common.obj engine.obj worker.obj manager.obj object_registry.obj xlo_device.obj gameengine.obj gamethread.obj gamemain.obj XLip.obj netinit.obj thread.obj save.obj %IMPORT_LIBS% %RRES%
 if errorlevel 1 (echo LINK FAILED & popd & popd & exit /b 1)
 
 rem The exe now really imports from the bundled third-party DLLs; copy the
