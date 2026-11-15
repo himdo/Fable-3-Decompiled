@@ -16,3 +16,5 @@ EXPORTS
     XLiveRender@0 @5002
     XLiveOnCreateDevice@8 @5005
     XLiveOnResetDevice@4 @5007
+    XContentCreateEnumerator@16 @5360
+    XEnumerate@20 @5256

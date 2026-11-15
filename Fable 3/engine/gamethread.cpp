@@ -869,12 +869,6 @@ static int   sub_72F8E0(void *obj) { (void)obj; return 0; }
 static void  sub_72F7E0(void *obj) { (void)obj; }
 static void  sub_72F7D0(void *obj) { (void)obj; }
 
-// sub_6234A0 (0x6234A0) -- the 0x120-byte object's dtor (nine 28-byte
-//   elements, each released through sub_4890E0). Remaining stub: its element
-//   releases are unimplemented and the object here is a stub-constructed raw
-//   block.
-static void  sub_6234A0(void *obj) { (void)obj; }
-
 // sub_627690 (0x627690) -- the 0x2E0-byte net object's dtor (nine nested
 //   lists + CNetPacketCallbackDtor + ReleaseSharedSlot). Remaining stub.
 static void  sub_627690(void *obj) { (void)obj; }
@@ -1144,10 +1138,11 @@ static void CGameEngineDestroy(CGameEngine *obj)
     }
     obj->member0xB4 = 0;
 
-    // 8. member0xB0: the 0x120-byte object (0x6234A0 dtor) + free.
+    // 8. member0xB0: the 0x120-byte CVersionTable (CVersionTableDtor,
+    //    sub_6234A0) + free.
     if (obj->member0xB0 != 0)
     {
-        sub_6234A0(obj->member0xB0);
+        CVersionTableDtor(obj->member0xB0);
         LHFree(obj->member0xB0);
     }
     obj->member0xB0 = 0;

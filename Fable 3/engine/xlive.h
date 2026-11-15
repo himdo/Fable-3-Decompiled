@@ -54,6 +54,15 @@ int   __stdcall XCancelOverlapped(void *pOverlapped);
 // while the device is not in a lost state.
 int   __stdcall XLiveRender(void);
 
+// ---- xlive.dll imports driven by XContentEnumeratePackageCollections
+//      (sub_762EB0) et al. ----
+// XContentCreateEnumerator ordinal 5360 stdcall @16
+DWORD __stdcall XContentCreateEnumerator(DWORD dwFlags, const void *pCreateEnumerator,
+                                         DWORD *pdwBufferSize, HANDLE *phContent);
+// XEnumerate ordinal 5256 stdcall @20
+DWORD __stdcall XEnumerate(HANDLE hContent, void *pBuffer, DWORD dwBufferSize,
+                           DWORD *pdwNumEntries, DWORD dwFlags);
+
 // ---- xlive.dll imports driven by InitNetworking (0x6A7210) et al. ----
 // XLiveInitializeEx      ordinal 5297  stdcall @8
 DWORD __stdcall XLiveInitializeEx(const void *pConfiguration, DWORD dwVersion);

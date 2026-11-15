@@ -44,6 +44,13 @@ void *GetHeapManager(void);
 // sound-system object). Declared as a plain free function here.
 void *GetHeapManagerSlot1C(void *hm);
 
+// 0x760FA0 - the version table's first CGameVersion sub-object (CV1, +0x04)
+// getter. The original is thiscall (obj in ECX); byte-identical naked this
+// call, so obj must be staged in ECX at the call site (the declaration's
+// obj parameter is unused). The sub_760FC0 / sub_761CC0 /
+// CGameVersionCopyFrom version-compare / copy family takes its result.
+void *CVersionTableGetVersion1(void *obj);
+
 // 0x1A01270 - copy-assign one shared slot onto another with refcounting
 // (this / src are both the addresses of F3SharedBuffer * fields).
 F3SharedBuffer **CopySharedSlot(F3SharedBuffer **thisSlot, F3SharedBuffer **srcSlot);

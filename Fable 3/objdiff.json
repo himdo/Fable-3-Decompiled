@@ -20,14 +20,6 @@
   ],
   "units": [
     {
-      "name": "XLip",
-      "target_path": "orig/main.obj",
-      "base_path": "Release/Win32/XLip_objdiff.obj",
-      "metadata": {
-        "source_path": "XLip.cpp"
-      }
-    },
-    {
       "name": "gamemain",
       "target_path": "orig/main.obj",
       "base_path": "Release/Win32/gamemain_objdiff.obj",

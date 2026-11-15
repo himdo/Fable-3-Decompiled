@@ -48,6 +48,14 @@ typedef char CGameVersionSizeCheck[(sizeof(CGameVersion) == 92) ? 1 : -1];
 void *CGameVersionCtor(void *obj);
 void *CGameVersionReset(void *obj);
 
+// CVersionTableDtor (sub_6234A0, 0x6234A0 - 0x623573) -- the 288-byte
+// CVersionTable dtor (counterpart of CVersionTableCtor, sub_762490),
+// implemented in gamemain.cpp. Destructs the nine embedded 28-byte
+// F3EntryArray members (three per CGameVersion sub-object) through the
+// F3EntryArrayDtor (sub_4890E0) + LHFree pair. Called by RunFrontEnd when
+// the table is swapped and by CGameEngineDestroy (engine member 0xB0).
+void CVersionTableDtor(void *obj);
+
 // ============================================================
 //  CGameEngine  -- the 356-byte game engine object
 //
@@ -88,7 +96,8 @@ typedef struct CGameEngine
     void *           member0x8C;    // +0x8C
     void *           member0x90;    // +0x90
     void *           member0x94;    // +0x94
-    void *           member0x98;    // +0x98
+    void *           member0x98;    // +0x98  the 0x38-byte sorted map (CSortedMapCtor)
+
     void *           member0x9C;    // +0x9C
     void *           member0xA0;    // +0xA0
     void *           member0xA4;    // +0xA4
@@ -97,9 +106,9 @@ typedef struct CGameEngine
     void *           member0xB0;    // +0xB0
     void *           member0xB4;    // +0xB4
     void *           member0xB8;    // +0xB8
-    void *           member0xBC;    // +0xBC
-    void *           member0xC0;    // +0xC0
-    void *           member0xC4;    // +0xC4
+    void *           member0xBC;    // +0xBC  the Lua module ("Fable 3" lua_State host, sub_629570)
+    void *           member0xC0;    // +0xC0  the CLuaManager (8-byte wrapper, sub_6F9890)
+    void *           member0xC4;    // +0xC4  the CEntityScriptHandleManager (80 bytes, sub_6E9620)
     void *           sub0xC8Node;   // +0xC8
     char             _pad6[12];     // +0xCC .. +0xD8
     char             _pad7[8];      // +0xD8 .. +0xE0

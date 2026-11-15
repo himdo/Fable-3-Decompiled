@@ -3,9 +3,23 @@
 #include <wchar.h>
 #include "engine/engine.h"
 
+static LONG WINAPI _CrashHandler(EXCEPTION_POINTERS *ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    BYTE *addr = (BYTE *)ep->ExceptionRecord->ExceptionAddress;
+    HMODULE h = 0;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                       (const char *)addr, &h);
+    printf("!! EXCEPTION 0x%lx at %p (base %p, rva %p)\n",
+           (unsigned long)code, (void *)addr, (void *)h,
+           (void *)((BYTE *)addr - (BYTE *)h));
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);   // unbuffered (see output on crash)
+    AddVectoredExceptionHandler(1, _CrashHandler);
 
     // Compute the shared-memory mapping name the same way GameThread does.
     WCHAR path[MAX_PATH];

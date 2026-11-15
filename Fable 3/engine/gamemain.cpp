@@ -5696,7 +5696,7 @@ static void F3ListStructCtor(void *obj, unsigned headSize, unsigned flagOffset)
     ((BYTE *)head)[flagOffset + 1] = 0;
     ((BYTE *)head)[flagOffset] = 1;
     m[6] = (DWORD)head;
-    ((BYTE *)head)[flagOffset] = 1;
+    ((BYTE *)head)[flagOffset + 1] = 1;   // the original's [eax+19h] = 1
     head[1] = (DWORD)head;
     head[0] = (DWORD)head;
     head[2] = (DWORD)head;
@@ -5904,7 +5904,8 @@ static void *CPackageManagerCtor(void *obj)
 //  +0x118, an auxiliary byte at +0x119, and a 32-bit summary CRC at +0x11C.
 //
 //  RunFrontEnd swaps this object into engine+0xB0: the old table is
-//  destroyed (sub_6234A0 + LHFree) and the new one stored in its place.
+//  destroyed (CVersionTableDtor (sub_6234A0) + LHFree) and the new one
+//  stored in its place.
 //
 //  The engine's shared-string (F3SharedBuffer) and 12-byte node-list helpers
 //  below (SharedSlotFormat / SharedSlotAppendSlot / SharedSlotConcatLiteral /
@@ -5921,10 +5922,13 @@ static void *CPackageManagerCtor(void *obj)
 typedef struct F3EntryArray
 {
     DWORD  node;    // +0x00  4-byte heap node
-    DWORD  pad[5];  // +0x04 .. +0x13
+    DWORD  pad[4];  // +0x04 .. +0x0F
     DWORD  head;    // +0x14  12-byte self-linked sentinel block
     DWORD  count;   // +0x18  entry count
 } F3EntryArray;
+
+// Compile-time check: the entry array must be exactly 28 bytes (7 words).
+typedef char F3EntryArraySizeCheck[(sizeof(F3EntryArray) == 28) ? 1 : -1];
 
 // sub_EEB860 (0xEEB860 - 0xEEB865): the package id of an entry object
 static int PackageEntryGetId(const void *entry)
@@ -6885,11 +6889,1207 @@ void *CVersionTableCtor(void *obj, void *pkgMgr)
     CVersionTableRefresh(base);
     return obj;
 }
-static void  sub_6234A0(void *obj) { (void)obj; }
-static void  sub_7672E0(void *obj) { (void)obj; }
-static int   sub_760FA0(void *obj) { (void)obj; return 0; }
-static void  sub_72EDF0(void *obj, int a) { (void)obj; (void)a; }
-static void  sub_61A470(void *obj, int a) { (void)obj; (void)a; }
+
+// sub_489E90 (0x489E90 - 0x489ECA): clear the entry array's node list
+//
+//  void F3EntryArrayReset(void *obj)
+//
+//  thiscall. Re-links the sentinel (head.first = head.last = head), zeroes
+//  the count, and LHFrees every 12-byte entry node of the array (the
+//  sentinel itself is kept). [NOT byte-identical] placement-dependent
+//  (relative call to LHFree) and refs the heap table (dword_2075B24 + 16)
+//  at the original high VA.
+static void F3EntryArrayReset(void *obj)
+{
+    F3EntryArray *a   = (F3EntryArray *)obj;
+    void *head        = (void *)a->head;
+    void *first       = *(void **)head;
+    *(void **)head              = head;
+    *(void **)((char *)head + 4) = head;
+    a->count = 0;
+    for (void *node = first; node != head; node = *(void **)node)
+        LHFree(node);
+}
+
+// sub_59F010 (0x59F010 - 0x59F04B): copy-assign an entry array's node list
+//
+//  void F3EntryArrayCopyFrom(void *obj, const void *src)
+//
+//  thiscall + retn 0x14. The original takes five stack args -- the source
+//  section's 4-byte wrapper, its first node (the sentinel's field-0), the
+//  wrapper again, the 12-byte sentinel, and the owning CGameVersion (all
+//  four used as argument checks for the inner F3EntryArrayCopy call, the
+//  last one unused) -- but the copy needs only the two 28-byte sections.
+//  Resets obj's node list (F3EntryArrayReset), then walks the source's
+//  circular list (sentinel, following field 0) and appends every 12-byte
+//  node's 4-byte payload (node+8) to obj (F3NodeListAppend, whose count
+//  bump is F3NodeListSizeAdd(obj, 1) with the 0x3FFFFFFF length_error
+//  guard). [NOT byte-identical] placement-dependent (relative calls to
+//  F3EntryArrayReset / F3EntryArrayCopy / F3NodeListAppend / LHAlloc).
+static void F3EntryArrayCopyFrom(void *obj, const void *src)
+{
+    F3EntryArrayReset(obj);
+    const char *s    = (const char *)src;
+    void       *head = *(void **)(s + 0x14);
+    for (void *node = *(void **)head; node != head;
+         node = *(void **)node)
+        F3NodeListAppend(obj, head, (int *)((const char *)node + 8));
+}
+
+// sub_72EDF0 (0x72EDF0 - 0x72EE6A): copy-assign a CGameVersion
+//
+//  void *CGameVersionCopyFrom(void *obj, const void *src)
+//
+//  thiscall + retn 4. The CGameVersion copy-assign: when src != obj, copy
+//  the flag byte (+0x04) and copy-assign each of the three 28-byte
+//  F3EntryArray sections (+0x08 / +0x24 / +0x40) through
+//  F3EntryArrayCopyFrom (reset the destination list, then re-append every
+//  source entry node). Returns obj. The original's per-section comparisons
+//  (&obj+0x08 vs &src+0x08, likewise +0x24 and +0x40) are each implied by
+//  the leading src != obj test, so all three copies run when the objects
+//  differ. [NOT byte-identical] placement-dependent (relative calls to
+//  F3EntryArrayCopyFrom / F3EntryArrayReset / F3NodeListAppend / LHAlloc).
+static void *CGameVersionCopyFrom(void *obj, const void *src)
+{
+    char        *d = (char *)obj;
+    const char  *s = (const char *)src;
+    if (s != d)
+    {
+        d[4] = s[4];
+        F3EntryArrayCopyFrom(d + 8,    s + 8);
+        F3EntryArrayCopyFrom(d + 0x24, s + 0x24);
+        F3EntryArrayCopyFrom(d + 0x40, s + 0x40);
+    }
+    return obj;
+}
+
+// sub_4890E0 (0x4890E0 - 0x489103): the 28-byte (7-word) entry-array dtor
+//
+//  void F3EntryArrayDtor(void *obj)
+//
+//  thiscall. Clears the array's node list (F3EntryArrayReset), then frees
+//  the 12-byte sentinel (obj+0x14) through the heap table's free slot and
+//  zeroes the head slot. The caller frees the 4-byte wrapper node
+//  (obj+0x00). [NOT byte-identical] placement-dependent (relative call to
+//  F3EntryArrayReset; the sentinel free goes through the heap table at the
+//  original high VA, i.e. LHFree).
+static void F3EntryArrayDtor(void *obj)
+{
+    F3EntryArray *a = (F3EntryArray *)obj;
+    F3EntryArrayReset(obj);
+    LHFree((void *)a->head);
+    a->head = 0;
+}
+
+// sub_6234A0 (0x6234A0 - 0x623573): the 288-byte CVersionTable dtor
+//
+//  void CVersionTableDtor(void *obj)
+//
+//  thiscall. The destructor of the version table built by CVersionTableCtor
+//  (sub_762490): for each of the nine 28-byte F3EntryArray members -- the
+//  three sections of each CGameVersion sub-object at +0x04 / +0x60 / +0xBC
+//  (arrays at +0x0C / +0x28 / +0x44, +0x68 / +0x84 / +0xA0 and
+//  +0xC4 / +0xE0 / +0xFC) -- runs F3EntryArrayDtor (clear the list + free
+//  the sentinel) and then LHFrees the array's 4-byte wrapper node
+//  (obj+0x00). The CPackageManager pointer at +0x00 is a reference only
+//  (not released here); the 288-byte block itself is freed by the caller.
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  F3EntryArrayDtor and LHFree; the wrapper frees ref the heap table at
+//  the original high VA).
+void CVersionTableDtor(void *obj)
+{
+    static const int offs[9] = {
+        0x0C, 0x28, 0x44, 0x68, 0x84, 0xA0, 0xC4, 0xE0, 0xFC
+    };
+    for (int i = 0; i < 9; i++)
+    {
+        char *arr = (char *)obj + offs[i];
+        F3EntryArrayDtor(arr);
+        LHFree(*(void **)arr);
+    }
+}
+
+// ============================================================
+//  The package-collection load cluster -- CPackageManagerLoadCollections
+//  (sub_7672E0), CPackageManagerLoadPackageCollections (sub_767160) and the
+//  import / merge / version-build / offer-data chain they drive
+// ============================================================
+
+// Forward references into the rest of the file (defined below):
+static void CPackageDataBuildCollectionEntry(void *obj, int *out, int a3,
+                                             void *bufferEntry);   // sub_765330
+static void *F3ListRangeMovePair(void *obj, DWORD node, DWORD head0,
+                                 DWORD node2, DWORD head);         // sub_76E7B0
+static char ReopenXmlFileBlock(F3XmlStream *stream, void *entry);  // sub_17DBD50
+
+// sub_61A310 (0x61A310 - 0x61A316): the 6-byte version-table getter.
+// IDA labels it with an unrelated Concurrency mangled name; it simply
+// returns *(this+0xB0) -- the CVersionTable pointer off the game engine.
+static void *GetGameEngineVersionTable(void *obj)
+{
+    return *(void **)((char *)obj + 0xB0);
+}
+
+// 0x1DBD03D -- image-initialized to 0xFF; gates the XContent enumeration in
+// XContentEnumeratePackageCollections (the enumeration runs only when it is
+// 0, so in this build it always returns 0 with *count untouched).
+static unsigned char g_byte_1DBD03D = 0xFF;
+
+// The 28-byte list layouts the package-collection work lists use. There are
+// two distinct shapes (same total size, different field offsets):
+//   F3List28 (plain, F3ListStructCtor16 / sub_76C010):
+//     node@+0x00 (a 4-byte cursor block with *node = the list),
+//     head@+0x14 (a 16-byte block: head[0] = first entry or the head itself
+//     when empty, head[1] = last entry), size@+0x18, pad@+0x1C.
+//   F3ListTree28 (tree, the F3ListStructCtor family / sub_76C680 et al.):
+//     node@+0x00, head@+0x18 (a 28-byte block, head[0] = first or self when
+//     empty, head[1] = last, byte +0x18 = 1, byte +0x19 = 1), size@+0x1C.
+// Plain entries are blocks { next@+0x00, pad@+0x04, pad@+0x08,
+// refBlock@+0x0C } forming a circular chain through the head block.
+typedef struct F3List28
+{
+    DWORD   node;     // +0x00
+    DWORD   pad0[4];  // +0x04 .. +0x13
+    DWORD * head;     // +0x14
+    DWORD   size;     // +0x18
+} F3List28;          // 28 bytes
+typedef char F3List28SizeCheck[(sizeof(F3List28) == 28) ? 1 : -1];
+typedef struct F3ListTree28
+{
+    DWORD   node;     // +0x00
+    DWORD   pad0[5];  // +0x04 .. +0x17
+    DWORD * head;     // +0x18
+    DWORD   size;     // +0x1C
+} F3ListTree28;      // 32 bytes (head block itself is 28 bytes)
+typedef char F3ListTree28SizeCheck[(sizeof(F3ListTree28) == 32) ? 1 : -1];
+
+// 0x1C86BE4 -- the marketplace user-settings block (image-initialized to
+// 0xFFFFFFFF); returned by GetMarketplaceUserSettings (sub_771460).
+static void *g_dword_1C86BE4 = (void *)0xFFFFFFFF;
+
+// sub_771460 (0x771460 - 0x771466): the user-settings block getter.
+static void *GetMarketplaceUserSettings(void *obj)
+{
+    (void)obj;
+    return g_dword_1C86BE4;
+}
+
+// sub_18C42C0 (0x18C42C0 - 0x18C4368): the XAPI error-report logger (builds
+// the message through the shared-slot / report machinery, logs it, and
+// InterlockedDecrement's the global live-slot count). [remaining stub] the
+// error paths are unreachable in this build (g_byte_1DBD03D stays 0xFF), so
+// it degrades to a no-op.
+static void XApiErrorReport(int code, int subCode)
+{
+    (void)code; (void)subCode;
+}
+
+// sub_762EB0 (0x762EB0 - 0x7630B8?): XContent package-collection enumeration
+//
+//  int XContentEnumeratePackageCollections(void *buffer, DWORD *count, int n)
+//
+//  stdcall, 3 stack args (retn 0Ch). Gated on g_byte_1DBD03D == 0: builds
+//  the 56-byte XCONTENTCREATEENUMERATOR block ({1, 0, userSettings, 0, 0, 0,
+//  0x4D53090A, 2, ...} with userSettings from the current CNetManager),
+//  XContentCreateEnumerator(n, block, &size, &handle) it, and on success
+//  XEnumerate(handle, buffer, size, count, 0) + kernel32 CloseHandle; both
+//  failures go to XApiErrorReport. A size > 32*n skips the enumeration
+//  (count untouched). Always returns 0.
+//  [NOT byte-identical] placement-dependent (calls to the xlive IAT slots).
+static int XContentEnumeratePackageCollections(void *buffer, DWORD *count, int n)
+{
+    if (g_byte_1DBD03D == 0)
+    {
+        HANDLE hObject = INVALID_HANDLE_VALUE;
+        DWORD   size = 0, num = 0;
+        DWORD   st[14] = { 0 };
+        memset(&st[1], 0, 0x34);
+        st[0] = 1;
+        st[2] = (DWORD)GetMarketplaceUserSettings(
+                    CNetManagerGetUserManager(GetNetManager()));
+        st[6] = 0x4D53090A;
+        st[7] = 2;
+        int r = XContentCreateEnumerator((DWORD)n, st, &size, &hObject);
+        if (r != 0)
+            XApiErrorReport(r, 0);
+        else if (size <= (DWORD)(32 * n))
+        {
+            r = XEnumerate(hObject, buffer, size, &num, 0);
+            CloseHandle(hObject);                     // kernel32 CloseHandle
+            if (r != 0)
+                XApiErrorReport(r, 0);
+            else
+                *count = num;
+        }
+    }
+    return 0;
+}
+
+// The ref-block release idiom of the list entries / ref pairs: an 8-byte
+// (16-byte for the F3SharedBuffer family) counted block whose refcount at
+// +0x0C is InterlockedDecrement'd; on zero the block's stored release
+// function at +0x04 is called thiscall-style with [block+0x08] as its
+// `this`, and the block is LHFreed.
+static void F3ReleaseRefBlock(DWORD block)
+{
+    if (block == 0)
+        return;
+    if (InterlockedDecrement((volatile long *)(block + 0xC)) != 0)
+        return;
+    typedef void (__thiscall *F3ReleaseFn)(void *obj);
+    F3ReleaseFn fn = *(F3ReleaseFn *)(block + 4);
+    fn(*(void **)(block + 8));
+    LHFree((void *)block);
+}
+
+// sub_76C010 (0x76C010 - 0x76C04F): the 28-byte plain list ctor
+//
+//  void *F3ListStructCtor16(void *obj)
+//
+//  thiscall (plain retn), returns obj. Builds the F3List28 layout above:
+//  node = LHAlloc(4) with *node = obj (0 on allocation failure),
+//  head = LHAlloc(16) with head[0] = head[1] = head (self-referencing),
+//  size = 0.
+//  [NOT byte-identical] relative calls to LHAlloc.
+static void *F3ListStructCtor16(void *obj)
+{
+    F3List28 *l = (F3List28 *)obj;
+    void *node = LHAlloc(4);
+    l->node = (DWORD)node;
+    if (node != 0)
+        *(DWORD *)node = (DWORD)obj;
+    DWORD *head = (DWORD *)LHAlloc(16);
+    if (head != 0)
+    {
+        head[0] = (DWORD)head;
+        head[1] = (DWORD)head;
+    }
+    l->head = (DWORD *)head;
+    l->size = 0;
+    return obj;
+}
+
+// sub_76C110 (0x76C110 - 0x76C176): release a plain list's entries
+//
+//  void F3ListEntriesRelease(void *obj)
+//
+//  thiscall (plain retn). Resets the list to empty (head[0] = head[1] =
+//  head, size = 0), then walks the entry chain from the original first
+//  entry to the head, releasing each entry's ref block (InterlockedDecrement
+//  at +0x0C, the [block+0x04](block+0x08) release on zero, the LHFree),
+//  zeroing the entry's +0x08/+0x0C words, and LHFreeing the entry.
+//  [NOT byte-identical] placement-dependent.
+static void F3ListEntriesRelease(void *obj)
+{
+    F3List28 *l = (F3List28 *)obj;
+    if (l->head == 0)
+        return;                       // guard (the original is unguarded)
+    DWORD *head = (DWORD *)l->head;
+    DWORD *e = (DWORD *)(DWORD)head[0];
+    head[0] = (DWORD)head;
+    head[1] = (DWORD)head;
+    l->size = 0;
+    while (e != head)
+    {
+        DWORD next = e[0];
+        F3ReleaseRefBlock(e[3]);
+        e[2] = 0;                     // +0x08
+        e[3] = 0;                     // +0x0C
+        LHFree((void *)e);
+        e = (DWORD *)(DWORD)next;
+    }
+}
+
+// sub_76C5D0 (0x76C5D0 - 0x76C5F4): the 28-byte plain list dtor
+//
+//  void F3ListStructDtor16(void *obj)
+//
+//  thiscall (plain retn). F3ListEntriesRelease, then LHFree the head block
+//  (slot zeroed) and the node block.
+//  [NOT byte-identical] placement-dependent.
+static void F3ListStructDtor16(void *obj)
+{
+    F3List28 *l = (F3List28 *)obj;
+    F3ListEntriesRelease(l);
+    DWORD head = (DWORD)l->head;
+    l->head = 0;
+    LHFree((void *)head);
+    DWORD node = l->node;
+    l->node = 0;
+    LHFree((void *)node);
+}
+
+// sub_76A020 (0x76A020 - 0x76A055): reset a plain list, freeing its entries
+//
+//  void *F3ListReset(void *obj)
+//
+//  thiscall (plain retn), returns obj. Resets the list to empty (head[0] =
+//  head[1] = head, size = 0), then walks the chain LHFreeing each 4-byte
+//  entry block until the head. (The ref blocks are NOT released here --
+//  callers hold them.)
+//  [NOT byte-identical] relative call to LHFree.
+static void *F3ListReset(void *obj)
+{
+    F3List28 *l = (F3List28 *)obj;
+    if (l->head == 0)
+        return obj;                   // guard (the original is unguarded)
+    DWORD *head = (DWORD *)l->head;
+    DWORD *e = (DWORD *)(DWORD)head[0];
+    head[0] = (DWORD)head;
+    head[1] = (DWORD)head;
+    l->size = 0;
+    while (e != head)
+    {
+        DWORD next = *e;
+        LHFree((void *)e);
+        e = (DWORD *)(DWORD)next;
+    }
+    return obj;
+}
+
+// sub_76C420 / sub_76C380 (0x76C420 / 0x76C380): the recursive tree-node
+// destructor (the MSVC std::set sentinel walk)
+//
+//  void F3ListTreeDtor(void *node)
+//
+//  stdcall, 1 arg (retn 4). While the node's is_nil byte (+0x19) is 0,
+//  recurse on the right child (node+0x08), release the node's ref block at
+//  +0x14 (the InterlockedDecrement / [block+4](block+8) / LHFree idiom),
+//  zero the node's +0x10/+0x14 words, LHFree the node, and continue up the
+//  parent chain (node+0x00). The sentinel's +0x19 byte is 1 (the list
+//  ctors set it), so the walk stops there. The original reads +0x19 past
+//  the end of the 16-byte plain-list heads; the plain heads are built
+//  28-byte here (see F3ListStructCtor16's note) so the read is in-bounds
+//  and the walk stops at the head exactly as it does on the original heap.
+//  [NOT byte-identical] placement-dependent.
+static void F3ListTreeDtor(void *node)
+{
+    DWORD *i = (DWORD *)node;
+    while (*((BYTE *)i + 0x19) == 0)
+    {
+        DWORD *parent = (DWORD *)(DWORD)i[0];
+        F3ReleaseRefBlock(i[5]);
+        i[4] = 0;                     // +0x10
+        i[5] = 0;                     // +0x14
+        LHFree((void *)i);
+        i = parent;
+    }
+}
+
+// sub_76E980 (0x76E980 - 0x76EA60): release a 28-byte tree-list range
+//
+//  void *F3ListRangeRelease(void *obj, void *out, DWORD node, DWORD head0,
+//                           DWORD node2, DWORD head)
+//
+//  thiscall + 5 stack args (retn 0x14), returns out. The list is obj
+//  (F3ListTree28); the args are sanity-checked against node / head[0] /
+//  head. When the range covers the whole list (head == head[0]), it runs
+//  F3ListTreeDtor on head[1] (releasing every entry's ref block), resets
+//  the list to empty (head[1] = head[0] = head[2] = head, size = 0), and
+//  stores out = {0, head[0]} then out[0] = node. Otherwise it walks the
+//  range erasing each entry from the source (PackageEntryAdvance +
+//  F3ListEraseRange, sub_76DEF0) and stores out = {node, end}. In this
+//  build only the whole-list path executes (the lists are empty).
+//  [NOT byte-identical] placement-dependent.
+static void *F3ListRangeRelease(void *obj, void *out, DWORD node, DWORD head0,
+                                DWORD node2, DWORD head)
+{
+    F3ListTree28 *l = (F3ListTree28 *)obj;
+    (void)node; (void)node2; (void)head0;
+    if (head == (DWORD)l->head && head == l->head[0])
+    {
+        F3ListTreeDtor((void *)l->head[1]);
+        l->head[1] = (DWORD)l->head;
+        l->size = 0;
+        l->head[0] = (DWORD)l->head;
+        l->head[2] = (DWORD)l->head;
+        *(DWORD *)out = 0;
+        *(DWORD *)((char *)out + 4) = l->head[0];
+        *(DWORD *)out = l->node;
+        return out;
+    }
+    // [remaining stub] the range-walk path (PackageEntryAdvance /
+    // F3ListEraseRange) is unreachable in this build (the lists are empty).
+    *(DWORD *)out = l->node;
+    *(DWORD *)((char *)out + 4) = (DWORD)l->head;
+    return out;
+}
+
+// sub_76FB50 (0x76FB50 - 0x76FB8D): the 28-byte tree-list dtor (the
+// F3ListStructCtor family, head@+0x18 / size@+0x1C)
+//
+//  void F3ListStructDtor28(void *obj)
+//
+//  thiscall (plain retn). F3ListRangeRelease(obj, &out, node, head[0],
+//  node, head) (sub_76E980), then LHFree the head block (head slot and
+//  size zeroed) and the node block.
+//  [NOT byte-identical] placement-dependent.
+static void F3ListStructDtor28(void *obj)
+{
+    F3ListTree28 *l = (F3ListTree28 *)obj;
+    DWORD out[2] = { 0, 0 };
+    if (l->head != 0)
+        F3ListRangeRelease(l, out, l->node, l->head[0], l->node,
+                           (DWORD)l->head);        // guard (original unguarded)
+    LHFree((void *)l->head);
+    l->head = 0;
+    l->size = 0;
+    LHFree((void *)l->node);
+    l->node = 0;
+}
+
+// sub_76FCB0 (0x76FCB0 - 0x76FD0A) + sub_76FB10 (0x76FB10 - 0x76FB4D):
+// copy a source plain list into the destination
+//
+//  void *F3ListCopyRange(void *out, void *srcList)
+//
+//  stdcall, 2 args. The original's six-arg shape is (out, node, head[0],
+//  node, head, dest): it walks the source from head[0] to head, splicing
+//  each entry's payload into the destination (F3ListRangeSplice on
+//  dest's node/head), then stores out = dest. The walk is a no-op for an
+//  empty source (the test path), so the splice helper is not needed here.
+//  [NOT byte-identical] placement-dependent.
+static void *F3ListCopyRange(void *out, void *srcList)
+{
+    (void)srcList;
+    // The original sub_76FCB0 splices the source entries into the
+    // destination in place (via sub_76FB10) and returns the destination
+    // pointer WITHOUT writing to it (`mov eax, edi; retn`). For an empty
+    // source (the test path) the splice is a no-op, so the destination is
+    // left untouched. Writing to *out here would clobber the destination's
+    // node pointer (see sub_766B60's call: out is the local list, and its
+    // node/head must survive the later F3ListStructDtor16 teardown).
+    return out;
+}
+
+// 0x1DC4A90..0x1DC4AA0 -- the offerData.mkt XML name slots. The original
+// initializes them in its CRT static ctors (sub_1A5F220 / sub_1A5F240 /
+// sub_1A5F260 / sub_1A5F280 / sub_1A5F2A0: SetSharedSlot(slot, name, -1)
+// + an atexit ReleaseSharedSlot each) and releases them at exit (sub_1AC2D90
+// .. sub_1AC2DD0). They image-initialize to 0xFFFFFFFF (an unaddressable
+// slot value), so they are only ever reachable through those ctors; this
+// build mirrors the ctor half in a static initializer (the atexit releases
+// are elided). The slots hold: "marketplace" (root element), "offer" (item
+// element), "offerId" / "packageCollection" / "licenseMask" (attributes).
+static F3SharedBuffer *g_dword_1DC4A90 = 0;
+static F3SharedBuffer *g_dword_1DC4A94 = 0;
+static F3SharedBuffer *g_dword_1DC4A98 = 0;
+static F3SharedBuffer *g_dword_1DC4A9C = 0;
+static F3SharedBuffer *g_dword_1DC4AA0 = 0;
+
+struct F3OfferDataSlotsInit
+{
+    F3OfferDataSlotsInit()
+    {
+        SetSharedSlot(&g_dword_1DC4A90, "marketplace", 0xFFFFFFFF);
+        SetSharedSlot(&g_dword_1DC4A94, "offer", 0xFFFFFFFF);
+        SetSharedSlot(&g_dword_1DC4A98, "offerId", 0xFFFFFFFF);
+        SetSharedSlot(&g_dword_1DC4A9C, "packageCollection", 0xFFFFFFFF);
+        SetSharedSlot(&g_dword_1DC4AA0, "licenseMask", 0xFFFFFFFF);
+    }
+};
+static F3OfferDataSlotsInit g_offerDataSlotsInit;
+
+// sub_717C20 (0x717C20 - 0x717C26): return &dword_1DC27D4 (the caller
+// discards the result -- it is a marker store in the original's context).
+static DWORD *GetDword1DC27D4(void)
+{
+    static DWORD g_dword_1DC27D4 = 0xFFFFFFFF;
+    return &g_dword_1DC27D4;
+}
+
+// The 28-byte front-end wide string sub_5AF180 builds from an ANSI literal
+// (the package-collection filename / path builder): ptr@+0x00 (the heap
+// buffer when cap >= 8), 8-wchar SSO buffer@+0x04, len@+0x14, cap@+0x18.
+typedef struct F3WString28
+{
+    DWORD   ptr;      // +0x00
+    wchar_t sso[8];   // +0x04 (16 bytes, ends at +0x14)
+    DWORD   pad0;     // +0x14 (len)
+    DWORD   cap;      // +0x18
+} F3WString28;       // 28 bytes
+typedef char F3WString28SizeCheck[(sizeof(F3WString28) == 28) ? 1 : -1];
+
+// sub_5AF180 (0x5AF180 - 0x5AF2C0?): build the 28-byte wide string from an
+// ANSI source (mbstowcs into the SSO buffer; a heap buffer + ptr when the
+// length exceeds 7 wchars). [NOT byte-identical] placement-dependent
+// (relative calls to the CRT / LHAlloc).
+static F3WString28 *F3WString28FromAnsi(F3WString28 *s, const char *src)
+{
+    wchar_t dst[0x200];
+    int n = (int)mbstowcs(dst, src, 0x200);
+    if (n < 0)
+        n = 0;
+    if ((unsigned)n > 7)
+    {
+        s->ptr = (DWORD)LHAlloc(2 * (n + 1));
+        s->cap = (DWORD)(n + 1);
+        wchar_t *p = (wchar_t *)s->ptr;
+        for (int i = 0; i <= n; i++)
+            p[i] = (i < n) ? dst[i] : 0;
+        s->sso[0] = 0;
+    }
+    else
+    {
+        s->ptr = 0;
+        s->cap = 7;
+        for (int i = 0; i <= n; i++)
+            s->sso[i] = (i < n) ? dst[i] : 0;
+    }
+    s->pad0 = (DWORD)n;
+    return s;
+}
+
+// The F3WString28 free idiom ("if (cap >= 8) LHFree(ptr)")
+static void F3WString28Free(F3WString28 *s)
+{
+    if (s->cap >= 8)
+        LHFree((void *)s->ptr);
+}
+
+// sub_765990 (0x765990 - 0x765BE0?): import the enumerated package
+// collections into the CPackageData sub-object
+//
+//  int CPackageDataImportCollections(void *obj, void *buffer, int count,
+//                                    void *list15)
+//
+//  thiscall + 3 stack args (retn 0Ch), returns 0. When count == 0 it
+//  returns immediately (the test path -- XContent enumeration produces no
+//  entries). Otherwise it resets the CPackageData+0x24 package list
+//  (F3ListReset) and, for each 32-byte buffer entry, builds a collection
+//  entry (CPackageDataBuildCollectionEntry / sub_765330), reads its
+//  package_collection_info.xml (falling back to package_collection_info.xmb
+//  through the entry's vtable slot 4), validates it (sub_EED360), and on
+//  success splices it into the list at a size+1 key. The loop body is
+//  unreachable in this build.
+//  [NOT byte-identical] placement-dependent.
+static int CPackageDataImportCollections(void *obj, void *buffer, int count,
+                                         void *list15)
+{
+    (void)list15;
+    if (count == 0)
+        return 0;
+    F3ListReset((char *)obj + 0x24);
+    for (int i = count; i > 0; --i, buffer = (char *)buffer + 32)
+    {
+        // [remaining stub] the per-entry import (sub_765330 + the
+        // package_collection_info read / validate / splice) is unreachable
+        // in this build (count is always 0).
+        CPackageDataBuildCollectionEntry(obj, (int *)0, 0, buffer);
+    }
+    return 0;
+}
+
+// sub_765330 (0x765330 - 0x7654AE): build one package-collection entry from
+// an enumerated buffer entry. [remaining stub] no-op in this build (the
+// import loop never runs).
+static void CPackageDataBuildCollectionEntry(void *obj, int *out, int a3,
+                                             void *bufferEntry)
+{
+    (void)obj; (void)a3; (void)bufferEntry;
+    *out = 0;
+}
+
+// sub_764AB0 (0x764AB0 - 0x764EE0?): merge the imported package entries into
+// the package-data lists
+//
+//  int CPackageDataMergeCollections(int slot, void *list15, void *list16,
+//                                   void *list17)
+//
+//  stdcall, 4 args (retn 0x10), returns 0. Walks list15's tree entries; for
+//  each collection it walks the container's package entries, ref-counting
+//  the ref pair, and when the slot flags admit the entry (sub_EEBAA0 /
+//  sub_EEC6B0 & sub_EEB8A0) it searches list17 for a matching id
+//  (PackageEntryGetId) and either drops the newer entry (splicing it out
+//  through F3ListSplicePair / F3ListSplicePairErase, sub_76C180 / sub_76C050)
+//  or splices the entry into list17 / list16 (F3ListRangeSplice / sub_76E660)
+//  per the entry's flags. An empty list15 (the test path) returns 0.
+//  [NOT byte-identical] placement-dependent.
+static int CPackageDataMergeCollections(int slot, void *list15, void *list16,
+                                        void *list17)
+{
+    (void)slot; (void)list16; (void)list17;
+    F3ListTree28 *l = (F3ListTree28 *)list15;
+    if (l->head == 0 || l->head[0] == (DWORD)l->head)
+        return 0;                     // empty list15 -- the test path
+    // [remaining stub] the per-entry merge (the container walk, the id
+    // match against list17, and the splices) is unreachable in this build
+    // (list15 is always empty -- XContent enumeration produces no entries).
+    return 0;
+}
+
+// sub_765BB0 (0x765BB0 - 0x765E40?): reconcile the package list against the
+// CPackageData+0x04 entries
+//
+//  int CPackageDataCompareCollections(void *obj, void *list15)
+//
+//  thiscall + 1 stack arg (retn 4), returns 1. An empty list15 (the test
+//  path) returns 1 immediately. Otherwise it walks list15's entries, and
+//  for each it searches the CPackageData+0x04 list for a matching interned
+//  name (sub_EEC630 + the [block+4] word compare + sub_403F10); a match
+//  releases / re-binds the entry's ref pair (vt[1] / vt[9], sub_7649C0,
+//  sub_EEC700) and, when the entry's flag byte (+0x14 bits 0/1) is set,
+//  moves the pair into the entry (sub_EED4C0 / sub_EED4D0); an unmatched
+//  entry copies its ref pair in (sub_76F7C0 / sub_768E80).
+//  [NOT byte-identical] placement-dependent.
+static int CPackageDataCompareCollections(void *obj, void *list15)
+{
+    (void)obj;
+    F3ListTree28 *l = (F3ListTree28 *)list15;
+    if (l->head == 0 || l->head[0] == (DWORD)l->head)
+        return 1;                     // empty list15 -- the test path
+    // [remaining stub] the per-entry reconcile is unreachable in this build
+    // (list15 is always empty).
+    return 1;
+}
+
+// sub_766740 (0x766740 - 0x766E00?): write the VFS config for the package
+// set
+//
+//  int CPackageDataWriteConfig(void *obj, void *listA, void *fileSubsys)
+//
+//  thiscall + 2 stack args (retn 8), returns the accumulated flag (0 on
+//  the test path). It builds a local 28-byte tree work list (sub_76C600 /
+//  the F3ListStructCtor family), then the first loop walks listA (empty
+//  -> break) tracking whether any entry's flag byte +0x15 bit 0 is set
+//  (sub_EEB940; it would then run sub_717C20 + ReleaseLipCultures). The
+//  second loop walks the local tree list's entries: for each, it looks the
+//  id up in the CPackageData+0x04 list (PackageEntryLookup); a match with
+//  a clear sub_EEB940 flag loads "startup.vfsconfig" through the file
+//  subsystem (sub_1801990 + F3WStringFromAnsi + sub_1801350) and sets the
+//  return's bit 0. Finally it folds the local list back together
+//  (F3ListRangeMovePair / sub_76E7B0) and frees its head + node. Both
+//  loops are empty on the test path, so it returns 0.
+//  [NOT byte-identical] placement-dependent.
+static int CPackageDataWriteConfig(void *obj, void *listA, void *fileSubsys)
+{
+    (void)obj; (void)listA; (void)fileSubsys;
+    int flags = 0;
+    F3ListTree28 localB;
+    F3ListStructCtor(&localB, 28, 0x18);       // the sub_76C600 local tree list
+    // [remaining stub] the per-entry config write (both loops, the
+    // sub_717C20 / ReleaseLipCultures marker, and the startup.vfsconfig
+    // load) is unreachable in this build (the local lists are empty).
+    F3ListRangeMovePair(&localB, localB.node, localB.head[0],
+                        localB.node, (DWORD)localB.head);
+    LHFree((void *)localB.head);
+    localB.size = 0;
+    LHFree((void *)localB.node);
+    return flags;
+}
+
+// sub_763810 (0x763810 - 0x763A78?): collect the version flags
+//
+//  int CPackageDataCollectVersionFlags(void *obj, void *listB)
+//
+//  thiscall + 1 stack arg (retn 4), returns the accumulated flags (0 on
+//  the test path). An empty CPackageData+0x04 list (the test path) returns
+//  the accumulator immediately. Otherwise it walks the CPackageData+0x04
+//  entries and their containers; for each package entry it searches listB
+//  for a matching id with the sub_EEB910 version compare and a set
+//  sub_403F10 flag (PackageEntryGetFlag24) and, on a match, ORs bit 1 into
+//  the accumulator (sub_EEB8C0(1)).
+//  [NOT byte-identical] placement-dependent.
+static int CPackageDataCollectVersionFlags(void *obj, void *listB)
+{
+    (void)listB;
+    F3ListTree28 *l = (F3ListTree28 *)((char *)obj + 0x04);
+    int flags = 0;
+    if (l->head == 0 || l->head[0] == (DWORD)l->head)
+        return flags;                // empty CPackageData+0x04 list -- test path
+    // [remaining stub] the per-entry flag collection is unreachable in this
+    // build (the CPackageData+0x04 list is empty at front-end entry).
+    return flags;
+}
+
+// sub_76E7B0 (0x76E7B0 - 0x76E890): release a 28-byte tree-list range
+// (the sub_766740 local-list fold)
+//
+//  void *F3ListRangeMovePair(void *obj, DWORD node, DWORD head0, DWORD node2,
+//                            DWORD head)
+//
+//  thiscall + 4 stack args (retn 0x14), returns obj. The list is obj
+//  (F3ListTree28); the args are sanity-checked against node / head[0] /
+//  head. When the range covers the whole list (head == head[0], the test
+//  path), it runs F3ListTreeDtor on head[1] (releasing every entry's ref
+//  block), resets the list to empty (head[1] = head[0] = head[2] = head,
+//  size = 0), and stores the out pair = {0, head[0]} then out[0] = node.
+//  The other path walks the range splicing each entry (PackageEntryAdvance
+//  + F3ListSplice, sub_76DB90).
+//  [NOT byte-identical] placement-dependent.
+static void *F3ListRangeMovePair(void *obj, DWORD node, DWORD head0,
+                                 DWORD node2, DWORD head)
+{
+    F3ListTree28 *l = (F3ListTree28 *)obj;
+    (void)node; (void)node2;
+    if (head == (DWORD)l->head && head == l->head[0])
+    {
+        F3ListTreeDtor((void *)l->head[1]);
+        l->head[1] = (DWORD)l->head;
+        l->size = 0;
+        l->head[0] = (DWORD)l->head;
+        l->head[2] = (DWORD)l->head;
+        return obj;
+    }
+    // [remaining stub] the range-walk path (PackageEntryAdvance /
+    // F3ListSplice) is unreachable in this build (the lists are empty).
+    return obj;
+}
+
+// sub_766B60 (0x766B60 - 0x766F80?): build the version-table entries from
+// the package set
+//
+//  int CPackageDataBuildVersionEntries(void *obj, int slot, void *list15,
+//                                      void *list16, void *list17, int flag1,
+//                                      int flag2)
+//
+//  thiscall + 6 stack args (retn 0x18), returns the accumulated flag (0 on
+//  the test path). It bumps the CPackageData+0x00 counter, builds two 28B
+//  plain work lists (node + 16-byte head each), copies list17 into the
+//  second (F3ListCopyRange), then walks list16's entries: for each it
+//  looks the id up in the CPackageData+0x04 list (PackageEntryLookup) and
+//  runs the sub_763A80 id match against the second work list; an unmatched
+//  / flag-24-clear entry either sets bit 0x20 (the sub_EEB9A0 match, when
+//  slot bit 2 + sub_EEB9A0 hold) or bit 0x08, or sets bit 0x01 and splices
+//  the entry into the first work list (F3ListRangeSplice); a matched entry
+//  with the sub_EEB910 version compare set is dropped, and one with
+//  sub_EEB8E0 set adds bit 0x08 (sub_768D70 releases the pair). When
+//  flag1 || flag2 it runs CPackageDataCompareCollections(list15), and for
+//  flag1 CPackageDataWriteConfig (early-exit when the result | v31 has bit
+//  0x80) and for flag2 CPackageDataCollectVersionFlags, ORing the results
+//  together. Finally it tears down both work lists (F3ListEntriesRelease +
+//  the node / head LHFree) and returns the flag. Both loops are empty on
+//  the test path, so it returns CPackageDataCollectVersionFlags's 0.
+//  [NOT byte-identical] placement-dependent.
+static int CPackageDataBuildVersionEntries(void *obj, int slot, void *list15,
+                                           void *list16, void *list17,
+                                           int flag1, int flag2)
+{
+    F3List28 *l16 = (F3List28 *)list16;
+    (void)l16; (void)list17;
+    *(int *)obj += 1;                 // the CPackageData+0x00 counter
+
+    F3List28 localA, localB;
+    F3ListStructCtor16(&localA);
+    F3ListStructCtor16(&localB);
+    F3ListEntriesRelease(&localA);    // sub_76C110 on the fresh localA (no-op)
+    F3ListCopyRange(&localB, list17); // sub_76FCB0 -- empty source, no-op
+
+    // [remaining stub] the per-entry version build (the list16 walk, the
+    // PackageEntryLookup / sub_763A80 match, the flag accumulation, and the
+    // splices) is unreachable in this build (list16 is always empty).
+
+    int result = 0;
+    if (flag1 != 0 || flag2 != 0)
+    {
+        CPackageDataCompareCollections(obj, list15);
+        if (flag1 != 0)
+        {
+            void *fs = GetFileSubsystem(0);          // sub_1801C20
+            int w = CPackageDataWriteConfig(obj, &localA, fs);
+            result = w | 0;
+            if ((result & 0x80) != 0)
+                goto cleanup;
+        }
+        else
+            result = 0;
+        if (flag2 != 0)
+            result |= CPackageDataCollectVersionFlags(obj, &localB);
+    }
+    goto cleanup;
+cleanup:
+    F3ListStructDtor16(&localB);
+    F3ListStructDtor16(&localA);
+    return result;
+}
+
+// sub_7654B0 (0x7654B0 - 0x7657E2): parse the marketplace offer data
+//
+//  int CPackageDataLoadOfferData(void *obj)
+//
+//  thiscall (plain retn). Returns 128 when the archive read fails, the
+//  ReopenXmlFileBlock parse fails, or the root-section check fails; 0
+//  otherwise (attribute parse failures set a separate local, not the
+//  return). It takes the archive manager out of its slot (GetArchiveSlot),
+//  builds the "miscellaneous\\offerData.mkt" wide string (sub_5AF180), and
+//  reads it through the archive's vtable slot 4 (a null slot -- the test
+//  path, g_dword_1E2D864 is 0 -- yields no data and returns 128). On
+//  success it CXMLReadStreamCtor's the stream, ReopenXmlFileBlock's the
+//  file block, XmlCheckRootSection's against the "marketplace" slot, and
+//  (when found) walks the "offer" items reading their "offerId" /
+//  "packageCollection" / "licenseMask" attributes (sub_17DC4B0), resolving
+//  the two date strings (sub_1A00C80 hex parse), and splicing an 8-byte
+//  encoded-date record into the CPackageData+0x9C list (sub_76F9E0). The
+//  teardown releases the file block (vtable slot 2), the CXMLReadStream,
+//  and the read-out handle.
+//  [NOT byte-identical] placement-dependent.
+static int CPackageDataLoadOfferData(void *obj)
+{
+    (void)obj;
+    int result = 0;
+    F3SharedBuffer *slot = 0;
+    GetArchiveSlot(&slot);
+    F3WString28 name;
+    F3WString28FromAnsi(&name, "miscellaneous\\offerData.mkt");
+
+    DWORD fileData = 0, fileHandle = 0;
+    if (slot != 0)
+    {
+        void **vt = (void **)(*(void **)slot);
+        (*(void (__thiscall *)(void *, DWORD *, void *, int))vt[4])
+            (slot, &fileData, &name, 1);
+    }
+    else
+        fileData = 0;                // the original dereferences the slot unconditionally
+    F3WString28Free(&name);
+
+    if (fileData == 0)
+    {
+        result = 128;                // no archive data -- the test path
+        goto done;
+    }
+
+    F3XmlStream stream;
+    CXMLReadStreamCtor(&stream);
+    if (ReopenXmlFileBlock(&stream, (void *)fileData) == 0)
+    {
+        result = 128;
+        goto done2;
+    }
+    if (XmlCheckRootSection(&stream, GetSlotString(&g_dword_1DC4A90)) == 0)
+    {
+        result = 128;
+        goto done2;
+    }
+    // [remaining stub] the "offer" item walk (sub_17DC640 / sub_17DC140 /
+    // sub_17DC4B0 / sub_1A00C80 / sub_76F9E0) is unreachable in this build
+    // (the LHXML parse is a stub, so the root section is never found).
+done2:
+    if (fileData != 0)
+        F3CallVtable((void *)fileData, 2);         // the file block Release
+    CXMLReadStreamDtor(&stream);
+    if (fileHandle != 0)
+        F3CallVtable((void *)fileHandle, 2);       // the read-out handle Release
+done:
+    return result;
+}
+
+// sub_767160 (0x767160 - 0x7672DA): the package-collection load
+//
+//  int CPackageManagerLoadPackageCollections(void *obj, int slot, int flag1,
+//                                            int flag2)
+//
+//  thiscall + 3 stack args (retn 0Ch). Bumps the CPackageManager+0x28
+//  counter, then (with this = the CPackageData sub-object at
+//  CPackageManager+0x2C) it XContentEnumeratePackageCollections's up to 16
+//  collections into a 0x204-byte zeroed buffer (count out), CPackageDataImportCollections's
+//  them into the 28B tree list (F3ListStructCtor28 / sub_76C680), builds
+//  two 28B plain work lists (F3ListStructCtor16), CPackageDataMergeCollections's,
+//  CPackageDataBuildVersionEntries's (with slot / flag1 / flag2), and on
+//  success CVersionTableRefresh's the game engine's version table
+//  (GetGameEngine + GetGameEngineVersionTable) and CPackageDataLoadOfferData's.
+//  Any negative step (0x80 error flag) tears down the two work lists + the
+//  tree list (F3ListStructDtor16 x2 + F3ListStructDtor28) and returns 128;
+//  the success path tears them down the same way and returns the OR of the
+//  step results.
+//  [NOT byte-identical] placement-dependent.
+static int CPackageManagerLoadPackageCollections(void *obj, int slot, int flag1,
+                                                int flag2)
+{
+    DWORD *m = (DWORD *)obj;
+    m[0x28 / 4] += 1;                // the CPackageManager+0x28 counter
+    void *cpd = *(void **)((char *)obj + 0x2C);   // the CPackageData sub-object
+
+    BYTE   buffer[0x204];
+    DWORD  count = 0;
+    F3ListTree28 list15;            // the 28B tree list (F3ListStructCtor family)
+    F3ListStructCtor(&list15, 28, 0x18);
+    F3List28 list16, list17;
+    F3ListStructCtor16(&list16);
+    F3ListStructCtor16(&list17);
+
+    int r = XContentEnumeratePackageCollections(buffer, &count, 16);
+    int err = (r < 0) ? 0x80 : 0;
+    if (err == 0)
+    {
+        int ir = CPackageDataImportCollections(cpd, buffer, (int)count,
+                                               &list15);
+        err = (ir < 0) ? 0x80 : 0;
+    }
+    if (err == 0)
+    {
+        int mr = CPackageDataMergeCollections(slot, &list15, &list16, &list17);
+        err = (mr < 0) ? 0x80 : 0;
+    }
+    int result = 0;
+    if (err == 0)
+    {
+        result = CPackageDataBuildVersionEntries(cpd, slot, &list15, &list16,
+                                                 &list17, flag1, flag2);
+        if (result < 0)
+            err = 0x80;
+    }
+    if (err == 0)
+    {
+        CVersionTableRefresh(GetGameEngineVersionTable(GetGameEngine()));
+        int or_ = CPackageDataLoadOfferData(cpd);
+        if (or_ < 0)
+            err = 0x80;
+        else
+            result |= or_;
+    }
+
+    F3ListStructDtor16(&list17);
+    F3ListStructDtor16(&list16);
+    F3ListStructDtor28(&list15);
+    return (err != 0) ? 128 : result;
+}
+
+// sub_7672E0 (0x7672E0 - 0x7672EC): the package-collection load thunk
+//
+//  int CPackageManagerLoadCollections(void *obj)
+//
+//  thiscall (plain retn): push 1; push 1; push 0x0B; call sub_767160 --
+//  passes (this, slot = 11, flag1 = 1, flag2 = 1) through to
+//  CPackageManagerLoadPackageCollections. The only caller is RunFrontEnd
+//  (0x61D3AB), which constructs the new CPackageManager (LHAlloc(0x30) +
+//  CPackageManagerCtor) into dw[0xAC/4] and then dispatches it here.
+//  [NOT byte-identical] relative call to the loader.
+static int CPackageManagerLoadCollections(void *obj)
+{
+    return CPackageManagerLoadPackageCollections(obj, 11, 1, 1);
+}
+
+// ============================================================
+//  CVersionTableGetVersion1  (0x760FA0 - 0x760FA4)  -- the first
+//  CGameVersion sub-object (CV1, +0x04) of the version table
+//
+//  void *CVersionTableGetVersion1(void *obj)   (obj = the CVersionTable,
+//  in ECX in the original)
+//
+//  thiscall (plain retn). The 4-byte accessor `lea eax, [ecx+4]; retn` --
+//  no calls, no globals, no absolute refs.
+//
+//  [BYTE-IDENTICAL] placement-independent (no calls / relative jumps /
+//  high-VA refs). `__declspec(naked)` inline asm so /Ob2 doesn't swap the
+//  out-of-line body for a 5-byte stack-argument thunk. The table's CV1
+//  (+0x04) is the local machine's package version (flag 0x35 after a
+//  refresh); the sub_760FC0 / sub_761CC0 / CGameVersionCopyFrom
+//  version-compare / copy family takes it. Sibling accessors: sub_760FB0
+//  returns CV3 (+0xBC).
+// ============================================================
+__declspec(naked)
+void *CVersionTableGetVersion1(void *obj)
+{
+    __asm {
+        lea eax, [ecx+4]
+        retn
+    }
+}
+
+// ============================================================
+//  ReinitEngineLua  (0x61A470 - 0x61A5D1)  -- (re)build the engine's
+//  Lua environment
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  GetNetManager, the Lua-module / CLuaManager /
+//  CEntityScriptHandleManager ctors, and LHAlloc) and it references
+//  the high-VA data slots unk_1DBE2B4 / unk_1DBDA6C.
+//
+//  int ReinitEngineLua(void *obj, int flag)
+//
+//  thiscall + `retn 4` in the original: the CGameEngine in ECX and one
+//  int on the stack (both implemented callers push 0: RunFrontEnd at
+//  0x61D3CB and the engine destructor at 0x67914C).  It (re)builds the
+//  three Lua-environment members of the engine:
+//    +0xBC  the Lua module -- the 1032-byte "Fable 3" lua_State host
+//           (CreateLuaModule, sub_629570; the old one is released via
+//           sub_6281B0 -> sub_5EDFE0)
+//    +0xC0  the CLuaManager -- the 8-byte wrapper (CLuaManagerCtor,
+//           sub_6F9890; its impl wraps the Lua module and the engine's
+//           +0x98 sorted map), followed by
+//           CLuaManagerRunSerialiseScript (sub_6F9880)
+//    +0xC4  the CEntityScriptHandleManager -- 80 bytes (sub_6E9620),
+//           holding the Lua-state reference
+//  First the old +0xC0 is released (vtable[0](slot, 1) deleting-dtor
+//  dispatch) and the net manager's +0x1C sub-object list is cleared
+//  (CNetManagerSlot1C + sub_6AA2C0).  When the +0xC0 slot was already
+//  empty (first-time init), the two startup-script path slots
+//  (unk_1DBE2B4 + unk_1DBDA6C via the sub_1A02260 2-source concat) are
+//  built and the Lua startup scripts are run (sub_616710).  Register
+//  EngineLuaFunctions (sub_6169D0: the ~40 Set*/Get* engine Lua
+//  functions) is called on the fresh Lua module; when `flag` is set the
+//  "EngineTest" module is registered too (nullsub_28 + sub_70DDB0), and
+//  the nullsub_27 no-op is called when the new +0xC0 is set.  The
+//  return value (the new +0xC4) is discarded by both callers.
+// ============================================================
+// 0x1DBE2B4 / 0x1DBDA6C: the two shared slots ReinitEngineLua concats
+// into the Lua startup-script path (sub_1A02260).
+static F3SharedBuffer *g_unk_1DBE2B4 = 0;   // 0x1DBE2B4
+static F3SharedBuffer *g_unk_1DBDA6C = 0;   // 0x1DBDA6C
+
+// sub_1A02260 (0x1A02260 - 0x1A02292) -- the 2-source shared-slot path
+// concat (the same helper as the XLip.cpp copy): zero dst, ref
+// (CopySharedSlot) src1, append src2 (sub_1A01940); returns the dst
+// slot address.  Both source slots are empty in this build, so the
+// stub just zeroes dst.
+static int * sub_1A02260(int *a1, int *a2, const char ***a3)
+{ (void)a2; (void)a3; *a1 = 0; return a1; }
+
+// sub_629570 (0x629570 - 0x629655) -- CreateLuaModule: build the
+// 1032-byte "Fable 3" Lua module (sub_5F7FA0) -- the sub_628DB0 Lua
+// allocator, the sub_628100 panic handler ("PANIC: unprotected error
+// in call to Lua API"), the 200x200 buffer words and the 512 / 0x10000
+// limits -- then register its six callbacks (sub_5FD2D0).  Remaining
+// stub: allocate + zero the 1032-byte block and return it.
+static void *CreateLuaModule(void)
+{
+    void *m = LHAlloc(1032);
+    if (m != 0)
+        memset(m, 0, 1032);
+    return m;
+}
+
+// sub_6281B0 (0x6281B0 - 0x6281B5) -- thunk into sub_5EDFE0, the Lua
+// module's release (the same stub as the gamethread.cpp copy).
+static void sub_6281B0(int a) { (void)a; }
+
+// sub_6AA2C0 (0x6AA2C0 - 0x6AA2EC) -- clear the net manager's +0x1C
+// sub-object's internal list (sub_6AB810 + list reset; the same stub as
+// the gamethread.cpp copy).
+static void sub_6AA2C0(void *obj) { (void)obj; }
+
+// CNetManagerSlot1C (0x6A6900 - 0x6A6904) -- thiscall getter of the
+// CNetManager's +0x1C sub-object (the same stub as the gamethread.cpp
+// copy; GetNetManager is canonical in netinit.h).
+static void *CNetManagerSlot1C(void *obj) { return *(void **)((char *)obj + 0x1C); }
+
+// Placeholder vtables for the Lua-environment members built by the stub
+// ctors below (the same trick as the g_CLoadingScreenVtable set): slot 0
+// must be a callable no-op so the deleting-dtor dispatch (vt[0](obj, 1))
+// in ReinitEngineLua and CGameEngineDestroy never dereferences an
+// unconstructed table.
+static void *g_CLuaManagerVtable[2]                = { (void *)F3StubRelease, 0 };
+static void *g_CEntityScriptHandleManagerVtable[2] = { (void *)F3StubRelease, 0 };
+
+// sub_6F9890 (0x6F9890 - 0x6F98F2) -- CLuaManagerCtor: CBaseClassNon
+// CopyableCtor, store &CLuaManager::`vftable', zero the +4 impl slot,
+// LHAlloc(708) + build the impl via sub_6F7F60(luaModule, sortedMap).
+// Remaining stub: store the placeholder vtable + zero the impl slot.
+static void *CLuaManagerCtor(void *obj, void *luaModule, void *sortedMap)
+{ (void)luaModule; (void)sortedMap;
+  *(void **)obj = g_CLuaManagerVtable; *(void **)((char *)obj + 4) = 0; return obj; }
+
+// sub_6F9880 (0x6F9880 - 0x6F9888) -- CLuaManagerRunSerialiseScript:
+// forward to the impl (sub_6F9790: the "Lua serialise script ... has an
+// error in it" path check + sub_6F0BF0 / sub_6F9690 / sub_627FC0).
+// Remaining stub.
+static void CLuaManagerRunSerialiseScript(void *obj) { (void)obj; }
+
+// sub_6169D0 (0x6169D0 - 0x6171A5) -- RegisterEngineLuaFunctions:
+// register the ~40 engine Set*/Get* Lua functions (SetApplicationName,
+// SetScreenResolution, SetInitialWorldName, ..., GetDemoMode) on the
+// Lua module.  Remaining stub.
+static void RegisterEngineLuaFunctions(int luaModule) { (void)luaModule; }
+
+// sub_616710 (0x616710 - 0x616894) -- RunLuaStartupScripts: run the
+// startup .lua script (error path "Lua startup script has an error in
+// it" via sub_629660) plus the optional per-locale startup scripts.
+// Remaining stub.
+static void RunLuaStartupScripts(int luaModule, int scriptPath)
+{ (void)luaModule; (void)scriptPath; }
+
+// sub_6E9620 (0x6E9620 - 0x6E96DF) -- CEntityScriptHandleManagerCtor:
+// the 80-byte object (&CEntityScriptHandleManager::`vftable') with
+// +0x4C = -2 and +0x50 = the Lua module, wiring the Lua references.
+// Remaining stub: store the placeholder vtable + zero the rest.
+static void *CEntityScriptHandleManagerCtor(void *obj, void *luaModule)
+{ (void)luaModule;
+  *(void **)obj = g_CEntityScriptHandleManagerVtable;
+  memset((char *)obj + 4, 0, 76);
+  return obj; }
+
+// nullsub_27 (0x6EFF60 - 0x6EFF61) -- one-byte `retn` no-op thunk.
+static void nullsub_27(void) { }
+
+// nullsub_28 / sub_70DDB0 -- the "EngineTest" module registration pair,
+// defined further down in this file.
+static void nullsub_28(int a);
+static void sub_70DDB0(int a);
+
+static int ReinitEngineLua(void *obj, int flag)
+{
+    DWORD *dw = (DWORD *)obj;
+
+    // 1. Release the old CLuaManager (+0xC0); remember if it was empty.
+    int wasEmpty = (dw[0xC0 / 4] == 0);
+    if (dw[0xC0 / 4] != 0)
+    {
+        void *old0C0 = (void *)dw[0xC0 / 4];
+        void **vt    = (void **)*(void **)old0C0;
+        ((void (*)(void *, int))vt[0])(old0C0, 1);   // deleting dtor
+        dw[0xC0 / 4] = 0;
+    }
+
+    // 2. Clear the net manager's +0x1C sub-object list.
+    sub_6AA2C0(CNetManagerSlot1C(GetNetManager()));
+
+    // 3. Release the old Lua module (+0xBC); build the fresh one.
+    if (dw[0xBC / 4] != 0)
+    {
+        sub_6281B0((int)dw[0xBC / 4]);
+        dw[0xBC / 4] = 0;
+    }
+    dw[0xBC / 4] = (DWORD)CreateLuaModule();
+
+    // 4. Build the new CLuaManager (8 bytes) over the fresh Lua module +
+    //    the engine's +0x98 sorted map.  (The original re-reads and
+    //    re-releases +0xC0 here, but it is always 0 -- cleared in step 1
+    //    -- so that branch is dead.)
+    int luaMgr = 0;
+    void *newMgr = LHAlloc(8);
+    if (newMgr != 0)
+        luaMgr = (int)CLuaManagerCtor(newMgr, (void *)dw[0xBC / 4], (void *)dw[0x98 / 4]);
+    dw[0xC0 / 4] = (DWORD)luaMgr;
+
+    CLuaManagerRunSerialiseScript((void *)luaMgr);
+    RegisterEngineLuaFunctions((int)dw[0xBC / 4]);
+
+    // 5. First-time init: build the startup-script path and run the
+    //    Lua startup scripts.
+    if (wasEmpty)
+    {
+        int startup = 0;
+        sub_1A02260(&startup, (int *)&g_unk_1DBE2B4,
+                    (const char ***)(void *)&g_unk_1DBDA6C);
+        RunLuaStartupScripts((int)dw[0xBC / 4], startup);
+        ReleaseSharedSlot((F3SharedBuffer **)&startup);
+    }
+
+    // 6. Optional "EngineTest" module.
+    if (flag != 0)
+    {
+        nullsub_28((int)dw[0xBC / 4]);
+        sub_70DDB0((int)dw[0xBC / 4]);
+    }
+
+    // 7. (The original calls the nullsub_27 no-op when +0xC0 is set.)
+    if (dw[0xC0 / 4] != 0)
+        nullsub_27();
+
+    // 8. Build the CEntityScriptHandleManager (80 bytes) into +0xC4.
+    int  esm    = 0;
+    void *esmMem = LHAlloc(0x50);
+    if (esmMem != 0)
+        esm = (int)CEntityScriptHandleManagerCtor(esmMem, (void *)dw[0xBC / 4]);
+    if (dw[0xC4 / 4] != 0)
+    {
+        void *old0C4 = (void *)dw[0xC4 / 4];
+        void **vt    = (void **)*(void **)old0C4;
+        ((void (*)(void *, int))vt[0])(old0C4, 1);   // deleting dtor
+    }
+    dw[0xC4 / 4] = (DWORD)esm;
+    return esm;
+}
 static void *sub_754DE0(void *obj) { return obj; }
 static void  sub_627690(void *obj) { (void)obj; }
 static void  sub_619990(void) {}
@@ -9067,15 +10267,19 @@ signedIn:
         void *v41 = (void *)dw[0xB0 / 4];
         if (v41 != 0)
         {
-            sub_6234A0(v41);
+            CVersionTableDtor(v41);
             LHFree(v41);
         }
         dw[0xB0 / 4] = (DWORD)v37;
 
-        sub_7672E0((void *)dw[0xAC / 4]);
-        int v42 = sub_760FA0((void *)dw[0xB0 / 4]);
-        sub_72EDF0(base + 0xEC, v42);
-        sub_61A470(obj, 0);
+        CPackageManagerLoadCollections((void *)dw[0xAC / 4]);
+        // 0x61D3B6: CGameVersionCopyFrom(base + 0xEC, CVersionTableGetVersion1(
+        // engine+0xB0)) -- copies CV1 into the engine's +0xEC slot. CVersion
+        // TableGetVersion1 is a byte-identical naked thiscall that reads the
+        // table's +0x04 slot from ECX; a C expression cannot stage that
+        // register, so read the slot directly (identical result).
+        CGameVersionCopyFrom(base + 0xEC, (char *)dw[0xB0 / 4] + 4);
+        ReinitEngineLua(obj, 0);
 
         void *p736 = LHAlloc(0x2E0);
         int   v44 = (p736 != 0) ? (int)sub_754DE0(p736) : 0;

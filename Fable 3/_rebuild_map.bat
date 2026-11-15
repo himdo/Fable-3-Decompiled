@@ -1,0 +1,12 @@
+@echo off
+setlocal EnableExtensions
+set "V90=D:\Program Files (x86)\Microsoft Visual Studio 9.0"
+set "SDK=C:\Program Files\Microsoft SDKs\Windows\v7.1"
+set "INCLUDE=%V90%\VC\INCLUDE;%SDK%\Include"
+set "LIB=%V90%\VC\LIB;%SDK%\Lib"
+set "PATH=%V90%\VC\bin;%PATH%"
+pushd test_out
+link /nologo /subsystem:console /machine:x86 /out:test_engine.exe /MAP test_engine.obj engine.obj worker.obj manager.obj object_registry.obj xlo_device.obj gameengine.obj gamethread.obj gamemain.obj XLip.obj netinit.obj thread.obj common.obj save.obj framework.obj xlive.lib d3dx9_42.lib d3d9.lib user32.lib kernel32.lib gdi32.lib ws2_32.lib ole32.lib
+if errorlevel 1 (echo LINK FAILED & popd & exit /b 1)
+echo === BUILD OK ===
+popd
