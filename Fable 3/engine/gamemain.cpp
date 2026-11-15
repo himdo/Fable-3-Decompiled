@@ -506,6 +506,13 @@ static void *g_CXMLWriteStreamVtable[32] = { 0 };
 
 // sub_17DC6D0 (defined below): the real vtable[1] slot (enter a section)
 static char FindXmlSection(F3XmlStream *obj, const char *name);
+// sub_17DC680 / sub_17DC3A0 / sub_17DC470 (defined below): the real
+// vtable[2] / [3] / [10] slots (check the current root element by name,
+// advance to the next sibling, and read a named boolean attribute). These are
+// the LHXML reader slots the VFS-config root reader (VfsLoadConfigRoot) uses.
+static char XmlCheckRootSection(F3XmlStream *obj, const char *name);
+static int  XmlAdvance(F3XmlStream *obj);
+static char XmlReadBoolAttr(F3XmlStream *obj, void *name, BYTE *out);
 
 // ============================================================
 //  LHXML report handler (off_1D94CA0)
@@ -594,6 +601,12 @@ static void CXMLReadStreamCtor(F3XmlStream *obj)
     obj->vtable = (void *)g_CXMLReadStreamVtable;   // the derived vtable
     if (g_CXMLReadStreamVtable[1] == 0)
         g_CXMLReadStreamVtable[1] = (void *)FindXmlSection;   // vt[1]: enter a section
+    if (g_CXMLReadStreamVtable[2] == 0)
+        g_CXMLReadStreamVtable[2] = (void *)XmlCheckRootSection;   // vt[2]
+    if (g_CXMLReadStreamVtable[3] == 0)
+        g_CXMLReadStreamVtable[3] = (void *)XmlAdvance;           // vt[3]
+    if (g_CXMLReadStreamVtable[10] == 0)
+        g_CXMLReadStreamVtable[10] = (void *)XmlReadBoolAttr;     // vt[10]
 }
 
 // sub_17DBD00 (0x17DBD00 - 0x17DBDB8): open + parse the XML file into the stream
@@ -672,6 +685,35 @@ static char SearchXmlSection(F3XmlStream *obj, const char *name, DWORD step, cha
 static char FindXmlSection(F3XmlStream *obj, const char *name)
 {
     return SearchXmlSection(obj, name, obj->sectionInfo, 1);
+}
+
+// sub_17DC680 (0x17DC680 - 0x17DC693): check the stream's current element for
+// the named root (SearchXmlSection with wrap = 0, i.e. no wrap-around). The
+// VFS-config root reader (VfsLoadConfigRoot) uses this as vtable[2] to test
+// whether the current element is "VFSConfig". [remaining stub] the LHXML parse
+// never populates the tree, so the root is never matched (returns 0).
+static char XmlCheckRootSection(F3XmlStream *obj, const char *name)
+{
+    return SearchXmlSection(obj, name, obj->sectionInfo, 0);
+}
+
+// sub_17DC3A0 (0x17DC3A0 - 0x17DC3B0): advance the stream to the next sibling
+// element (vtable[3]). [remaining stub] no element is ever current in this
+// build, so it is a no-op (returns 0).
+static int XmlAdvance(F3XmlStream *obj)
+{
+    (void)obj;
+    return 0;
+}
+
+// sub_17DC470 (0x17DC470 - 0x17DC4A8): read the named boolean attribute of
+// the current element into *out (1 when the value is "true") (vtable[10]).
+// [remaining stub] no element is ever current in this build, so it returns 0
+// (leaving *out as is; the caller defaults the attribute to true).
+static char XmlReadBoolAttr(F3XmlStream *obj, void *name, BYTE *out)
+{
+    (void)obj; (void)name; (void)out;
+    return 0;
 }
 
 // sub_17DC2B0 + sub_17DAA20 (0x17DC2B0 - 0x17DC2DA): the CXMLReadStream dtor
@@ -5632,7 +5674,7 @@ void CSortedMapDtor(void *obj)
 //     LHAlloc(96 * count, the original's `mul` overflow folds to -1), then
 //     per 96-byte entry fills the 85-byte name (XLipGetCultureName,
 //     sub_17C0680), the culture id
-//     (sub_17CC320) at +88, and records the "text" culture index in
+//     (XLipGetCultureInfoPtr) at +88, and records the "text" culture index in
 //     dword_1DC27F4. (With the empty registered-culture table the count is
 //     0, so the per-entry loop is dead in this build.)
 //  5. Zeros byte_1DC2804, registers the standard asset packages
@@ -8743,9 +8785,76 @@ static int XLipGetCultureName(const char *pcszComponent, int iLanguage,
     SetLastError(0x54F);
     return -1;
 }
-// sub_17CC320 (0x17CC320 - 0x17CC4E2) -- XLipCultures name -> culture id
-// (lower-cased lookup through sub_17CD070; case 1 = the id at +28).
-static int   sub_17CC320(char *s, int a2) { (void)s; (void)a2; return 0; }
+// sub_17CC320 (0x17CC320 - 0x17CC4E2) -- return a direct pointer to one
+// field of a culture definition (the XLipCultures.cpp pointer-form sibling
+// of XLipGetCultureInfo, sub_17CC4F0):  type 1 -- the wide language string
+// (the W3AString at +0x1C; the SSO buffer or heap data pointer, through the
+// sub_17CD170 getter);  type 2 -- the source / parent name (the F3AString
+// at +0x38, through the sub_17B3D50 cstr getter; NULL +
+// SetLastError(0x10D2) when the source is "null", i.e. a top-level culture);
+//  type 3 -- the defined major version WORD (at +0x54);  anything else --
+// the line-72 `false && "Unknown XLIPCULTUREINFOTYPE specified"` assert +
+// SetLastError(0x57) + NULL.  Gates on the init flag (unset ->
+// SetLastError(0x15) + NULL), asserts the name is non-null and non-empty
+// (line 28, falling through to SetLastError(0x57) + NULL when it is not),
+// lowercases an 85-byte copy (strcpy_s / _strlwr_s, the line-37 ret==0
+// asserts), and resolves it through XLipFindCultureDef (a miss ->
+// SetLastError(0x490) + NULL).  cdecl, two args.
+// [NOT byte-identical] placement-dependent (relative calls to XLipAssert /
+// XLipFindCultureDef / the sub_17CD170 and sub_17B3D50 string getters) and
+// refs the high-VA init-flag global byte_1E2C6B4, the "null" rdata string
+// (0x01BC33EC), the wide assert-condition strings and the _strcpy_s /
+// _strlwr_s / __imp_SetLastError IAT slots.
+static const void *XLipGetCultureInfoPtr(const char *pcszCultureName,
+                                         unsigned int type)
+{
+    char name[85];
+    XLipCultureInfo *info;
+    if (g_byte_1E2C6B4 == 0)
+    {
+        SetLastError(0x15);
+        return 0;
+    }
+    if (pcszCultureName == NULL || pcszCultureName[0] == 0)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileCultures, 28,
+                   L"pcszCultureName && pcszCultureName[0] && \"Parameter can't be NULL\"");
+    if (pcszCultureName == NULL || pcszCultureName[0] == 0)
+    {
+        SetLastError(0x57);
+        return 0;
+    }
+    if (strcpy_s(name, 0x55, pcszCultureName) != 0)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileCultures, 37, L"ret==0");
+    if (_strlwr_s(name, 0x55) != 0)
+        XLipAssert(g_xlipAssertFailed, g_xlipFileCultures, 37, L"ret==0");
+    info = XLipFindCultureDef(name);
+    if (info == NULL)
+    {
+        SetLastError(0x490);
+        return 0;
+    }
+    switch (type)
+    {
+    case 1:   /* sub_17CD170(info + 0x1C) -- the wide language data pointer */
+        return (info->language.cap < 8)
+             ? (const void *)info->language.u.buf
+             : (const void *)info->language.u.ptr;
+    case 2:   /* sub_17B3D50(info + 0x38) -- the source / parent cstr */
+        if (strcmp(XLipStrCstr(&info->source), "null") == 0)
+        {
+            SetLastError(0x10D2);
+            return 0;
+        }
+        return XLipStrCstr(&info->source);
+    case 3:
+        return (const void *)&info->version;   /* the +0x54 major version */
+    default:
+        XLipAssert(g_xlipAssertFailed, g_xlipFileCultures, 72,
+                   L"false && \"Unknown XLIPCULTUREINFOTYPE specified\"");
+        SetLastError(0x57);
+        return 0;
+    }
+}
 //  RegisterStandardAssets  (0x718690 - 0x718BCC)  -- register the game's
 // standard asset packages ("speech" / "speechdoc" / "lipsync" / "text" /
 // "fonts" / "videos" / "gui") into the language / VFS resource table.
@@ -8917,18 +9026,71 @@ typedef struct XLipComponentSettings
     char  name[0x55];      // +0x04: the component name (85 bytes)
     char  language[0x57];  // +0x59: the effective language name (87 bytes)
 } XLipComponentSettings;   // 176 bytes total
-// sub_17B4270 (0x17B4270 - 0x17B465E) -- the component-settings map
-// find-or-create over unk_1E2C600 (thiscall, the 28-byte name key on the
-// stack): the tree iterator (sub_17B43F0 / sub_17B5A70 / sub_17B52B0 /
-// sub_17B5290) walks for the key; a hit returns the found node's 176-byte
+// XLipSettingsNode -- one entry of the lip component-settings map
+// (dword_1E2C600): a 176-byte XLIPCOMPONENTSETTINGS block keyed by the
+// component name.  The original is an MSVC red-black tree whose 0xDC-byte
+// nodes hold a 28-byte F3AString key and the 176-byte value (at node + 28);
+// here it is modeled as a list of heap nodes with stable value addresses so
+// the find-or-insert (map::operator[]) semantics are identical.
+typedef struct XLipSettingsNode
+{
+    XLipSettingsNode *next;           // next entry (insertion order)
+    char              *name;          // heap NUL-terminated component name (key)
+    unsigned int       nameLen;       // key length (basic_string compare)
+    XLipComponentSettings value;      // 176-byte settings block (stable address)
+} XLipSettingsNode;
+// XLipSettingsMap -- the map object itself (the original tree at 0x1E2C600,
+// the thiscall `this` for XLipSettingsMapFind / the tree walk and insert).
+typedef struct XLipSettingsMap
+{
+    XLipSettingsNode *first;          // head of the node list
+    unsigned int      count;          // entry count (the tree's +0x1C count)
+} XLipSettingsMap;
+// 0x1E2C600 -- the lip component-settings map object (name-keyed).  Image-
+// initializes empty and is only ever populated through XLipSettingsMapFind.
+static XLipSettingsMap g_xlipSettingsMap;
+// sub_17B4270 (0x17B4270 - 0x17B43B6) -- the component-settings map
+// find-or-create (map::operator[]) over the settings map at 0x1E2C600
+// (thiscall, the map object in ECX, the 28-byte name key on the stack, `retn
+// 4`): the tree walk (sub_17B71C0 find / sub_17B5A70 equal / sub_17B5290
+// compare) looks the name up; a hit returns the found node's 176-byte
 // settings value (node + 28), a miss inserts a zero-filled default value
-// (sub_17B5BE0 / sub_17B52E0) and returns it.  [remaining stub] the tree
-// internals are out of scope; the map is empty and never populated in this
-// build, and the only path that can reach it (a non-empty name for a
-// registered component) is unreached (the seven component slots are all
-// null), so the lookup models as a 0 return (the caller's memcpy_s then
-// fails into its SetLastError(0x54F) path).
-static void *XLipSettingsMapFind(F3AString *name) { (void)name; return 0; }
+// (memset 0xB0, sub_17B5BE0 / the sub_17B52E0 rebalancing insert) and
+// returns it.  Returns the stable value pointer, or 0 if the entry could not
+// be allocated.  The original's SEH frame drops the temp copy of the key when
+// the body throws; nothing here throws, so that path is a no-op.  [NOT
+// byte-identical] placement-dependent (relative calls to the tree walk /
+// insert / _memset and the __security_check_cookie landing pad) and refs the
+// high-VA settings-map object (0x01E2C600).
+static void *XLipSettingsMapFind(void *map, F3AString *name)
+{
+    XLipSettingsMap *m = (XLipSettingsMap *)map;
+    const char *key = XLipStrCstr(name);
+    unsigned int keyLen = name->len;
+    XLipSettingsNode *n;
+
+    for (n = m->first; n != 0; n = n->next)
+        if (n->nameLen == keyLen && memcmp(n->name, key, keyLen) == 0)
+            return (void *)&n->value;
+
+    n = (XLipSettingsNode *)LHAlloc(sizeof(XLipSettingsNode));
+    if (n == 0)
+        return 0;
+    n->name = (char *)LHAlloc(keyLen + 1);
+    if (n->name == 0)
+    {
+        LHFree(n);
+        return 0;
+    }
+    memcpy(n->name, key, keyLen);
+    n->name[keyLen] = 0;
+    n->nameLen = keyLen;
+    memset(&n->value, 0, sizeof(n->value));
+    n->next = m->first;
+    m->first = n;
+    m->count++;
+    return (void *)&n->value;
+}
 // XLipApplyComponentSettings  (sub_17B2C30, 0x17B2C30 - 0x17B2DDD)  --
 // apply one XLIPCOMPONENTSETTINGS block to the component named in its +4
 // field (XLipSettings.cpp): gated by the init flag byte_1E2C6B4
@@ -8986,7 +9148,7 @@ static int XLipApplyComponentSettings(char *pSettings)
     {
         F3AString temp;
         XLipStrAssign(&temp, pSettings + 4);      // sub_17B8EF0
-        void *entry = XLipSettingsMapFind(&temp); // sub_17B4270
+        void *entry = XLipSettingsMapFind(&g_xlipSettingsMap, &temp); // sub_17B4270
         if (memcpy_s(entry, 0xB0, pSettings, *(DWORD *)pSettings) != 0)
         {
             SetLastError(0x54F);
@@ -9152,7 +9314,7 @@ static long InitLipCultures(void)
         {
             char *entry = (char *)(DWORD)g_dword_1DC27EC + off;
             XLipGetCultureName(0, (int)count, entry, 0x55);
-            *(DWORD *)(entry + 88) = (DWORD)sub_17CC320(entry, 1);
+            *(DWORD *)(entry + 88) = (DWORD)XLipGetCultureInfoPtr(entry, 1);
             if (strcmp(entry, GetSlotString(&textSlot)) == 0)
                 g_dword_1DC27F4 = count;
             ++count;
@@ -9167,8 +9329,6 @@ static long InitLipCultures(void)
     return ReleaseSharedSlot(&cultureName);
 }
 
-static void  sub_4358A0(void *obj, const char *name) { (void)obj; (void)name; }
-static void  sub_1801580(void *obj, void *str) { (void)obj; (void)str; }
 // Placeholder vtables for the frontend's stub-constructed engine members.
 // The original constructors store real vtables (NUI::CLoadingScreen, 0x7330F0;
 // CGameRenderer, 0x72FB30; NUI::CFullScreenMoviePlayer, 0x731B80; 0x767360:
@@ -9562,9 +9722,10 @@ static void  sub_18FB930(void) {}
 
 // ============================================================
 //  F3WString -- the 36-byte front-end wide path string (the MSVC
-//  basic_string<wchar_t, 2> layout + two extra zeroed dwords) that
-//  InitFrontendData's callees (sub_435C10 / sub_4358A0 / sub_436BA0 /
-//  sub_5AF180) operate on:
+//  basic_string<wchar_t, 2> layout + two extra zeroed dwords) that the
+//  front-end path-string methods operate on (sub_435C10 = F3WStringAssign
+//  assign, sub_4358A0 = F3WStringFromAnsi, sub_4357C0 =
+//  F3WStringNormalizeSeparators, sub_436BA0 = F3WStringNormalize, sub_5AF180):
 //    +0    d0 (low word zeroed by the reset idiom)
 //    +4    SSO buffer (8 wchars) / heap pointer
 //    +20   wchar length
@@ -9626,7 +9787,8 @@ static void F3WStringAssign(F3WString *s, const wchar_t *src, unsigned int len)
     s->e1 = s->e2 = 0;
 }
 
-// sub_4358A0 -- ANSI -> wide, then assign (the +28 / +32 words zeroed).
+// ANSI -> wide, then assign (F3WStringReset + F3WStringAssign; the building
+// block of F3WStringFromAnsi (sub_4358A0) minus the separator pass).
 static void F3WStringAssignAnsi(F3WString *s, const char *src)
 {
     wchar_t dst[0x801];
@@ -9652,6 +9814,35 @@ static void F3WStringNormalize(F3WString *s)
     }
 }
 
+// sub_4357C0 -- the separator pass: the original scans case-insensitively
+// (towlower) for '/' and replaces each in place with '\\'.  Unlike
+// F3WStringNormalize (sub_436BA0), it does not append a trailing separator.
+static void F3WStringNormalizeSeparators(F3WString *s)
+{
+    wchar_t *p = F3WStringData(s);
+    for (unsigned int i = 0; i < s->len; i++)
+        if (p[i] == '/')
+            p[i] = L'\\';
+}
+
+//  F3WStringFromAnsi  (0x4358A0 - 0x43593D)  -- build the 36-byte front-end
+//  wide path string from an ANSI string: reset the SSO layout (cap 7, len 0,
+//  first wchar 0, the +28 / +32 words zeroed), mbstowcs_s the whole source
+//  into a 0x801-wchar stack buffer, assign (src, wcslen) through sub_435C10
+//  (F3WStringAssign), then the sub_4357C0 separator pass ('/' -> '\\').
+//  The original is a thiscall + retn 4 hybrid (the string in ECX, the ANSI
+//  buffer on the stack) that returns this; here it is a plain two-arg free
+//  function per the project convention.
+//  [NOT byte-identical] placement-dependent: E8 calls to the _mbstowcs_s /
+//  __alloca_probe / __security_check_cookie CRT slots and to sub_435C10 /
+//  sub_4357C0, plus the original 0x1010-byte stack frame and cookie.
+static F3WString *F3WStringFromAnsi(F3WString *obj, const char *src)
+{
+    F3WStringAssignAnsi(obj, src);
+    F3WStringNormalizeSeparators(obj);
+    return obj;
+}
+
 // sub_718250 (0x718250 - 0x718686) -- register one asset file into the
 // language / VFS resource table: a1 = the file's F3WString path, a2 = its
 // package / category name ("speech", "speechdoc", "lipsync", "text", "fonts",
@@ -9667,12 +9858,12 @@ static long sub_718250(F3WString *a1, const char *a2)
 // standard asset packages into the language / VFS resource table. Walks a
 // fixed list of
 // (path, package) pairs; for each it builds a temp F3WString (sub_4358A0 =
-// F3WStringAssignAnsi), registers it by package (sub_718250), then drops the
+// F3WStringFromAnsi), registers it by package (sub_718250), then drops the
 // string's heap buffer (the "if (cap >= 8) LHFree" idiom -- every path here is
 // > 7 chars, so it is always heap-allocated and freed).
 // [NOT byte-identical] the original is 26 hand-inlined
 // (push-constant / call) blocks referencing high-VA .rdata string constants
-// and E8 calls to sub_4358A0 / sub_718250 / LHFree.
+// and E8 calls to F3WStringFromAnsi (sub_4358A0) / sub_718250 / LHFree.
 static int RegisterStandardAssets(void)
 {
     static const struct F3Asset { const char *path; const char *package; }
@@ -9710,7 +9901,7 @@ static int RegisterStandardAssets(void)
     int rc = 0;
     for (unsigned i = 0; i < n; ++i)
     {
-        F3WStringAssignAnsi(&s, kAssets[i].path);       // sub_4358A0
+        F3WStringFromAnsi(&s, kAssets[i].path);         // sub_4358A0
         rc = (int)sub_718250(&s, kAssets[i].package);   // register by package
         F3WStringFree(&s);                              // if (cap >= 8) LHFree
     }
@@ -9798,6 +9989,17 @@ static DWORD g_dword_1E2D854 = 0;
 // 0x1E2D864 -- the archive-manager handle slot: the file subsystem is
 // constructed around it. 0 here while the archive framework is stubbed.
 static void *g_dword_1E2D864 = 0;
+// 0x1E2D870 / 0x1E2D890 -- the two global VFS archive-collection objects
+// (each a 0x20-byte {4-byte wrapper, sentinel node at +0x18, count at +0x1C}
+// record): the 44-byte red-black tree collection and its 24-byte vector
+// sibling, both lazily initialized by GetVfsArchiveCollection (sub_180D9B0).
+static DWORD g_unk_1E2D870[8];    // 0x1E2D870 (0x20 bytes)
+static DWORD g_unk_1E2D890[8];    // 0x1E2D890 (0x20 bytes)
+// 0x1E2D8B0 -- the archive handle held by the collection (AddRef'd; 0 while
+// the archive framework is stubbed).
+static void *g_dword_1E2D8B0 = 0;
+// 0x1E2D8B4 -- the archive-collection init flag (bit 0 = constructed).
+static DWORD g_dword_1E2D8B4 = 0;
 
 // sub_180AC90 (0x180AC90 - 0x180ACAC): the archive manager slot (the
 // dword_1E2D864 handle) with a reference: *out = the slot handle (AddRef'd
@@ -10205,6 +10407,571 @@ static void *GetFileSubsystem(void *obj)
     return g_fileSubsys;
 }
 
+// sub_180F350 (0x180F350 - 0x180F3C4) -- initialize the 0x20-byte
+// VFS archive-collection object's 44-byte red-black-tree sentinel: the
+// 4-byte heap wrapper (pointing back at the object) at [0], the 44-byte
+// sentinel node (all three child/self pointers set to itself, the 40/41
+// flag bytes set) at [6], and [7] = 0.  The archive framework is stubbed, so
+// the tree stays empty (a single sentinel).
+static void VfsCollectionTreeInit(void *slot)
+{
+    void *w = LHAlloc(4);
+    if (w != 0)
+        *(void **)w = slot;
+    *(void **)slot = w;                       // slot[0] = wrapper
+    BYTE *n = (BYTE *)LHAlloc(44);            // the 44-byte sentinel node
+    DWORD *o = (DWORD *)slot;
+    o[6] = (DWORD)n;                          // slot[6] = node (+0x18)
+    if (n != 0)
+    {
+        memset(n, 0, 44);
+        n[40] = 1;
+        n[41] = 1;
+        ((DWORD *)n)[0] = (DWORD)n;           // node[0] = node (self)
+        ((DWORD *)n)[1] = (DWORD)n;           // node[1] = node (self)
+        ((DWORD *)n)[2] = (DWORD)n;           // node[2] = node (self)
+    }
+    o[7] = 0;                                 // slot[7] = 0 (+0x1C)
+}
+
+// sub_180F3D0 (0x180F3D0 - 0x180F444) -- the vector sibling of the above:
+// the same {wrapper, sentinel, count} init but with a 24-byte sentinel node
+// (the 20/21 flag bytes set).  The archive framework is stubbed, so the
+// vector stays empty.
+static void VfsCollectionVecInit(void *slot)
+{
+    void *w = LHAlloc(4);
+    if (w != 0)
+        *(void **)w = slot;
+    *(void **)slot = w;                       // slot[0] = wrapper
+    BYTE *n = (BYTE *)LHAlloc(24);            // the 24-byte sentinel node
+    DWORD *o = (DWORD *)slot;
+    o[6] = (DWORD)n;                          // slot[6] = node (+0x18)
+    if (n != 0)
+    {
+        memset(n, 0, 24);
+        n[20] = 1;
+        n[21] = 1;
+        ((DWORD *)n)[0] = (DWORD)n;           // node[0] = node (self)
+        ((DWORD *)n)[1] = (DWORD)n;           // node[1] = node (self)
+        ((DWORD *)n)[2] = (DWORD)n;           // node[2] = node (self)
+    }
+    o[7] = 0;                                 // slot[7] = 0 (+0x1C)
+}
+
+// sub_5B17B0 (0x5B17B0 - 0x5B17F5) -- clear a range of 36-byte (9-DWORD)
+// records from first to last (exclusive): for each record, free the +0x04
+// payload when the +0x18 type is >= 8 (through the heap-table free slot =
+// LHFree), then set the type to 7, zero the +0x14 word, and zero the payload
+// pointer's low word.  Shared by the VFS archive-collection tree nodes
+// (VfsCollectionTreeNodeDtor) and the general record-table teardown
+// (sub_5AF760 / sub_5B0330 / sub_5B0350 / sub_5B1460).
+// [NOT byte-identical] placement-dependent (relative call) and refs the
+// high-VA heap table (0x02075B24) via LHFree.
+static void ReleaseRecordRange(void *first, void *last)
+{
+    for (DWORD *r = (DWORD *)first; r != (DWORD *)last; r += 9)
+    {
+        if (r[6] >= 8)
+            LHFree((void *)r[1]);
+        r[6] = 7;
+        r[5] = 0;
+        *(WORD *)(r + 1) = 0;
+    }
+}
+
+// sub_180F060 (0x180F060 - 0x180F0A4) -- the recursive vector-node dtor of
+// the VFS archive-collection vector (cdecl): walks the 24-byte element nodes
+// backward through the +0x00 links, stopping at the sentinel (byte +0x15 = 1).
+// For each live node: recurse into the +0x08 link, release the +0x10 payload
+// handle through vtable slot 1 when non-null, and LHFree the node.
+// [NOT byte-identical] placement-dependent (relative recursive call + LHFree +
+// the payload's vtable release).
+static void VfsCollectionVecNodeDtor(void *node)
+{
+    for (DWORD *i = (DWORD *)node; ((BYTE *)i)[21] == 0; )
+    {
+        VfsCollectionVecNodeDtor((void *)i[2]);
+        if (i[4] != 0)
+            F3CallVtable((void *)i[4], 1);     // vtable slot 1 (Release)
+        DWORD *next = (DWORD *)i[0];
+        LHFree(i);
+        i = next;
+    }
+}
+
+// sub_18109B0 (0x18109B0 - 0x1810A1C) -- the recursive tree-node dtor of the
+// VFS archive-collection tree (cdecl): walks the 44-byte red-black element
+// nodes backward through the +0x00 links, stopping at the sentinel (byte
+// +0x29 = 1).  For each live node: recurse into the +0x08 link, clear the
+// [+0x1C, +0x20) 36-byte record range (ReleaseRecordRange) and LHFree the
+// record block when present, zero the +0x1C / +0x20 / +0x24 fields, and
+// LHFree the +0x10 block and the node.
+// [NOT byte-identical] placement-dependent (relative recursive call +
+// ReleaseRecordRange + LHFree).
+static void VfsCollectionTreeNodeDtor(void *node)
+{
+    for (DWORD *i = (DWORD *)node; ((BYTE *)i)[41] == 0; )
+    {
+        VfsCollectionTreeNodeDtor((void *)i[2]);
+        if (i[7] != 0)
+        {
+            ReleaseRecordRange((void *)i[7], (void *)i[8]);
+            LHFree((void *)i[7]);
+        }
+        i[7] = 0;
+        i[8] = 0;
+        i[9] = 0;
+        LHFree((void *)i[4]);
+        DWORD *next = (DWORD *)i[0];
+        LHFree(i);
+        i = next;
+    }
+}
+
+// sub_180DF70 (0x180DF70 - 0x180DFD3) -- advance a VFS archive-collection
+// vector iterator by one element (thiscall; the 2-DWORD {base, node} iterator
+// in ECX): a sentinel base or node is __invalid_parameter_noinfo; when the
+// node's +0x08 link is the sentinel, walk the +0x00 links from the sentinel
+// back to its predecessor (the last live node); otherwise follow the +0x04
+// links while the iterator's node equals the candidate's +0x08 link, stopping
+// at the sentinel, and the +0x04 value is stored.  Pure pointer logic.
+// [NOT byte-identical] placement-dependent (relative call to
+// __invalid_parameter_noinfo).
+static void VfsCollectionVecIterAdvance(DWORD *it)
+{
+    if (it[0] == 0)
+    {
+        F3InvalidParam();
+        return;                    // original: jmp __invalid_parameter_noinfo (no return)
+    }
+    DWORD *n = (DWORD *)it[1];
+    if (((BYTE *)n)[21] != 0)
+    {
+        F3InvalidParam();
+        return;                    // original: jmp __invalid_parameter_noinfo (no return)
+    }
+    DWORD *m = (DWORD *)n[2];
+    if (((BYTE *)m)[21] != 0)
+    {
+        DWORD *x = m;
+        while (((BYTE *)(*x))[21] == 0)
+            x = (DWORD *)(*x);
+        it[1] = (DWORD)x;
+    }
+    else
+    {
+        DWORD *x = (DWORD *)n[1];
+        while (((BYTE *)x)[21] == 0 && it[1] == x[2])
+        {
+            it[1] = (DWORD)x;
+            x = (DWORD *)x[1];
+        }
+        it[1] = (DWORD)x;
+    }
+}
+
+// sub_180E070 (0x180E070 - 0x180E0D3) -- the tree sibling of the above, over
+// the 44-byte nodes (the sentinel flag is byte +0x29 instead of +0x15).
+// [NOT byte-identical] placement-dependent (relative call to
+// __invalid_parameter_noinfo).
+static void VfsCollectionTreeIterAdvance(DWORD *it)
+{
+    if (it[0] == 0)
+    {
+        F3InvalidParam();
+        return;                    // original: jmp __invalid_parameter_noinfo (no return)
+    }
+    DWORD *n = (DWORD *)it[1];
+    if (((BYTE *)n)[41] != 0)
+    {
+        F3InvalidParam();
+        return;                    // original: jmp __invalid_parameter_noinfo (no return)
+    }
+    DWORD *m = (DWORD *)n[2];
+    if (((BYTE *)m)[41] != 0)
+    {
+        DWORD *x = m;
+        while (((BYTE *)(*x))[41] == 0)
+            x = (DWORD *)(*x);
+        it[1] = (DWORD)x;
+    }
+    else
+    {
+        DWORD *x = (DWORD *)n[1];
+        while (((BYTE *)x)[41] == 0 && it[1] == x[2])
+        {
+            it[1] = (DWORD)x;
+            x = (DWORD *)x[1];
+        }
+        it[1] = (DWORD)x;
+    }
+}
+
+// sub_180F450 (0x180F450 - 0x180F77F) -- erase one element from the VFS
+// archive-collection vector (the 815-byte red-black rebalance +
+// std::out_of_range throw).  Remaining no-op stub: only reachable from the
+// slow path of VfsCollectionVecEraseRange, which requires a non-empty
+// collection -- never the case in this build.
+static DWORD *VfsCollectionVecEraseElement(DWORD *obj, DWORD *out, DWORD base, DWORD node)
+{
+    (void)base;
+    out[0] = obj[0];
+    out[1] = node;
+    return out;
+}
+
+// sub_1810650 (0x1810650 - 0x18109AA) -- erase one element from the VFS
+// archive-collection tree (the 858-byte red-black rebalance +
+// std::out_of_range throw + the record-range release).  Remaining no-op
+// stub: only reachable from the slow path of VfsCollectionTreeEraseRange,
+// which requires a non-empty collection -- never the case in this build.
+static DWORD *VfsCollectionTreeEraseElement(DWORD *obj, DWORD *out, DWORD base, DWORD node)
+{
+    (void)base;
+    out[0] = obj[0];
+    out[1] = node;
+    return out;
+}
+
+// sub_180FA60 (0x180FA60 - 0x180FB3E) -- erase a range of elements from the
+// VFS archive-collection vector (thiscall + `retn 14h` hybrid; declared as a
+// free function here): the 0x20-byte collection record in ECX, the 2-DWORD
+// out iterator pair, and the begin / end iterator pairs (each {base, node};
+// the begin pair is advanced in place).  A base that is null or != the
+// collection's 4-byte wrapper is __invalid_parameter_noinfo.  The fast path
+// (begin node == the sentinel's +0x00 value and end node == the sentinel
+// itself, i.e. the whole collection in its empty state) destroys the first
+// node (VfsCollectionVecNodeDtor),
+// resets the list to a single self-linked sentinel with the count zeroed,
+// and returns {wrapper, sentinel}.  The slow path advances the begin
+// iterator (VfsCollectionVecIterAdvance) and erases the current element
+// (VfsCollectionVecEraseElement) until the end node is reached.
+// [NOT byte-identical] placement-dependent (relative calls to the node dtor
+// / iterator advance / element erase / __invalid_parameter_noinfo).
+static DWORD *VfsCollectionVecEraseRange(DWORD *obj, DWORD *out,
+    DWORD beginBase, DWORD beginNode, DWORD endBase, DWORD endNode)
+{
+    DWORD *node = (DWORD *)obj[6];
+    if (beginBase == 0 || beginBase != obj[0])
+        F3InvalidParam();
+    if (beginNode == node[0])
+    {
+        if (endBase == 0 || endBase != obj[0])
+            F3InvalidParam();
+        if (endNode == (DWORD)node)
+        {
+            VfsCollectionVecNodeDtor((void *)node[1]);   // destroy the list
+            node[1] = (DWORD)node;
+            obj[7] = 0;                                  // count
+            node[0] = (DWORD)node;
+            node[2] = (DWORD)node;
+            out[1] = node[0];
+            out[0] = obj[0];                             // wrapper
+            return out;
+        }
+    }
+    DWORD it[2] = { beginBase, beginNode };
+    DWORD cur = beginBase;
+    DWORD last = beginNode;
+    for (;;)
+    {
+        if (cur == 0 || cur != endBase)
+            F3InvalidParam();
+        last = it[1];
+        if (it[1] == endNode)
+            break;
+        VfsCollectionVecIterAdvance(it);
+        DWORD tmp[2];
+        VfsCollectionVecEraseElement(obj, tmp, cur, last);
+        cur = it[0];
+    }
+    out[0] = obj[0];                                     // wrapper
+    out[1] = last;
+    return out;
+}
+
+// sub_1810D20 (0x1810D20 - 0x1810DFB) -- the tree sibling of the above, over
+// the 44-byte red-black nodes (VfsCollectionTreeNodeDtor /
+// VfsCollectionTreeIterAdvance / VfsCollectionTreeEraseElement).
+// [NOT byte-identical] placement-dependent (relative calls to the node dtor
+// / iterator advance / element erase / __invalid_parameter_noinfo).
+static DWORD *VfsCollectionTreeEraseRange(DWORD *obj, DWORD *out,
+    DWORD beginBase, DWORD beginNode, DWORD endBase, DWORD endNode)
+{
+    DWORD *node = (DWORD *)obj[6];
+    if (beginBase == 0 || beginBase != obj[0])
+        F3InvalidParam();
+    if (beginNode == node[0])
+    {
+        if (endBase == 0 || endBase != obj[0])
+            F3InvalidParam();
+        if (endNode == (DWORD)node)
+        {
+            VfsCollectionTreeNodeDtor((void *)node[1]);  // destroy the tree
+            node[1] = (DWORD)node;
+            obj[7] = 0;                                  // count
+            node[0] = (DWORD)node;
+            node[2] = (DWORD)node;
+            out[1] = node[0];
+            out[0] = obj[0];                             // wrapper
+            return out;
+        }
+    }
+    DWORD it[2] = { beginBase, beginNode };
+    DWORD cur = beginBase;
+    DWORD last = beginNode;
+    for (;;)
+    {
+        if (cur == 0 || cur != endBase)
+            F3InvalidParam();
+        last = it[1];
+        if (it[1] == endNode)
+            break;
+        VfsCollectionTreeIterAdvance(it);
+        DWORD tmp[2];
+        VfsCollectionTreeEraseElement(obj, tmp, cur, last);
+        cur = it[0];
+    }
+    out[0] = obj[0];                                     // wrapper
+    out[1] = last;
+    return out;
+}
+
+// sub_1810F50 (0x1810F50 - 0x1810FD6) -- the global VFS archive-collection
+// dtor (thiscall; the 0x1E2D870 collection record in ECX): release the held
+// archive handle (+0x40 = 0x1E2D8B0) through vtable slot 1 when non-null,
+// erase + free the 24-byte-node vector sub-object at +0x20 (0x1E2D890) --
+// the whole-range erase, then LHFree the sentinel node and the 4-byte
+// wrapper, the node / count fields zeroed -- and do the same for the
+// 44-byte-node tree sub-object at +0x00.
+// [NOT byte-identical] placement-dependent (relative calls to the two range
+// erases / LHFree / the handle's vtable release).
+static void VfsArchiveCollectionDtor(DWORD *obj)
+{
+    DWORD out[2];
+    if (obj[16] != 0)                                    // +0x40 = 0x1E2D8B0
+        F3CallVtable((void *)obj[16], 1);                // vtable slot 1 (Release)
+    DWORD *vnode = (DWORD *)obj[14];                     // +0x38 = 0x1E2D8A8
+    VfsCollectionVecEraseRange(obj + 8, out, obj[8], vnode[0], obj[8], (DWORD)vnode);
+    LHFree((void *)vnode);
+    obj[14] = 0;
+    obj[15] = 0;
+    LHFree((void *)obj[8]);
+    DWORD *tnode = (DWORD *)obj[6];                      // +0x18 = 0x1E2D888
+    VfsCollectionTreeEraseRange(obj, out, obj[0], tnode[0], obj[0], (DWORD)tnode);
+    LHFree((void *)tnode);
+    obj[6] = 0;
+    obj[7] = 0;
+    LHFree((void *)obj[0]);
+}
+
+// sub_1AD39E0 (0x1AD39E0 - 0x1AD39EA) -- the atexit destructor for the
+// global VFS archive collection: destruct the 0x1E2D870 collection record
+// (VfsArchiveCollectionDtor).  Registered by GetVfsArchiveCollection; in this
+// build the handle is null and both collections hold only their sentinels, so
+// it frees the two 4-byte wrappers + two sentinel nodes and zeroes the fields.
+// [NOT byte-identical] placement-dependent (the original is
+// `mov ecx, offset dword_1E2D870; jmp sub_1810F50`).
+static void VfsArchiveCollectionAtExit(void)
+{
+    VfsArchiveCollectionDtor(g_unk_1E2D870);
+}
+
+// sub_180D9B0 (0x180D9B0 - 0x180DA37) -- the lazy one-time init of the global
+// VFS archive collection (guarded by the g_dword_1E2D8B4 flag): the archive
+// handle (GetArchiveSlot, AddRef'd) is taken, the two collection sub-objects
+// are initialized (the 44-byte tree sentinel at g_unk_1E2D870 and the 24-byte
+// vector sentinel at g_unk_1E2D890), the handle is stored at g_dword_1E2D8B0
+// (its reference bumped and the temporary dropped), and the atexit destructor
+// (VfsArchiveCollectionAtExit, sub_1AD39E0) is registered.  Always returns
+// &g_unk_1E2D870.
+//  [NOT byte-identical] placement-dependent (relative calls to GetArchiveSlot /
+//  the two collection sub-object inits / the vtable AddRef + Release /
+//  _atexit) and refs the high-VA globals at their original addresses.
+static void *GetVfsArchiveCollection(void)
+{
+    if ((g_dword_1E2D8B4 & 1) == 0)
+    {
+        g_dword_1E2D8B4 |= 1;
+        F3SharedBuffer *slot = 0;
+        F3SharedBuffer *handle = *GetArchiveSlot(&slot);    // sub_180AC90
+        VfsCollectionTreeInit(g_unk_1E2D870);               // sub_180F350
+        VfsCollectionVecInit(g_unk_1E2D890);                // sub_180F3D0
+        g_dword_1E2D8B0 = handle;
+        if (handle != 0)
+            F3CallVtable(handle, 1);                        // vtable slot 1 (AddRef)
+        if (slot != 0)
+            F3CallVtable(slot, 2);                          // vtable slot 2 (Release)
+        atexit(VfsArchiveCollectionAtExit);
+    }
+    return g_unk_1E2D870;
+}
+
+// sub_180D220 (0x180D220 - 0x180D3E1) -- the file subsystem's per-entry VFS
+// reload (thiscall + `retn 0Ch`; the archive collection in ECX, the out entry
+// slot, the entry, and the .vfsconfig path F3WString on the stack).  Hashes the
+// path (sub_56DFD0), looks the entry up in the archive collection (sub_180F0E0
+// tree search), and dispatches the matched provider's reload (the entry
+// vtable[4] with the path / provider index).  Unimplemented in this build: the
+// provider-name lookup + the tree search are remaining no-op stubs because the
+// archive collection is empty, so no provider is ever matched and the reload
+// finds nothing -- the out slot is cleared and the out pointer is returned.
+static void *VfsReloadFileEntry(void *collection, void **out, void *entry, void *path)
+{
+    (void)collection; (void)entry; (void)path;
+    *out = 0;                    // no provider matched (empty archive collection)
+    return out;
+}
+
+// sub_17DBD50 (0x17DBD50 - 0x17DBD9C) -- re-open the stream's 8-byte file
+// block (close + free the old, allocate + init a fresh one) and (re)read the
+// entry into it through the CXMLDocumentParser (sub_17E69D0).  Returns the
+// parse result (0 / 1).  The LHXML parse engine is a remaining stub, so the
+// parse is reported to have succeeded (the block is freshly allocated) but the
+// tree is never populated -- no section is ever found, matching OpenXmlFile.
+static char ReopenXmlFileBlock(F3XmlStream *stream, void *entry)
+{
+    (void)entry;
+    DWORD *old = (DWORD *)stream->fileBuf;
+    if (old != 0)
+    {
+        CloseXmlFileBlock(old);           // sub_17E68F0
+        XmlHeapFree(old);                 // sub_17E65B0
+    }
+    DWORD *block = (DWORD *)XmlHeapAlloc(8);
+    stream->fileBuf = (block != 0) ? InitXmlFileBlock(block) : 0;
+    return (stream->fileBuf != 0) ? 1 : 0;
+}
+
+// sub_1812980 (0x1812980 - 0x1812C0A) -- the VFS config-group builder: builds
+// a 64-byte group node from the "ID" / "Mountable" attributes + the child
+// provider elements (VfsCfgGroupNodeInit + the per-child FileProviderCtorSlot
+// dispatch + sub_18192A0 registration).  Never reached in this build (the
+// VFSConfig root is never found), so it degrades to a no-op returning 0.
+static void *BuildVfsConfigGroup(void *pair, int flag1, int flag2)
+{
+    (void)pair; (void)flag1; (void)flag2;
+    return 0;
+}
+
+// sub_18192A0 (0x18192A0 - 0x181931B) -- register (or erase) a VFS config node
+// in the global node collection (a vector-erase by node handle).  Never reached
+// in this build (the VFSConfig root is never found); no-op.
+static void RegisterVfsConfig(void *node)
+{
+    (void)node;
+}
+
+// sub_1813760 (0x1813760 - 0x1813850) -- the file subsystem's VFS-config root
+// reader (thiscall + `retn 8`; the file subsystem in ECX, the entry + the
+// stream on the stack): when the current root element is "VFSConfig" (stream
+// vtable[2]), it reads the "AutoMount" attribute (stream vtable[10], defaulting
+// to true when absent), builds the config group from {entry, stream}
+// (BuildVfsConfigGroup), registers it (RegisterVfsConfig), and advances the
+// stream (vtable[3]); returns 0 on success or E_FAIL (0x80004005) when the
+// group build (or the AutoMount handle bind) fails.  The "VFSConfig" root is
+// never found in this build (the LHXML parse is a remaining stub), so the body
+// is unreachable and it returns 0.
+static int VfsLoadConfigRoot(void *fs, void *entry, F3XmlStream *stream)
+{
+    void **vt = (void **)*(void **)stream;
+    if (((char(__thiscall *)(void *, const char *))vt[2])(stream, "VFSConfig") != 0)
+    {
+        F3AString autoMount;
+        F3AStringReset(&autoMount);
+        F3AStringAssign(&autoMount, "AutoMount", 9);      // sub_402F00
+        BYTE autoMountVal = 1;
+        if (((char(__thiscall *)(void *, void *, BYTE *))vt[10])
+                    (stream, &autoMount, &autoMountVal) == 0)
+            autoMountVal = 1;
+        DWORD pair[2] = { (DWORD)entry, (DWORD)stream };
+        void *config = BuildVfsConfigGroup(pair, 1, 1);   // sub_1812980 (stub -> 0)
+        int bindFailed = 0;
+        if (config != 0 && autoMountVal != 0)
+        {
+            void **configVt = (void **)*(void **)config;  // the group-node vtable
+            bindFailed = ((int(__thiscall *)(void *, DWORD))configVt[1])
+                               (config, ((DWORD *)fs)[18]) < 0;
+        }
+        if (config == 0 || bindFailed)
+            return 0x80004005;                            // E_FAIL
+        RegisterVfsConfig(config);                        // sub_18192A0 (stub)
+        ((void(__thiscall *)(void *))vt[3])(stream);      // vtable[3] (advance)
+    }
+    return 0;
+}
+
+// sub_1813850 (0x1813850 - 0x18138FA) -- the file subsystem's per-entry
+// VFS-config file load: thiscall + `retn 8` (the file subsystem in ECX, the
+// file entry + the .vfsconfig path F3WString on the stack; declared as a plain
+// cdecl free function here, all callers are project code).  Lazily inits the
+// global archive collection (GetVfsArchiveCollection -> &g_unk_1E2D870),
+// re-loads the named file entry from its provider (VfsReloadFileEntry: the
+// provider-name lookup + the entry vtable[4] reload dispatch), then builds a
+// 24-byte CXMLReadStream, re-opens the file block (ReopenXmlFileBlock), and
+// when the root element is "VFSConfig" (VfsLoadConfigRoot) builds + registers
+// the config object (sub_1812980 / sub_18192A0), returning 0 or E_FAIL
+// (0x80004005).  [NOT byte-identical] placement-dependent (relative calls to
+// GetVfsArchiveCollection / VfsReloadFileEntry / ReopenXmlFileBlock /
+// VfsLoadConfigRoot / the entry vtable[2] release dispatch).
+static int FileSubsysLoadVfsConfigFile(void *fs, void *entry, void *path)
+{
+    (void)fs;
+    if (entry == 0)
+        return 0x80004005;                            // E_FAIL
+    void *collection = GetVfsArchiveCollection();     // sub_180D9B0
+    VfsReloadFileEntry(collection, &entry, entry, path);   // sub_180D220
+    if (entry == 0)
+        return 0;
+    F3XmlStream stream;
+    CXMLReadStreamCtor(&stream);
+    if (ReopenXmlFileBlock(&stream, entry) == 0)      // sub_17DBD50
+    {
+        CXMLReadStreamDtor(&stream);
+        if (entry != 0)
+            F3CallVtable(entry, 2);                   // vtable slot 2 (Release)
+        return 0x80004005;                            // E_FAIL
+    }
+    int result = VfsLoadConfigRoot(fs, entry, &stream);   // sub_1813760
+    CXMLReadStreamDtor(&stream);
+    if (entry != 0)
+        F3CallVtable(entry, 2);                       // vtable slot 2 (Release)
+    return result;
+}
+
+//  FileSubsysLoadVfsConfig  (sub_1801580, 0x1801580 - 0x180161F)  -- the
+//  file subsystem's VFS-config load: thiscall + `retn 4` (the 0x8C-byte
+//  file-subsystem object in ECX, the .vfsconfig path F3WString on the stack;
+//  declared as a plain cdecl free function here, all callers are project
+//  code).  Iterates the file-entry collection [begin = +0x58, end = +0x5C),
+//  and for each entry locks it (vtable slot 1), (re)loads its VFS config
+//  from the path (sub_1813850 -> FileSubsysLoadVfsConfigFile), and unlocks
+//  it (vtable slot 2).  The original's _invalid_parameter_noinfo bounds
+//  asserts are dropped (the collection is zero-initialized and never
+//  inconsistent in this build).  Dead in this build: no entries are ever
+//  registered in g_fileSubsys, so the loop body never runs.  Six call sites
+//  in the original: RunFrontEnd ("startup.vfsconfig") and the speech / lipsync /
+//  cutscene config loaders (sub_61C320 / sub_719DA0 / sub_9F4B50 /
+//  sub_11C4C30, all still stubs).  [NOT byte-identical] placement-dependent
+//  (relative calls to __invalid_parameter_noinfo / sub_1813850 / the entry
+//  vtable dispatches).
+static void FileSubsysLoadVfsConfig(void *fs, void *path)
+{
+    DWORD *o = (DWORD *)fs;
+    void **begin = (void **)o[0x58 / 4];
+    void **end = (void **)o[0x5C / 4];
+    for (void **i = begin; i != end; i++)
+    {
+        void *entry = *i;
+        if (entry != 0)
+            F3CallVtable(entry, 1);                     // vtable slot 1 (lock)
+        FileSubsysLoadVfsConfigFile(fs, entry, path);   // sub_1813850
+        if (entry != 0)
+            F3CallVtable(entry, 2);                     // vtable slot 2 (unlock)
+    }
+}
+
 // sub_18A9970 (0x18A9970 - 0x18A99A0) -- allocate (LHAlloc 0x54) and
 // construct the 84-byte streaming manager (VirtualFileSystemCtor, 0x18A98F0),
 // store it in *out (AddRef'd through vtable slot 1) and return out.  The
@@ -10424,8 +11191,7 @@ static long LegacyFileDtor(void *obj)
 static int DataStreamingBnkExists(void)
 {
     F3WString bnk, dir;
-    F3WStringReset(&bnk);
-    F3WStringAssignAnsi(&bnk, "streaming.bnk");
+    F3WStringFromAnsi(&bnk, "streaming.bnk");           // sub_4358A0
     F3WStringReset(&dir);
     F3WStringAssign(&dir, L"data", 4);
     F3WStringNormalize(&dir);
@@ -10545,7 +11311,7 @@ static long InitFrontendData(void *obj, int regB, int regP, int regD, int regS)
     // streaming.bnk present, not fakeDVD: resolve through dir.manifest.
     {
         F3WStringClear(&langSet);
-        F3WStringAssignAnsi(&langSet, "dir.manifest");
+        F3WStringFromAnsi(&langSet, "dir.manifest");    // sub_4358A0
         tmpHandle = (F3SharedBuffer *)ResolveDirManifest(&tmpHandle, dataHandle, &langSet);
         if (tmpHandle != 0 && F3_VT(tmpHandle) != 0)
             ((void (*)(void *))F3_VT(tmpHandle)[1])(tmpHandle);
@@ -10614,7 +11380,7 @@ afterArchive:
     // 8. The babel text book + the manager flag byte (the original writes
     //    past the 84-byte allocation at manager+0x161, and clears it again
     //    when the book string's ptr field reads 0).
-    F3WStringAssignAnsi(&bookPath, "language\\en-uk\\text\\book.babel");
+    F3WStringFromAnsi(&bookPath, "language\\en-uk\\text\\book.babel");  // sub_4358A0
     if (streamMgr != 0)
         ((char *)streamMgr)[0x161] = 1;
     ArchiveMgrAddPath(archive, &cwdSlot, &bookPath, &langSet.u, 1);
@@ -10717,7 +11483,7 @@ char RunFrontEnd(void *obj, int arg)
     int             v71;                    // var_16E (sign-in wait flag)
     int             v164;                   // sub_1801C20 result
     void           *v168 = 0;              // sub_18013B0 out-pointer
-    char            v81[4];                 // "startup.vfsconfig" string
+    F3WString       vfsCfg;                 // the 36-byte "startup.vfsconfig" string (sub_4358A0)
     int             vfs[4];                 // the 16-byte vfs config word block
     DWORD           modelHdr;               // "globals_model_headers" string
     int             v140, v154;             // sub_402F00 model-headers word block
@@ -10982,9 +11748,9 @@ signedIn:
 
         InitLipCultures();
         v164 = (int)GetFileSubsystem(0);             // sub_1801C20 (obj unused)
-        sub_4358A0(&v81[0], "startup.vfsconfig");
+        F3WStringFromAnsi(&vfsCfg, "startup.vfsconfig");   // sub_4358A0
         memset(vfs, 0, sizeof(vfs));
-        sub_1801580((void *)v164, &v81[0]);
+        FileSubsysLoadVfsConfig((void *)v164, &vfsCfg);   // sub_1801580
         if (vfs[3] >= 8)
             LHFree((void *)vfs[0]);
 
