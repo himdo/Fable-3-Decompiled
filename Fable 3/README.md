@@ -9,7 +9,9 @@ folders** so it can be filled in one subsystem at a time.
 
 - **Toolchain:** VS2008 SP1 (cl 15.00.30729 / link 9.00.30729), Win SDK 7.1,
   flags `/MT /GL /O2 /Ob2`, image base `0x400000`, GUI subsystem.
-- **Build:** `build_vs2008.bat` → `Release/Win32/Fable3.exe`.
+- **Build:** `build_vs2008.bat` → `Release/Win32/Fable3.exe` (release; the
+  debug variant `build_vs2008_debug.bat` adds `/DEBUG /Zi` +
+  `FABLE3_WAIT_FOR_DEBUGGER=1` and outputs the same exe).
 - **Ground truth:** IDA database `../Fable3.exe.i64` (symbols stripped). Every
   function keeps its IDA address-range annotation
   (`// name  (0x<start> - 0x<end>)`) so it maps back to the original binary.
@@ -18,7 +20,8 @@ folders** so it can be filled in one subsystem at a time.
 
 ```
 main.cpp                    application entry point (WinMain)
-build_vs2008.bat            compiles + links every module .cpp
+build_vs2008.bat            compiles + links every module .cpp (release)
+build_vs2008_debug.bat      same, with /DEBUG /Zi + FABLE3_WAIT_FOR_DEBUGGER=1
 
 framework/                  refcounted framework init / shutdown
   framework.h
@@ -227,45 +230,14 @@ engine/                     game engine init + main run loop  [growing]
                             SharedSlotCrc32 sub_1A15800); empty-list test path
                             CVersionTableGetVersion1 (0x760FA0) — the version table's CV1
                             (+0x04) CGameVersion getter (byte-identical naked thiscall)
-                            ReinitEngineLua (0x61A470) — (re)build the engine's Lua
-                            environment: the +0xBC "Fable 3" Lua module (CreateLuaModule
-                            sub_629570, release via DestroyLuaModule sub_6281B0),
-                            the +0xC0 8-byte
-                            CLuaManager (CLuaManagerCtor sub_6F9890 +
-                            CLuaManagerRunSerialiseScript sub_6F9880), the +0xC4
-                            80-byte CEntityScriptHandleManager (sub_6E9620);
-                            RegisterEngineLuaFunctions (sub_6169D0) + the first-time
-                            RunLuaStartupScripts (sub_616710) over the
-                            unk_1DBE2B4 / unk_1DBDA6C path slots; the Lua ctors /
-                            script runners are remaining stubs
-                            DestroyLuaModule (sub_6281B0) — the 5-byte `jmp sub_5EDFE0`
-                            thunk that releases the +0xBC "Fable 3" Lua module (the
-                            1032-byte KoreVM host): the body DestroyLuaModuleBody
-                            (sub_5EDFE0) marks the VM released, dumps its stats
-                            (KoreDumpVMStats sub_5DEB70), frees the memory-allocation
-                            list (KoreFreeAllocList sub_5ED910), runs the finalise step
-                            (KoreFinalizeVM sub_5DA690), detaches the heap
-                            (KoreDetachHeap sub_5DA150), and deallocates the 1032-byte
-                            block through the VM's own heap-dealloc; KoreDumpVMStats
-                            (sub_5DEB70, with its KoreFindFirstFreeAlloc sub_5D97E0 /
-                            KoreFindFreeBlock sub_5D3680 callees) is implemented,
-                            KoreFreeAllocList (sub_5ED910, with its
-                            KoreReleaseAllocNode sub_5ED860 / KoreLookupInternedString
-                            sub_5DDE20 / KoreLookupStringTable sub_5D3370 /
-                            KoreLookupStringRegistry sub_60C5E0 /
-                            KoreSwapTableContext sub_5DA0A0 callees) is now
-                            implemented; KoreAllocRecordTable (sub_5DFE90, with the
-                            record-table construction + VM-heap allocation chain
-                            KoreBuildRecordTable sub_5DEAD0 /
-                            KoreSetupRecordTableBuffers sub_5DEA70 /
-                            KoreVmHeapAlloc sub_5EEAE0 / KoreHeapBlockAlloc
-                            sub_5DA1C0 / KoreGrowRegistry sub_5EE150 /
-                            KoreVmAlloc sub_5DA4F0 / KoreVmAllocExpand sub_5F6420)
-                            is implemented too, leaving only KoreHashTableInsert
-                            (sub_5EC960) + the two OOM/panic leaves
-                            KoreHeapInitGrow (sub_5EDAC0) / KorePanicTraceback
-                            (sub_5F1A20) as no-op stubs (deep VM internals out of
-                            scope)
+                            + the ReinitEngineLua (0x61A470) call site (RunFrontEnd
+                            0x61D3CB / the engine destructor 0x67914C (re)building the
+                            engine's Lua environment) — the Lua / Kore VM
+                            implementation itself (ReinitEngineLua, CreateLuaModule /
+                            DestroyLuaModule, the 1032-byte KoreVM host + Kore*
+                            internals, the CLuaManager / CEntityScriptHandleManager
+                            wrappers) now lives in engine/luavm.cpp — see the
+                            luavm.h / luavm.cpp entry below
 
                             InitLipCultures (sub_719770) — the lip-sync culture / component
                             system init (loads cultures_win32.txt / cultures.txt, registers
@@ -520,6 +492,49 @@ engine/                     game engine init + main run loop  [growing]
                               nine 16-byte {prev, next, id} nodes (id =
                               0x4D5308D6_0CCF0000 + i) inserted after the head
                               (F3ListSizeAdd 0x76CE80 size guard)
+  luavm.h / luavm.cpp       the engine's "Fable 3" Lua / KoreVM module (split out of
+                            gamemain.cpp, the frontend run module): the 1032-byte
+                            Lua module + its VM internals, the CLuaManager /
+                            CEntityScriptHandleManager wrappers, and ReinitEngineLua
+                            ReinitEngineLua (0x61A470) — (re)build the engine's Lua
+                            environment: the +0xBC "Fable 3" Lua module (CreateLuaModule
+                            sub_629570, release via DestroyLuaModule sub_6281B0),
+                            the +0xC0 8-byte
+                            CLuaManager (CLuaManagerCtor sub_6F9890 +
+                            CLuaManagerRunSerialiseScript sub_6F9880), the +0xC4
+                            80-byte CEntityScriptHandleManager (sub_6E9620);
+                            RegisterEngineLuaFunctions (sub_6169D0) + the first-time
+                            RunLuaStartupScripts (sub_616710) over the
+                            unk_1DBE2B4 / unk_1DBDA6C path slots; the Lua ctors /
+                            script runners are remaining stubs
+                            DestroyLuaModule (sub_6281B0) — the 5-byte `jmp sub_5EDFE0`
+                            thunk that releases the +0xBC "Fable 3" Lua module (the
+                            1032-byte KoreVM host): the body DestroyLuaModuleBody
+                            (sub_5EDFE0) marks the VM released, dumps its stats
+                            (KoreDumpVMStats sub_5DEB70), frees the memory-allocation
+                            list (KoreFreeAllocList sub_5ED910), runs the finalise step
+                            (KoreFinalizeVM sub_5DA690), detaches the heap
+                            (KoreDetachHeap sub_5DA150), and deallocates the 1032-byte
+                            block through the VM's own heap-dealloc; KoreDumpVMStats
+                            (sub_5DEB70, with its KoreFindFirstFreeAlloc sub_5D97E0 /
+                            KoreFindFreeBlock sub_5D3680 callees) is implemented,
+                            KoreFreeAllocList (sub_5ED910, with its
+                            KoreReleaseAllocNode sub_5ED860 / KoreLookupInternedString
+                            sub_5DDE20 / KoreLookupStringTable sub_5D3370 /
+                            KoreLookupStringRegistry sub_60C5E0 /
+                            KoreSwapTableContext sub_5DA0A0 callees) is now
+                            implemented; KoreAllocRecordTable (sub_5DFE90, with the
+                            record-table construction + VM-heap allocation chain
+                            KoreBuildRecordTable sub_5DEAD0 /
+                            KoreSetupRecordTableBuffers sub_5DEA70 /
+                            KoreVmHeapAlloc sub_5EEAE0 / KoreHeapBlockAlloc
+                            sub_5DA1C0 / KoreGrowRegistry sub_5EE150 /
+                            KoreVmAlloc sub_5DA4F0 / KoreVmAllocExpand sub_5F6420)
+                            is implemented too, leaving only KoreHashTableInsert
+                            (sub_5EC960) + the two OOM/panic leaves
+                            KoreHeapInitGrow (sub_5EDAC0) / KorePanicTraceback
+                            (sub_5F1A20) as no-op stubs (deep VM internals out of
+                            scope)
   netinit.h / netinit.cpp   InitNetworking (0x6A7210) — network-subsystem bootstrap
                             (XLive settings + XLiveInitializeEx, worker pre-translate
                             hook via SetPreTranslate, LIONHEAD::StartupNetworking
@@ -578,7 +593,7 @@ save/                       save-game loading  [growing]
   `[STUB]` so the real body can be slotted in later.
 - To add a module: create `folder/folder.h` + `folder/folder.cpp`, then add
   `..\..\folder\folder.cpp` to `SRCS` and the `.obj` to the `link` line in
-  `build_vs2008.bat`.
+  both `build_vs2008.bat` and `build_vs2008_debug.bat`.
 
 ## Byte-identity status
 

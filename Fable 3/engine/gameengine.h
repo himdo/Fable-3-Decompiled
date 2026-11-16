@@ -139,13 +139,13 @@ void *GetGameEngine(void);
 // void DestroyLuaModule(int luaModule)   (sub_6281B0, 0x6281B0 - 0x6281B5)
 // -- the 5-byte near-`jmp` thunk that releases the engine's "Fable 3" Lua
 // module (the 1032-byte KoreVM host). The counterpart of CreateLuaModule
-// (sub_629570, gamemain.cpp). It forwards the module pointer to the body
+// (sub_629570, luavm.cpp). It forwards the module pointer to the body
 // sub_5EDFE0 (DestroyLuaModuleBody), which marks the VM released, dumps its
 // stats, frees the memory-allocation list, runs the finalise step, and
 // deallocates the 1032-byte block through the VM's own heap-dealloc function.
 // Called by ReinitEngineLua (0x61A4BA, when the +0xBC module is rebuilt) and
 // CGameEngineCleanup (0x61AF0C, post-pump teardown). Implemented in
-// gamemain.cpp; declared here so both call sites use it.
+// luavm.cpp; declared here so both call sites use it.
 void DestroyLuaModule(int luaModule);
 
 #endif  // F3_GAMEENGINE_H

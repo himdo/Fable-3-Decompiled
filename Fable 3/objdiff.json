@@ -36,6 +36,14 @@
       }
     },
     {
+      "name": "luavm",
+      "target_path": "orig/main.obj",
+      "base_path": "Release/Win32/luavm_objdiff.obj",
+      "metadata": {
+        "source_path": "luavm.cpp"
+      }
+    },
+    {
       "name": "worker",
       "target_path": "orig/main.obj",
       "base_path": "Release/Win32/worker_objdiff.obj",
