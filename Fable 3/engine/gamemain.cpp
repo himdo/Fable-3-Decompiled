@@ -24,6 +24,7 @@
 #include <wchar.h>                // _wgetcwd
 #include <stdarg.h>               // va_list / va_start / vswprintf_s (XLipDebugMessage)
 #include <string.h>
+#include <setjmp.h>               // longjmp / jmp_buf (the VM-heap OOM expand)
 #include <wctype.h>               // iswspace (the XLipCultures line trim)
 #include <mbstring.h>             // _mbscmp
 #include <math.h>                 // fabsf
@@ -8231,13 +8232,298 @@ static void KoreSwapTableContext(int a, int b)
     t = pa[18]; pa[18] = pb[18]; pb[18] = t;
 }
 
-// sub_5DFE90 (0x5DFE90 - 0x5DFEB9) -- KoreAllocRecordTable: lazily create
-// the allocation list's +0x08 record-table object — the 112-byte table clone
-// sub_5DEAD0(vmcore) (sub_5EEAE0 vm-core allocation + field copies + the
-// {ptr, 8} entry-array write at vmcore+0x1C with the cursor rewound), then
-// set result+0x48 = *(vmcore+0)+0x14C and publish it at list+0x08. Remaining
-// stub (the vm-core 112-byte table-object construction is out of scope).
-static int KoreAllocRecordTable(int obj) { (void)obj; return 0; }
+// sub_5F1A20 (0x5F1A20 - 0x5F1BA6) -- KorePanicTraceback: the "Kore Panic"
+// traceback printer — the out-of-scope leaf of the record-table allocation
+// path. In the real VM it walks the current VM state and prints a full
+// function/local traceback, then never returns; the whole path is dead in the
+// stub world (the VM heap never grows or panics), so this is a no-op stub.
+// [NOT byte-identical] remaining stub (390-byte traceback emitter).
+static void KorePanicTraceback(int obj) { (void)obj; }
+
+// sub_5EDAC0 (0x5EDAC0 - 0x5EDDB7) -- KoreHeapInitGrow: the setjmp/longjmp
+// state machine that (re)initialises / grows the VM heap on an OOM expand
+// (thiscall on the heap+0x2C sub-object, the grow size / vm-core on the
+// stack). This 759-byte subsystem is the other out-of-scope leaf of the
+// record-table allocation path; stubbed to the success result (the whole path
+// is dead in the stub world). [NOT byte-identical] remaining stub.
+static int KoreHeapInitGrow(int obj, int size) { (void)obj; (void)size; return 1; }
+
+// sub_5F6420 (0x5F6420 - 0x5F64A5) -- KoreVmAllocExpand: the last-resort
+// expansion for a failed VM-heap allocation (the OOM path). First retries a
+// direct alloc through the heap's +0x294 function pointer and returns 1 when
+// it satisfies the size; otherwise it records a {heap+0x144, heap+0x148} pair
+// at the vm-core's +0x1C entry cursor (advancing it by 8), zeroes the heap's
+// +0x78 and +0x64 counters, and either longjmp(-200) back through the
+// vm-core's +0x40 saved jmp buffer (when set) or calls the heap's +0x290
+// handler and the KorePanicTraceback. [NOT byte-identical] placement-dependent
+// (the relative call to KorePanicTraceback) and refs the heap's +0x290 / +0x294
+// function slots.
+static int KoreVmAllocExpand(int vmcore, int size)
+{
+    int *heap = (int *)*(int *)vmcore;
+    int fn = *(int *)((char *)heap + 0x294);
+    int r  = ((int (*)(int, int))fn)(vmcore, size);
+    if (r >= size)
+        return 1;
+    *(int *)((char *)heap + 0x78) = 0;
+    int *cur = (int *)(vmcore + 0x1C);
+    cur[0]   = *(int *)((char *)heap + 0x144);
+    cur[1]   = *(int *)((char *)heap + 0x148);
+    *(int *)(vmcore + 0x1C) = (int)(cur + 2);
+    *(int *)((char *)heap + 0x64) = 0;
+    int jmpbuf = *(int *)(vmcore + 0x40);
+    if (jmpbuf != 0)
+    {
+        *(int *)(vmcore + 0x40) = *(int *)(jmpbuf + 0x40);
+        longjmp(*(jmp_buf *)jmpbuf, -200);
+    }
+    int handler = *(int *)((char *)heap + 0x290);
+    if (handler != 0)
+        ((void (*)(int))handler)(vmcore);
+    (void)KorePanicTraceback(vmcore);
+    return 0;
+}
+
+// sub_5DA1C0 (0x5DA1C0 - 0x5DA238) -- KoreHeapBlockAlloc: allocate a block of
+// the given size from the VM heap's bump region (thiscall + retn 4; the heap
+// object in ECX is {+0x00 tag word, +0x04 bump cursor, +0x08 high-water, +0x0C
+// alloc-fn ptr, +0x10 alloc-fn context, +0x1C free-list link}). Advance the
+// bump cursor by size+8 and call the alloc-fn (context, 0, 0, size+8); on
+// success stamp the 8-byte block header {tag | ((size+8)*4 & ~1), free-list
+// link = heap+0x1C & ~3} at the block and relink the free-list tag, on failure
+// revert the cursor; returns the block at result+8 (the 8-byte header sits
+// just before it). [NOT byte-identical] a thiscall + retn 4 hybrid in the
+// original (declared object-first here).
+static int KoreHeapBlockAlloc(int obj, int size)
+{
+    int *h    = (int *)obj;
+    int bump  = h[1];
+    int bytes = size + 8;
+    h[1] = bump + bytes;
+    int r = ((int (*)(int, int, int, int))h[3])(h[4], 0, 0, bytes);
+    if (r == 0)
+    {
+        h[1] = bump;
+        return 0;
+    }
+    *(int *)r       = ((bytes * 4) & ~1) | h[0];
+    *(int *)(r + 4) = h[7] & ~3;
+    h[7] = (h[7] & 3) | r;
+    h[2] = (h[2] > h[1]) ? h[2] : h[1];
+    return r + 8;
+}
+
+// sub_5EE150 (0x5EE150 - 0x5EE196) -- KoreGrowRegistry: the VM-heap grow
+// wrapper (thiscall + retn 8; the heap+0x2C sub-object in ECX, the grow size in
+// the first stack arg, the vm-core in the second). When the sub-object's +0x68
+// notify slot is set and fires (called with the sub-object's +0x04 arg) it
+// aborts (returns 0); otherwise it temporarily sets the sub-object's +0x70 slot
+// to the vm-core (when non-zero), mirrors it to +0x6C, drives the heap grow
+// through KoreHeapInitGrow, and restores +0x70. [NOT byte-identical] a thiscall
+// + retn 8 hybrid in the original (declared object-first here).
+static int KoreGrowRegistry(int obj, int size, int vmcore)
+{
+    int *b      = (int *)obj;
+    int handler = b[0x68 / 4];
+    if (handler != 0)
+    {
+        int r = ((int (*)(int))handler)(b[1]);
+        if (r != 0)
+            return 0;
+    }
+    int saved = b[0x70 / 4];
+    if (vmcore != 0)
+        b[0x70 / 4] = vmcore;
+    b[0x6C / 4] = b[0x70 / 4];
+    int r = KoreHeapInitGrow(obj, size);
+    b[0x70 / 4] = saved;
+    return r;
+}
+
+// sub_5DA4F0 (0x5DA4F0 - 0x5DA5B5) -- KoreVmAlloc: the VM-heap bump allocator
+// (the primary size-class allocator; the vm-core object is the first arg, the
+// size the second; returns the allocated block or 0). A zero size returns 0;
+// otherwise it decrements the heap's free-block counter (+0xA4) and, when the
+// pending-alloc high-water (+0x38) has overrun the +0xA0 bound with the counter
+// drained and the +0x90 flag clear, re-seeds the counter to 317 and grows the
+// registry (KoreGrowRegistry over heap+0x2C). It then bump-allocates (advance
+// heap+0x04 by the size and call the heap's +0x0C alloc-fn with the +0x10
+// context) up to three times, growing the registry after each miss and, on the
+// third miss, driving the last-resort expand (KoreVmAllocExpand); a hit updates
+// the +0x08 high-water and returns the block. [NOT byte-identical]
+// placement-dependent (relative calls to the grow / expand helpers) and refs the
+// heap's +0x0C alloc-fn slot.
+static int KoreVmAlloc(int vmcore, int size)
+{
+    int *heap = (int *)*(int *)vmcore;
+    if (size == 0)
+        return 0;
+    --heap[0xA4 / 4];
+    if (*(int *)(heap[0x38 / 4] + 4) > heap[0xA0 / 4]
+        && heap[0xA4 / 4] <= 0
+        && heap[0x90 / 4] == 0)
+    {
+        int count   = heap[0x8C / 4];
+        heap[0xA4 / 4] = 317;
+        int newsize = (count == -1) ? 0 : 317 * count;
+        (void)KoreGrowRegistry((int)((char *)heap + 0x2C), newsize, vmcore);
+    }
+    int retry = 3;
+    for (;;)
+    {
+        int bump = heap[1];
+        heap[1] = bump + size;
+        --retry;
+        int result = ((int (*)(int, int, int, int))heap[3])(heap[4], 0, 0, size);
+        if (result != 0)
+        {
+            heap[2] = (heap[2] > heap[1]) ? heap[2] : heap[1];
+            return result;
+        }
+        heap[1] = bump;
+        if (retry == 0 && KoreVmAllocExpand(vmcore, size) != 0)
+            retry = 3;
+        (void)KoreGrowRegistry((int)((char *)heap + 0x2C), -1, vmcore);
+        if (retry == 0)
+            return 0;
+    }
+}
+
+// sub_5EEAE0 (0x5EEAE0 - 0x5EEBA3) -- KoreVmHeapAlloc: allocate a block from
+// the VM heap for a record-table build (the vm-core object is the first arg,
+// the size the second; returns the allocated block or 0). It mirrors the
+// growth re-seed of KoreVmAlloc (decrement the free-block counter +0xA4,
+// re-seed it to 317 and grow the registry over heap+0x2C when the pending
+// high-water overruns +0xA0 with the counter drained and +0x90 clear), then
+// block-allocates (KoreHeapBlockAlloc) in a bounded retry: after each miss it
+// fires the heap's +0x94 error handler (with the +0x30 arg; a non-zero result
+// aborts), sets the heap+0x2C sub-object's +0x9C / +0x98 slots to -1 and drives
+// the heap grow through KoreHeapInitGrow, restoring +0x9C; on the third miss it
+// first drives the last-resort expand (KoreVmAllocExpand) before the grow, and
+// only gives up (returns 0) once the expand has not reset the retry count.
+// [NOT byte-identical] placement-dependent (relative calls to the block / grow /
+// expand helpers) and refs the heap's +0x94 handler slot.
+static int KoreVmHeapAlloc(int vmcore, int size)
+{
+    int *heap = (int *)*(int *)vmcore;
+    --heap[0xA4 / 4];
+    if (*(int *)(heap[0x38 / 4] + 4) > heap[0xA0 / 4]
+        && heap[0xA4 / 4] <= 0
+        && heap[0x90 / 4] == 0)
+    {
+        int count   = heap[0x8C / 4];
+        heap[0xA4 / 4] = 317;
+        int newsize = (count == -1) ? 0 : 317 * count;
+        (void)KoreGrowRegistry((int)((char *)heap + 0x2C), newsize, vmcore);
+    }
+    int retry = 3;
+    for (;;)
+    {
+        --retry;
+        int result = KoreHeapBlockAlloc((int)heap, size);
+        if (result != 0)
+            return result;
+        if (retry == 0 && KoreVmAllocExpand(vmcore, size) != 0)
+            retry = 3;
+        int handler = heap[0x94 / 4];
+        int hr = 0;
+        if (handler != 0)
+        {
+            hr = ((int (*)(int))handler)(heap[0x30 / 4]);
+            if (hr != 0)
+                return hr;
+        }
+        int saved = heap[0x9C / 4];
+        heap[0x9C / 4] = -1;
+        heap[0x98 / 4] = -1;
+        (void)KoreHeapInitGrow((int)((char *)heap + 0x2C), vmcore);
+        heap[0x9C / 4] = saved;
+        if (retry == 0)
+            return 0;
+    }
+}
+
+// sub_5DEA70 (0x5DEA70 - 0x5DEAC6) -- KoreSetupRecordTableBuffers: set up the
+// two backing buffers of a freshly allocated 112-byte record-table object (a
+// usercall passing the block in ESI). Allocate a 440-byte buffer (zeroed) and
+// publish it at the block's +0x1C / +0x20 / +0x28 words (all the buffer) and
+// +0x24 (the buffer's +400 tail); then a 128-byte buffer published at the
+// block's +0x04 (head), +0x08 (head+128) and +0x0C (head-16) words; and mark
+// the block's +0x18 word -2. Returns the -16 base of the 128-byte buffer.
+// [NOT byte-identical] a usercall in the original (declared object-first here)
+// and placement-dependent (relative calls to KoreVmAlloc).
+static int KoreSetupRecordTableBuffers(int obj)
+{
+    int *b    = (int *)obj;
+    int buf1  = KoreVmAlloc(obj, 440);
+    memset((void *)buf1, 0, 440);
+    b[9]  = buf1 + 400;
+    b[8]  = buf1;
+    b[7]  = buf1;
+    b[10] = buf1;
+    int buf2 = KoreVmAlloc(obj, 128);
+    b[1]  = buf2;
+    b[2]  = buf2 + 128;
+    b[3]  = buf2 - 16;
+    b[6]  = -2;
+    return buf2 - 16;
+}
+
+// sub_5DEAD0 (0x5DEAD0 - 0x5DEB6D) -- KoreBuildRecordTable: build a fresh
+// 112-byte record-table object from the vm-core (the vm-core is the sole arg;
+// returns the new block). Allocate 112 bytes (KoreVmHeapAlloc), zero them, clear
+// bit 0 and set bit 1 of the 4-byte header word just before the block, then
+// clone the table-context fields from the vm-core: the +0x00 head, the +0x30 /
+// +0x34 words, the +0x48 word (from *vmcore+0x1B4, later corrected by the
+// caller), the +0x58..+0x6C run, and the +0x4C chain pointer (linked into the
+// *vmcore+0xE4 chain); record the {block, 8} entry at the vm-core's +0x1C entry
+// cursor (advancing it by 8); and set up the two backing buffers
+// (KoreSetupRecordTableBuffers). [NOT byte-identical] placement-dependent
+// (relative calls to KoreVmHeapAlloc / KoreSetupRecordTableBuffers).
+static int KoreBuildRecordTable(int vmcore)
+{
+    int *block = (int *)KoreVmHeapAlloc(vmcore, 112);
+    memset(block, 0, 112);
+    *(int *)((char *)block - 4) =
+        (*(int *)((char *)block - 4) & 0xFFFFFFFE) | 2;
+    block[18] = *(int *)(*(int *)vmcore + 0x1B4);
+    block[12] = *(int *)(vmcore + 0x30);
+    block[13] = *(int *)(vmcore + 0x34);
+    block[0]  = *(int *)vmcore;
+    block[22] = *(int *)(vmcore + 0x58);
+    block[23] = *(int *)(vmcore + 0x5C);
+    block[24] = *(int *)(vmcore + 0x60);
+    block[25] = *(int *)(vmcore + 0x64);
+    block[26] = *(int *)(vmcore + 0x68);
+    block[27] = *(int *)(vmcore + 0x6C);
+    int chainHead = *(int *)(*(int *)vmcore + 0xE4);
+    block[19]  = *(int *)(chainHead + 0x4C);
+    *(int *)(chainHead + 0x4C) = (int)block;
+    int *cursor = (int *)*(int *)(vmcore + 0x1C);
+    cursor[0]   = (int)block;
+    cursor[1]   = 8;
+    *(int *)(vmcore + 0x1C) = (int)(cursor + 2);
+    (void)KoreSetupRecordTableBuffers((int)block);
+    return (int)block;
+}
+
+// sub_5DFE90 (0x5DFE90 - 0x5DFEB9) -- KoreAllocRecordTable: lazily create the
+// allocation list's +0x08 record-table object (thiscall on the list object,
+// whose +0x04 word is the vm-core). Build the 112-byte record table from the
+// vm-core (KoreBuildRecordTable), publish it at the list's +0x08, set the
+// table's +0x48 word to *vmcore+0x14C, and rewind the vm-core's +0x1C entry
+// cursor by 8 (KoreBuildRecordTable advanced it by 8); returns the new table.
+// [NOT byte-identical] placement-dependent (the relative call to
+// KoreBuildRecordTable).
+static int KoreAllocRecordTable(int obj)
+{
+    int vmcore = *(int *)(obj + 4);
+    int table  = KoreBuildRecordTable(vmcore);
+    *(int *)(obj + 8) = table;
+    *(int *)(table + 0x48) = *(int *)(*(int *)vmcore + 0x14C);
+    *(int *)(vmcore + 0x1C) -= 8;
+    return table;
+}
 
 // sub_5EC960 (0x5EC960 - 0x5ECACA) -- KoreHashTableInsert: the
 // setjmp/longjmp-guarded insert of a table entry (thiscall on the table,
