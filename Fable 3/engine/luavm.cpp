@@ -423,14 +423,20 @@ static int    KoreFrameRowEntry(int table, int frameIndex);             // sub_5
 static int    KoreLocalNameAt(int offset, int localIndex, int descriptor); // sub_5D23E0
 static int    KoreFrameLocalStart(int table, int frameIndex);           // sub_5D2710
 static int    KoreFrameLocalEnd(int table, int frameIndex);             // sub_5D2740
-// 'L' / 'f' local-dump table machinery (documented stubs, not reached
-// by the "Snlu" flag string in the panic path):
+// 'L' / 'f' local-dump table machinery (the table-set cluster below is
+// implemented; the rest remain documented stubs, not reached by the "Snlu"
+// flag string in the panic path):
 static int    KoreReallocValueStack(int table, int extra);              // sub_5DD730
 static int    KoreAllocHashTable(int table, int a2, int a3);            // sub_5DDC90
 static int    KoreTableSet(int table, int vmcore, int key, int value);   // sub_5E7400
+static int    KoreTablePanic(int vmcore, const char *format, ...);      // sub_5E2580
+static int    KoreTableEnsureRow(int table, int vmcore, int key, int value); // sub_5E5040
+static int    KoreFindEmptyRow(int table);                              // sub_5D3640
+static int    KoreRowRelocateHash(int mask, int key, int type);         // sub_5D3120
+static int    KoreTableResize(int vmcore, int key, int value);          // sub_5E3F20
 static int    KoreEnsureBackingTable(int table, int vmcore, int a3, int a4); // sub_610CA0
 static void   KoreArraySet(int table, int index, int value);             // sub_5D3210
-static void   KoreDebugMarkDirty(int value, int key);                   // sub_5F7E10
+static void   KoreDebugMarkDirty(int flags, int key);                    // sub_5F7E10
 static int    KoreDebugTrackAppend(int table, int *value);              // sub_5F7D80
 // Existing VM-heap helpers defined later in this translation unit:
 static int    KoreGrowRegistry(int obj, int size, int vmcore);          // sub_5EE150
@@ -1043,14 +1049,15 @@ static int KoreSourceVarName(int table, int *fr)
 // KoreVM table internals already stubbed in this file.
 static int KoreReallocValueStack(int table, int extra) { (void)table; (void)extra; return 0; }
 static int KoreAllocHashTable(int table, int a2, int a3) { (void)table; (void)a2; (void)a3; return 0; }
-static int KoreTableSet(int table, int vmcore, int key, int value)
-{ (void)table; (void)vmcore; (void)key; (void)value; return 0; }
 static int KoreEnsureBackingTable(int table, int vmcore, int a3, int a4)
 { (void)table; (void)vmcore; (void)a3; (void)a4; return 0; }
 static void KoreArraySet(int table, int index, int value)
 { (void)table; (void)index; (void)value; }
-static void KoreDebugMarkDirty(int value, int key) { (void)value; (void)key; }
 static int KoreDebugTrackAppend(int table, int *value) { (void)table; (void)value; return 0; }
+// KoreTableSet (sub_5E7400) and KoreDebugMarkDirty (sub_5F7E10), along with
+// their insert-path closure (KoreTablePanic / KoreTableEnsureRow /
+// KoreFindEmptyRow / KoreRowRelocateHash / KoreTableResize), are implemented
+// further down in this file, after KoreFindGlobalRow (their probe helper).
 
 // ---- sub_5E1280: fill a Lua frame record from the 8-byte value
 // descriptor, walking the flag characters.  'S' sets the type /
@@ -1720,13 +1727,587 @@ static void KoreSweepAllocNodes(int obj)
     (void)obj;
 }
 
-// sub_5E8220 (0x5E8220 - 0x5E83D9) -- KoreRebindAllocNodes: rebind the heap's
-// alloc nodes to the (possibly new) heap storage after a grow, updating the
-// alloc budget (obj+0x6C). [NOT byte-identical] remaining stub.
+// ---- KoreRebindAllocNodes' callees: the VM's global-table enumeration ----
+//
+// A VM table object (the KoreVM "globals" table) is laid out:
+//   +0x00  (owner / tag)
+//   +0x04  hash row count - 1
+//   +0x08  20-byte hash row array, a row is {key, type, value, size, next}
+//          (next is an absolute row-array pointer; type 3 = integer key,
+//          type 4 = string key, 0 = empty, 5..10 / 12 = reference types)
+//   +0x0C  8-byte dense row array, a row is {size, state}
+//   +0x10  dense row count
+// The enumeration walks the dense rows first, then the hash rows; the 2-word
+// `key` parameter is the enumerator's in/out cursor of the form
+// {index (as float), 3} while walking the dense rows, or {row key, row type}
+// while walking the hash rows.  A 2-word `cursor` receives the entry
+// {row value, row size} (the "not found" marker pair on exhaustion).
+
+// dword_1DBCFE0 / dword_1DBCFE4 (both image-zero): the "not found" marker
+// pair a KoreVM lookup fills when it misses and a table entry holds when it
+// is absent.
+static int g_dword_1DBCFE0 = 0;
+static int g_dword_1DBCFE4 = 0;
+
+// sub_5D30B0 (0x5D30B0 - 0x5D3115) -- KoreGlobalRowHash: the probe index
+// into a table's 20-byte row hash array (the mask word first, the {key,
+// type} pair second). Type 3 (integer key): (key >> 2) * 0x9E3779B1 & mask;
+// type 4 (string key): (key ^ ((key ^ (key>>3)) >> 5)) & mask; anything
+// else: the x87-truncated int of the key & mask.
+// [NOT byte-identical] trivial reimplementation.
+static int KoreGlobalRowHash(int mask, int *key)
+{
+    if (key[1] == 3)
+        return (int)((((unsigned int)key[0] >> 2) * 0x9E3779B1u) & (unsigned int)mask);
+    if (key[1] == 4)
+    {
+        unsigned int k = (unsigned int)key[0];
+        return (int)((k ^ ((k ^ (k >> 3)) >> 5)) & (unsigned int)mask);
+    }
+    return (int)(((unsigned int)(int)(float)key[0]) & (unsigned int)mask);
+}
+
+// sub_5D3730 (0x5D3730 - 0x5D37AA) -- KoreFindGlobalStringRow: hash-chain
+// search of the table's 20-byte rows for the string key (type 4, key at
+// row+0, chain through row+16); returns the row index, or -1 when the table
+// is empty (count-1 word == -1), the chain exhausts, or the row index
+// unwinds to -1. Thiscall + retn 4 in the original (the table in ECX, the
+// key on the stack); a plain function here. [NOT byte-identical]
+// placement-dependent (the relative call shape of the original).
+static int KoreFindGlobalStringRow(int table, int key)
+{
+    int *t = (int *)table;
+    if (t[1] == -1)
+        return -1;
+    int *rows = (int *)t[2];
+    int k4[2] = { key, 4 };
+    int idx = KoreGlobalRowHash(t[1], k4);
+    for (;;)
+    {
+        int *row = rows + 5 * idx;
+        int v = (row[1] == 4) ? row[0] : 0;
+        if (v == key)
+            return idx;
+        int next = row[4];
+        if (next != 0)
+        {
+            idx = (next - t[2]) / 20;
+            if (idx != -1)
+                continue;
+        }
+        return -1;
+    }
+}
+
+// sub_5D9940 (0x5D9940 - 0x5D9A86) -- KoreFindGlobalRow: find the 20-byte
+// row index of a {key, type} pair in the table's hash rows. Empty table
+// (the +0x04 count-1 word == -1) or type-0 key -> -1; an integer key (type
+// 3, a whole number) -> the free-block-table lookup KoreFindFreeBlock (its
+// -4 miss result is passed through); a string key (type 4) ->
+// KoreFindGlobalStringRow. Everything else probes (KoreGlobalRowHash) and
+// walks the row chain: a row matches when its type equals the key's type
+// and (for type 3) the row key equals the key exactly as floats (an
+// unordered NaN comparison falls straight to the chain), or when the key
+// words are equal as dwords. Thiscall + retn 8 in the original (the table
+// in ECX, the vm-core and the key on the stack; the vm-core is dead).
+// [NOT byte-identical] placement-dependent (relative calls).
+static int KoreFindGlobalRow(int table, int vmcore, int *key)
+{
+    (void)vmcore;
+    int *t = (int *)table;
+    if (t[1] == -1 || key[1] == 0)
+        return -1;
+    if (key[1] == 3)
+    {
+        float f = *(float *)key;
+        int v = (int)f;
+        if ((double)v == (double)f)
+            return KoreFindFreeBlock(table, v);
+    }
+    else if (key[1] == 4)
+        return KoreFindGlobalStringRow(table, key[0]);
+    int idx = KoreGlobalRowHash(t[1], key);
+    int *rows = (int *)t[2];
+    for (;;)
+    {
+        int *row = rows + 5 * idx;
+        if (row[1] == key[1])
+        {
+            if (key[1] == 3)
+            {
+                float a = *(float *)row;
+                float b = *(float *)key;
+                if (a == b)
+                    return idx;
+                if (a != a || b != b)   // unordered (NaN): skip to the chain
+                    goto next_row;
+            }
+            if (row[0] == key[0])
+                return idx;
+        }
+next_row:
+        int next = row[4];
+        if (next == 0)
+            return -1;
+        idx = (next - t[2]) / 20;
+        if (idx == -1)
+            return -1;
+    }
+}
+
+// sub_5E2580 (0x5E2580 - 0x5E25A4) -- KoreTablePanic: the table-operation
+// error path -- format the message (sub_5E24E0) then raise the VM panic
+// (sub_5F1C30, which longjmps to the nearest handler or calls the error
+// callback).  Only reached for a nil / NaN table index, which the panic
+// traceback's "Snlu" flag string never produces, so it is a documented no-op
+// stub (the original would not return).  A cdecl variadic in the original
+// ((Size, Format, ...)); declared plain here.
+static int KoreTablePanic(int vmcore, const char *format, ...)
+{
+    (void)vmcore; (void)format;
+    return -100;
+}
+
+// sub_5D3640 (0x5D3640 - 0x5D3676) -- KoreFindEmptyRow: find an empty
+// (type == 0) 20-byte hash row by walking the hash-row count (the table's
+// +0x14 word) downward; returns the row index, or -1 when the table has no
+// rows (count <= 0) or the walk reaches row 0.  thiscall in the original
+// (the table in ECX); a plain free function here.  [NOT byte-identical] a
+// thiscall hybrid and placement-dependent.
+static int KoreFindEmptyRow(int table)
+{
+    int *t = (int *)table;
+    if (t[5] <= 0)
+        return -1;
+    int *rows = (int *)t[2];
+    for (;;)
+    {
+        int idx = --t[5];
+        if (rows[idx * 5 + 1] == 0)   // the row's type word is 0
+            return idx;
+        if (idx == 0)
+            return -1;
+    }
+}
+
+// sub_5D3120 (0x5D3120 - 0x5D3188) -- KoreRowRelocateHash: recompute the
+// probe index of a {key, type} pair after a table rehash.  Type 3 (integer
+// key): the x87 round-to-nearest int of the key & mask; type 4 (string):
+// (key ^ ((key ^ (key>>3)) >> 5)) & mask; anything else: (key>>2) *
+// 0x9E3779B1 & mask.  [NOT byte-identical] a trivial reimplementation (the
+// x87 round-to-nearest is approximated by a plain int cast).
+static int KoreRowRelocateHash(int mask, int key, int type)
+{
+    if (type == 3)
+        return (int)(((unsigned int)(int)(float)key) & (unsigned int)mask);
+    if (type == 4)
+    {
+        unsigned int k = (unsigned int)key;
+        return (int)((k ^ ((k ^ (k >> 3)) >> 5)) & (unsigned int)mask);
+    }
+    return (int)((((unsigned int)key >> 2) * 0x9E3779B1u) & (unsigned int)mask);
+}
+
+// sub_5E3F20 (0x5E3F20 - 0x5E406F) -- KoreTableResize: grow / rehash the
+// table's 20-byte row hash array (the deep resize taken when no free row is
+// available), charging the alloc budget.  Only reached when a table grows
+// during a set, which the panic path never does, so it is a documented no-op
+// stub.  [NOT byte-identical] remaining stub.
+static int KoreTableResize(int vmcore, int key, int value)
+{
+    (void)vmcore; (void)key; (void)value;
+    return 0;
+}
+
+// sub_5F7E10 (0x5F7E10 - 0x5F7E6F) -- KoreDebugMarkDirty: mark a referenced
+// global as dirty for the debug GC.  `flags` is a pointer to a debug-flag
+// byte (the table's -8 header) and `key` is the {payload, type} value pair.
+// When the pair's type is a reference type (4..10 or 12), the flag byte's
+// bit 0 is clear, and (for type 4) the payload's high bit is clear, the
+// payload's header byte (payload-4 for type 4 / 7, else payload-8) has bit 0
+// set; for a non-type-4 payload it then appends to the debug track
+// (KoreDebugTrackAppend, a remaining stub).  thiscall + retn 8 hybrid in the
+// original (declared plain here).  [NOT byte-identical] a retn-8 hybrid and
+// placement-dependent.
+static void KoreDebugMarkDirty(int flags, int key)
+{
+    int *pair = (int *)key;
+    int type = pair[1];
+    if (!((type >= 4 && type <= 10) || type == 12))
+        return;
+    if ((*(unsigned char *)flags & 1) != 0)
+        return;
+    int payload = pair[0];
+    if (type == 4 && (*(int *)payload & 0x80000000) != 0)
+        return;
+    int header = (type == 7 || type == 4) ? payload - 4 : payload - 8;
+    if ((*(unsigned char *)header & 1) != 0)
+        return;
+    *(int *)header |= 1;
+    if (type != 4)
+        (void)KoreDebugTrackAppend(flags, pair);
+}
+
+// sub_5E5040 (0x5E5040 - 0x5E52AB) -- KoreTableEnsureRow: reserve the 20-byte
+// hash row for a {key, type} pair and return the row index the key now
+// occupies (or a negative dense index, -index, for a whole-number integer key
+// once the table has been resized).  The probe (KoreGlobalRowHash) row is used
+// directly when its value word is empty; otherwise a free row
+// (KoreFindEmptyRow) is taken and the probe's incumbent is relocated -- either
+// chained right after the probe (when the incumbent's rehashed probe
+// KoreRowRelocateHash equals the probe) or spliced into its own rehashed chain
+// (the incumbent's 20 bytes are copied, the probe row is reset to the "not
+// found" globals, and KoreDebugMarkDirty is invoked for the relocated key and
+// value halves when the relocated row precedes the probe and the vm's +0x3C
+// debug byte is 1) -- then the key pair is written into the reserved row. With
+// no free row the value is stashed in the vm-core's +0x60 / +0x64 words and
+// the table is resized (KoreTableResize); a whole-number integer key within
+// the dense range then returns -index, otherwise the probe is recomputed.
+// thiscall + retn 0Ch in the original (declared plain here).  [NOT
+// byte-identical] a thiscall + retn 0Ch hybrid, placement-dependent (relative
+// calls), and refs the high-VA "not found" globals.
+static int KoreTableEnsureRow(int table, int vmcore, int key, int value)
+{
+    int *t = (int *)table;
+    int *kp = (int *)key;      // {key, type}
+    int *vp = (int *)value;    // {value, size}
+    int *rows;
+    int v8;
+    for (;;)
+    {
+        rows = (int *)t[2];
+        v8 = (rows != 0) ? KoreGlobalRowHash(t[1], kp) : 0;
+        if (rows != 0 && rows[v8 * 5 + 3] == 0)
+            break;   // empty probe row: write the key directly
+        int freerow = KoreFindEmptyRow(table);
+        if (freerow != -1)
+        {
+            int newhash = KoreRowRelocateHash(t[1], rows[v8 * 5 + 0], rows[v8 * 5 + 1]);
+            if (newhash == v8)
+            {
+                // fast: chain the free row right after the probe
+                rows[freerow * 5 + 4] = rows[v8 * 5 + 4];
+                rows[v8 * 5 + 4] = (int)(rows + freerow * 20);
+                v8 = freerow;
+            }
+            else
+            {
+                // walk the rehashed chain to find where the probe sits
+                int pos = newhash;
+                int found = 0;
+                for (;;)
+                {
+                    int next = rows[pos * 5 + 4];
+                    int nidx = (next == 0) ? -1 : (next - (int)rows) / 20;
+                    if (nidx == v8)
+                    {
+                        found = 1;
+                        break;
+                    }
+                    if (nidx == -1)
+                        break;   // chain exhausted before the probe
+                    pos = nidx;
+                }
+                if (found)
+                {
+                    rows[pos * 5 + 4] = (int)(rows + freerow * 20);
+                    // copy the probe's 20 bytes into the free row
+                    rows[freerow * 5 + 0] = rows[v8 * 5 + 0];
+                    rows[freerow * 5 + 1] = rows[v8 * 5 + 1];
+                    rows[freerow * 5 + 2] = rows[v8 * 5 + 2];
+                    rows[freerow * 5 + 3] = rows[v8 * 5 + 3];
+                    rows[freerow * 5 + 4] = rows[v8 * 5 + 4];
+                    if (freerow < v8 && *(int *)(*(int *)vmcore + 0x3C) == 1)
+                    {
+                        int relocated[2] = { rows[v8 * 5 + 0], rows[v8 * 5 + 1] };
+                        int rvalue[2]    = { rows[v8 * 5 + 2], rows[v8 * 5 + 3] };
+                        KoreDebugMarkDirty(table - 8, (int)relocated);
+                        KoreDebugMarkDirty(table - 8, (int)rvalue);
+                    }
+                    // reset the probe row to the "not found" globals
+                    rows[v8 * 5 + 4] = 0;
+                    rows[v8 * 5 + 2] = g_dword_1DBCFE0;
+                    rows[v8 * 5 + 3] = g_dword_1DBCFE4;
+                }
+            }
+            break;
+        }
+        // no free row: stash the value and resize the table
+        *(int *)(*(int *)vmcore + 0x60) = vp[0];
+        *(int *)(*(int *)vmcore + 0x64) = vp[1];
+        (void)KoreTableResize(vmcore, key, value);
+        *(int *)(*(int *)vmcore + 0x64) = 0;
+        int idx = (int)(float)kp[0];
+        if (kp[1] == 3 && (double)idx == (double)(float)kp[0] && idx > 0 &&
+            (unsigned int)(idx - 1) < (unsigned int)t[4])
+            return -idx;
+        // else recompute the probe (loop)
+    }
+    rows[v8 * 5 + 1] = kp[1];
+    rows[v8 * 5 + 0] = kp[0];
+    return v8;
+}
+
+// sub_5E7400 (0x5E7400 - 0x5E7521) -- KoreTableSet: set a {key, type} ->
+// {value, size} entry in a VM table.  The table layout is {+0x00 ?, +0x04
+// hash mask, +0x08 20-byte hash rows, +0x0C 8-byte dense rows, +0x10 dense
+// count, +0x14 hash row count}.  A whole-number integer key (type 3) within
+// the dense range is written straight into the dense row (index-1); a NaN
+// index raises the "table index is NaN" panic and a nil key (type 0) the
+// "table index is nil" panic (both then fall through).  Otherwise the key's
+// row is found (KoreFindGlobalRow): a found row gets the value pair written
+// into its +0x08 / +0x0C words; a not-found key is inserted (KoreTableEnsureRow)
+// -- a non-negative result writes the value into the new hash row (with
+// KoreDebugMarkDirty when the vm's +0x3C debug byte is 1), a negative result
+// is a dense index that writes into the dense row.  Returns the value's size
+// word.  thiscall + retn 0Ch in the original (declared plain here).  [NOT
+// byte-identical] a thiscall + retn 0Ch hybrid, placement-dependent (relative
+// calls), and refs the high-VA "table index" string globals.
+static int KoreTableSet(int table, int vmcore, int key, int value)
+{
+    int *t = (int *)table;
+    int *kp = (int *)key;      // {key, type}
+    int *vp = (int *)value;    // {value, size}
+    if (kp[1] == 3)
+    {
+        float f = *(float *)kp;
+        if (f != f)   // NaN index
+            KoreTablePanic(vmcore, "table index is NaN");
+        else
+        {
+            int idx = (int)f;
+            if (idx > 0 && (unsigned int)(idx - 1) < (unsigned int)t[4])
+            {
+                int *dense = (int *)t[3];
+                dense[(idx - 1) * 2 + 0] = vp[0];
+                dense[(idx - 1) * 2 + 1] = vp[1];
+                return vp[1];
+            }
+        }
+    }
+    else if (kp[1] == 0)
+        KoreTablePanic(vmcore, "table index is nil");
+    int row = KoreFindGlobalRow(table, vmcore, kp);
+    if (row == -1)
+    {
+        int r = KoreTableEnsureRow(table, vmcore, key, value);
+        if (r >= 0)
+        {
+            if (*(int *)(*(int *)vmcore + 0x3C) == 1)
+                KoreDebugMarkDirty(table - 8, key);
+            int *rows = (int *)t[2];
+            rows[r * 5 + 2] = vp[0];
+            rows[r * 5 + 3] = vp[1];
+            return vp[1];
+        }
+        int *dense = (int *)t[3];
+        int base = -(r + 1);   // r = -index, so base = index - 1
+        dense[base * 2 + 0] = vp[0];
+        dense[base * 2 + 1] = vp[1];
+        return vp[1];
+    }
+    int *rows = (int *)t[2];
+    rows[row * 5 + 2] = vp[0];
+    rows[row * 5 + 3] = vp[1];
+    return vp[1];
+}
+
+// sub_5D34E0 (0x5D34E0 - 0x5D3587) -- KoreNextHashGlobal: advance the
+// enumerator to the first occupied (type != 0) 20-byte hash row at or after
+// row `start` (0-based, the count is the +0x04 word + 1): the key pair
+// becomes {row key, row type} and the cursor {row value, row size}. On
+// exhaustion (an empty row array or the scan reaching the count) the cursor
+// becomes the "not found" marker pair (key is left untouched, exactly as
+// in the original). Thiscall + retn 12 in the original (the table in ECX,
+// the cursor / start / key on the stack). [NOT byte-identical] a thiscall +
+// retn 12 hybrid (declared object-first here) and refs the high-VA globals.
+static void KoreNextHashGlobal(int table, int *cursor, int start, int *key)
+{
+    int *t = (int *)table;
+    int *rows = (int *)t[2];
+    if (rows == 0)
+    {
+        cursor[0] = g_dword_1DBCFE0;
+        cursor[1] = g_dword_1DBCFE4;
+        return;
+    }
+    int n = t[1] + 1;
+    int i = start;
+    while (i < n && rows[5 * i + 1] == 0)
+        ++i;
+    if (i >= n)
+    {
+        cursor[0] = g_dword_1DBCFE0;
+        cursor[1] = g_dword_1DBCFE4;
+        return;
+    }
+    int *row = rows + 5 * i;
+    key[0]     = row[0];
+    key[1]     = row[1];
+    cursor[0]  = row[2];
+    cursor[1]  = row[3];
+}
+
+// sub_5D3590 (0x5D3590 - 0x5D363E) -- KoreNextDenseGlobal: advance the
+// enumerator over the table's 8-byte dense rows ({size, state}, count at
+// +0x10, base +0x0C): the index resumes at the whole-number float in the
+// key (0 when the key type is 0) and skips empty (state 0) rows. On a hit
+// the key becomes {index+1 (as a float, + 2^32 when negative, exactly as
+// the original), 3} and the cursor {row size, row state}; when the scan
+// reaches the count it hands off to the hash rows through
+// KoreNextHashGlobal (start 0). Thiscall + retn 8 in the original.
+// [NOT byte-identical] a thiscall + retn 8 hybrid (declared object-first
+// here) and placement-dependent (the relative call into KoreNextHashGlobal).
+static void KoreNextDenseGlobal(int table, int *cursor, int *key)
+{
+    int *t = (int *)table;
+    int i = (key[1] != 0) ? (int)(float)key[0] : 0;
+    int count = t[4];
+    int *rows = (int *)t[3];
+    if (i < count)
+        while (i < count && rows[2 * i + 1] == 0)
+            ++i;
+    if (i >= count)
+    {
+        KoreNextHashGlobal(table, cursor, 0, key);
+        return;
+    }
+    int next = i + 1;
+    *(float *)key = (float)next;
+    if (next < 0)
+        *(float *)key += 4294967296.0f;  // the original's 2^32 bias branch
+    key[1] = 3;
+    int *row = rows + 2 * i;
+    cursor[0] = row[0];
+    cursor[1] = row[1];
+}
+
+// sub_5DDBD0 (0x5DDBD0 - 0x5DDE1A) -- KoreNextGlobalByKey: the hash-side
+// step of the global enumerator -- find the row of the key (KoreFindGlobalRow
+// with the vm-core forwarded, dead) and advance to the next occupied row
+// past it (KoreNextHashGlobal, start = row + 1; a -1 miss makes the cursor
+// the "not found" marker pair). Returns the cursor pointer. Thiscall +
+// retn 12 in the original. [NOT byte-identical] a thiscall + retn 12 hybrid
+// (declared object-first here), placement-dependent, and refs the high-VA
+// globals.
+static int *KoreNextGlobalByKey(int table, int *cursor, int vmcore, int *key)
+{
+    int idx = KoreFindGlobalRow(table, vmcore, key);
+    if (idx == -1)
+    {
+        cursor[0] = g_dword_1DBCFE0;
+        cursor[1] = g_dword_1DBCFE4;
+    }
+    else
+        KoreNextHashGlobal(table, cursor, idx + 1, key);
+    return cursor;
+}
+
+// sub_5DF6B0 (0x5DF6B0 - 0x5DF73A) -- KoreNextGlobal: one step of the VM's
+// global-table enumerator. `key` is the in/out cursor ({index-as-float, 3}
+// while walking the dense rows, {row key, row type} while walking the hash
+// rows) and `cursor` receives the entry {value, size}; the vm-core (the 2nd
+// stack arg) is forwarded to the hash-side step but dead there. The dense
+// side runs when the key type is 0 (fresh enumerator) or when it is 3 with
+// a whole-number index in 1..dense count (the dense row array's count at
+// +0x10 must be > 0); anything else takes the hash side
+// (KoreNextGlobalByKey). Returns the cursor pointer. Thiscall + retn 12 in
+// the original. [NOT byte-identical] a thiscall + retn 12 hybrid (declared
+// object-first here) and placement-dependent (relative calls).
+static int *KoreNextGlobal(int table, int *cursor, int vmcore, int *key)
+{
+    int dense = (key[1] == 0);
+    if (!dense && *(int *)(table + 16) > 0 && key[1] == 3)
+    {
+        float f = *(float *)key;
+        int v = (int)f;
+        dense = ((double)v == (double)f && v > 0 && v - 1 < *(int *)(table + 16));
+    }
+    if (dense)
+        KoreNextDenseGlobal(table, cursor, key);
+    else
+        KoreNextGlobalByKey(table, cursor, vmcore, key);
+    return cursor;
+}
+
+// sub_5E8220 (0x5E8220 - 0x5E83D9) -- KoreRebindAllocNodes: the post-grow
+// rebind of the heap's alloc-node chain (obj+0x2C head, a node is {flags,
+// table, next}). For each node, every global of the node's table is
+// enumerated (KoreNextGlobal, the fresh key from the "not found" globals);
+// for each entry whose key half ({row key, row type}) or value half
+// ({row value, row size}) carries a reference type (5..10 or 12), whose
+// node flag bit is set (bit 2 for the key half, bit 1 for the value half)
+// and whose payload header byte is unflagged (the low bit clear at
+// pointer-4 for type 4 / 7 payloads, else pointer-8), the global is reset
+// through KoreTableSet to the "not found" marker pair, the VM's +0x3C
+// debug byte (behind the vm-core's +0x00, the heap's obj+0x04 slot) is
+// checked and KoreDebugMarkDirty invoked when it is 1, and the alloc
+// budget (obj+0x6C) is charged 5 per rebind. Every third node additionally
+// charges the budget 1. The chain head (obj+0x2C) is cleared and the null
+// tail returned. [NOT byte-identical] a thiscall in the original (declared
+// object-first here), placement-dependent (relative calls into the
+// enumerator, KoreTableSet and KoreDebugMarkDirty), and refs the high-VA
+// globals.
 static int KoreRebindAllocNodes(int obj)
 {
-    (void)obj;
-    return 0;
+    int *h = (int *)obj;
+    int *node = (int *)h[11];      // the obj+0x2C alloc-node chain head
+    if (node == 0)
+    {
+        h[11] = 0;
+        return 0;
+    }
+    int vmcore = h[1];             // obj+0x04 (the table enumerator arg, dead)
+    int counter = 0;
+    for (;;)
+    {
+        int table = node[1];       // the node's table
+        int key[2]  = { g_dword_1DBCFE0, g_dword_1DBCFE4 };
+        int nil[2]  = { g_dword_1DBCFE0, g_dword_1DBCFE4 };
+        int cursor[2];
+        (void)KoreNextGlobal(table, cursor, vmcore, key);
+        int i = cursor[0];
+        int v = cursor[1];
+        while (v != 0)
+        {
+            if ((key[1] >= 5 && key[1] <= 10 || key[1] == 12) && (node[0] & 2) != 0)
+            {
+                int p = (key[1] == 7) ? (key[0] - 4) : (key[0] - 8);
+                if ((*(unsigned char *)p & 1) == 0)
+                {
+                    (void)KoreTableSet(table, vmcore, (int)key, (int)nil);
+                    if (*(int *)(*(int *)vmcore + 0x3C) == 1)
+                        KoreDebugMarkDirty((int)cursor, (int)nil);
+                    h[27] -= 5;
+                }
+            }
+            if ((v >= 5 && v <= 10 || v == 12) && (node[0] & 1) != 0)
+            {
+                int p = (v == 7) ? (i - 4) : (i - 8);
+                if ((*(unsigned char *)p & 1) == 0)
+                {
+                    (void)KoreTableSet(table, vmcore, (int)key, (int)nil);
+                    if (*(int *)(*(int *)vmcore + 0x3C) == 1)
+                        KoreDebugMarkDirty((int)cursor, (int)nil);
+                    h[27] -= 5;
+                }
+            }
+            (void)KoreNextGlobal(table, cursor, vmcore, key);
+            i = cursor[0];
+            v = cursor[1];
+        }
+        if (++counter == 3)
+        {
+            --h[27];
+            counter = 0;
+        }
+        node = (int *)node[2];
+        if (node == 0)
+        {
+            h[11] = 0;
+            return 0;
+        }
+    }
 }
 
 // sub_5ED980 (0x5ED980 - 0x5EDAB2) -- KoreReassignAllocHeap: move the alloc
