@@ -102,6 +102,12 @@ for %%F in (%SRCS%) do (
 )
 
 echo.
+echo === ml, x86: ..\..\engine\luavm_asm.asm ===
+rem MASM routines needing byte-exact encodings the C inline assembler cannot emit (KoreForEachAllocNode).
+ml /nologo /c /coff ..\..\engine\luavm_asm.asm
+if errorlevel 1 (echo ASM FAILED & popd & popd & exit /b 1)
+
+echo.
 echo === lib: import libraries (from engine/*.def) ===
 rem One .def per non-SDK DLL the original imports; generate an import
 rem library for each so the linker can bind calls to those DLLs. (Standard
@@ -117,7 +123,7 @@ echo === link, x86 ===
 rem .lib order: bundled third-party / DirectX import libs, then the standard
 rem Windows DLLs the original imports (kernel32 is pulled by the default CRT).
 set "IMPORT_LIBS=xlive.lib d3d9.lib dinput8.lib dsound.lib xinput1_3.lib x3daudio1_7.lib d3dx9_42.lib binkw32.lib steam_api.lib user32.lib gdi32.lib shell32.lib ole32.lib rpcrt4.lib oleaut32.lib ws2_32.lib"
-link %LNKFLAGS% /out:Fable3.exe /pdb:Fable3.pdb main.obj framework.obj common.obj engine.obj worker.obj manager.obj object_registry.obj xlo_device.obj gameengine.obj gamethread.obj gamemain.obj luavm.obj XLip.obj netinit.obj thread.obj save.obj %IMPORT_LIBS% %RRES%
+link %LNKFLAGS% /out:Fable3.exe /pdb:Fable3.pdb main.obj framework.obj common.obj engine.obj worker.obj manager.obj object_registry.obj xlo_device.obj gameengine.obj gamethread.obj gamemain.obj luavm.obj luavm_asm.obj XLip.obj netinit.obj thread.obj save.obj %IMPORT_LIBS% %RRES%
 if errorlevel 1 (echo LINK FAILED & popd & popd & exit /b 1)
 
 rem The exe now really imports from the bundled third-party DLLs; copy the

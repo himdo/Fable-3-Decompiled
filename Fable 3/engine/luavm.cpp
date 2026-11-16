@@ -19,6 +19,8 @@
 #include <float.h>                // _controlfp (the FPU round-toward-zero in KoreHeapInitGrow)
 #include <intrin.h>               // __rdtsc (the QPC span accounting in KoreHeapInitGrow)
 #include <string.h>               // memset
+#include <stdio.h>                // _vsnprintf_s (the float / source formatting)
+#include <stdarg.h>               // va_list (the vsnprintf wrapper)
 
 // F3StubRelease (the vtable slot 0 release stub) — a module-private copy
 // of gamemain.cpp's identical static stub, so the CLuaManager /
@@ -369,13 +371,1089 @@ static void KoreSwapTableContext(int a, int b)
     t = pa[18]; pa[18] = pb[18]; pb[18] = t;
 }
 
-// sub_5F1A20 (0x5F1A20 - 0x5F1BA6) -- KorePanicTraceback: the "Kore Panic"
-// traceback printer — the out-of-scope leaf of the record-table allocation
-// path. In the real VM it walks the current VM state and prints a full
-// function/local traceback, then never returns; the whole path is dead in the
-// stub world (the VM heap never grows or panics), so this is a no-op stub.
-// [NOT byte-identical] remaining stub (390-byte traceback emitter).
-static void KorePanicTraceback(int obj) { (void)obj; }
+// ============================================================
+//  KorePanicTraceback  (0x5F1A20 - 0x5F1BA6)  and its full
+//  reachable closure -- the "Kore Panic" traceback printer.
+//
+//  When the VM heap OOM-expands past its last-resort handler the
+//  error path (sub_5F1C30) dispatches here to dump the current
+//  VM state: the main / state names, the unprotected error string
+//  (the top of the value array, reformatted through the float /
+//  string interning), and a full function / local traceback (one
+//  "Function ... Line ..." line per frame plus the local variable
+//  of each frame).  The whole path is dead in the stub world (the
+//  VM heap never actually grows or panics), but it is reimplemented
+//  faithfully here: every reachable frame / source / string-intern
+//  / value-format helper is implemented per IDA, and only the deep
+//  local-dump table machinery (the 'L' / 'f' branches of the frame
+//  fillers, which the "Snlu" flag string never reaches) is left as
+//  documented stubs.
+//  [NOT byte-identical] placement-dependent (relative calls to the
+//  VM-printf at *a1+692, the frame fillers, the intern / alloc
+//  helpers) and it references the high-VA string slots
+//  unk_1ADDF7E / unk_1ADDF7F / unk_1ADDF82 (all empty strings).
+// ============================================================
+
+// The VM-printf dispatch slot (a1+692) takes (this, format, ...).
+typedef int (*KoreVprintfFn)(int, const char *, ...);
+
+// ROL / ROR helpers for the KoreVM string hash (the seed constant
+// 0x6B6F7265 == "kore" little-endian).
+static unsigned int KROL(unsigned int x, int s) { return (x << s) | (x >> (32 - s)); }
+static unsigned int KROR(unsigned int x, int s) { return (x >> s) | (x << (32 - s)); }
+
+// Forward declarations for the reachable closure.
+static int    KoreFormatValue(int table, int valuePtr, int *outLen);   // sub_5EF090
+static int    KoreResolveFrameIndex(int table, int frameNo, int *fr);  // sub_5D9240
+static int    KoreResolveFrameInfo(int table, const char *flags, int *fr); // sub_5E1520
+static int    KoreGetLocalName(int table, int *fr, int localIndex);    // sub_5D8D50
+static int    KoreFillLuaFrame(int *fr, int table, int desc, const char *flags); // sub_5E1280
+static int    KoreFillCFrame(int *fr, int table, int desc, const char *flags);   // sub_5D9090
+static int    KoreSourceVarName(int table, int *fr);                    // sub_5D8DE0
+static int    KoreBuildSourceDesc(int *fr);                             // sub_5D2430
+static int    KoreVsnprintf(char *buf, unsigned int cnt, const char *fmt, ...); // sub_5D1390
+static int    KoreStrncpy(char *dst, unsigned int size, const char *src);        // sub_5D1330
+static int   *KoreInternString(int *table, int vmcore, const void *src, int size, unsigned int hash); // sub_5EEED0
+static int    KoreRehashInterned(int *table, int vmcore);               // sub_5EEC00
+static int   *KoreAllocVmMem(int vmcore, unsigned int size);            // sub_5DA410
+static int    KoreFrameLocalBase(int *fr, int table);                   // sub_5D8D30
+static int    KoreFrameLocalRange(int table, int frameIndex);           // sub_5D2860
+static int    KoreFrameRowValid(int table, int frameIndex);             // sub_5D27D0
+static int    KoreFrameRowEntry(int table, int frameIndex);             // sub_5D2810
+static int    KoreLocalNameAt(int offset, int localIndex, int descriptor); // sub_5D23E0
+static int    KoreFrameLocalStart(int table, int frameIndex);           // sub_5D2710
+static int    KoreFrameLocalEnd(int table, int frameIndex);             // sub_5D2740
+// 'L' / 'f' local-dump table machinery (documented stubs, not reached
+// by the "Snlu" flag string in the panic path):
+static int    KoreReallocValueStack(int table, int extra);              // sub_5DD730
+static int    KoreAllocHashTable(int table, int a2, int a3);            // sub_5DDC90
+static int    KoreTableSet(int table, int vmcore, int key, int value);   // sub_5E7400
+static int    KoreEnsureBackingTable(int table, int vmcore, int a3, int a4); // sub_610CA0
+static void   KoreArraySet(int table, int index, int value);             // sub_5D3210
+static void   KoreDebugMarkDirty(int value, int key);                   // sub_5F7E10
+static int    KoreDebugTrackAppend(int table, int *value);              // sub_5F7D80
+// Existing VM-heap helpers defined later in this translation unit:
+static int    KoreGrowRegistry(int obj, int size, int vmcore);          // sub_5EE150
+static int    KoreVmAllocExpand(int vmcore, int size);                  // sub_5F6420
+static int    KoreVmHeapAlloc(int vmcore, int size);                    // sub_5EEAE0
+
+// ---- sub_5D1390: the vsnprintf wrapper (returns BufferCount on a
+// negative truncation result, matching the original's contract). ----
+static int KoreVsnprintf(char *buf, unsigned int cnt, const char *fmt, ...)
+{
+    va_list va;
+    va_start(va, fmt);
+    int result = vsnprintf(buf, cnt, fmt, va);
+    va_end(va);
+    if (result < 0)
+        return (int)cnt;
+    return result;
+}
+
+// ---- sub_5D1330: the strncpy wrapper (null-terminates at size-1). ----
+static int KoreStrncpy(char *dst, unsigned int size, const char *src)
+{
+    if (size != 0)
+    {
+        (void)strncpy(dst, src, size - 1);
+        dst[size - 1] = 0;
+    }
+    return 0;
+}
+
+// ---- sub_5D83D0-style float hash: the "kore" 32-bit string hash used
+// by every string-interning path.  Seed = (len + 0x6B6F7265); up to two
+// 12-byte chunks are mixed, then the tail bytes are folded into the
+// three accumulators, then a 6-step finalization.  (The effective hash
+// only ever sees the first min(24, len) bytes of the content.) ----
+static unsigned int KoreHashKore(const char *buf, int len)
+{
+    unsigned int seed = (unsigned int)len + 0x6B6F7265u;
+    unsigned int acc1 = seed, acc2 = seed, acc3 = seed;
+    int n = len;
+    const unsigned int *p = (const unsigned int *)buf;
+    if (n >= 0x1F)
+        n = 31;
+    if (n > 12)
+    {
+        // chunk 1
+        unsigned int d0 = p[0], d1 = p[1];
+        n -= 12;
+        unsigned int v12 = acc1 + d0;
+        unsigned int v13 = d1 + acc1;
+        unsigned int v14 = acc3 + d0 - v13;
+        unsigned int v16 = v12 + v13;
+        unsigned int v17 = v14 ^ KROL(v13, 4);
+        unsigned int v18 = v12 - v17;
+        unsigned int v20 = v16 + v17;
+        unsigned int v21 = v18 ^ KROL(v17, 6);
+        unsigned int v22 = (v16 - v21) ^ KROL(v21, 8);
+        unsigned int v23 = v20 + v21;
+        unsigned int v24 = (v20 - v22) ^ KROL(v22, 16);
+        unsigned int v25 = v23 + v22;
+        unsigned int v26 = (v23 - v24) ^ KROR(v24, 13);
+        acc3 = v25 + v24;
+        acc1 = (v25 - v26) ^ KROL(v26, 4);
+        acc2 = acc3 + v26;
+        p += 3;
+        if (n > 12)
+        {
+            // chunk 2
+            unsigned int e0 = p[0], e1 = p[1], e2 = p[2];
+            n -= 12;
+            unsigned int v27 = e2 + acc1;
+            unsigned int v28 = e1 + acc2;
+            unsigned int v29 = (acc3 + e0 - v27) ^ KROL(v27, 4);
+            unsigned int v30 = v28 + v27;
+            unsigned int v31 = v28 - v29;
+            unsigned int v33 = v30 + v29;
+            unsigned int v34 = v31 ^ KROL(v29, 6);
+            unsigned int v35 = (v30 - v34) ^ KROL(v34, 8);
+            unsigned int v36 = v33 + v34;
+            unsigned int v37 = (v33 - v35) ^ KROL(v35, 16);
+            unsigned int v38 = v36 + v35;
+            unsigned int v39 = KROR(v37, 13);
+            unsigned int v40 = v36 - v37;
+            acc3 = v38 + v37;
+            acc1 = (v38 - (v40 ^ v39)) ^ KROL(v40 ^ v39, 4);
+            acc2 = acc3 + (v40 ^ v39);
+            p += 3;
+        }
+    }
+    const unsigned char *q = (const unsigned char *)p;
+    switch (n)
+    {
+        case 12: acc1 += *(const unsigned int *)(q + 8);
+        case 11: acc1 += ((unsigned int)q[10]) << 8;
+        case 10: acc1 += ((unsigned int)q[9]) << 16;
+        case 9:  acc1 += ((unsigned int)q[8]) << 24;
+        case 8:  acc2 += *(const unsigned int *)(q + 4);
+                 acc3 += *(const unsigned int *)(q + 0);
+                 break;
+        case 7:  acc2 += ((unsigned int)q[6]) << 8;
+        case 6:  acc2 += ((unsigned int)q[5]) << 16;
+        case 5:  acc2 += ((unsigned int)q[4]) << 24;
+        case 4:  acc3 += *(const unsigned int *)(q + 0);
+                 break;
+        case 3:  acc3 += ((unsigned int)q[2]) << 8;
+        case 2:  acc3 += ((unsigned int)q[1]) << 16;
+        case 1:  acc3 += ((unsigned int)q[0]) << 24;
+                 break;
+        default: break;   // case 0
+    }
+    unsigned int v41 = (acc2 ^ acc1) - KROL(acc2, 14);
+    unsigned int v42 = (acc3 ^ v41) - KROL(v41, 11);
+    unsigned int v43 = (v42 ^ acc2) - KROR(v42, 7);
+    unsigned int v44 = (v43 ^ v41) - KROL(v43, 16);
+    unsigned int v45 = (v42 ^ v44) - KROL(v44, 4);
+    unsigned int v46 = (v45 ^ v43) - KROL(v45, 14);
+    unsigned int result = (v46 ^ v44) - KROR(v46, 8);
+    return result;
+}
+
+// ---- sub_5DA410: the VM-heap block allocation with retry.  `vmcore`
+// holds the heap object at +0; it decrement the free-block counter
+// (+0xA4), re-seeds the registry when the free-list is over the
+// threshold, then bump-allocates (advance +0x04, call the +0x0C
+// block-alloc fn with the +0x10 context) in a bounded 4-attempt retry,
+// driving the last-resort expand (KoreVmAllocExpand) before each re-seed.
+// Returns the block just past the 4-byte header, or 0 on exhaustion. ----
+static int *KoreAllocVmMem(int vmcore, unsigned int size)
+{
+    int *heap = (int *)vmcore;
+    int v2 = heap[0];
+    if (size != 0)
+    {
+        --*(int *)(v2 + 164);
+        if (*(int *)(*(int *)(v2 + 56) + 4) > *(int *)(v2 + 160)
+            && *(int *)(v2 + 164) <= 0
+            && *(int *)(v2 + 144) == 0)
+        {
+            int v4 = *(int *)(v2 + 140);
+            *(int *)(v2 + 164) = 317;
+            int v5 = (v4 == -1) ? 0 : 317 * v4;
+            KoreGrowRegistry((int)(v2 + 44), (size_t)heap, v5);
+        }
+        int v6 = 3;
+        int v7 = (int)size + 4;
+        while (1)
+        {
+            int v8 = *(int *)(v2 + 4);
+            *(int *)(v2 + 4) = v8 + v7;
+            --v6;
+            int v9 = (*(int (**)(int, int, int, unsigned int))(v2 + 12))(
+                         *(int *)(v2 + 16), 0, 0, (unsigned int)v7);
+            if (v9 != 0)
+            {
+                *(int *)v9 = 0;
+                *(int *)v9 = *(int *)v2;
+                int v10 = *(int *)(v2 + 4);
+                if (*(int *)(v2 + 8) > v10)
+                    v10 = *(int *)(v2 + 8);
+                *(int *)(v2 + 8) = v10;
+                if (v9 + 4 != 0)
+                    return (int *)(v9 + 4);
+            }
+            else
+            {
+                *(int *)(v2 + 4) = v8;   // roll back the bump
+            }
+            if (v6 == 0)
+            {
+                KoreVmAllocExpand(vmcore, (int)size);
+                v6 = 3;
+            }
+            KoreGrowRegistry((int)(v2 + 44), (size_t)heap, -1);
+        }
+    }
+    return 0;
+}
+
+// ---- sub_5EEC00: rehash the interned-string hash table (double the
+// capacity, reinsert every existing entry).  `table` is the intern
+// object (+0 array base, +4 count, +8 mask); `vmcore` is the VM core. ----
+static int KoreRehashInterned(int *table, int vmcore)
+{
+    unsigned int newCount = (unsigned int)table[2] + 1;
+    int oldArray = table[0];
+    void *v4 = (void *)KoreVmHeapAlloc(vmcore, 8 * (int)newCount);
+    table[0] = (int)v4;
+    memset(v4, 0, 8 * newCount);
+    if (*(int *)(*(int *)vmcore + 60) == 1)
+        *(int *)((int)v4 - 8) |= 1;
+    table[2] = (int)newCount * 2 - 1;
+    int i = 0;
+    for (i = 0; i < *(int *)(*(int *)vmcore + 172); ++i)
+    {
+        int e = *(int *)(oldArray + 4 * i);
+        if (e != 0 && *(int *)e >= 0)
+            *(int *)(e - 4) |= 1;
+    }
+    i = 0;
+    *(int *)(*(int *)vmcore + 172) = 0;
+    while (i < (int)newCount)
+    {
+        int slot = *(int *)(oldArray + 4 * i);
+        if (slot != 0)
+        {
+            int mask = table[2];
+            int h = *(int *)(slot + 4);
+            if (*(int *)(table[0] + 4 * (h & mask)) != 0)
+            {
+                do
+                    ++h;
+                while (*(int *)(table[0] + 4 * (h & mask)) != 0);
+            }
+            *(int *)(table[0] + 4 * (h & mask)) = slot;
+        }
+        ++i;
+    }
+    *(int *)(oldArray - 8) &= ~1;
+    return 0;
+}
+
+// ---- sub_5EEED0: intern a string into the interned-string table
+// (find-or-insert by (hash, length, content)).  On a content match it
+// sets the debug dirty flag (bit 0 of entry-1) when debug level is 2-4
+// and returns the existing entry; on a miss it grows the table when the
+// load factor exceeds half, allocates a {length, hash, bytes, NUL}
+// record via KoreAllocVmMem, and linearly probes for a free slot. ----
+static int *KoreInternString(int *table, int vmcore, const void *src, int size, unsigned int hash)
+{
+    int probe = (int)hash;
+    for (int i = (int)(hash & (unsigned int)table[2]); ; ++probe, i = table[2] & probe)
+    {
+        int *entry = *(int **)(table[0] + 4 * i);
+        if (entry == 0)
+            break;
+        if (entry[1] == (int)hash && (*entry & 0x3FFFFFFF) == size)
+        {
+            if (memcmp(entry + 2, src, (size_t)size) == 0)
+            {
+                int dbg = *(int *)(*(int *)vmcore + 60);
+                if (dbg > 1 && dbg <= 4 && *entry >= 0)
+                    *(entry - 1) |= 1;
+                return entry;
+            }
+        }
+    }
+    if ((unsigned int)(table[1] + 1) > (unsigned int)(table[2] + 1) >> 1)
+        KoreRehashInterned(table, vmcore);
+    int *v20 = KoreAllocVmMem(vmcore, (unsigned int)(size + 11));
+    *v20 = size;
+    v20[1] = (int)hash;
+    memcpy(v20 + 2, src, (size_t)size);
+    *((char *)v20 + size + 8) = 0;
+    ++table[1];
+    int j = (int)hash;
+    while (*(int *)(table[0] + 4 * (j & table[2])) != 0)
+        ++j;
+    *(int *)(table[0] + 4 * (j & table[2])) = (int)v20;
+    return v20;
+}
+
+// ---- sub_5EF090: reformat a stack value as an interned string.  For a
+// float (type 3) it formats with "%0.14g", hashes, and interns; for a
+// pointer (type 4) it returns the pointee; otherwise null.  On a float /
+// pointer hit it rewrites the value in place to {entry, 4} and, when
+// `outLen` is non-null, writes entry[0] & 0x3FFFFFFF (the length). ----
+static int KoreFormatValue(int table, int valuePtr, int *outLen)
+{
+    int *a2 = (int *)valuePtr;
+    if (a2[1] == 3)
+    {
+        char Buffer[0x100];
+        float f = *(float *)a2;
+        int len = KoreVsnprintf(Buffer, 0x100u, "%0.14g", f);
+        unsigned int hash = KoreHashKore(Buffer, len);
+        // The intern table object lives at vmstate+0xBC (table[0]+0xBC);
+        // the vmcore passed through is `table` itself.
+        int *v5 = KoreInternString((int *)(*(int *)table + 0xBC), table, Buffer, len, hash);
+        if (outLen != 0)
+            *outLen = *(int *)v5 & 0x3FFFFFFF;
+        a2[1] = 4;
+        a2[0] = (int)v5;
+        return (int)(v5 + 2);
+    }
+    if (a2[1] == 4)
+    {
+        if (outLen != 0)
+            *outLen = *(int *)a2[0] & 0x3FFFFFFF;
+        return (int)((int *)a2[0] + 2);
+    }
+    if (outLen != 0)
+        *outLen = 0;
+    return 0;
+}
+
+// ---- Frame-row helpers: the 16-byte circular frame list that starts
+// at table[1] and ends at table[3] (frame count = (table[3]-table[1])>>4).
+// Each row's leading 8 bytes (row-8 descriptor, row-4 type word) precede
+// the row; type 9 marks a Lua frame, 10 a C frame. ----
+
+// sub_5D27D0: is the frame row at `frameIndex` a valid Lua (type 9) row?
+static int KoreFrameRowValid(int table, int frameIndex)
+{
+    int frameCount = (*(int *)(table + 12) - *(int *)(table + 4)) >> 4;
+    int v3;
+    if (frameIndex == frameCount)
+        v3 = *(int *)(table + 32);
+    else
+        v3 = *(int *)(*(int *)(table + 4) + 16 * (frameIndex + 1));
+    return *(int *)(v3 - 4) == 9;
+}
+
+// sub_5D2810: the 8-byte value descriptor pointer for the frame row.
+static int KoreFrameRowEntry(int table, int frameIndex)
+{
+    int frameCount = (*(int *)(table + 12) - *(int *)(table + 4)) >> 4;
+    if (frameIndex == frameCount)
+        return *(int *)(*(int *)(table + 32) - 8);
+    int p = *(int *)(*(int *)(table + 4) + 16 * (frameIndex + 1));
+    return *(int *)(p - 8);
+}
+
+// sub_5D2710: the start of the frame's local range.
+static int KoreFrameLocalStart(int table, int frameIndex)
+{
+    int frameCount = (*(int *)(table + 12) - *(int *)(table + 4)) >> 4;
+    if (frameIndex == frameCount)
+        return *(int *)(table + 32);
+    return *(int *)(*(int *)(table + 4) + 16 * (frameIndex + 1));
+}
+
+// sub_5D2740: the end of the frame's local range.
+static int KoreFrameLocalEnd(int table, int frameIndex)
+{
+    int frameCount = (*(int *)(table + 12) - *(int *)(table + 4)) >> 4;
+    int v4;
+    if (frameIndex == frameCount)
+        v4 = *(int *)(table + 28);
+    else if (frameIndex + 1 == frameCount)
+        v4 = *(int *)(table + 32);
+    else
+        v4 = *(int *)(*(int *)(table + 4) + 16 * (frameIndex + 2));
+    int localCount = *(short *)(*(int *)(table + 4) + 16 * frameIndex + 0xA);
+    return v4 - (8 * localCount + 8);
+}
+
+// sub_5D2860: resolve the start of the frame's local range (validating
+// the row is a Lua frame and adjusting for the descriptor base).
+static int KoreFrameLocalRange(int table, int frameIndex)
+{
+    int frameCount = (*(int *)(table + 12) - *(int *)(table + 4)) >> 4;
+    int v3;
+    if (frameIndex == frameCount)
+        v3 = *(int *)(table + 32);
+    else
+        v3 = *(int *)(*(int *)(table + 4) + 16 * (frameIndex + 1));
+    if (*(int *)(v3 - 4) != 9)
+        return 0;
+    if (frameIndex == *(int *)(table + 24))       // this[5] = table[6]
+        return *(int *)(table + 20);              // this[4] = table[5]
+    if (frameIndex == frameCount)
+        return *(int *)(table + 16);              // this[3] = table[4]
+    int v5 = *(int *)(*(int *)(table + 4) + 16 * frameIndex + 0x14);
+    if (v5 == 0)
+        return 0;
+    int v6 = *(int *)KoreFrameRowEntry(table, frameIndex);
+    if (v5 != *(int *)(v6 + 8))
+        return v5 - 4;
+    return v5;
+}
+
+// sub_5D23E0: resolve the name of the Nth local whose [low,high] range
+// contains `offset`, from the descriptor's 12-byte local-name entries.
+static int KoreLocalNameAt(int offset, int localIndex, int descriptor)
+{
+    if (offset == 0)
+        return 0;
+    int v7 = (offset - *(int *)(descriptor + 8)) >> 2;
+    int count = *(int *)(descriptor + 60);
+    int base = *(int *)(descriptor + 64);
+    int v8 = 0;
+    if (count > 0 && localIndex > 0)
+    {
+        int *v9 = (int *)(base + 8);
+        while (localIndex > 0)
+        {
+            if (*(v9 - 1) <= v7 && *v9 >= v7)
+                --localIndex;
+            if (localIndex == 0)
+                return *(int *)(base + 12 * v8) + 8;
+            ++v8;
+            v9 += 3;
+            if (v8 >= count)
+                return 0;
+        }
+    }
+    return 0;
+}
+
+// sub_5D8D30: the base of the frame's local range (0 for tail-call
+// frames, i.e. frame[141] != 0; otherwise the resolved local range).
+static int KoreFrameLocalBase(int *fr, int table)
+{
+    if (*(int *)(fr + 564) != 0)
+        return 0;
+    return KoreFrameLocalRange(table, *(int *)(fr + 560));
+}
+
+// ---- sub_5D2430: format the source description into frame+0x2C
+// (512 bytes) from the frame's +0x10 source string: '@' is a file path
+// (copy path-1, "..."-truncated to the last 504 bytes when long), '='
+// is a chunk name (copy up to 512 bytes), anything else is shown as
+// [string "first line..."] (first line truncated at 494 bytes); a null
+// source writes [string "?"]. ----
+static int KoreBuildSourceDesc(int *fr)
+{
+    char *v1 = *(char **)(fr + 16);
+    if (v1 != 0)
+    {
+        if (*v1 == 64)   // '@' -> file path
+        {
+            unsigned int v3 = (unsigned int)strlen(v1);
+            if (v3 <= 0x1F9)
+            {
+                (void)KoreStrncpy((char *)(fr + 44), 0x200u, v1 + 1);
+                *(char *)(fr + 555) = 0;
+            }
+            else
+            {
+                (void)KoreStrncpy((char *)(fr + 44), 4u, "...");
+                *(char *)(fr + 47) = 0;
+                (void)KoreStrncpy((char *)(fr + 47), 0x1F9u, &v1[v3 - 504]);
+                *(char *)(fr + 551) = 0;
+            }
+        }
+        else if (*v1 == 61)   // '=' -> chunk name
+        {
+            unsigned int v4 = (unsigned int)strlen(v1);
+            if (v4 > 0x200)
+                v4 = 512;
+            (void)KoreStrncpy((char *)(fr + 44), v4, v1 + 1);
+            *(char *)(fr + 44 + v4 - 1) = 0;
+        }
+        else   // -> [string "first line..."]
+        {
+            (void)KoreStrncpy((char *)(fr + 44), 0xAu, "[string \"");
+            *(char *)(fr + 53) = 0;
+            unsigned int v5 = (unsigned int)strcspn(v1, "\n\r");
+            if (v5 <= 0x1EF)
+            {
+                unsigned int v6 = (unsigned int)strlen(v1);
+                KoreStrncpy((char *)(fr + 53), v5 + 1, v1);
+                if (v5 < v6)
+                {
+                    KoreStrncpy((char *)(v5 + fr + 53), 4u, "...");
+                    v5 += 3;
+                }
+            }
+            else
+            {
+                v5 = 498;
+                KoreStrncpy((char *)(fr + 53), 0x1F3u, v1);
+                (void)KoreStrncpy((char *)(fr + 548), 4u, "...");
+                *(char *)(fr + 551) = 0;
+            }
+            char *v7 = (char *)(v5 + fr + 53);
+            (void)KoreStrncpy(v7, 3u, "\"]");
+            v7[2] = 0;
+        }
+    }
+    else
+    {
+        (void)KoreStrncpy((char *)(fr + 44), 0x200u, "[string \"?\"]");
+        *(char *)(fr + 555) = 0;
+    }
+    return 0;
+}
+
+// ---- sub_5D8DE0: resolve the source variable name for a frame, writing
+// the class label ("field" / "global" / "local" / "method" / "UpValue")
+// to frame+8 and the resolved name pointer to frame+4.  It reads the
+// frame's code-object descriptor and walks its 12-byte operand range
+// entries to match the current instruction operand's type tag. ----
+static int KoreSourceVarName(int table, int *fr)
+{
+    int v3 = fr[140];
+    fr[2] = (int)"";      // class label default = ""
+    fr[1] = 0;            // function name default = 0
+    if (v3 >= 1 && fr[141] == 0)
+    {
+        int v4 = v3 - 1;
+        int v2b = *(int *)(table + 4);
+        int v6 = KoreFrameLocalRange(table, v3 - 1);
+        if (*(short *)(16 * v3 + v2b + 8) == 0)
+        {
+            int valid = KoreFrameRowValid(table, v4);
+            if (valid != 0 && v6 != 0)
+            {
+                int v7 = KoreFrameRowEntry(table, v4);
+                int v8 = *(int *)v7;
+                int v9 = *(unsigned char *)v6;
+                int v10 = *(int *)(v7 + 16);
+                int v2c = *(int *)v6 >> 25;
+                if (v2c == 2 || v2c == 3 || v2c == 22 || v2c == 23 || v2c == 24
+                    || v2c == 29 || v2c == 30 || v2c == 31 || v2c == 62 || v2c == 63)
+                {
+                    int v11 = *(int *)(v8 + 8);
+                    int *v12 = (int *)(v6 - 4);
+                    if ((unsigned int)v12 >= (unsigned int)v11)
+                    {
+                        int result = v11 + 4 * *(int *)(v8 + 4);
+                        do
+                        {
+                            if ((unsigned int)v12 >= (unsigned int)(v11 + 4 * *(int *)(v8 + 4)))
+                                return result;
+                            int d = *v12;
+                            int tag = *(unsigned char *)v12;
+                            --v12;
+                            if (tag == v9)
+                            {
+                                switch (d >> 25)
+                                {
+                                    case 0:
+                                    case 0x43:
+                                        result = v10 + 8 * ((d >> 8) & 0xFF);
+                                        fr[2] = (int)"field";
+                                        if (*(int *)(result + 4) == 4)
+                                            fr[1] = *(int *)result + 8;
+                                        else
+                                            fr[1] = (int)"?";
+                                        return result;
+                                    case 2:
+                                    case 3:
+                                    case 0x1D:
+                                    case 0x1E:
+                                    case 0x3F:
+                                        return d;
+                                    case 6:
+                                        {
+                                            int idx = (d >> 8) & 0x1FFFF;
+                                            result = v10 + 8 * idx;
+                                            if (*(int *)(result + 4) != 4)
+                                                return result;
+                                            fr[2] = (int)"global";
+                                            fr[1] = *(int *)result + 8;
+                                            return result;
+                                        }
+                                    case 7:
+                                        {
+                                            int idx = (d >> 17) & 0xFF;
+                                            if (idx < *(unsigned char *)(v8 + 3))
+                                            {
+                                                fr[2] = (int)"local";
+                                                int name = KoreLocalNameAt((int)(v12 + 8), idx + 1, v8);
+                                                fr[1] = name;
+                                                return name;
+                                            }
+                                            v9 = idx;
+                                            break;
+                                        }
+                                    case 8:
+                                        {
+                                            result = (d >> 8) & 0x1FF;
+                                            fr[2] = (int)"method";
+                                            if (result >= 0x100)
+                                                fr[1] = *(int *)(v10 + 8 * (result & 0xFF)) + 8;
+                                            return result;
+                                        }
+                                    case 0xA:
+                                    case 0xC:
+                                        {
+                                            result = (d >> 8) & 0x1FF;
+                                            fr[2] = (int)"field";
+                                            if (result < 0x100)
+                                                return result;
+                                            result = v10 + 8 * (result & 0xFF);
+                                            if (*(int *)(result + 4) == 4)
+                                                fr[1] = *(int *)result + 8;
+                                            else
+                                                fr[1] = (int)"?";
+                                            return result;
+                                        }
+                                    case 0x20:
+                                        {
+                                            result = (d >> 17) & 0xFF;
+                                            fr[2] = (int)"UpValue";
+                                            if ((signed int)result < *(int *)(v8 + 44))
+                                                fr[1] = *(int *)(*(int *)(v8 + 48) + 4 * result) + 8;
+                                            return result;
+                                        }
+                                    default:
+                                        break;
+                                }
+                            }
+                        }
+                        while ((unsigned int)v12 >= (unsigned int)v11);
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// ---- 'L' / 'f' local-dump table machinery: documented stubs.  These
+// are only reached through the uppercase 'L' (local dump) and 'f'
+// (push the function value) flag characters, which the panic path's
+// "Snlu" flag string never contains, so they are never executed in the
+// traceback.  They remain no-op stubs consistent with the other deep
+// KoreVM table internals already stubbed in this file.
+static int KoreReallocValueStack(int table, int extra) { (void)table; (void)extra; return 0; }
+static int KoreAllocHashTable(int table, int a2, int a3) { (void)table; (void)a2; (void)a3; return 0; }
+static int KoreTableSet(int table, int vmcore, int key, int value)
+{ (void)table; (void)vmcore; (void)key; (void)value; return 0; }
+static int KoreEnsureBackingTable(int table, int vmcore, int a3, int a4)
+{ (void)table; (void)vmcore; (void)a3; (void)a4; return 0; }
+static void KoreArraySet(int table, int index, int value)
+{ (void)table; (void)index; (void)value; }
+static void KoreDebugMarkDirty(int value, int key) { (void)value; (void)key; }
+static int KoreDebugTrackAppend(int table, int *value) { (void)table; (void)value; return 0; }
+
+// ---- sub_5E1280: fill a Lua frame record from the 8-byte value
+// descriptor, walking the flag characters.  'S' sets the type /
+// description / line-range words, 'n' resolves the function name, 'l'
+// resolves the line, 'u' copies the two value words; 'f' pushes the
+// descriptor as a type-9 value and 'L' performs the full local dump
+// (the deep table machinery, stubbed above). ----
+static int KoreFillLuaFrame(int *fr, int table, int desc, const char *flags)
+{
+    int v5 = desc;                 // the descriptor base (*a3)
+    char c = *flags;
+    int fL = 0;                    // 'L' seen
+    int ff = 0;                    // 'f' seen
+    int ebp = 0;                   // the 'l'-resolved line / locals pointer
+    if (c != 0)
+    {
+        do
+        {
+            switch (c)
+            {
+                case 'L':
+                    fL = 1;
+                    break;
+                case 'S':
+                    fr[3] = (int)"Lua";
+                    fr[4] = *(int *)(v5 + 52) + 8;
+                    KoreBuildSourceDesc(fr);
+                    fr[9] = *(int *)(v5 + 28);
+                    fr[10] = *(int *)(v5 + 32);
+                    break;
+                case 'f':
+                    ff = 1;
+                    break;
+                case 'l':
+                {
+                    fr[5] = -1;
+                    if (v5 != 0)
+                    {
+                        int v8 = *(int *)(v5 + 40);
+                        ebp = v8;
+                        if (v8 != 0 && fr[140] != -1)
+                        {
+                            int v9 = KoreFrameLocalBase(fr, table);
+                            if (v9 != 0)
+                                fr[5] = ((int *)v8)[((v9 - *(int *)(v5 + 8)) >> 2)];
+                            else
+                                fr[5] = *(int *)v8;
+                        }
+                    }
+                    break;
+                }
+                case 'n':
+                {
+                    KoreSourceVarName(table, fr);
+                    int v7 = *(int *)(v5 + 56);
+                    if (v7 != 0)
+                        fr[1] = v7 + 8;
+                    if (fr[1] == 0)
+                        fr[1] = (int)"(anonymous)";
+                    break;
+                }
+                case 'u':
+                    fr[6] = *(unsigned char *)v5;
+                    fr[7] = *(unsigned char *)(v5 + 1);
+                    fr[8] = ebp;
+                    break;
+                default:
+                    break;
+            }
+            c = *++flags;
+        } while (*flags != 0);
+        if (ff != 0)
+        {
+            int top = *(int *)(table + 28);
+            *(int *)top = desc;
+            *(int *)(top + 4) = 9;
+            *(int *)(table + 28) = top + 8;
+        }
+        if (fL != 0)
+        {
+            if ((unsigned int)(*(int *)(table + 28) + 24) > (unsigned int)*(int *)(table + 36))
+                KoreReallocValueStack(table, 3);
+            int v11 = KoreAllocHashTable(table, 1, 1);
+            *(int *)(*(int *)(table + 28) + 4) = 5;
+            *(int *)(*(int *)(table + 28)) = v11;
+            *(int *)(table + 28) += 8;
+            if (v5 != 0)
+            {
+                int v12 = 0;
+                while (v12 < *(int *)(v5 + 36))
+                {
+                    int v13 = *(int *)(table + 28);
+                    *(int *)v13 = 1;
+                    *(int *)(v13 + 4) = 1;
+                    v13 += 8;
+                    *(int *)(table + 28) = v13;
+                    int v14 = *(int *)(*(int *)(v5 + 40) + 4 * v12);
+                    int is5 = *(int *)(v13 - 12) == 5;
+                    int v16 = v13 - 8;
+                    int v17 = *(int *)(v13 - 16);
+                    int v25 = v14;
+                    if (is5)
+                    {
+                        int v18 = v14 - 1;
+                        int v23 = v17;
+                        if ((unsigned int)v18 >= (unsigned int)*(int *)(v17 + 16))
+                        {
+                            int v22[2];
+                            v22[0] = (int)(float)v25;
+                            v22[1] = 3;
+                            KoreTableSet(v17, table, v22[0], v16);
+                            v17 = v23;
+                        }
+                        else
+                        {
+                            int v19 = *(int *)v16;
+                            int v24 = ((int *)v16)[1];
+                            int v20 = *(int *)(v17 + 12);
+                            *(int *)(v20 + 8 * v18) = v19;
+                            *(int *)(v20 + 8 * v18 + 4) = v24;
+                        }
+                        if (*(int *)(*(int *)table + 60) == 1)
+                            KoreDebugMarkDirty(v17 - 8, v16);
+                    }
+                    else
+                    {
+                        KoreEnsureBackingTable(table, 0, 0, v14);
+                        KoreArraySet(table, v14, v16);
+                    }
+                    *(int *)(table + 28) -= 8;
+                    ++v12;
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+// ---- sub_5D9090: fill a C frame record from the 8-byte value
+// descriptor, walking the flag characters.  'S' sets the "C" type /
+// "=[C]" description / "[C]" buffer, 'n' resolves the name, 'l' clears
+// the line, 'u' copies the two 16-bit value words; 'f' pushes the
+// descriptor as a type-10 value and 'L' pushes an 8-byte zero record. ----
+static int KoreFillCFrame(int *fr, int table, int desc, const char *flags)
+{
+    char c = *flags;
+    int fL = 0;                    // 'L' seen
+    int ff = 0;                    // 'f' seen
+    if (c != 0)
+    {
+        do
+        {
+            switch (c)
+            {
+                case 'L':
+                    fL = 1;
+                    break;
+                case 'S':
+                    *(int *)(fr + 16) = (int)"=[C]";
+                    *(int *)(fr + 12) = (int)"C";
+                    *(int *)(fr + 36) = -1;
+                    *(int *)(fr + 40) = -1;
+                    (void)KoreStrncpy((char *)(fr + 44), 0x200u, "[C]");
+                    *(char *)(fr + 555) = 0;
+                    break;
+                case 'f':
+                    ff = 1;
+                    break;
+                case 'l':
+                    *(int *)(fr + 20) = -1;
+                    break;
+                case 'n':
+                    KoreSourceVarName(table, fr);
+                    break;
+                case 'u':
+                    *(int *)(fr + 28) = 0;
+                    *(int *)(fr + 24) = *(short *)(desc + 8);
+                    *(int *)(fr + 32) = *(short *)(desc + 10);
+                    break;
+                default:
+                    break;
+            }
+            c = *++flags;
+        } while (*flags != 0);
+        if (ff != 0)
+        {
+            int *v7 = *(int **)(table + 28);
+            *v7 = desc;
+            v7[1] = 10;
+            *(int *)(table + 28) = (int)(v7 + 2);
+        }
+        if (fL != 0)
+        {
+            int v8 = *(int *)(table + 28);
+            *(int *)(v8 + 4) = 0;
+            *(int *)(table + 28) = v8 + 8;
+        }
+    }
+    return 1;
+}
+
+// ---- sub_5D9240: resolve the frame that contains the Nth value in the
+// traceback (walking the circular 16-byte frame list backward,
+// subtracting each frame's local-count+1) and initialize the 568-byte
+// frame record (defaults, then the frame index at +0x230 and the
+// partial-remaining flag at +0x234).  Returns 1 on success, 0 when the
+// index is negative or out of range. ----
+static int KoreResolveFrameIndex(int table, int frameNo, int *fr)
+{
+    int v3 = frameNo;
+    *(int *)(fr + 4) = 0;
+    *(int *)(fr + 8) = (int)"";          // unk_1ADDF82 (empty)
+    *(int *)(fr + 12) = 0;
+    *(int *)(fr + 16) = 0;
+    *(int *)(fr + 20) = -1;
+    *(int *)(fr + 24) = 0;
+    *(int *)(fr + 28) = 0;
+    *(int *)(fr + 36) = -1;
+    *(int *)(fr + 40) = -1;
+    *(char *)(fr + 44) = 0;
+    *(int *)(fr + 560) = -1;
+    *(int *)(fr + 564) = -1;
+    if (frameNo < 0)
+        return 0;
+    int v5 = (*(int *)(table + 12) - *(int *)(table + 4)) >> 4;
+    if (v5 < 0)
+        return 0;
+    short *i = (short *)(16 * v5 + *(int *)(table + 4) + 8);
+    for (; ; i -= 8)
+    {
+        int v7 = *i + 1;
+        if (v3 < v7)
+            break;
+        --v5;
+        v3 -= v7;
+        if (v5 < 0)
+            return 0;
+    }
+    *(int *)(fr + 560) = v5;
+    *(int *)(fr + 564) = v3 > 0;
+    return 1;
+}
+
+// ---- sub_5E1520: resolve the function name / type / line for a frame,
+// filling the 568-byte record.  Three paths: (a) a '>'-prefixed flag
+// pops one 8-byte value from the top of the value array and resets the
+// frame state; (b) a tail-call frame (frame[141] != 0) writes the
+// "tail" / "=(tail call)" labels and consumes the 'f' / 'L' value slots;
+// (c) otherwise it dispatches to the Lua (type 9) or C (type 10) frame
+// filler based on the row's type word. ----
+static int KoreResolveFrameInfo(int table, const char *flags, int *fr)
+{
+    char *v3 = (char *)flags;
+    int v7, v8;
+    if (*flags == 62)   // '>'
+    {
+        int top = *(int *)(table + 28);
+        if ((int)((top - *(int *)(table + 32)) & 0xFFFFFFF8) < 8)
+            return 0;
+        v7 = *(int *)(top - 8);
+        v8 = *(int *)(top - 4);
+        v3 = (char *)flags + 1;
+        *(int *)(table + 28) = top - 8;
+        *(int *)(fr + 564) = 0;
+        *(int *)(fr + 560) = -1;
+    }
+    else
+    {
+        if (*(int *)(fr + 564) != 0)   // tail-call frame
+        {
+            *(int *)(fr + 12) = (int)"tail";
+            *(int *)(fr + 16) = (int)"=(tail call)";
+            (void)KoreStrncpy((char *)(fr + 44), 0x200u, "(tail call)");
+            *(char *)(fr + 555) = 0;
+            *(int *)(fr + 8) = (int)"";       // unk_1ADDF7F (empty)
+            *(int *)(fr + 4) = (int)"";       // unk_1ADDF7F (empty)
+            int v11 = 0, v10 = 0;
+            char *p = (char *)flags;
+            while (*p != 0)
+            {
+                if (*p == 'f')
+                    v11 = 1;
+                else if (*p == 'L')
+                    v10 = 1;
+                ++p;
+            }
+            if (v11 != 0)
+            {
+                int t = *(int *)(table + 28);
+                *(int *)(t + 4) = 0;
+                *(int *)(table + 28) = t + 8;
+            }
+            if (v10 != 0)
+            {
+                int t = *(int *)(table + 28);
+                *(int *)(t + 4) = 0;
+                *(int *)(table + 28) = t + 8;
+            }
+            return 1;
+        }
+        int v15 = *(int *)(fr + 560);
+        int v16;
+        if (v15 == (*(int *)(table + 12) - *(int *)(table + 4)) >> 4)
+            v16 = *(int *)(table + 32);
+        else
+            v16 = *(int *)(16 * (v15 + 1) + *(int *)(table + 4));
+        v7 = *(int *)(v16 - 8);
+        v8 = *(int *)(v16 - 4);
+    }
+    int v17 = v8 - 9;
+    if (v17 == 0)
+        return KoreFillLuaFrame(fr, table, v7, v3);
+    if (v17 != 1)
+        return 0;
+    return KoreFillCFrame(fr, table, v7, v3);
+}
+
+// ---- sub_5D8D50: the local-variable name for the Nth local of the
+// frame.  Returns the resolved name, "(*temporary)" for an unnamed local
+// within the frame's local range, or 0 when out of range / tail-call. ----
+static int KoreGetLocalName(int table, int *fr, int localIndex)
+{
+    if (*(int *)(fr + 564) != 0)
+        return 0;
+    int v3 = *(int *)(fr + 560);
+    int frameCount = (*(int *)(table + 12) - *(int *)(table + 4)) >> 4;
+    if (v3 < 0 || v3 > frameCount || localIndex <= 0)
+        return 0;
+    int result = 0;
+    if (KoreFrameRowValid(table, v3) != 0)
+    {
+        int entry = KoreFrameRowEntry(table, v3);
+        int offset = KoreFrameLocalBase(fr, table);   // sub_5D8D30 return
+        result = KoreLocalNameAt(offset, localIndex, *(int *)entry);
+    }
+    if (result == 0)
+    {
+        int v6 = KoreFrameLocalStart(table, v3) + 8 * localIndex - 8;
+        return v6 < KoreFrameLocalEnd(table, v3) ? (int)"(*temporary)" : 0;
+    }
+    return result;
+}
+
+// ---- sub_5F1A20: the "Kore Panic" traceback printer (the top of the
+// error path).  Prints the main / state names, the unprotected error
+// string (the top value, reformatted), and a full function / local
+// traceback; returns -1.  [NOT byte-identical] placement-dependent (the
+// relative calls to the VM-printf at *a1+692, the frame fillers, the
+// intern / alloc helpers) and it references the high-VA string slots
+// unk_1ADDF7E / unk_1ADDF7F / unk_1ADDF82.
+static int KorePanicTraceback(int table)
+{
+    int *T = (int *)table;
+    int top = T[7] - 8;
+    int errstr = 0;
+    if (top >= T[8])
+        errstr = KoreFormatValue(table, top, 0);
+    else
+        errstr = 0;
+    KoreVprintfFn vprintf = *(KoreVprintfFn *)(T[0] + 692);
+    int mainstate = *(int *)(*(int *)(T[0] + 228) + 72) + 8;
+    vprintf(table, "Kore Panic - Main State: %s - State name: %s\n\n",
+            (const char *)mainstate, (const char *)(T[18] + 8));
+    vprintf(table, "Unprotected error (%s)\n\n", (const char *)errstr);
+    vprintf(table, "Full Traceback:\n\n");
+    int frameInfo[142];   // the 568-byte frame record
+    for (int i = 1; KoreResolveFrameIndex(table, i, frameInfo) != 0; ++i)
+    {
+        int name = frameInfo[1];
+        if (name == 0)
+            name = (int)"?";
+        KoreResolveFrameInfo(table, "Snlu", frameInfo);
+        vprintf(table, "Function %s() %s Line %d\n", (const char *)name,
+                (const char *)(frameInfo + 0x2C), frameInfo[5]);
+        for (int j = 1; ; ++j)
+        {
+            int localName = KoreGetLocalName(table, frameInfo, j);
+            if (localName == 0)
+                break;
+            int v16 = frameInfo[140];
+            int v6;
+            if (v16 == (*(int *)(table + 12) - *(int *)(table + 4)) >> 4)
+                v6 = *(int *)(table + 32);
+            else
+                v6 = *(int *)(16 * (v16 + 1) + *(int *)(table + 4));
+            int *v7 = (int *)T[7];
+            *v7 = *(int *)(v6 + 8 * j - 8);
+            v7[1] = *(int *)(v6 + 8 * j - 4);
+            v7 += 2;
+            T[7] = (int)v7;
+            int v8 = (int)v7 - 8;
+            int v9 = 0;
+            if ((unsigned int)v8 >= (unsigned int)T[8])
+                v9 = KoreFormatValue(table, v8, 0);
+            else
+                v9 = 0;
+            vprintf(table, "    Local %2d: %s = %s\n", j,
+                    (const char *)localName, (const char *)v9);
+            T[7] -= 8;
+        }
+    }
+    return -1;
+}
 
 // ---- KoreHeapInitGrow's callees: the VM-heap alloc-node bookkeeping ----
 
@@ -562,21 +1640,67 @@ static int KoreInitAllocList(int obj, int flags)
 }
 
 // sub_5E2340 (0x5E2340 - 0x5E23B6) -- KoreInitAllocTable: re-adopt every node
-// of the heap's secondary alloc-node table chain (obj+0x3C), zeroing the
-// retired blocks. [NOT byte-identical] remaining stub.
+// of the heap's secondary alloc-node table chain (the obj+0x3C linked list of
+// nodes, each node's next pointer at +0x50) through KoreInitAllocNode, first
+// zeroing each node's retired payload blocks. For each node i in the chain the
+// current node is published at obj+0x44, and (only when the node's
+// "retired" bit is set, the low bit at i-8) the node's payload block base
+// (i+0x1C, non-null) is memset to zero for 8*((i+0x24 - base + 40) >> 3) - 8
+// bytes, then every 8-byte {payload, type} node pair in [i+0x28 .. i+0x1C)
+// is re-adopted through KoreInitAllocNode with flags - 1. On exit obj+0x44 is
+// reset to null. [NOT byte-identical] a thiscall + retn 4 hybrid in the
+// original (the heap object in ECX, the flags word on the stack; declared
+// object-first here) and placement-dependent (relative call into
+// KoreInitAllocNode plus an IAT call to memset).
 static void KoreInitAllocTable(int obj, int flags)
 {
-    (void)obj; (void)flags;
+    int *h = (int *)obj;
+    int i = h[15];                     // obj+0x3C secondary alloc-node chain
+    for (; i != 0; i = ((int *)i)[20]) // next node at i+0x50
+    {
+        int *n = (int *)i;
+        h[17] = i;                     // obj+0x44 current node
+        if ((*(unsigned char *)(i - 8) & 1) != 0)  // retired bit at i-8
+        {
+            int base = n[7];           // i+0x1C payload block base
+            if (base != 0)
+            {
+                int span = ((n[9] - base + 40) >> 3);   // (end - base + 40) / 8
+                memset((void *)base, 0, 8 * span - 8);  // zero the retired block
+            }
+            for (int j = n[10]; (unsigned int)j < (unsigned int)n[7]; j += 8)
+                KoreInitAllocNode(obj, j, flags - 1);   // i+0x28..i+0x1C node pairs
+        }
+    }
+    h[17] = 0;                         // clear the current-node slot
 }
 
-// sub_5DC610 (0x5DC610 - 0x5DC721) -- KoreForEachAllocNode: walk every alloc
-// node known to obj and invoke the callback (a1, a2) on each. [NOT
-// byte-identical] remaining stub.
-static int KoreForEachAllocNode(int obj, int (*callback)(int, int))
-{
-    (void)obj; (void)callback;
-    return 0;
-}
+// sub_5DC610 (0x5DC610 - 0x5DC721) -- KoreForEachAllocNode: walk every
+// alloc node registered in the VM's alloc-node registry (the heap+0x50
+// sub-object) and invoke the callback (a1 = the registry's +0x0C context
+// pointer, a2 = the node) on each. When the registry's +0x7E58 single node
+// is non-null it is the only visit and the callback's result is returned.
+// Otherwise, when the +0x7E40 record count is non-zero, the row chain is
+// walked: each row (the +0x7E38 head, linked through +0x7B04) owns a block
+// of three 0x1EC0-byte table records at +0x7B00; each record's +0x04 node
+// is visited, and when that node is null or child-less (node+0x18 == 0) and
+// the record's +0xB20 flag is set, the record's inline node array is
+// visited too: the 12-byte chain elements at +0xB18 (each owning a
+// 28-byte run of 4-byte nodes at +0x20, linked through +0x24) are walked
+// up to the record's +0xB24 end pointer, invoking the callback on every
+// 4-byte slot. The walk ends when the record pointer reaches the registry's
+// +0x7E44 end (or becomes null); the last row pointer is returned. The
+// callback is a plain cdecl int(int, int). Byte-identical: the original's
+// exact instruction sequence with the original thiscall + retn 4
+// convention (the registry in ECX, the callback on the stack); the body is
+// assembled in engine/luavm_asm.asm (ml.exe, linked as luavm_asm.obj)
+// because the 3-byte `lea ecx, [ecx]` nop (8D 49 00) after the entry jmp
+// cannot be emitted by the C inline assembler -- both it and ml normalize
+// the zero-displacement lea to the 2-byte 8D 09 form -- so the nop is raw
+// bytes there. Callers invoke it through the KoreForEachAllocFn __thiscall
+// function-pointer cast.
+extern "C" int KoreForEachAllocNode(int obj, int (*callback)(int, int));
+typedef int (__thiscall *KoreForEachAllocFn)(int, int (*callback)(int, int));
 
 // sub_5D59E0 (0x5D59E0 - 0x5D5A1D) -- KoreMarkAllocTree: mark the alloc node
 // at a2 (and its children, a2+20 count / a2+24 array) with the +(-8) bit.
@@ -708,7 +1832,7 @@ static int KoreHeapInitGrow(int obj, int size)
                 KoreInitAllocNode(obj, table + off, 0x40);
             KoreInitAllocTable(obj, 0x40);
             if (h[20] != 0)
-                (void)KoreForEachAllocNode(h[20], KoreMarkAllocTree);
+                (void)((KoreForEachAllocFn)KoreForEachAllocNode)(h[20], KoreMarkAllocTree);
             int child = h[21];
             if (child != 0)
             {
