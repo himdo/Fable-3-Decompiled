@@ -28,6 +28,8 @@
 #include <wctype.h>               // iswspace (the XLipCultures line trim)
 #include <mbstring.h>             // _mbscmp
 #include <math.h>                 // fabsf
+#include <float.h>                // _controlfp (the FPU round-toward-zero in KoreHeapInitGrow)
+#include <intrin.h>               // __rdtsc (the QPC span accounting in KoreHeapInitGrow)
 #include <direct.h>               // _chdir / _mkdir
 #include <stdexcept>              // std::length_error (F3ListSizeAdd overflow path)
 
@@ -8240,13 +8242,349 @@ static void KoreSwapTableContext(int a, int b)
 // [NOT byte-identical] remaining stub (390-byte traceback emitter).
 static void KorePanicTraceback(int obj) { (void)obj; }
 
+// ---- KoreHeapInitGrow's callees: the VM-heap alloc-node bookkeeping ----
+
+// sub_5D56D0 (0x5D56D0 - 0x5D5704) -- KoreHeapPanic: the OOM abort -- unlink
+// the heap sub-object from the +0x3C / +0x40 / +0x44 handler list, then
+// longjmp(*(obj+0), 1) back into the KoreHeapInitGrow setjmp frame.
+// [NOT byte-identical] remaining stub (never panics in the stub world).
+static void KoreHeapPanic(int obj)
+{
+    (void)obj;
+}
+
+// sub_5D5D30 (0x5D5D30 - 0x5D5DCD) -- KoreDrainFreeList: claim free blocks
+// off the free-list object (obj; its block head is obj[10]), freeing the
+// unclaimed blocks on the way; returns 1 when the claim (the `claim` word)
+// can be satisfied, 0 on OOM (the caller then panics). [NOT byte-identical]
+// remaining stub (returns the success result so the grow path never panics).
+static int KoreDrainFreeList(int obj, int heap, int claim)
+{
+    (void)obj; (void)heap; (void)claim;
+    return 1;
+}
+
+// sub_5DF740 (0x5DF740 - 0x5DFF46) -- KoreInitAllocNode8: adopt / register a
+// type-8 (heap-block) alloc node. In re-adopt mode (node != 0) it finishes by
+// popping one node off the table (--*(obj+24)). [NOT byte-identical]
+// remaining stub (keeps the pop so the KoreHeapInitGrow table walk ends).
+static int KoreInitAllocNode8(int obj, int ptr, int node, int flags)
+{
+    (void)ptr; (void)flags;
+    if (node != 0)
+        --*(int *)(obj + 24);
+    return node;
+}
+
+// sub_5E0C30 (0x5E0C30 - 0x5E0ED8) -- KoreInitAllocNode5: adopt / register a
+// type-5 (interned key/value string) alloc node (same shape as the type-8
+// routine; re-adopt mode pops one node off the table). [NOT byte-identical]
+// remaining stub.
+static void KoreInitAllocNode5(int obj, int ptr, int node, int flags)
+{
+    (void)ptr; (void)flags;
+    if (node != 0)
+        --*(int *)(obj + 24);
+}
+
+// sub_5E1770 (0x5E1770 - 0x5E189B) -- KoreInitAllocNode7: adopt / register a
+// type-7 alloc node (same shape as the type-8 routine; re-adopt mode pops one
+// node off the table). [NOT byte-identical] remaining stub.
+static void KoreInitAllocNode7(int obj, int ptr, int node, int flags)
+{
+    (void)ptr; (void)flags;
+    if (node != 0)
+        --*(int *)(obj + 24);
+}
+
+// sub_5DF9F0 (0x5DF9F0 - 0x5DFB80) -- KoreInitAllocNode9: adopt / register a
+// type-9 alloc node (same shape as the type-8 routine; re-adopt mode pops one
+// node off the table). [NOT byte-identical] remaining stub.
+static int KoreInitAllocNode9(int obj, int ptr, int node, int flags)
+{
+    (void)ptr; (void)flags;
+    if (node != 0)
+        --*(int *)(obj + 24);
+    return node;
+}
+
+// sub_5DFB80 (0x5DFB80 - 0x5DFCD7) -- KoreInitAllocNode10: adopt / register a
+// type-10 alloc node (same shape as the type-8 routine; re-adopt mode pops
+// one node off the table). [NOT byte-identical] remaining stub.
+static void KoreInitAllocNode10(int obj, int ptr, int node, int flags)
+{
+    (void)ptr; (void)flags;
+    if (node != 0)
+        --*(int *)(obj + 24);
+}
+
+// sub_5DFCE0 (0x5DFCE0 - 0x5DFE81) -- KoreInitAllocNode12: adopt / register a
+// type-12 (table) alloc node (same shape as the type-8 routine; re-adopt mode
+// pops one node off the table). [NOT byte-identical] remaining stub.
+static int KoreInitAllocNode12(int obj, int ptr, int node, int flags)
+{
+    (void)ptr; (void)flags;
+    if (node != 0)
+        --*(int *)(obj + 24);
+    return node;
+}
+
+// sub_5E21E0 (0x5E21E0 - 0x5E229F) -- KoreInitAllocNode: the alloc-node
+// init/adopt dispatcher -- the node's type word (node[1]) selects the
+// per-type routine (4 = plain buffer flag, 5 / 7 / 8 / 9 / 10 / 12 as above).
+// [NOT byte-identical] remaining stub.
+static void KoreInitAllocNode(int obj, int node, int flags)
+{
+    (void)obj; (void)node; (void)flags;
+}
+
+// sub_5E22D0 (0x5E22D0 - 0x5E2331) -- KoreInitAllocList: re-adopt every node
+// of the heap's primary alloc-node list (obj+0x20 / obj+0x24) through
+// KoreInitAllocNode. [NOT byte-identical] remaining stub.
+static int KoreInitAllocList(int obj, int flags)
+{
+    (void)obj; (void)flags;
+    return 0;
+}
+
+// sub_5E2340 (0x5E2340 - 0x5E23B6) -- KoreInitAllocTable: re-adopt every node
+// of the heap's secondary alloc-node table chain (obj+0x3C), zeroing the
+// retired blocks. [NOT byte-identical] remaining stub.
+static void KoreInitAllocTable(int obj, int flags)
+{
+    (void)obj; (void)flags;
+}
+
+// sub_5DC610 (0x5DC610 - 0x5DC721) -- KoreForEachAllocNode: walk every alloc
+// node known to obj and invoke the callback (a1, a2) on each. [NOT
+// byte-identical] remaining stub.
+static int KoreForEachAllocNode(int obj, int (*callback)(int, int))
+{
+    (void)obj; (void)callback;
+    return 0;
+}
+
+// sub_5D59E0 (0x5D59E0 - 0x5D5A1D) -- KoreMarkAllocTree: mark the alloc node
+// at a2 (and its children, a2+20 count / a2+24 array) with the +(-8) bit.
+// [NOT byte-identical] remaining stub.
+static int KoreMarkAllocTree(int a1, int a2)
+{
+    (void)a1; (void)a2;
+    return 0;
+}
+
+// sub_5D5980 (0x5D5980 - 0x5D59D5) -- KoreSweepAllocNodes: sweep the heap's
+// alloc-node chain (obj+0x04 sub-object, its +76 list), dropping the unmarked
+// nodes and charging the marked ones against the alloc budget (obj+0x6C).
+// [NOT byte-identical] remaining stub.
+static void KoreSweepAllocNodes(int obj)
+{
+    (void)obj;
+}
+
+// sub_5E8220 (0x5E8220 - 0x5E83D9) -- KoreRebindAllocNodes: rebind the heap's
+// alloc nodes to the (possibly new) heap storage after a grow, updating the
+// alloc budget (obj+0x6C). [NOT byte-identical] remaining stub.
+static int KoreRebindAllocNodes(int obj)
+{
+    (void)obj;
+    return 0;
+}
+
+// sub_5ED980 (0x5ED980 - 0x5EDAB2) -- KoreReassignAllocHeap: move the alloc
+// node chain from the old heap (the vm-core's +224 slot) onto the heap
+// sub-object's +0x88 chain, releasing the retired nodes. [NOT byte-identical]
+// remaining stub.
+static int KoreReassignAllocHeap(int obj, int vmcore)
+{
+    (void)obj; (void)vmcore;
+    return 0;
+}
+
+// sub_5D9FC0 (0x5D9FC0 - 0x5DA09C) -- KoreRehashAllocTable: rebuild / refresh
+// the alloc-node hash table (the heap sub-object's +0x80 table, +0x84 cursor)
+// after a grow, charging the alloc budget (obj+0x6C). [NOT byte-identical]
+// remaining stub.
+static int KoreRehashAllocTable(int obj)
+{
+    (void)obj;
+    return 0;
+}
+
 // sub_5EDAC0 (0x5EDAC0 - 0x5EDDB7) -- KoreHeapInitGrow: the setjmp/longjmp
-// state machine that (re)initialises / grows the VM heap on an OOM expand
-// (thiscall on the heap+0x2C sub-object, the grow size / vm-core on the
-// stack). This 759-byte subsystem is the other out-of-scope leaf of the
-// record-table allocation path; stubbed to the success result (the whole path
-// is dead in the stub world). [NOT byte-identical] remaining stub.
-static int KoreHeapInitGrow(int obj, int size) { (void)obj; (void)size; return 1; }
+// state machine that (re)initialises / grows the VM heap (thiscall on the
+// heap+0x2C sub-object, the grow size / vm-core on the stack). It publishes
+// a local setjmp buffer in the sub-object's +0x00 slot (KoreHeapPanic and the
+// other OOM paths longjmp back into it) and then resumes the six-stage
+// machine from the persisted +0x10 state: (0) zero the OOM-handler list and
+// register the heap object as an alloc node; (1) re-adopt every alloc node of
+// the type tables, the two inline nodes at +0x34 / +0x48, and the eight fixed
+// nodes of the API table at +0x1F0 .. +0x228, mark them, and flag the array
+// blocks; (2) sweep + rebind the alloc nodes; (3) reassign the alloc chain
+// from the old heap; (4) rehash the alloc table and reset the free list;
+// (5) drain the free list (panics when it cannot claim a block); (6) compute
+// the new grow size (48 * +0x1C + 20 * +0x58 + 2576), warn through the API
+// table's +0x2B4 printer when occupancy is over the +0x8C percent threshold,
+// store floor(used * +0x5C percent / 100) at +0x74 (the FPU is put in
+// round-toward-zero with a 2^32 bias for negative values, only the low dword
+// is kept), and set the API table's +0x2B0 flag. On the way out it zeroes the
+// +0x00 slot and adds the QPC span to the API table's +0x2A8 / +0x2AC
+// 64-bit counter. Returns 1 on completion, 0 when a panic longjmped in (with
+// +0x6C restored from +0x70); a call with a live +0x00 slot returns 0 at
+// once. [NOT byte-identical] a thiscall + retn 4 hybrid in the original
+// (declared object-first here), placement-dependent (relative calls into the
+// alloc-node helpers), and refs the "Low memory warning" string, the 100.0 /
+// 2^32 doubles, and the API table's mutable slots.
+static int KoreHeapInitGrow(int obj, int size)
+{
+    int *h = (int *)obj;
+    if (h[0] != 0)
+        return 0;
+
+    // aLowMemoryWarni (0x1AE1454)
+    static const char lowMemoryWarning[] =
+        "Low memory warning: %d out of %d (%d%%) bytes occupied\n";
+    // dbl_1AE36F8 (100.0) / dbl_1BF9398 (2^32)
+    static const double koreHundredDouble    = 100.0;
+    static const double koreTwoThirtyTwoBias = 4294967296.0;
+    // first arg lands in ECX (the original's "this"), the rest on the stack
+    typedef void (__thiscall *KoreLowMemoryPrintFn)(int, int, const char *, int, int, int);
+
+    unsigned __int64 start = __rdtsc();
+    jmp_buf jmb;
+    h[0] = (int)jmb;
+    int ret = 0;
+    if (setjmp(jmb) != 0)                       // a panic longjmped back in
+    {
+        h[27] = h[28];                          // restore +0x6C from +0x70
+    }
+    else
+    {
+        switch (h[4])
+        {
+        case 0:
+            h[6]  = -1;                         // the type-table node count
+            h[15] = h[16] = h[17] = 0;          // the +0x3C OOM-handler list
+            h[4]  = 1;
+            (void)KoreInitAllocNode8(obj, h[1], 0, 0x40);
+            // fall through (the original falls into the case 1 code)
+        case 1:
+            {
+            while (h[6] >= 0)
+            {
+                int node = h[5] + 24 * h[6];
+                switch (*(int *)node)
+                {
+                case 5:  (void)KoreInitAllocNode5(obj, 0, node, 0x40);  break;
+                case 7:  (void)KoreInitAllocNode7(obj, 0, node, 0x40);  break;
+                case 8:  (void)KoreInitAllocNode8(obj, 0, node, 0x40);  break;
+                case 9:  (void)KoreInitAllocNode9(obj, 0, node, 0x40);  break;
+                case 0xA:(void)KoreInitAllocNode10(obj, 0, node, 0x40); break;
+                case 0xC:(void)KoreInitAllocNode12(obj, 0, node, 0x40); break;
+                default: break;
+                }
+            }
+            (void)KoreInitAllocList(obj, 0x40);
+            if (h[14] != 0)
+                KoreInitAllocNode(obj, (int)(h + 13), 0x40);
+            if (h[19] != 0)
+                KoreInitAllocNode(obj, (int)(h + 18), 0x40);
+            int table = *(int *)h[1];           // the API table behind the heap
+            for (int off = 0x1F0; off < 0x230; off += 8)
+                KoreInitAllocNode(obj, table + off, 0x40);
+            KoreInitAllocTable(obj, 0x40);
+            if (h[20] != 0)
+                (void)KoreForEachAllocNode(h[20], KoreMarkAllocTree);
+            int child = h[21];
+            if (child != 0)
+            {
+                int kid = *(int *)(child + 56);
+                if (kid != 0)
+                    (void)KoreMarkAllocTree(0, kid);
+            }
+            *(int *)h[3]           = 1;         // the free-list head tag
+            *(int *)(h[5] - 8)    |= 1;         // the type-table block flag
+            if (h[8] != 0)
+                *(int *)(h[8] - 8) |= 1;        // the second array block flag
+            h[4] = 2;
+            }
+            // fall through
+        case 2:
+            KoreSweepAllocNodes(obj);
+            (void)KoreRebindAllocNodes(obj);
+            h[4] = 3;
+            // fall through
+        case 3:
+            (void)KoreReassignAllocHeap(obj, size);
+            h[4] = 4;
+            // fall through
+        case 4:
+            (void)KoreRehashAllocTable(obj);
+            {
+                int *freeList = (int *)h[3];
+                freeList[0]  = 0;
+                freeList[9]  = freeList[7] ^ ((freeList[7] ^ freeList[9]) & 3);
+                freeList[10] = (int)(freeList + 8);
+                freeList[7] &= 3;
+            }
+            h[4] = 5;
+            // fall through
+        case 5:
+            {
+                int claim = (h[28] != -1) ? 1 : 0;
+                if (KoreDrainFreeList(h[3], h[1], claim) == 0)
+                {
+                    h[27] = 0;
+                    if (h[28] != -1)
+                        KoreHeapPanic(obj);     // longjmps to the setjmp above
+                }
+            }
+            h[4] = 6;
+            // fall through
+        case 6:
+            {
+                int threshold = h[35];
+                h[31] = 48 * h[7] + 20 * h[22] + 2576;  // the new grow size
+                h[22] = 0;
+                int used = *(int *)(h[3] + 4);
+                if (threshold != 0)
+                {
+                    int pct = 100 * used / used;  // 100, exactly as the original div
+                    if (pct > threshold)
+                    {
+                        int *table = (int *)h[1];
+                        ((KoreLowMemoryPrintFn)(table + 173))(used, h[1],
+                            lowMemoryWarning, used, used, pct);
+                    }
+                }
+                double scale  = (double)h[23] / koreHundredDouble;
+                double scaled = (double)used;
+                if (used < 0)
+                    scaled += koreTwoThirtyTwoBias;
+                h[4] = 0;
+                unsigned short cw = _controlfp(0, 0);
+                _controlfp(_RC_CHOP, _MCW_RC);       // round toward zero
+                h[29] = (int)(__int64)(scaled * scale);   // only the low dword kept
+                _controlfp(cw, 0xFFFF);
+                *(char *)((int *)h[1] + 0x2B0) = 1;       // the API-table flag
+            }
+            break;
+        default:
+            break;
+        }
+        ret = 1;
+    }
+
+    // the QPC span goes onto the API table's 64-bit counter at +0x2A8 / +0x2AC
+    unsigned __int64 now   = __rdtsc();
+    unsigned __int64 delta = now - start;
+    h[0] = 0;
+    int *table = (int *)h[1];
+    unsigned __int64 sum = (unsigned __int64)(unsigned int)table[170] + (unsigned int)delta;
+    table[170] = (int)sum;
+    table[171] = (int)((sum >> 32) + (unsigned int)(delta >> 32));
+    return ret;
+}
 
 // sub_5F6420 (0x5F6420 - 0x5F64A5) -- KoreVmAllocExpand: the last-resort
 // expansion for a failed VM-heap allocation (the OOM path). First retries a
