@@ -242,18 +242,239 @@ static void *SetNetManager(void *obj)
 }
 
 // ============================================================
-//  CNetManagerStart  (0x6A6DB0 - 0x6A70E3)  -- [remaining stub]
+//  The CNetLuaEventManager -- the CNetManager's +0x1C sub-object (52 bytes)
+//  and its net-event node list
+// ============================================================
+//
+//  Layout (built by CNetLuaEventManagerCtor, sub_6AA3C0):
+//    +0x00  vtable (CNetLuaEventManager)
+//    +0x04  0
+//    +0x08  32-byte internal list object (NetLuaEventListCtor, sub_6AAC00):
+//        +0x00  4-byte heap owner wrapper (back-pointer to the list object)
+//        +0x18  the 48-byte head node (list head)
+//        +0x1C  node count (0 when empty)
+//    +0x28  12-byte CNetPacketCallback (DNameNode base): vtable + 0
+//    +0x30  back-pointer to the CNetLuaEventManager
+//
+//  The 48-byte event node (one per registered Lua net event) is a circular
+//  list element:
+//    +0x00  next       / +0x04  prev       / +0x08  child node
+//    +0x0C  F3SharedBuffer* shared slot (released via ReleaseSharedSlot)
+//    +0x10  20-byte SEH wrapper list object (see SehBlockListClear)
+//    +0x24  payload block (LHFreed on dispose)
+//    +0x2C  kind byte (1 at construction)
+//    +0x2D  dispose flag: 1 = sentinel (never disposed), 0 = disposable
+//
+//  The head node is constructed with the kind + flag bytes set, so an empty
+//  list is the self-linked head with flag 1.
+
+// Placeholder vtable for the CNetLuaEventManager (the same trick as the
+// CNetManager vtable above): slot 0 must be a callable no-op so the
+// deleting-dtor dispatch (vt[0](slot, 1)) in CNetManagerDtorBody /
+// CNetManagerStart never dereferences an unconstructed table.
+static void F3NetStubRelease(void *obj, int freeIt) { (void)obj; (void)freeIt; }
+static void *g_CNetLuaEventManagerVtable[2] = { (void *)F3NetStubRelease, 0 };
+
+// ============================================================
+//  SehBlockListClear  (0x6AAA50 - 0x6AAAB7)  -- release an SEH-block
+//  circular list and reset it to empty
+//  [NOT byte-identical] placement-dependent (relative calls to the
+//  InterlockedDecrement IAT slot and to LHFree).
+//
+//  void SehBlockListClear(void *obj)   (thiscall in the original)
+//
+//  obj:
+//    +0x14  circular list of 20-byte wrapper nodes ({+0x00 next, +0x10
+//           payload (zeroed), +0x14 F3SehBlock*}), or 0
+//    +0x18  node count
+//  Re-self-links the head, zeroes the count, then walks the old list from
+//  the last element: for each node, InterlockedDecrement the block's
+//  refcount (skipping null blocks) and, on zero, call
+//  block->handler(block->arg); LHFree the block; zero the node's +0x10 / +0x14;
+//  LHFree the node. Stops when the next pointer wraps back to the head (the
+//  head itself is never freed).
+// ============================================================
+static void SehBlockListClear(void *obj)
+{
+    DWORD *dw = (DWORD *)obj;
+    DWORD *head = (DWORD *)dw[0x14 / 4];
+    if (head == 0)
+        return;
+    DWORD *cur = (DWORD *)head[0];
+    head[0] = (DWORD)head;
+    head[1] = (DWORD)head;
+    dw[0x18 / 4] = 0;
+    while (cur != head)
+    {
+        F3SehBlock *block = (F3SehBlock *)cur[0x14 / 4];
+        DWORD *next = (DWORD *)cur[0];
+        if (block != 0)
+        {
+            if (InterlockedDecrement((volatile long *)&block->refcount) == 0)
+                block->handler(block->arg);
+            LHFree(block);
+        }
+        cur[0x10 / 4] = 0;
+        cur[0x14 / 4] = 0;
+        LHFree(cur);
+        cur = next;
+    }
+}
+
+// ============================================================
+//  NetLuaEventNodeDtor  (0x6AB810 - 0x6AB87A)  -- recursively dispose
+//  net-event nodes
+//  [NOT byte-identical] placement-dependent (relative self-call + the
+//  calls to SehBlockListClear / LHFree / ReleaseSharedSlot).
+//
+//  The original is thiscall + `retn 4`: the internal list object in ECX
+//  (obj+8 of the CNetLuaEventManager) + the node on the stack, callee
+//  cleans the arg. This build takes the list object + node as plain
+//  arguments (same order, plain call).
+//
+//  void NetLuaEventNodeDtor(void *listObj, DWORD *node)
+//
+//  Skips the node when its dispose flag (+0x2D) is set (the sentinel).  A
+//  disposable node: recursively dispose the child (+0x08), clear the node's
+//  SEH wrapper list (SehBlockListClear on +0x10), LHFree the +0x24 payload
+//  (zeroed), LHFree the +0x10 wrapper, ReleaseSharedSlot the +0x0C slot,
+//  LHFree the node -- then step to the next (+0x00) and stop when its flag
+//  is set (the head).
+// ============================================================
+static void NetLuaEventNodeDtor(void *listObj, DWORD *node)
+{
+    for (;;)
+    {
+        if (((BYTE *)node)[0x2D] != 0)
+            break;
+        NetLuaEventNodeDtor(listObj, (DWORD *)node[0x08 / 4]);
+        DWORD *next = (DWORD *)node[0];
+        SehBlockListClear((char *)node + 0x10);
+        LHFree((void *)node[0x24 / 4]);
+        node[0x24 / 4] = 0;
+        LHFree((void *)node[0x10 / 4]);
+        ReleaseSharedSlot((F3SharedBuffer **)((char *)node + 0x0C));
+        LHFree(node);
+        node = next;
+    }
+}
+
+// ============================================================
+//  CNetLuaEventManagerListReset  (0x6AA2C0 - 0x6AA2EC)  -- reset the
+//  CNetLuaEventManager's event list to empty
+//  [NOT byte-identical] placement-dependent (relative call to
+//  NetLuaEventNodeDtor).
+//
+//  DWORD *CNetLuaEventManagerListReset(void *obj)   (thiscall in the
+//  original; returns the head node, discarded by both callers)
+//
+//  obj = the 52-byte CNetLuaEventManager (the CNetManager's +0x1C
+//  sub-object).  Disposes the nodes on the list (NetLuaEventNodeDtor on
+//  the list object at +0x08, starting at the head node's next field), then
+//  restores the 48-byte head node at +0x20 to the empty self-linked state
+//  ({head, head, head}) and zeroes the count at +0x24.
+// ============================================================
+DWORD *CNetLuaEventManagerListReset(void *obj)
+{
+    DWORD *node = (DWORD *)((DWORD *)obj)[0x20 / 4];
+    NetLuaEventNodeDtor((char *)obj + 0x08, (DWORD *)node[1]);
+    node[1] = (DWORD)node;
+    ((DWORD *)obj)[0x24 / 4] = 0;
+    node[0] = (DWORD)node;
+    node[2] = (DWORD)node;
+    return node;
+}
+
+// ============================================================
+//  NetLuaEventListCtor  (sub_6AAC00, 0x6AAC00 - 0x6AAC72)  -- construct
+//  the 32-byte internal list object in place
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc).
+//
+//  The original is thiscall + `retn 8` (the list object in ECX + two
+//  stack args). The 4-byte heap owner wrapper at +0x00 (back-pointer to
+//  the list object), the 48-byte head node at +0x18 (the first three
+//  words zeroed -- the game's LHAlloc zeroes the rest of the 48 bytes --
+//  byte +0x2C = 1, then the dispose flag +0x2D = 1), the count at +0x1C =
+//  0, and the head self-linked ({node, node, node}). This build memsets
+//  the node because the test heap (malloc) is not zeroed.
+// ============================================================
+static void NetLuaEventListCtor(void *obj)
+{
+    DWORD *dw = (DWORD *)obj;
+    void *wrap = LHAlloc(4);
+    if (wrap != 0)
+        *(DWORD *)wrap = (DWORD)obj;
+    dw[0] = (DWORD)wrap;
+    DWORD *node = (DWORD *)LHAlloc(48);
+    if (node != 0)
+    {
+        memset(node, 0, 48);
+        ((BYTE *)node)[0x2C] = 1;
+        dw[6] = (DWORD)node;
+        ((BYTE *)node)[0x2D] = 1;
+        node[1] = (DWORD)node;
+        node[0] = (DWORD)node;
+        node[2] = (DWORD)node;
+    }
+    else
+        dw[6] = 0;
+    dw[7] = 0;
+}
+
+// ============================================================
+//  CNetLuaEventManagerCtor  (sub_6AA3C0, 0x6AA3C0 - 0x6AA438)  --
+//  construct the 52-byte CNetLuaEventManager in place
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  CBaseClassNonCopyableCtor / NetLuaEventListCtor / DNameNode / GetNetManager).
+//
+//  void *CNetLuaEventManagerCtor(void *obj)
+//
+//  The original: the base ctor + CNetLuaEventManager vtable, +0x04 = 0,
+//  NetLuaEventListCtor at +0x08, the DNameNode base at +0x28 (vtable
+//  re-stored to CNetPacketCallback, +0x08 = 0), GetNetManager() +
+//  sub_6A6820 (registration -- remaining stub, no-op), the +0x30
+//  back-pointer, and a reader-writer-lock + sub_A1AA30(386, ...) global
+//  registration (unimplemented registry -- skipped here). This build
+//  stores the placeholder vtable instead of the CNetLuaEventManager one.
+// ============================================================
+static void *CNetLuaEventManagerCtor(void *obj)
+{
+    *(void **)obj = (void *)g_CNetLuaEventManagerVtable;   // +0x00 vtable
+    ((DWORD *)obj)[1] = 0;                                 // +0x04
+    NetLuaEventListCtor((char *)obj + 0x08);               // +0x08 internal list
+    ((DWORD *)obj)[0x28 / 4] = (DWORD)g_CNetPacketCallbackVtable;  // +0x28 DNameNode base vtable
+    ((DWORD *)obj)[0x2C / 4] = 0;                          // +0x2C node (0)
+    ((DWORD *)obj)[0x30 / 4] = (DWORD)obj;                 // +0x30 back-pointer
+    return obj;
+}
+
+// ============================================================
+//  CNetManagerStart  (0x6A6DB0 - 0x6A70E3)  -- [partial stub]
 //
 //  The real function is 0x333 bytes: it constructs the CNetManager's ~15
 //  sub-objects (LHAlloc + a per-class ctor into each +0x04..+0x5C slot,
 //  releasing the old one through its deleting destructor), wires the packet
 //  callback + reader-writer lock, and returns sub_A1AA30(535, ...).
-//  Out of scope for InitNetworking. Returns 0 (success).
+//  This build constructs only the +0x1C sub-object (the 52-byte
+//  CNetLuaEventManager, sub_6AA3C0) -- the slot CNetLuaEventManagerListReset
+//  (sub_6AA2C0) reads -- and leaves the rest stubbed. Returns 0 (success).
 //
 //  int CNetManagerStart(void *obj)
 // ============================================================
 static int CNetManagerStart(void *obj)
-{ (void)obj; return 0; }
+{
+    DWORD *dw = (DWORD *)obj;
+    if (dw[0x1C / 4] != 0)
+    {
+        void **vt = (void **)*(void **)dw[0x1C / 4];
+        ((void (*)(void *, int))vt[0])((void *)dw[0x1C / 4], 1);   // deleting dtor
+    }
+    void *sub = LHAlloc(52);
+    if (sub != 0)
+        CNetLuaEventManagerCtor(sub);
+    dw[0x1C / 4] = (DWORD)sub;
+    return 0;
+}
 
 // The CNetManagerShutdown direct-release callees (remaining stubs): the
 // +0x10 sub-object release (thiscall + a 0 flag), the +0x34 sub-object

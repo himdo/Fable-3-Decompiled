@@ -48,18 +48,6 @@
 "source": "gamemain"
 },
 {
-"name": "?sub_6281B0@@YAXH@Z",
-"rva": 2261424,
-"size": 5,
-"source": "gamemain"
-},
-{
-"name": "?sub_6AA2C0@@YAXPAX@Z",
-"rva": 2794176,
-"size": 44,
-"source": "gamemain"
-},
-{
 "name": "?sub_754DE0@@YAPAXPAX@Z",
 "rva": 3493344,
 "size": 722,

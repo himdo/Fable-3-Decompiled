@@ -755,13 +755,12 @@ static void  EngineServiceStop(void) { }                                  // sub
 // thunk: engine-subsystem stops (remaining stubs).
 static void  sub_718C50(void) { }
 static int   sub_1926120(void) { return 0; }
-// The +0xBC release chain (remaining stubs): sub_6AA2C0 clears the net
-// manager's +0x1C sub-object's internal list (sub_6AB810 + reset),
-// sub_6281B0 forwards to sub_5EDFE0 (the +0xBC object's release), and
-// sub_717AB0 frees the dword_1DC26E4 global (sub_19FEA30 / sub_19FE510
-// releases + LHFree).
-static void  sub_6AA2C0(void *obj) { (void)obj; }
-static void  sub_6281B0(int a) { (void)a; }
+// The +0xBC release chain: CNetLuaEventManagerListReset (0x6AA2C0,
+// implemented in netinit.cpp) clears the net manager's +0x1C sub-object's
+// internal list (sub_6AB810 + reset); DestroyLuaModule (sub_6281B0 ->
+// sub_5EDFE0, implemented in gamemain.cpp / declared in gameengine.h) is the
+// +0xBC object's release; and sub_717AB0 frees the dword_1DC26E4 global
+// (sub_19FEA30 / sub_19FE510 releases + LHFree).
 static void  sub_717AB0(void) { }
 // nullsub_189 / nullsub_190: bare `retn` thunks (no-ops).
 static void  nullsub_189(void) { }
@@ -789,7 +788,7 @@ static void *CNetManagerSlot1C(void *obj) { return *(void **)((char *)obj + 0x1C
 //  sleeps 10 ms. It then releases the +0xC0 object through its deleting
 //  destructor (vtable[0](slot, 1), zeroed) and, when the +0xBC handle is
 //  set, clears the net manager's +0x1C sub-object list (sub_6A66C0 /
-//  sub_6A6900 / sub_6AA2C0), releases the +0xBC object (sub_6281B0, zeroed),
+//  sub_6A6900 / CNetLuaEventManagerListReset), releases the +0xBC object
 //  and frees the dword_1DC26E4 global (sub_717AB0). The trailing no-op
 //  thunks (nullsub_189 / nullsub_190) lead into the shared 0x6A72F0
 //  epilogue: when the net-manager pair (dword_1DC2550 / dword_1DC2554) is
@@ -830,10 +829,10 @@ void CGameEngineCleanup(CGameEngine *obj)
 
     if (obj->member0xBC != 0)
     {
-        sub_6AA2C0(CNetManagerSlot1C(GetNetManager()));
+        CNetLuaEventManagerListReset(CNetManagerSlot1C(GetNetManager()));
         if (obj->member0xBC != 0)
         {
-            sub_6281B0((int)obj->member0xBC);
+            DestroyLuaModule((int)obj->member0xBC);
             obj->member0xBC = 0;
         }
         sub_717AB0();

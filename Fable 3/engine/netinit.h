@@ -75,6 +75,15 @@ typedef struct F3NetUserSignin
 // (0x7724BA, on a sign-in event) and the listener setup (0x772EFA).
 void CNetUserManagerRefreshSignin(void *obj);
 
+// DWORD *CNetLuaEventManagerListReset(void *obj)   (sub_6AA2C0, thiscall)
+// -- the CNetManager's +0x1C sub-object (the 52-byte CNetLuaEventManager,
+// built by CNetManagerStart) event-list reset: dispose the registered net-
+// event nodes (NetLuaEventNodeDtor, sub_6AB810) and restore the 48-byte
+// head node at +0x20 to the empty self-linked state ({head, head, head},
+// count at +0x24 := 0). Returns the head node (discarded by both callers:
+// ReinitEngineLua 0x61A4AA and CGameEngineCleanup 0x61AEFC).
+DWORD *CNetLuaEventManagerListReset(void *obj);
+
 // 0x770960 - seed the global net-state factory map (0x1DC4AA4) with the four
 // net matchmaking state factories (id 2..5). Called by RunFrontEnd after
 // CreateHeapManager; a later net-state transition looks a state id up in

@@ -7903,7 +7903,7 @@ void *CVersionTableGetVersion1(void *obj)
 //  three Lua-environment members of the engine:
 //    +0xBC  the Lua module -- the 1032-byte "Fable 3" lua_State host
 //           (CreateLuaModule, sub_629570; the old one is released via
-//           sub_6281B0 -> sub_5EDFE0)
+//           DestroyLuaModule (sub_6281B0) -> DestroyLuaModuleBody (sub_5EDFE0))
 //    +0xC0  the CLuaManager -- the 8-byte wrapper (CLuaManagerCtor,
 //           sub_6F9890; its impl wraps the Lua module and the engine's
 //           +0x98 sorted map), followed by
@@ -7912,7 +7912,7 @@ void *CVersionTableGetVersion1(void *obj)
 //           holding the Lua-state reference
 //  First the old +0xC0 is released (vtable[0](slot, 1) deleting-dtor
 //  dispatch) and the net manager's +0x1C sub-object list is cleared
-//  (CNetManagerSlot1C + sub_6AA2C0).  When the +0xC0 slot was already
+//  (CNetManagerSlot1C + CNetLuaEventManagerListReset).  When the +0xC0 slot was already
 //  empty (first-time init), the two startup-script path slots
 //  (unk_1DBE2B4 + unk_1DBDA6C via the sub_1A02260 2-source concat) are
 //  built and the Lua startup scripts are run (sub_616710).  Register
@@ -7949,14 +7949,441 @@ static void *CreateLuaModule(void)
     return m;
 }
 
-// sub_6281B0 (0x6281B0 - 0x6281B5) -- thunk into sub_5EDFE0, the Lua
-// module's release (the same stub as the gamethread.cpp copy).
-static void sub_6281B0(int a) { (void)a; }
+// ============================================================
+//  DestroyLuaModule  (0x6281B0 - 0x6281B5)  -- release the engine's
+//  "Fable 3" Lua module (the 1032-byte KoreVM host)
+//  [NOT byte-identical] the original is a 5-byte near `jmp sub_5EDFE0`
+//  thunk; that tail jump is rebased to the build's DestroyLuaModuleBody,
+//  so the E9 displacement differs. A plain C tail call (the forward)
+//  emits the same single-jmp shape under /O2.
+//
+//  void DestroyLuaModule(int luaModule)
+//
+//  The counterpart of CreateLuaModule (sub_629570). Called by
+//  ReinitEngineLua (0x61A4BA, when the +0xBC module is rebuilt) and
+//  CGameEngineCleanup (0x61AF0C, post-pump teardown) to release the old
+//  Lua module: it forwards the module pointer to the body sub_5EDFE0
+//  (DestroyLuaModuleBody), which marks the VM released, dumps its stats,
+//  frees the memory-allocation list, runs the finalise step, and
+//  deallocates the 1032-byte block through the VM's own heap-dealloc
+//  function. (Shared declaration in gameengine.h; both call sites use it.)
+// ============================================================
+// sub_5D3680 (0x5D3680 - 0x5D372D) -- KoreFindFreeBlock: locate a free
+// block of the requested (float) size in the KoreVM block table.  obj is
+// the VM allocator object {+0x04 index mask, +0x08 20-byte block table};
+// a block-table row is {+0x00 float size, +0x04 state, +0x08 value,
+// +0x0C in-use flag, +0x10 next}.  The probe index is
+// mask & (int)(float)size (the original truncates through the x87);
+// a row matches when state == 3 and its stored float equals the request,
+// otherwise the row's next pointer (block offset from the table / 20) is
+// followed.  Returns the block index, or -4 (0xFFFFFFFC) when the chain
+// is exhausted or unwinds to -4.  thiscall + retn 4 hybrid in the
+// original (obj in ECX, size on the stack); a plain free function here.
+static int KoreFindFreeBlock(int obj, int size)
+{
+    int mask   = *(int *)(obj + 4);
+    int blocks = *(int *)(obj + 8);
+    int idx    = ((int)(float)size) & mask;
+    for (;;)
+    {
+        int state = *(int *)(blocks + idx * 20 + 4);
+        int fsize = *(int *)(blocks + idx * 20);
+        if (state == 3 && (float)size == (float)fsize)
+            return idx;
+        int next = *(int *)(blocks + idx * 20 + 16);
+        if (next == 0)
+            return 0xFFFFFFFC;
+        idx = (next - blocks) / 20;
+        if (idx == 0xFFFFFFFC)
+            return 0xFFFFFFFC;
+    }
+}
 
-// sub_6AA2C0 (0x6AA2C0 - 0x6AA2EC) -- clear the net manager's +0x1C
-// sub-object's internal list (sub_6AB810 + list reset; the same stub as
-// the gamethread.cpp copy).
-static void sub_6AA2C0(void *obj) { (void)obj; }
+// sub_5D97E0 (0x5D97E0 - 0x5D9937) -- KoreFindFirstFreeAlloc: find the
+// first free allocation index in the VM's registry allocator (the vm+0xCC
+// object, {+0x04 count field, +0x08 block table, +0x0C 8-byte item array
+// {value, in-use flag}, +0x10 item count}).  When the item array is empty
+// or its last item is in use the block table is probed instead: starting
+// at size count+1 (KoreFindFreeBlock), doubling while the found block is
+// still in use (a binary search between the last two sizes once the
+// doubling overflows 0x7FFFFFFF -- or, past 0x7FFFFFFF, a linear scan
+// from 1 + the in-use item count -- then the block's index is returned).
+// Otherwise a binary search returns the first item whose flag is 0 (the
+// in-use items are packed at the front).  The value KoreDumpVMStats
+// prints as the "Registry Array Size".  thiscall free function in the
+// original (obj in ECX, retn); a plain free function here.
+// [NOT byte-identical] placement-dependent (relative calls to
+// KoreFindFreeBlock).
+static int KoreFindFirstFreeAlloc(int obj)
+{
+    int count = *(int *)(obj + 0x10);
+    if (count > 0)
+    {
+        int items = *(int *)(obj + 0x0C);
+        if (*(int *)(items + 8 * count - 4) == 0)
+        {
+            int result = 0;
+            if (count > 1)
+                while (count - result > 1)
+                {
+                    int mid = (result + count) >> 1;
+                    if (*(int *)(items + 8 * mid - 4) != 0)
+                        result = mid;
+                    else
+                        count = mid;
+                }
+            return result;
+        }
+    }
+    if (*(int *)(obj + 4) == 0xFFFFFFFF)
+        return count;
+    int v5 = count;
+    unsigned int v6 = (unsigned int)count + 1;
+    int v7 = KoreFindFreeBlock(obj, (int)v6);
+    int blocks = 0;
+    if (v7 != 0xFFFFFFFC)
+    {
+        blocks = *(int *)(obj + 8);
+        for (;;)
+        {
+            if (*(int *)(blocks + v7 * 20 + 12) == 0)
+                break;
+            v5 = (int)v6;
+            v6 *= 2;
+            if (v6 > 0x7FFFFFFFu)
+            {
+                int v9 = 1;
+                if (count > 0)
+                {
+                    int p = *(int *)(obj + 0x0C);
+                    while (*(int *)(p + 4) != 0)
+                    {
+                        ++v9;
+                        p += 8;
+                        if (v9 > count)
+                            break;
+                    }
+                }
+                while (KoreFindFreeBlock(obj, v9) == 0xFFFFFFFC)
+                    ++v9;
+                return v9 - 1;
+            }
+            v7 = KoreFindFreeBlock(obj, (int)v6);
+            if (v7 == 0xFFFFFFFC)
+                break;
+        }
+    }
+    while (v6 - (unsigned int)v5 > 1)
+    {
+        int mid = (int)((v6 + (unsigned int)v5) >> 1);
+        int v8 = KoreFindFreeBlock(obj, mid);
+        if (v8 == 0xFFFFFFFC || *(int *)(blocks + v8 * 20 + 12) == 0)
+            v6 = (unsigned int)mid;
+        else
+            v5 = mid;
+    }
+    return v5;
+}
+
+// sub_5DEB70 (0x5DEB70 - 0x5DEC12) -- KoreDumpVMStats: dump the KoreVM's
+// stats through the VM's printf-like logger (vm+0x2B4, cdecl
+// (module, format, ...)): the "KoreVM: %s" line (the module name from
+// *(vm+0xE4)+0x48), the registry array size (KoreFindFirstFreeAlloc on
+// the vm+0xCC registry allocator -- the original stashes the result in
+// its own dead parameter slot and re-reads it for the line; a local is
+// equivalent, the sole caller never re-reads the slot), the globals hash
+// size (*( *(mod+0x30) )+4) + 1, the intern-string table (vm+0xC0
+// allocated, vm+0xC4 + 1 used), the max memory allocated (vm+8 >> 10
+// kilobytes), and a blank line.  [NOT byte-identical] placement-dependent
+// (the relative call to KoreFindFirstFreeAlloc) and refs the six format
+// strings at their original high VAs (0x01AE2DA0..0x01AE2E48).  mod is
+// the 1032-byte module block; *mod is the VM.  The vm == 0 guard keeps
+// the stub-world (zeroed module block) a no-op where the original would
+// fault.
+static void KoreDumpVMStats(int mod)
+{
+    int *vm = (int *)mod;
+    if (vm == 0)
+        return;
+    int registrySize = KoreFindFirstFreeAlloc(vm[0xCC / 4]);
+    typedef void (__cdecl *KoreLogFn)(int, const char *, ...);
+    KoreLogFn log = (KoreLogFn)(void *)(unsigned int)vm[0x2B4 / 4];
+    log(mod, "KoreVM:               %s\n", *(int *)(vm[0xE4 / 4] + 0x48) + 8);
+    log(mod, "Registry Array Size:  %d\n", registrySize);
+    log(mod, "Globals Hash Size:    %d\n", *(int *)(*(int *)(mod + 0x30) + 4) + 1);
+    log(mod, "Intern String Table:  %d allocated, %d used\n", vm[0xC0 / 4], vm[0xC4 / 4] + 1);
+    log(mod, "Max memory allocated: %d kilobytes\n", vm[8 / 4] >> 10);
+    log(mod, "\n");
+}
+// sub_5D3370 (0x5D3370 - 0x5D33DD) -- KoreLookupStringTable: hash-chain
+// search of the VM's 20-byte-row string table (thiscall + retn 12; the table
+// object in ECX is {+0x04 mask, +0x08 row array}, a row is {+0x00 key,
+// +0x04 hash, +0x08 value, +0x0C size, +0x10 next absolute row pointer}).
+// Probe index = (key ^ ((key ^ (key>>3)) >> 5)) & mask; walk the chain until
+// a row matches {key, hash} and copy {row+8, row+12} into the 8-byte out
+// parameter; on exhaustion write the zero-initialized "no interned string"
+// globals (dword_1DBCFE0 / dword_1DBCFE4, both image-zero) and return out.
+// [NOT byte-identical] a thiscall + retn 12 hybrid in the original (declared
+// object-first here) and refs the two high-VA globals.
+static int KoreLookupStringTable(int table, int out, int key, int hash)
+{
+    int rows = *(int *)(table + 8);
+    if (rows != 0)
+    {
+        int idx = (key ^ ((key ^ (key >> 3)) >> 5)) & *(int *)(table + 4);
+        int *row = (int *)(rows + idx * 20);
+        for (;;)
+        {
+            int next = row[4];
+            if (row[0] == key && row[1] == hash)
+            {
+                *(int *)out = row[2];
+                *(int *)(out + 4) = row[3];
+                return out;
+            }
+            row = (int *)next;
+            if (next == 0)
+                break;
+        }
+    }
+    *(int *)out = 0;       // dword_1DBCFE0 (zero-init "not found" global)
+    *(int *)(out + 4) = 0; // dword_1DBCFE4
+    return out;
+}
+
+// sub_60C5E0 (0x60C5E0 - 0x60C689) -- KoreLookupStringRegistry: the registry
+// (odd-object) form of the interned-string lookup (thiscall + retn 16).
+// obj's {+0x04 count, +0x1C 16-byte row array} is scanned for a row whose
+// first word equals key; on a hit the row's +13 descriptor byte selects the
+// result pair {obj word[desc], byte obj[16*(desc>>2) + (desc&3)]}. On a miss
+// (or empty array) it falls back to the sub-table at obj+12 through
+// KoreLookupStringTable (key, hash), or to the zero globals when that is
+// null. [NOT byte-identical] a thiscall + retn 16 hybrid in the original
+// (declared object-first here) and refs the two high-VA zero globals.
+static int KoreLookupStringRegistry(int obj, int out, int key, int hash, int a4)
+{
+    (void)a4; // the 4 the sole caller pushes (dead in the original too)
+    int count = *(int *)(obj + 4);
+    if (count > 0)
+    {
+        int *row = (int *)(obj + 0x1C);
+        for (int i = 0; i < count; ++i, row += 4)
+        {
+            if (*row == key && row != 0)
+            {
+                int desc = *(unsigned char *)(row + 13);
+                *(int *)out = *(int *)(obj + 4 * desc);
+                *(int *)(out + 4) = *(unsigned char *)(obj + 16 * (desc >> 2) + (desc & 3));
+                return out;
+            }
+        }
+    }
+    int sub = *(int *)(obj + 12);
+    if (sub != 0)
+    {
+        int tmp[2];
+        (void)KoreLookupStringTable(sub, (int)tmp, key, hash);
+        *(int *)out = tmp[0];
+        *(int *)(out + 4) = tmp[1];
+        return out;
+    }
+    *(int *)out = 0;       // dword_1DBCFE0 (zero-init "not found" global)
+    *(int *)(out + 4) = 0; // dword_1DBCFE4
+    return out;
+}
+
+// sub_5DDE20 (0x5DDE20 - 0x5DDE86) -- KoreLookupInternedString: resolve an
+// interned string to the {pointer, size} qword (returned in {eax, edx}).
+// The table is *(obj+0) + 0xE8 + 4*index; when obj's low bit is set the
+// registry form is used (KoreLookupStringRegistry on obj & ~1 with index
+// a3), otherwise the plain hash table (KoreLookupStringTable on obj with
+// index a2). [NOT byte-identical] placement-dependent (relative calls).
+static unsigned __int64 KoreLookupInternedString(int obj, int idxEven, int idxOdd)
+{
+    int out[2];
+    if (obj & 1)
+    {
+        int table = *(int *)(*(int *)obj + 4 * idxOdd + 0xE8);
+        (void)KoreLookupStringRegistry(obj & ~1, (int)out, obj, table, 4);
+    }
+    else
+    {
+        int table = *(int *)(*(int *)obj + 4 * idxEven + 0xE8);
+        (void)KoreLookupStringTable(obj, (int)out, table, 4);
+    }
+    return ((unsigned __int64)(unsigned int)out[1] << 32) | (unsigned int)out[0];
+}
+
+// sub_5DA0A0 (0x5DA0A0 - 0x5DA14F) -- KoreSwapTableContext: swap the 12-word
+// {+0x04..+0x2C} block + the +0x48 word between two 80-byte VM table-context
+// objects (a pure word exchange; the original is a usercall taking the two
+// objects in EAX/ECX and returns the first). [NOT byte-identical] a plain
+// C++ reimplementation of the swap (the original is call-free 175 bytes).
+static void KoreSwapTableContext(int a, int b)
+{
+    int *pa = (int *)a, *pb = (int *)b;
+    int t;
+    int i;
+    for (i = 1; i <= 11; ++i)
+    {
+        t = pa[i]; pa[i] = pb[i]; pb[i] = t;
+    }
+    t = pa[18]; pa[18] = pb[18]; pb[18] = t;
+}
+
+// sub_5DFE90 (0x5DFE90 - 0x5DFEB9) -- KoreAllocRecordTable: lazily create
+// the allocation list's +0x08 record-table object — the 112-byte table clone
+// sub_5DEAD0(vmcore) (sub_5EEAE0 vm-core allocation + field copies + the
+// {ptr, 8} entry-array write at vmcore+0x1C with the cursor rewound), then
+// set result+0x48 = *(vmcore+0)+0x14C and publish it at list+0x08. Remaining
+// stub (the vm-core 112-byte table-object construction is out of scope).
+static int KoreAllocRecordTable(int obj) { (void)obj; return 0; }
+
+// sub_5EC960 (0x5EC960 - 0x5ECACA) -- KoreHashTableInsert: the
+// setjmp/longjmp-guarded insert of a table entry (thiscall on the table,
+// the table also as the first stack arg): swap the table's +0x40 slot with a
+// 64-byte stack jmp buffer, run the table core (sub_5EC770), restore the
+// slot, and unwind through the saved chain (sub_407540 / sub_5D2950) on the
+// longjmp path; returns 0 on the no-exception path. Remaining stub (the
+// 459-byte table core + its resize/error cluster is out of scope); the no-op
+// returns 0 (the no-exception result) and leaves the table untouched.
+static int KoreHashTableInsert(int obj, int a1, int a2, int a3, int a4)
+{ (void)obj; (void)a1; (void)a2; (void)a3; (void)a4; return 0; }
+
+// sub_5ED860 (0x5ED860 - 0x5ED90E) -- KoreReleaseAllocNode: the per-node
+// step of the allocation-list free (thiscall on the list + retn 8: stack
+// args are the node, then the vm-core object vmcore = list+0x04). Look up
+// the node's interned string (node+0x04 is the string id):
+// (name, size) = KoreLookupInternedString(vmcore, id, 0x0F); when size != 0,
+// lazily create the list's record table (KoreAllocRecordTable on list+0x08
+// when null), swap the vm-core's table context into the record table
+// (KoreSwapTableContext), append the {name, size, node, 7} 16-byte entry at
+// the vm-core's entry cursor (+0x1C, advanced by 16), and insert it into the
+// hash table (KoreHashTableInsert, the list+0x30 re-entrancy flag set for
+// the duration). A non-zero insert result truncates the entry array: zero
+// the second word of each 8-byte pair from the new cursor to +0x20 and set
+// the cursor to +0x20. Swap the context back; returns the name word (the
+// original returns the lookup qword; both callers ignore it).
+// [NOT byte-identical] placement-dependent (relative calls to the helpers).
+static int KoreReleaseAllocNode(int list, int node, int vmcore)
+{
+    int id = *(int *)(node + 4);
+    if (id == 0)
+        return 0;
+    unsigned __int64 r = KoreLookupInternedString(vmcore, id, 0x0F);
+    int name = (int)r;
+    int size = (int)(r >> 32);
+    if (size == 0)
+        return name;
+    if (*(int *)(list + 8) == 0)
+        KoreAllocRecordTable(list);
+    int table = *(int *)(list + 8);
+    KoreSwapTableContext(table, vmcore);
+    int *ent = (int *)*(int *)(vmcore + 0x1C);
+    ent[0] = name;
+    ent[1] = size;
+    ent[2] = node;
+    ent[3] = 7;
+    *(int *)(vmcore + 0x1C) = (int)(ent + 4);
+    *(int *)(list + 0x30) = 1;
+    int r2 = KoreHashTableInsert(vmcore, vmcore, 1, 0, 0);
+    *(int *)(list + 0x30) = 0;
+    if (r2 != 0)
+    {
+        int *cur = (int *)*(int *)(vmcore + 0x1C);
+        int end = *(int *)(vmcore + 0x20);
+        for (;;)
+        {
+            if ((int)cur >= end)
+                break;
+            cur[1] = 0;
+            cur += 2;
+        }
+        *(int *)(vmcore + 0x1C) = end;
+    }
+    KoreSwapTableContext(table, vmcore);
+    return name;
+}
+
+// sub_5ED910 (0x5ED910 - 0x5ED97E) -- KoreFreeAllocList: free the VM's
+// memory-allocation list (thiscall on the VM's +0x2C list object, which is
+// {+0x00 state flag, +0x04 vm-core object P, +0x08 record-table ptr,
+// +0x0C heap object}). Set the state flag to -1, then walk P's
+// allocation-node freelist (head at *(P+0)+0xE0; a node is {+0x04 string
+// id, +0x08 next, +0x0C size}, with the block flag word at node-4): release
+// the node's interned
+// string record (KoreReleaseAllocNode), then dealloc the node's block
+// through the list's heap object — decrement the used-byte counter
+// (heap+0x04) by size + 20 and call heap+0x0C(heap+0x10, node-4, size+20,
+// 0) (the 4 bytes before the node are the block header). Zero the freelist
+// head (P+0xE0) and the record-table pointer (list+0x08); returns P (the
+// original's return value, ignored by both callers).
+// [NOT byte-identical] placement-dependent (the relative call to
+// KoreReleaseAllocNode).
+static int KoreFreeAllocList(int list)
+{
+    int vmcore = *(int *)(list + 4);
+    *(int *)list = -1;
+    int node = *(int *)(((int *)vmcore)[0] + 0xE0);
+    while (node != 0)
+    {
+        KoreReleaseAllocNode(list, node, vmcore);
+        int next = *(int *)(node + 8);
+        int heap = *(int *)(list + 0xC);
+        int bytes = *(int *)(node + 0xC) + 20;
+        *(int *)(heap + 4) -= bytes;
+        int fn = *(int *)(heap + 0xC);
+        int ctx = *(int *)(heap + 0x10);
+        ((void (*)(int, int, int, int))fn)(ctx, node - 4, bytes, 0);
+        node = next;
+    }
+    *(int *)(((int *)vmcore)[0] + 0xE0) = 0;
+    *(int *)(list + 8) = 0;
+    return vmcore;
+}
+// sub_5DA690 (0x5DA690 - 0x5DA6D2) -- the VM finalise step (thiscall on the
+// VM's +0xBC object with the module as the second arg): the finalise loop over
+// the VM's remaining slots. Remaining stub (deep VM internals out of scope).
+static void KoreFinalizeVM(int obj, int a1) { (void)obj; (void)a1; }
+// sub_5DA150 (0x5DA150 - 0x5DA1C0) -- detach the VM's heap: free the two
+// pending-allocation lists (sub_5D5B20 each), zero the +0x28 slot, and pull
+// out the 3-word heap-dealloc context {vm[3] (the dealloc fn), vm[4], vm[5]}
+// into the out pointer. Remaining stub (deep VM internals out of scope).
+static void KoreDetachHeap(int obj, int heap) { (void)obj; (void)heap; }
+
+// sub_5EDFE0 (0x5EDFE0 - 0x5EE03C) -- DestroyLuaModuleBody: the Lua module's
+// (KoreVM's) release.  [NOT byte-identical] placement-dependent (relative
+// calls to the four VM-teardown helpers above).
+//
+//  void DestroyLuaModuleBody(int luaModule)
+//
+//  luaModule is the 1032-byte block; *luaModule is the VM object it hosts.
+//  (In the real binary *luaModule is always the valid VM object; the stub
+//  CreateLuaModule leaves the block zeroed, so the guard below keeps that
+//  path a no-op instead of writing to address 0x29C.)
+static void DestroyLuaModuleBody(int luaModule)
+{
+    int *mod = (int *)luaModule;
+    int *vm  = (int *)mod[0];
+    if (vm == 0)
+        return;
+    vm[0x29C / 4] = -1;                                 // mark the VM released
+    KoreDumpVMStats((int)mod);                          // sub_5DEB70(mod)
+    KoreFreeAllocList((int)(vm + 0x2C / 4));            // sub_5ED910 (thiscall vm+0x2C)
+    KoreFinalizeVM((int)(vm + 0xBC / 4), luaModule);    // sub_5DA690 (thiscall vm+0xBC, a1)
+    KoreDetachHeap((int)vm, 0);                         // sub_5DA150 (thiscall vm, &heap)
+    if (vm[3] != 0)                                     // the VM's heap-dealloc fn (vm[3])
+        ((void (*)(int, int, int, int))vm[3])(vm[4], (int)vm, 1032, 0);  // free the 1032-byte block
+}
+
+void DestroyLuaModule(int luaModule)
+{
+    DestroyLuaModuleBody(luaModule);   // the original's 5-byte `jmp sub_5EDFE0`
+}
+
+// CNetLuaEventManagerListReset (0x6AA2C0 - 0x6AA2EC) -- clear the net
+// manager's +0x1C sub-object's internal list (sub_6AB810 + list reset);
+// implemented in netinit.cpp, declared in netinit.h.
 
 // CNetManagerSlot1C (0x6A6900 - 0x6A6904) -- thiscall getter of the
 // CNetManager's +0x1C sub-object (the same stub as the gamethread.cpp
@@ -8031,12 +8458,12 @@ static int ReinitEngineLua(void *obj, int flag)
     }
 
     // 2. Clear the net manager's +0x1C sub-object list.
-    sub_6AA2C0(CNetManagerSlot1C(GetNetManager()));
+    CNetLuaEventManagerListReset(CNetManagerSlot1C(GetNetManager()));
 
     // 3. Release the old Lua module (+0xBC); build the fresh one.
     if (dw[0xBC / 4] != 0)
     {
-        sub_6281B0((int)dw[0xBC / 4]);
+        DestroyLuaModule((int)dw[0xBC / 4]);
         dw[0xBC / 4] = 0;
     }
     dw[0xBC / 4] = (DWORD)CreateLuaModule();
