@@ -379,13 +379,30 @@ static void KorePanicTraceback(int obj) { (void)obj; }
 
 // ---- KoreHeapInitGrow's callees: the VM-heap alloc-node bookkeeping ----
 
-// sub_5D56D0 (0x5D56D0 - 0x5D5704) -- KoreHeapPanic: the OOM abort -- unlink
-// the heap sub-object from the +0x3C / +0x40 / +0x44 handler list, then
-// longjmp(*(obj+0), 1) back into the KoreHeapInitGrow setjmp frame.
-// [NOT byte-identical] remaining stub (never panics in the stub world).
+// sub_5D56D0 (0x5D56D0 - 0x5D5704) -- KoreHeapPanic: the OOM abort. The
+// heap sub-object's +0x3C / +0x40 / +0x44 words are the OOM-handler list
+// (head / tail / pending node) whose nodes link through their +0x50 next.
+// When the +0x44 pending node is non-null and not already the +0x40 tail it
+// is spliced in: the +0x3C head becomes the node's old +0x50 next, the node's
+// +0x50 next is cleared, the old tail's +0x50 next becomes the old head, and
+// the +0x40 tail becomes the node; then longjmp(*(obj+0), 1) back into the
+// KoreHeapInitGrow setjmp frame (the +0x00 slot is the published jmp buffer).
+// [NOT byte-identical] a pure thiscall in the original (declared object-first
+// here) that ends in a relative call to the _longjmp IAT slot (high-VA
+// import), so it is placement-dependent.
 static void KoreHeapPanic(int obj)
 {
-    (void)obj;
+    int *h = (int *)obj;
+    int node = h[17];                    // the +0x44 pending OOM-handler node
+    if (node != 0 && node != h[16])      // skip when null or already the tail
+    {
+        int head = h[15];                // the +0x3C OOM-handler list head
+        h[15]  = *(int *)(node + 0x50);  // head  := node's next
+        *(int *)(node + 0x50) = 0;       // node's next := 0 (detach)
+        *(int *)(h[16] + 0x50) = head;   // old tail's next := old head
+        h[16] = node;                    // tail := node
+    }
+    longjmp(*(jmp_buf *)h[0], 1);        // back into the KoreHeapInitGrow setjmp
 }
 
 // sub_5D5D30 (0x5D5D30 - 0x5D5DCD) -- KoreDrainFreeList: claim free blocks
@@ -466,19 +483,81 @@ static int KoreInitAllocNode12(int obj, int ptr, int node, int flags)
 
 // sub_5E21E0 (0x5E21E0 - 0x5E229F) -- KoreInitAllocNode: the alloc-node
 // init/adopt dispatcher -- the node's type word (node[1]) selects the
-// per-type routine (4 = plain buffer flag, 5 / 7 / 8 / 9 / 10 / 12 as above).
-// [NOT byte-identical] remaining stub.
+// per-type routine. Thiscall + `retn 8`: `this` is ecx, the node pointer
+// (a 2-word header, [0] = payload pointer, [1] = type) and the flags are
+// the stack parameters. Type 4 (plain buffer) just marks the byte just
+// before the buffer with bit 0 (the "adopted" flag) when the buffer
+// pointer is non-negative and the flag is still clear, then decrements
+// the alloc budget (obj+0x6C) -- unless the guard word (obj+0x70) is -1,
+// which suspends budget accounting -- and panics (KoreHeapPanic) when the
+// decrement would drive the budget to 0 or below. Types 5 / 7 / 8 / 9 /
+// 10 / 12 forward to their per-type routine with node = 0 (adopt mode).
+// [NOT byte-identical] the body has relative calls to the per-type
+// helpers and to KoreHeapPanic, so it is placement-dependent.
 static void KoreInitAllocNode(int obj, int node, int flags)
 {
-    (void)obj; (void)node; (void)flags;
+    int *n = (int *)node;
+    switch (n[1])
+    {
+        case 4:
+        {
+            int p = n[0];
+            if (p >= 0 && (*((unsigned char *)p - 1) & 1) == 0)
+            {
+                *((unsigned char *)p - 1) |= 1;   // mark the buffer header
+                int budget = *(int *)(obj + 0x6C) - 1;  // the alloc budget
+                if (*(int *)(obj + 0x70) != -1)
+                {
+                    if (budget <= 0)
+                        KoreHeapPanic(obj);   // longjmps to the grow setjmp
+                    *(int *)(obj + 0x6C) = budget;
+                }
+            }
+            break;
+        }
+        case 5:  KoreInitAllocNode5(obj, n[0], 0, flags);  break;
+        case 7:  KoreInitAllocNode7(obj, n[0], 0, flags);  break;
+        case 8:  (void)KoreInitAllocNode8(obj, n[0], 0, flags);  break;
+        case 9:  (void)KoreInitAllocNode9(obj, n[0], 0, flags);  break;
+        case 0xA:(void)KoreInitAllocNode10(obj, n[0], 0, flags); break;
+        case 0xC:(void)KoreInitAllocNode12(obj, n[0], 0, flags); break;
+        default: break;
+    }
 }
 
 // sub_5E22D0 (0x5E22D0 - 0x5E2331) -- KoreInitAllocList: re-adopt every node
-// of the heap's primary alloc-node list (obj+0x20 / obj+0x24) through
-// KoreInitAllocNode. [NOT byte-identical] remaining stub.
+// of the heap's primary alloc-node list (the obj+0x20 list of 8-byte
+// {payload, type} pairs, count at obj+0x24) through KoreInitAllocNode. The
+// walk runs from the last pair (base + 8*count - 8) backward down to the
+// base: each node's header word is unflagged (bit 0 cleared at payload-4 for
+// types 4 / 7, else payload-8), the list count (obj+0x24) is popped, and the
+// node pair is re-adopted through KoreInitAllocNode via a stack copy of the
+// two words, with flags - 1. A null list base skips the walk entirely.
+// [NOT byte-identical] a thiscall + retn 4 hybrid in the original (the heap
+// object in ECX, the flags word on the stack; declared object-first here) and
+// placement-dependent (relative call into KoreInitAllocNode). The sole caller
+// (KoreHeapInitGrow stage 1) discards the return value.
 static int KoreInitAllocList(int obj, int flags)
 {
-    (void)obj; (void)flags;
+    int *h = (int *)obj;
+    int base = h[5];                 // obj+0x20 primary alloc-node list
+    if (base != 0)
+    {
+        int *cur = (int *)(base + 8 * h[6] - 8);   // the last node pair
+        for (;;)
+        {
+            if ((unsigned int)cur < (unsigned int)base)
+                break;
+            int payload = cur[0];
+            int type    = cur[1];
+            *(int *)((type == 4 || type == 7) ? payload - 4
+                                              : payload - 8) &= ~1;
+            --h[6];                  // pop the node off the list
+            int nodeCopy[2] = { payload, type };
+            KoreInitAllocNode(obj, (int)nodeCopy, flags - 1);
+            cur -= 2;
+        }
+    }
     return 0;
 }
 
