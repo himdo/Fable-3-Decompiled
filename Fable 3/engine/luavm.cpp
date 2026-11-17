@@ -1652,14 +1652,159 @@ static void KoreHeapPanic(int obj)
     longjmp(*(jmp_buf *)h[0], 1);        // back into the KoreHeapInitGrow setjmp
 }
 
-// sub_5D5D30 (0x5D5D30 - 0x5D5DCD) -- KoreDrainFreeList: claim free blocks
-// off the free-list object (obj; its block head is obj[10]), freeing the
-// unclaimed blocks on the way; returns 1 when the claim (the `claim` word)
-// can be satisfied, 0 on OOM (the caller then panics). [NOT byte-identical]
-// remaining stub (returns the success result so the grow path never panics).
-static int KoreDrainFreeList(int obj, int heap, int claim)
+// sub_5D5B20 (0x5D5B20 - 0x5D5D1E) -- KoreDeallocAllocNode: free an
+// allocation-node block (and its type-specific sub-objects) through the
+// object's block-dealloc fn (obj+0x0C, called cdecl as fn(obj+0x10, ptr,
+// size, 0)), updating the object's used-bytes counter (obj+0x04) as each
+// piece is released. The node is the 8-byte free-list header {[0] (size <<
+// 2) | flags, [1] next | 2-bit node type}; the type (the low 2 bits of the
+// next word) selects the sub-object layout: type 0 owns no sub-objects (the
+// plain block, sized node[0] >> 2, released and returned at once); type 1
+// owns the 20*(node[3]+1)-byte block at node+0x10 (the counter charged
+// -20 - 20*node[3]) and the 8*node[6]-byte block at node+0x14 (charged
+// -8*node[6]); type 2 owns the 40 + 8*((node[11]-node[12]) >> 3)-byte block
+// at node+0x30 (gated on node[12] non-zero) and always releases node[3]
+// with size 16*((node[4]-node[3]) >> 4) (0 when node[3] is 0); type 3 owns
+// the blocks at node+0x10 / +0x18 / +0x20 / +0x30 / +0x48 / +0x38 sized
+// 4*node[3] / 8*node[5] / 4*node[7] / 4*node[11] / 12*node[17] /
+// 4*node[13] (each gated on its pointer non-zero). Every other type falls
+// through to the shared final step (release the node's own block, size node
+// [0] >> 2, through the same fn); a corrupt type >= 4 skips even that
+// (the original returns the type word, which both callers ignore).
+// KoreDrainFreeList and the VM-heap detach (KoreDetachHeap) call it for
+// every unclaimed / pending node. [NOT byte-identical] a thiscall + retn 4
+// hybrid in the original (declared object-first here), placement-dependent.
+static int KoreDeallocAllocNode(int obj, int node)
 {
-    (void)obj; (void)heap; (void)claim;
+    int *o = (int *)obj;
+    int *n = (int *)node;
+    int ctx = o[0x10 / 4];
+    int (*fn)(int, int, int, int) = (int (*)(int, int, int, int))o[0x0C / 4];
+    switch (n[1] & 3)
+    {
+    case 0:
+        o[1] -= (unsigned)n[0] >> 2;
+        return fn(ctx, node, (unsigned)n[0] >> 2, 0);
+    case 1:
+        if (n[4] != 0)
+        {
+            o[1] += -20 - 20 * n[3];
+            fn(ctx, n[4], 20 * (n[3] + 1), 0);
+        }
+        if (n[5] != 0)
+        {
+            o[1] += -8 * n[6];
+            fn(ctx, n[5], 8 * n[6], 0);
+        }
+        break;
+    case 2:
+        if (n[12] != 0)
+        {
+            int size = 40 + 8 * ((n[11] - n[12]) >> 3);
+            o[1] -= size;
+            fn(ctx, n[12], size, 0);
+        }
+        {
+        int size = (n[3] != 0) ? 16 * ((n[4] - n[3]) >> 4) : 0;
+        o[1] -= size;
+        fn(ctx, n[3], size, 0);
+        }
+        break;
+    case 3:
+        if (n[4] != 0)
+        {
+            o[1] -= 4 * n[3];
+            fn(ctx, n[4], 4 * n[3], 0);
+        }
+        if (n[6] != 0)
+        {
+            o[1] -= 8 * n[5];
+            fn(ctx, n[6], 8 * n[5], 0);
+        }
+        if (n[8] != 0)
+        {
+            o[1] -= 4 * n[7];
+            fn(ctx, n[8], 4 * n[7], 0);
+        }
+        if (n[12] != 0)
+        {
+            o[1] -= 4 * n[11];
+            fn(ctx, n[12], 4 * n[11], 0);
+        }
+        if (n[18] != 0)
+        {
+            o[1] -= 12 * n[17];
+            fn(ctx, n[18], 12 * n[17], 0);
+        }
+        if (n[14] != 0)
+        {
+            o[1] -= 4 * n[13];
+            fn(ctx, n[14], 4 * n[13], 0);
+        }
+        break;
+    default:   // a corrupt type: the original falls straight to the
+        return 0;                     // epilogue (return reg = the type word)
+    }
+    o[1] -= (unsigned)n[0] >> 2;
+    return fn(ctx, node, (unsigned)n[0] >> 2, 0);
+}
+
+// sub_5D5D30 (0x5D5D30 - 0x5D5DCD) -- KoreDrainFreeList: walk the free-list
+// object's (obj) block list from the cursor node's (obj+0x28) next, claiming
+// the free blocks and releasing the unclaimed pending ones. Each list node
+// is 8 bytes {flags, next | 2-bit state}: a node with flags bit 0 set is a
+// plain free block (the budget word decrements by 1, the cursor advances
+// onto the node, and its flag bit 0 is cleared); a node with the flag clear
+// is a pending allocation (spliced out from under the cursor — the cursor's
+// next word keeps its own low 2 state bits, budget charged 16 — and freed
+// through KoreDeallocAllocNode). With the claim word set, the walk returns 0
+// (the caller zeroes the budget and panics when the guard is armed) as soon
+// as the budget word is drained to 0 or below. When the list runs out — or
+// the cursor's next is empty from the start — the low-2-bit state words are
+// folded (the cursor's next word := old obj+0x1C ^ ((old obj+0x1C ^ next) &
+// 3), obj+0x1C := old obj+0x24 ^ ((old obj+0x24 ^ old obj+0x1C) & 3),
+// obj+0x24 &= 3), the cursor is zeroed, and 1 is returned. The table word
+// (the heap's API table, the original's a2) is unused by the body.
+// [NOT byte-identical] a thiscall + retn 0Ch hybrid in the original
+// (declared object-first here), placement-dependent (relative call to
+// KoreDeallocAllocNode).
+static int KoreDrainFreeList(int obj, int table, int claim, int budget)
+{
+    (void)table;
+    int *o = (int *)obj;
+    int head = o[0x28 / 4];
+    if ((*(int *)(head + 4) & ~3) != 0)
+    {
+        int node = *(int *)(head + 4) & ~3;
+        for (;;)
+        {
+            int flags = *(int *)node;
+            int next  = *(int *)(node + 4) & ~3;
+            if (flags & 1)
+            {
+                --budget;
+                o[0x28 / 4] = node;
+                *(int *)node = flags & ~1;
+            }
+            else
+            {
+                int cur = o[0x28 / 4];
+                *(int *)(cur + 4) = (*(int *)(cur + 4) & 3) | next;
+                budget -= 16;
+                (void)KoreDeallocAllocNode(obj, node);
+            }
+            node = next;
+            if (claim != 0 && budget <= 0)
+                return 0;
+            if (node == 0)
+                break;
+        }
+    }
+    int cur = o[0x28 / 4];
+    *(int *)(cur + 4) = o[0x1C / 4] ^ ((o[0x1C / 4] ^ *(int *)(cur + 4)) & 3);
+    o[0x1C / 4] = o[0x24 / 4] ^ ((o[0x24 / 4] ^ o[0x1C / 4]) & 3);
+    o[0x24 / 4] &= 3;
+    o[0x28 / 4] = 0;
     return 1;
 }
 
@@ -2885,14 +3030,170 @@ done:
     return result;
 }
 
-// sub_5D9FC0 (0x5D9FC0 - 0x5DA09C) -- KoreRehashAllocTable: rebuild / refresh
-// the alloc-node hash table (the heap sub-object's +0x80 table, +0x84 cursor)
-// after a grow, charging the alloc budget (obj+0x6C). [NOT byte-identical]
-// remaining stub.
+// sub_5D6C10 (0x5D6C10 - 0x5D6DD2) -- KoreRehashAllocNode: the per-bucket
+// rehash step that KoreRehashAllocTable (and the VM finaliser) call on a live
+// alloc node (thiscall + retn 8 in the original: this = the bucket sub-object
+// at table+0xBC, arg 1 = the table wrapper, arg 2 = the bucket cursor). It
+// drops the node: decrements the sub-object's +0x04 node count, sizes the
+// block as (node+0x00 & 0x3FFFFFFF) + 15, subtracts that from the table's
+// +0x04 used-bytes, and calls the table's +0x0C dealloc fn (its +0x10 context
+// on node-4 / size / 0), then clears the bucket. When the next bucket is empty
+// the unchanged cursor is returned; otherwise it finds the first empty bucket
+// at or after cursor + 2 and, walking the bucket index backward from there,
+// re-inserts each out-of-order node into its home bucket (B[home] = B[cur],
+// B[cur] = 0) and ORs bit 0 of the block header of every shifted node (whose
+// key's top bit is clear) so the outer pass re-does it, updating the home /
+// accumulator as it goes. Returns the final cursor. [NOT byte-identical] a
+// thiscall + retn 8 hybrid in the original (declared object-first here) and it
+// calls the table's mutable +0x0C dealloc slot.
+static int KoreRehashAllocNode(int obj, int wrapper, int cursor)
+{
+    int *sub = (int *)obj;                    // the bucket sub-object (thiscall this)
+    int T    = *(int *)wrapper;               // the table behind the wrapper
+    int *B   = (int *)sub[0];                 // the bucket array
+    unsigned int mask = (unsigned int)sub[2];
+    --sub[1];                                 // the sub-object's node count
+    int node = B[cursor];
+    int n0   = *(int *)node;
+    int size = (n0 & 0x3FFFFFFF) + 15;
+    *(int *)(T + 4) -= size;                  // the table's used-bytes
+    ((void (*)(int, int, int, int))*(int *)(T + 0x0C))(*(int *)(T + 0x10), node - 4, size, 0);
+    B[cursor] = 0;
+    if (B[(cursor + 1) & mask] == 0)
+        return cursor;
+
+    // Find the first empty bucket at or after cursor + 2.
+    unsigned int firstEmpty = (unsigned int)cursor + 2;
+    if (B[mask & firstEmpty] != 0)
+    {
+        do
+        {
+            ++firstEmpty;
+        } while (B[mask & firstEmpty] != 0);
+    }
+    unsigned int home = (unsigned int)cursor;
+    unsigned int acc  = (unsigned int)cursor;
+    if (firstEmpty - 1 <= (unsigned int)cursor)
+        return (int)acc;
+
+    unsigned int vC = firstEmpty - 1;         // the outer walk cursor
+    do
+    {
+        unsigned int v13 = vC & mask;         // the current bucket
+        int nd = B[v13];
+        unsigned int v14 = (unsigned int)(*(int *)(nd + 4)) & mask;
+        unsigned int v15 = firstEmpty & mask;
+        unsigned char v28 = (firstEmpty >= mask + 1) || (v14 > vC);
+        unsigned char v22 = (v28 == 0) && (v14 <= home);
+        unsigned char v23 = (v28 != 0) && (v14 <= home) && (v14 > v15);
+        int v16 = (v28 != 0) && (v14 >= (unsigned int)cursor) && (home < v15);
+
+        unsigned int nextVC;
+        if (v22 != 0 || v23 != 0 || v16 != 0)
+        {
+            unsigned int v17 = home & mask;
+            B[v17] = B[v13];
+            B[v13] = 0;
+            home = vC;
+            if (v17 >= acc)
+            {
+                if (v13 < acc)
+                {
+                    int nn = B[v17];
+                    if (*(int *)nn >= 0)
+                        *(int *)(nn - 4) |= 1;
+                }
+            }
+            else if (v13 >= acc)
+            {
+                for (unsigned int i = v17 + 1; i < acc; ++i)
+                {
+                    int nn = B[i];
+                    if (nn != 0 && *(int *)nn >= 0)
+                        *(int *)(nn - 4) |= 1;
+                }
+                acc = v17;
+            }
+            nextVC = firstEmpty - 1;
+        }
+        else
+        {
+            nextVC = vC - 1;
+        }
+        vC = nextVC;
+    } while (vC > home);
+
+    return (int)acc;
+}
+
+// sub_5D9FC0 (0x5D9FC0 - 0x5DA09C) -- KoreRehashAllocTable: the stage-4
+// rehash of the heap sub-object's alloc table (thiscall on the heap
+// sub-object). The alloc table sits behind the sub-object's +0x04 wrapper
+// pointer (*wrapper = the table; its bucket sub-object at table+0xBC holds the
+// bucket array / node count / mask at its +0x00 / +0x04 / +0x08). It walks the
+// bucket cursor from the persisted +0x80 (reset to 0 whenever the +0x84
+// "table size" stamp differs from mask + 1, i.e. the table just grew) up to
+// mask + 1. For each bucket, an empty or negative-key node is skipped; a node
+// whose block-header bit 0 is already set, or whose key has bit 0x40000000
+// set, is just cleared (bit 0 dropped) and advanced; any other live node is
+// rehashed through the per-node helper KoreRehashAllocNode (which returns the
+// resumed cursor) and charges the alloc budget (obj+0x6C) 5. Every fourth such
+// node additionally charges 1, persists the cursor to +0x80, and -- when the
+// +0x70 panic-limit is not -1 -- panics through KoreHeapPanic if the budget is
+// non-positive. On completion the final budget and a zeroed cursor are written
+// back and the cursor is returned. [NOT byte-identical] a thiscall in the
+// original (declared object-first here), placement-dependent (relative calls
+// into KoreRehashAllocNode and KoreHeapPanic).
 static int KoreRehashAllocTable(int obj)
 {
-    (void)obj;
-    return 0;
+    int *h = (int *)obj;
+    int wrapper = h[1];                       // obj + 0x04 (the table wrapper)
+    int T       = *(int *)wrapper;            // the table
+    int *t      = (int *)T;
+    unsigned int mask = (unsigned int)t[0xC4 / 4];
+    int *B       = (int *)t[0xBC / 4];
+    int bound    = (int)mask + 1;
+
+    if (bound != h[33])                       // obj + 0x84 (the table-size stamp)
+    {
+        h[33] = bound;
+        h[32] = 0;                            // obj + 0x80 (the rehash cursor)
+    }
+    int cursor  = h[32];
+    int budget  = h[27];                      // obj + 0x6C
+    int counter = 0;
+    while (cursor < bound)
+    {
+        int node = B[mask & (unsigned int)cursor];
+        if (node != 0 && *(int *)node >= 0)
+        {
+            if ((*(int *)(node - 4) & 1) != 0 || (*(int *)node & 0x40000000) != 0)
+            {
+                *(int *)(node - 4) &= ~1;     // drop the rehash-pending flag
+                ++cursor;
+            }
+            else
+            {
+                cursor = KoreRehashAllocNode(T + 0xBC, wrapper, cursor);
+                budget -= 5;
+            }
+            if (++counter == 4)
+            {
+                --budget;
+                h[32] = cursor;               // persist progress
+                if (h[28] != -1 && budget <= 0)   // obj + 0x70 (the panic limit)
+                    KoreHeapPanic(obj);
+                counter = 0;
+            }
+        }
+        else
+        {
+            ++cursor;
+        }
+    }
+    h[27] = budget;
+    h[32] = 0;
+    return cursor;
 }
 
 // sub_5EDAC0 (0x5EDAC0 - 0x5EDDB7) -- KoreHeapInitGrow: the setjmp/longjmp
@@ -3016,7 +3317,7 @@ static int KoreHeapInitGrow(int obj, int size)
         case 5:
             {
                 int claim = (h[28] != -1) ? 1 : 0;
-                if (KoreDrainFreeList(h[3], h[1], claim) == 0)
+                if (KoreDrainFreeList(h[3], h[1], claim, h[27]) == 0)
                 {
                     h[27] = 0;
                     if (h[28] != -1)
@@ -3454,7 +3755,7 @@ static int KoreFreeAllocList(int list)
 // the VM's remaining slots. Remaining stub (deep VM internals out of scope).
 static void KoreFinalizeVM(int obj, int a1) { (void)obj; (void)a1; }
 // sub_5DA150 (0x5DA150 - 0x5DA1C0) -- detach the VM's heap: free the two
-// pending-allocation lists (sub_5D5B20 each), zero the +0x28 slot, and pull
+// pending-allocation lists (KoreDeallocAllocNode each), zero the +0x28 slot, and pull
 // out the 3-word heap-dealloc context {vm[3] (the dealloc fn), vm[4], vm[5]}
 // into the out pointer. Remaining stub (deep VM internals out of scope).
 static void KoreDetachHeap(int obj, int heap) { (void)obj; (void)heap; }
