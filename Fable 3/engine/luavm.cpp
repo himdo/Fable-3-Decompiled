@@ -414,8 +414,11 @@ static int    KoreBuildSourceDesc(int *fr);                             // sub_5
 static int    KoreVsnprintf(char *buf, unsigned int cnt, const char *fmt, ...); // sub_5D1390
 static int    KoreStrncpy(char *dst, unsigned int size, const char *src);        // sub_5D1330
 static int   *KoreInternString(int *table, int vmcore, const void *src, int size, unsigned int hash); // sub_5EEED0
+static int    KoreFloatToDec(double value, char *buf, unsigned int bufCount); // sub_5D83D0
+static int    KoreNumberToString(int vmcore, int index);              // sub_5DC000
 static int    KoreRehashInterned(int *table, int vmcore);               // sub_5EEC00
 static int   *KoreAllocVmMem(int vmcore, unsigned int size);            // sub_5DA410
+static int    KoreVmAlloc(int vmcore, int size);                        // sub_5DA4F0 (VM-heap bump alloc)
 static int    KoreFrameLocalBase(int *fr, int table);                   // sub_5D8D30
 static int    KoreFrameLocalRange(int table, int frameIndex);           // sub_5D2860
 static int    KoreFrameRowValid(int table, int frameIndex);             // sub_5D27D0
@@ -426,10 +429,22 @@ static int    KoreFrameLocalEnd(int table, int frameIndex);             // sub_5
 // 'L' / 'f' local-dump table machinery (the table-set cluster below is
 // implemented; the rest remain documented stubs, not reached by the "Snlu"
 // flag string in the panic path):
-static int    KoreReallocValueStack(int table, int extra);              // sub_5DD730
+static void   KoreReallocValueStack(int thisObj, int vmcore, int extra); // sub_5DD730
 static int    KoreAllocHashTable(int table, int a2, int a3);            // sub_5DDC90
 static int    KoreTableSet(int table, int vmcore, int key, int value);   // sub_5E7400
 static int    KoreTablePanic(int vmcore, const char *format, ...);      // sub_5E2580
+// The VM error-message / panic formatter closure (KoreTablePanic and friends):
+static int    KoreRaisePanic(int vmcore, int code);                     // sub_5F1C30
+static void   KoreFormatMessage(int vmcore, const char *format, const char *suffix, va_list args); // sub_5E24E0
+static int    KoreMessagePrefix(int vmcore, int frameNo);               // sub_5E19D0
+static int    KoreVmVprintf(int vmcore, const char *format, ...);       // sub_5DBFE0
+static int    KoreVmSprintf(int vmcore, const char *format, void *arglist); // sub_5D7A90
+static int    KoreInternPush(int vmcore, const void *src, int len, unsigned int hash); // sub_5D2A50
+static int    KoreAppendString(int vmcore, const void *src, int len);   // sub_407070
+static void   KoreStackTraceback(int vmcore, int frameNo, int startFrame, int endFrame); // sub_5E1AA0
+static void   KoreConcatValues(int vmcore, int n);                       // sub_5DC2B0
+static int    KoreInternBuffer(int vmcore, int *buf, int len);           // sub_5DA6F0
+static int   *KoreInsertInterned(int *table, int vmcore, int *buf, int len); // sub_5D6A40
 static int    KoreTableEnsureRow(int table, int vmcore, int key, int value); // sub_5E5040
 static int    KoreFindEmptyRow(int table);                              // sub_5D3640
 static int    KoreRowRelocateHash(int mask, int key, int type);         // sub_5D3120
@@ -442,6 +457,7 @@ static int    KoreDebugTrackAppend(int table, int *value);              // sub_5
 static int    KoreGrowRegistry(int obj, int size, int vmcore);          // sub_5EE150
 static int    KoreVmAllocExpand(int vmcore, int size);                  // sub_5F6420
 static int    KoreVmHeapAlloc(int vmcore, int size);                    // sub_5EEAE0
+static int    KoreReleaseAllocNode(int list, int node, int vmcore);     // sub_5ED860
 
 // ---- sub_5D1390: the vsnprintf wrapper (returns BufferCount on a
 // negative truncation result, matching the original's contract). ----
@@ -467,62 +483,60 @@ static int KoreStrncpy(char *dst, unsigned int size, const char *src)
     return 0;
 }
 
-// ---- sub_5D83D0-style float hash: the "kore" 32-bit string hash used
-// by every string-interning path.  Seed = (len + 0x6B6F7265); up to two
-// 12-byte chunks are mixed, then the tail bytes are folded into the
-// three accumulators, then a 6-step finalization.  (The effective hash
-// only ever sees the first min(24, len) bytes of the content.) ----
+// ---- sub_5D83D0-style Kore string hash: the "kore" 32-bit string hash
+// used by every string-interning path.  Seed = (len + 0x6B6F7265) ("kore"
+// little-endian).  Up to two 12-byte chunks are mixed (each through an
+// 11-step rotation/xor DAG), the remaining <=12 bytes are folded into the
+// three lane accumulators, then a 6-step finalization.  The effective hash
+// only ever sees the first min(31, len) bytes of the content. ----
+// One 12-byte chunk's mixing DAG.  P, Q, R are the three pre-mixed dwords
+// (their exact derivation differs between chunk 1 and chunk 2); `useQ`
+// selects which of P / Q feeds the first rotate-xor step (chunk 1 uses P,
+// chunk 2 uses Q).  Writes the updated lane state to (*oS1, *oS2, *oS3).
+static void KoreHashMixChunk(unsigned int P, unsigned int Q, unsigned int R,
+                             int useQ, unsigned int *oS1, unsigned int *oS2,
+                             unsigned int *oS3)
+{
+    unsigned int t1 = P + Q;
+    unsigned int t5 = (useQ ? (Q - R) : (P - R)) ^ KROL(R, 6);
+    unsigned int t6 = (t1 - t5) ^ KROL(t5, 8);
+    unsigned int t4 = t1 + R;
+    unsigned int t7 = t4 + t5;
+    unsigned int t8 = (t4 - t6) ^ KROL(t6, 16);
+    unsigned int t9 = t7 + t6;
+    unsigned int t10 = (t7 - t8) ^ KROR(t8, 13);
+    unsigned int s3 = t9 + t8;
+    *oS3 = s3;
+    *oS2 = s3 + t10;
+    *oS1 = (t9 - t10) ^ KROL(t10, 4);
+}
+
 static unsigned int KoreHashKore(const char *buf, int len)
 {
-    unsigned int seed = (unsigned int)len + 0x6B6F7265u;
-    unsigned int acc1 = seed, acc2 = seed, acc3 = seed;
+    unsigned int acc1 = (unsigned int)len + 0x6B6F7265u;  // S1
+    unsigned int acc2 = acc1;                              // S2
+    unsigned int acc3 = acc1;                              // S3
     int n = len;
     const unsigned int *p = (const unsigned int *)buf;
     if (n >= 0x1F)
         n = 31;
     if (n > 12)
     {
-        // chunk 1
-        unsigned int d0 = p[0], d1 = p[1];
+        // chunk 1 (dwords d0,d1,d2): P=S1+d1, Q=S1+d2, R=(S3+d0-Q)^ROL(Q,4)
+        unsigned int d0 = p[0], d1 = p[1], d2 = p[2];
+        unsigned int Q = acc1 + d2;
+        KoreHashMixChunk(acc1 + d1, Q, (acc3 + d0 - Q) ^ KROL(Q, 4), 0,
+                         &acc1, &acc2, &acc3);
         n -= 12;
-        unsigned int v12 = acc1 + d0;
-        unsigned int v13 = d1 + acc1;
-        unsigned int v14 = acc3 + d0 - v13;
-        unsigned int v16 = v12 + v13;
-        unsigned int v17 = v14 ^ KROL(v13, 4);
-        unsigned int v18 = v12 - v17;
-        unsigned int v20 = v16 + v17;
-        unsigned int v21 = v18 ^ KROL(v17, 6);
-        unsigned int v22 = (v16 - v21) ^ KROL(v21, 8);
-        unsigned int v23 = v20 + v21;
-        unsigned int v24 = (v20 - v22) ^ KROL(v22, 16);
-        unsigned int v25 = v23 + v22;
-        unsigned int v26 = (v23 - v24) ^ KROR(v24, 13);
-        acc3 = v25 + v24;
-        acc1 = (v25 - v26) ^ KROL(v26, 4);
-        acc2 = acc3 + v26;
         p += 3;
         if (n > 12)
         {
-            // chunk 2
-            unsigned int e0 = p[0], e1 = p[1], e2 = p[2];
+            // chunk 2 (dwords d3,d4,d5): P=S1+d5, Q=S2+d4, R=(S3+d3-P)^ROL(P,4)
+            unsigned int d3 = p[0], d4 = p[1], d5 = p[2];
+            unsigned int P = acc1 + d5;
+            KoreHashMixChunk(P, acc2 + d4, (acc3 + d3 - P) ^ KROL(P, 4), 1,
+                             &acc1, &acc2, &acc3);
             n -= 12;
-            unsigned int v27 = e2 + acc1;
-            unsigned int v28 = e1 + acc2;
-            unsigned int v29 = (acc3 + e0 - v27) ^ KROL(v27, 4);
-            unsigned int v30 = v28 + v27;
-            unsigned int v31 = v28 - v29;
-            unsigned int v33 = v30 + v29;
-            unsigned int v34 = v31 ^ KROL(v29, 6);
-            unsigned int v35 = (v30 - v34) ^ KROL(v34, 8);
-            unsigned int v36 = v33 + v34;
-            unsigned int v37 = (v33 - v35) ^ KROL(v35, 16);
-            unsigned int v38 = v36 + v35;
-            unsigned int v39 = KROR(v37, 13);
-            unsigned int v40 = v36 - v37;
-            acc3 = v38 + v37;
-            acc1 = (v38 - (v40 ^ v39)) ^ KROL(v40 ^ v39, 4);
-            acc2 = acc3 + (v40 ^ v39);
             p += 3;
         }
     }
@@ -555,6 +569,80 @@ static unsigned int KoreHashKore(const char *buf, int len)
     unsigned int v46 = (v45 ^ v43) - KROL(v45, 14);
     unsigned int result = (v46 ^ v44) - KROR(v46, 8);
     return result;
+}
+
+// ---- sub_5D83D0: convert a double to a fixed-point decimal string.
+// For |x| <= 2^31 it emits the integer part, then (if the fractional
+// mantissa is nonzero) a '.' and up to 14 fractional digits with trailing
+// zeros trimmed; for |x| > 2^31 it falls back to "%e" of the signed value.
+// The value is a 32-bit float widened to double (the VM number type), so
+// the significant fractional digits never exceed ~7.  Returns the character
+// count excluding the null terminator. ----
+static int KoreFloatToDec(double value, char *buf, unsigned int bufCount)
+{
+    int neg = (value < 0.0);
+    double ax = neg ? -value : value;
+    if (ax > 2147483648.0)
+        return KoreVsnprintf(buf, bufCount, "%e", value);
+
+    unsigned __int64 ipart = (unsigned __int64)ax;
+    double f = (ax - (double)ipart) * 1.0e14;
+    unsigned __int64 v4 = (unsigned __int64)f;
+    double r = f - (double)v4;
+    if (r <= 0.5)
+    {
+        if (r == 0.5 && (v4 == 0 || (v4 & 1)))
+            v4 += 1;
+    }
+    else
+    {
+        v4 += 1;
+        if (v4 >= 100000000000000ULL)
+        {
+            v4 = 0;
+            ipart += 1;
+        }
+    }
+
+    // Build the final string most-significant-digit-first.  The original
+    // builds it least-significant-digit-first and reverses in place; the
+    // resulting byte sequence is identical either way.
+    char tmp[32];
+    int n = 0;
+    if (neg)
+        tmp[n++] = '-';
+    char intbuf[32];
+    int in = 0;
+    unsigned __int64 ip = ipart;
+    do
+    {
+        intbuf[in++] = (char)('0' + (ip % 10));
+        ip /= 10;
+    } while (ip != 0);
+    for (int i = in - 1; i >= 0; i--)
+        tmp[n++] = intbuf[i];
+    if (v4 != 0)
+    {
+        // 14-digit zero-padded form of the fractional mantissa, then strip
+        // the trailing zeros.
+        unsigned __int64 fv = v4;
+        char frac[15];
+        for (int i = 13; i >= 0; i--)
+        {
+            frac[i] = (char)('0' + (fv % 10));
+            fv /= 10;
+        }
+        int fend = 14;
+        while (fend > 0 && frac[fend - 1] == '0')
+            fend--;
+        tmp[n++] = '.';
+        for (int i = 0; i < fend; i++)
+            tmp[n++] = frac[i];
+    }
+    tmp[n] = 0;
+    for (int i = 0; i <= n; i++)
+        buf[i] = tmp[i];
+    return n;
 }
 
 // ---- sub_5DA410: the VM-heap block allocation with retry.  `vmcore`
@@ -696,6 +784,27 @@ static int *KoreInternString(int *table, int vmcore, const void *src, int size, 
         ++j;
     *(int *)(table[0] + 4 * (j & table[2])) = (int)v20;
     return v20;
+}
+
+// ---- sub_5DC000: format a value-stack number (type 3) as an interned
+// string.  `index` addresses the cell relative to the value stack: when
+// positive, base + index*8 - 8; otherwise (zero / negative), top + index*8.
+// The 32-bit float at that cell is converted with KoreFloatToDec, hashed,
+// and interned; the cell is then rewritten in place to {entry, 4}.  Returns
+// the interned string's length. ----
+static int KoreNumberToString(int vmcore, int index)
+{
+    int *top = (int *)(*(int *)(vmcore + 0x1C));
+    int *base = (int *)(*(int *)(vmcore + 0x20));
+    int cell = (index > 0) ? (int)base + index * 8 - 8 : (int)top + index * 8;
+    float f = *(float *)cell;
+    char buf[0x100];
+    int len = KoreFloatToDec((double)f, buf, 0x100);
+    unsigned int hash = KoreHashKore(buf, len);
+    int *entry = KoreInternString((int *)(*(int *)vmcore + 0xBC), vmcore, buf, len, hash);
+    *(int *)cell = (int)entry;
+    *(int *)(cell + 4) = 4;
+    return len;
 }
 
 // ---- sub_5EF090: reformat a stack value as an interned string.  For a
@@ -1047,7 +1156,60 @@ static int KoreSourceVarName(int table, int *fr)
 // "Snlu" flag string never contains, so they are never executed in the
 // traceback.  They remain no-op stubs consistent with the other deep
 // KoreVM table internals already stubbed in this file.
-static int KoreReallocValueStack(int table, int extra) { (void)table; (void)extra; return 0; }
+// sub_5DD730 (0x5DD730 - 0x5DD87F) -- KoreReallocValueStack: grow the value
+// stack.  thiscall + retn 8 with this = vmcore + 4 (the value-stack
+// sub-object), arg1 = vmcore, arg2 = extra slots.  The new slot count is
+// extra + 2*((end - start) >> 3) + 5; a fresh block of 8*count bytes is
+// always allocated via KoreVmAlloc.  When top + 8*extra > end it copies the
+// old block, memsets the tail, fixes up the circular 16-byte node list at
+// thisObj[0..2] and the 12-stride linked list at vmcore[11], rewrites the
+// top / base / end / start pointers, and hands the old block back to the
+// heap.  Otherwise it simply charges the heap for the (unused) new block.
+// [NOT byte-identical] a thiscall hybrid, placement-dependent.
+static void KoreReallocValueStack(int thisObj, int vmcore, int extra)
+{
+    int *v = (int *)vmcore;
+    int *hp = (int *)(*(int *)vmcore);
+    int count = extra + 2 * ((v[9] - v[10]) >> 3) + 5;
+    int bytes = 8 * count;
+    int newBuf = KoreVmAlloc(vmcore, bytes);
+    if ((unsigned int)(v[7] + 8 * extra) > (unsigned int)v[9]) // top + 8*extra > end
+    {
+        int oldStart = v[10];
+        int nTop = (v[7] - oldStart) >> 3;
+        int nBase = (v[8] - oldStart) >> 3;
+        int copySize = (oldStart != 0) ? 8 * ((v[9] - oldStart) >> 3) + 40 : 0;
+        if (oldStart != 0)
+            memcpy((void *)newBuf, (void *)oldStart, copySize);
+        memset((void *)(newBuf + copySize), 0, bytes - copySize);
+        int nodeCount = (*(int *)(thisObj + 8) - *(int *)thisObj) >> 4;
+        if (nodeCount >= 0)
+        {
+            int off = 16 * nodeCount;
+            for (;;)
+            {
+                int *node = (int *)(*(int *)thisObj + off);
+                *node = newBuf + 8 * ((*node - oldStart) >> 3);
+                if (off == 0)
+                    break;
+                off -= 16;
+            }
+        }
+        for (int i = v[11]; i != 0; i = *(int *)(i + 12))
+            *(int *)(i + 8) = newBuf + 8 * ((*(int *)(i + 8) - oldStart) >> 3);
+        v[9] = newBuf + 8 * count - 40;                     // end
+        v[8] = newBuf + 8 * nBase;                          // base
+        v[10] = newBuf;                                     // start
+        v[7] = newBuf + 8 * nTop;                           // top
+        hp[1] -= copySize;                                  // return the old block
+        ((void (*)(int, int, int, int))hp[3])(hp[4], oldStart, copySize, 0);
+    }
+    else
+    {
+        hp[1] -= bytes;
+        ((void (*)(int, int, int, int))hp[3])(hp[4], newBuf, bytes, 0);
+    }
+}
 static int KoreAllocHashTable(int table, int a2, int a3) { (void)table; (void)a2; (void)a3; return 0; }
 static int KoreEnsureBackingTable(int table, int vmcore, int a3, int a4)
 { (void)table; (void)vmcore; (void)a3; (void)a4; return 0; }
@@ -1139,7 +1301,7 @@ static int KoreFillLuaFrame(int *fr, int table, int desc, const char *flags)
         if (fL != 0)
         {
             if ((unsigned int)(*(int *)(table + 28) + 24) > (unsigned int)*(int *)(table + 36))
-                KoreReallocValueStack(table, 3);
+                KoreReallocValueStack(table + 4, table, 3);
             int v11 = KoreAllocHashTable(table, 1, 1);
             *(int *)(*(int *)(table + 28) + 4) = 5;
             *(int *)(*(int *)(table + 28)) = v11;
@@ -1855,17 +2017,326 @@ next_row:
     }
 }
 
-// sub_5E2580 (0x5E2580 - 0x5E25A4) -- KoreTablePanic: the table-operation
-// error path -- format the message (sub_5E24E0) then raise the VM panic
-// (sub_5F1C30, which longjmps to the nearest handler or calls the error
-// callback).  Only reached for a nil / NaN table index, which the panic
-// traceback's "Snlu" flag string never produces, so it is a documented no-op
-// stub (the original would not return).  A cdecl variadic in the original
-// ((Size, Format, ...)); declared plain here.
+// ---------------------------------------------------------------------------
+// The VM error-message / panic formatter closure.  These push 8-byte
+// {pointer, type} cells onto the value stack (top at vmcore[7], base at
+// vmcore[8]) and intern the pieces via the intern table at *(vmcore)+0xBC.
+// A string cell stores the interned record pointer (the record's low-30
+// bits hold its length) with type 4; a number cell stores the float in the
+// low 4 bytes with type 3.  The intern table is a linear-probing hash table
+// whose bucket array holds pointers to inline records ({length, hash, content}).
+// ---------------------------------------------------------------------------
+
+// Push an interned literal string (known length + kore hash) as a {ptr,4} cell.
+static void KorePushStringCell(int vmcore, const char *str, int len, unsigned int hash)
+{
+    int *vm = (int *)vmcore;
+    int *entry = KoreInternString((int *)(*(int *)vmcore + 0xBC), vmcore, str, len, hash);
+    int *top = (int *)vm[7];
+    *top = (int)entry;
+    top[1] = 4;
+    vm[7] = (int)(top + 2);
+}
+
+// ---- sub_5D6A40: insert a freshly-built interned record (buf) into the
+// intern hash table.  thiscall (this = the intern table) in the original.
+// Linearly probes from bucket[hash & mask]; on a full (hash, length, content)
+// match it sets the debug "dirty" flag (bit 0 of the record's 4-byte pre-header)
+// when the debug level is 2-4 and returns the existing record; on a miss it
+// rehashes when the load factor would exceed half, bumps the count, and stores
+// the record in the first empty slot (returns 0).  [NOT byte-identical]
+// thiscall hybrid, placement-dependent.
+static int *KoreInsertInterned(int *table, int vmcore, int *buf, int len)
+{
+    int hash = buf[1];
+    int *chain = (int *)table[0];
+    int mask = table[2];
+    int probe = hash;
+    int *slot = (int *)chain[probe & mask];
+    while (slot != 0)
+    {
+        if (slot[1] == hash && (*slot & 0x3FFFFFFF) == len
+            && memcmp((char *)slot + 8, (char *)buf + 8, len) == 0)
+        {
+            int debugLevel = *(int *)(*(int *)vmcore + 60);
+            if (debugLevel > 1 && debugLevel <= 4 && *slot >= 0)
+                *(slot - 1) |= 1;
+            return slot;
+        }
+        probe++;
+        slot = (int *)chain[probe & mask];
+    }
+    if ((unsigned int)(table[1] + 1) > (unsigned int)(table[2] + 1) >> 1)
+        KoreRehashInterned(table, vmcore);
+    ++table[1];
+    mask = table[2];    // re-read (the rehash may have resized the table)
+    probe = hash;
+    while (chain[probe & mask] != 0)
+        probe++;
+    chain[probe & mask] = (int)buf;
+    return 0;
+}
+
+// ---- sub_5DA6F0: hash a freshly-allocated buffer's content (buf+8, len bytes)
+// with the kore hash, stamp buf[0] = len / buf[1] = hash, and insert the record
+// via KoreInsertInterned.  thiscall + retn 0x0C in the original (this = the
+// intern table); a plain free function here.  Returns the existing record on a
+// match, or 0 when the record was newly inserted.
+static int KoreInternBuffer(int vmcore, int *buf, int len)
+{
+    unsigned int hash = KoreHashKore((char *)buf + 8, len);
+    buf[0] = len;
+    buf[1] = hash;
+    return (int)KoreInsertInterned((int *)(*(int *)vmcore + 0xBC), vmcore, buf, len);
+}
+
+// ---- sub_5DC2B0: concatenate the top n value-stack cells into a single
+// interned string.  n < 0 is ignored; n == 0 pushes the empty string; n == 1
+// is a no-op; n >= 2 first sums the lengths (converting number cells in place
+// via KoreNumberToString), allocates len+11, memcpys the string contents into
+// buf+8, null-terminates, replaces the n cells with one {buf,4} cell, and
+// interns the buffer (freeing the fresh buffer when an identical entry already
+// exists).  A non-number / non-string cell raises the panic.
+static void KoreConcatValues(int vmcore, int n)
+{
+    if (n < 0)
+        return;
+    if (n == 0)
+    {
+        KorePushStringCell(vmcore, "", 0, 0x6B6F7265u);
+        return;
+    }
+    if (n == 1)
+        return;
+    int *vm = (int *)vmcore;
+    int top = vm[7];
+    int totalLen = 0;
+    for (int i = -n; i < 0; ++i)
+    {
+        int *cell = (int *)(top + i * 8);
+        int type = cell[1];
+        if (type == 3)
+            totalLen += KoreNumberToString(vmcore, i);
+        else if (type == 4)
+            totalLen += (*(int *)cell[0]) & 0x3FFFFFFF;
+        else
+        {
+            KoreTablePanic(vmcore, "can only concat number and string");
+            return;
+        }
+    }
+    int buf = (int)KoreAllocVmMem(vmcore, (unsigned int)(totalLen + 11));
+    char *dst = (char *)buf + 8;
+    int *srcCell = (int *)(top - 8 * n);
+    for (int i = 0; i < n; ++i)
+    {
+        int ptr = srcCell[0];
+        int len = (*(int *)ptr) & 0x3FFFFFFF;
+        memcpy(dst, (char *)ptr + 8, len);
+        dst += len;
+        srcCell += 8;
+    }
+    *dst = 0;
+    int *resultCell = (int *)(top - 8 * n);
+    vm[7] = (int)(resultCell + 2);
+    resultCell[1] = 4;
+    *resultCell = buf;
+    int existing = KoreInternBuffer(vmcore, (int *)buf, totalLen);
+    if (existing != 0)
+    {
+        *resultCell = existing;
+        resultCell[1] = 4;
+        int *hp = (int *)(*(int *)vmcore);
+        int freeLen = (*(int *)buf & 0x3FFFFFFF) + 15;
+        hp[1] -= freeLen;
+        ((void (*)(int, int, int, int))hp[3])(hp[4], buf - 4, freeLen, 0);
+    }
+}
+
+// ---- sub_5D7A90: VM vsprintf -- vsnprintf the format into a 512-byte buffer
+// (capping at 511), hash the result, intern it, and push a {entry,4} cell.
+// Returns the cell's entry+2 (matching the original's return).
+static int KoreVmSprintf(int vmcore, const char *format, void *arglist)
+{
+    char buf[0x200];
+    int len = vsnprintf(buf, 0x200, format, (va_list)arglist);
+    if (len < 0 || len > 511)
+        len = 511;
+    unsigned int hash = KoreHashKore(buf, len);
+    int *entry = KoreInternString((int *)(*(int *)vmcore + 0xBC), vmcore, buf, len, hash);
+    int *vm = (int *)vmcore;
+    int *top = (int *)vm[7];
+    *top = (int)entry;
+    top[1] = 4;
+    vm[7] = (int)(top + 2);
+    return (int)(entry + 2);
+}
+
+// ---- sub_5DBFE0: variadic wrapper that forwards to the VM vsprintf.
+static int KoreVmVprintf(int vmcore, const char *format, ...)
+{
+    va_list va;
+    va_start(va, format);
+    int result = KoreVmSprintf(vmcore, format, (void *)va);
+    va_end(va);
+    return result;
+}
+
+// ---- sub_5D2A50: intern a buffer and return its record pointer (the
+// original additionally returns {eax=ptr, edx=4} for a stack push).
+static int KoreInternPush(int vmcore, const void *src, int len, unsigned int hash)
+{
+    return (int)KoreInternString((int *)(*(int *)vmcore + 0xBC), vmcore, src, len, hash);
+}
+
+// ---- sub_407070: hash a buffer, intern it, and push a {entry,4} cell.
+static int KoreAppendString(int vmcore, const void *src, int len)
+{
+    unsigned int hash = KoreHashKore((const char *)src, len);
+    int entry = KoreInternPush(vmcore, src, len, hash);
+    int *vm = (int *)vmcore;
+    int *top = (int *)vm[7];
+    *top = entry;
+    top[1] = 4;
+    vm[7] = (int)(top + 2);
+    return entry;
+}
+
+// ---- sub_5E19D0: the message prefix.  Resolves frame 0's source/line; when
+// the line is > 0 it vsprintfs "%s:%d: " (source description, line) and
+// pushes it; otherwise it pushes the empty string.
+static int KoreMessagePrefix(int vmcore, int frameNo)
+{
+    int fr[142];   // the 568-byte frame record
+    if (KoreResolveFrameIndex(vmcore, frameNo, fr) != 0)
+    {
+        KoreResolveFrameInfo(vmcore, "Sl", fr);
+        int line = fr[5];   // fr + 20
+        if (line > 0)
+            return KoreVmVprintf(vmcore, "%s:%d: ", (char *)(fr + 44), line);
+    }
+    int *entry = KoreInternString((int *)(*(int *)vmcore + 0xBC), vmcore, "", 0, 0x6B6F7265u);
+    int *vm = (int *)vmcore;
+    int *top = (int *)vm[7];
+    *top = (int)entry;
+    top[1] = 4;
+    vm[7] = (int)(top + 2);
+    return (int)entry;
+}
+
+// ---- sub_5E1AA0: build the "stack traceback" text.  When startFrame >= 0 and
+// the VM state at vmcore+0x54 is in {-2, 0, -100} it pushes the "stack
+// traceback:" header, then for each frame in [startFrame, endFrame) resolves
+// its info ("nSl") and appends "\n\t<desc>:" (optional "<line>:") plus a
+// per-frame suffix (" in function '<name>'", " ?", " in main chunk", or
+// " in function <desc:line>"), consolidating each frame into the running
+// string via KoreConcatValues.  Otherwise it pushes "stack traceback:\n".
+// [NOT byte-identical] the frame record and loop are placement-dependent.
+static void KoreStackTraceback(int vmcore, int frameCtx, int startFrame, int endFrame)
+{
+    int *vm = (int *)vmcore;   // the value-stack owner (Size in the original)
+    int state = *(int *)(frameCtx + 0x54);   // a2[21] (the frame context)
+    if (startFrame >= 0 && (state == -2 || state == 0 || state == -100))
+    {
+        int n0 = (vm[7] - vm[8]) >> 3;
+        if ((unsigned int)(vm[7] + 32) > (unsigned int)vm[9])
+            KoreReallocValueStack(vmcore + 4, vmcore, 4);
+        KorePushStringCell(vmcore, "stack traceback:", 16, (unsigned int)-699903551);
+        if (startFrame < endFrame)
+        {
+            int frame = startFrame;
+            do
+            {
+                int fr[142];
+                if (KoreResolveFrameIndex(frameCtx, frame, fr) == 0)
+                    return;
+                if (KoreResolveFrameInfo(frameCtx, "nSl", fr) == 0)
+                    return;
+                KoreVmVprintf(vmcore, "\n\t%s:", (char *)(fr + 44));
+                int line = fr[5];   // fr + 20 (current line)
+                if (line > 0)
+                    KoreVmVprintf(vmcore, "%d:", line);
+                int name = fr[1];   // fr + 4 (function name)
+                if (name != 0 && *(char *)name != 0)
+                {
+                    KoreVmVprintf(vmcore, " in function '%s'", (char *)name);
+                }
+                else
+                {
+                    char c = *(char *)(fr + 12);   // descriptor ('L'/'C'/'m'/'t'/...)
+                    if (c == 'C')
+                        KorePushStringCell(vmcore, " ?", 2, (unsigned int)-1049149715);
+                    else if (c == 'm')
+                        KorePushStringCell(vmcore, " in main chunk", 14, (unsigned int)-1721606804);
+                    else if (c == 't')
+                        KorePushStringCell(vmcore, " ?", 2, (unsigned int)-1049149715);
+                    else
+                        KoreVmVprintf(vmcore, " in function <%s:%d>", (char *)(fr + 44), fr[9]);
+                }
+                KoreConcatValues(vmcore, ((vm[7] - vm[8]) >> 3) - n0);
+                ++frame;
+            } while (frame < endFrame);
+        }
+    }
+    else
+    {
+        KorePushStringCell(vmcore, "stack traceback:\n", 17, (unsigned int)-1567176437);
+    }
+}
+
+// ---- sub_5E24E0: the VM message formatter.  Pushes the message prefix
+// (frame 0), the vsprintf'ed format string, an optional suffix, a newline, and
+// the stack traceback (frames 0-9), then concatenates the 4 (or 5, with a
+// suffix) cells into a single interned error message.
+static void KoreFormatMessage(int vmcore, const char *format, const char *suffix, va_list args)
+{
+    int v4 = 4;
+    KoreMessagePrefix(vmcore, 0);
+    KoreVmSprintf(vmcore, format, (void *)args);
+    if (suffix != 0 && *suffix != 0)
+    {
+        KoreAppendString(vmcore, suffix, (int)strlen(suffix));
+        v4 = 5;
+    }
+    KorePushStringCell(vmcore, "\n", 1, 1798745018u);
+    KoreStackTraceback(vmcore, vmcore, 0, 10);
+    KoreConcatValues(vmcore, v4);
+}
+
+// ---- sub_5F1C30: the VM panic raiser.  Clears heap[0x64], and if a jmp_buf
+// is live at vmcore+0x40 it pops the chain (vmcore+0x40 <- the next buffer
+// stored at jmp_buf+0x40) and longjmps to it with the code; otherwise it calls
+// the error callback at heap+0x290 if set, then the panic traceback.
+// [NOT byte-identical] the jmp_buf chain bookkeeping is placement-dependent.
+static int KoreRaisePanic(int vmcore, int code)
+{
+    int *vm = (int *)vmcore;
+    int heap = *(int *)vmcore;
+    *(int *)(heap + 0x64) = 0;
+    int jmpbuf = vm[0x40 / 4];   // the live jmp_buf (next-in-chain at jmpbuf+0x40)
+    if (jmpbuf != 0)
+    {
+        vm[0x40 / 4] = *(int *)(jmpbuf + 0x40);
+        jmp_buf *jb = (jmp_buf *)(void *)jmpbuf;
+        longjmp(*jb, code);
+    }
+    void (*errCb)(int) = *(void (**)(int))(heap + 0x290);
+    if (errCb != 0)
+        errCb(vmcore);
+    return KorePanicTraceback(vmcore);
+}
+
+// ---- sub_5E2580 (KoreTablePanic): the table-operation error path.  Formats
+// the message via the VM formatter (no suffix) and raises the VM panic with
+// code -100 (which longjmps to the nearest handler and never returns).  A
+// cdecl variadic in the original ((Size, Format, ...)).
 static int KoreTablePanic(int vmcore, const char *format, ...)
 {
-    (void)vmcore; (void)format;
-    return -100;
+    va_list va;
+    va_start(va, format);
+    KoreFormatMessage(vmcore, format, 0, va);
+    va_end(va);
+    return KoreRaisePanic(vmcore, -100);
 }
 
 // sub_5D3640 (0x5D3640 - 0x5D3676) -- KoreFindEmptyRow: find an empty
@@ -2310,14 +2781,108 @@ static int KoreRebindAllocNodes(int obj)
     }
 }
 
-// sub_5ED980 (0x5ED980 - 0x5EDAB2) -- KoreReassignAllocHeap: move the alloc
-// node chain from the old heap (the vm-core's +224 slot) onto the heap
-// sub-object's +0x88 chain, releasing the retired nodes. [NOT byte-identical]
-// remaining stub.
+// sub_5ED980 (0x5ED980 - 0x5EDAB2) -- KoreReassignAllocHeap: the
+// heap-grow stage-3 chain reassign (thiscall + retn 4 on the VM-heap
+// sub-object, the vm-core object as the sole stack arg). Walk the
+// alloc-node chain starting at the sub-object's +0x88 new-chain head
+// (falling back to the old-chain head at *vmcore+0xE0, the same slot the
+// +0x04 object reaches); a node is a 12-byte record {+0x00 kind, +0x04
+// string id, +0x08 next, +0x0C size} with the 4-byte block header at
+// node-4 (the block flag byte just before the record). A node whose header
+// bit 0 is set is adopted into the new chain (clear bit 0 of the previous
+// new head, new head := node, and every third adoption decrements the
+// +0x6C charge by 1 when the +0x70 limit is not -1, panicking through
+// KoreHeapPanic when it reaches 0); any other node is unlinked (the new
+// head's +0x08 splices past it, or, with an empty new head, the old-chain
+// head is updated — or the whole old chain is adopted into +0x88 when the
+// node is not the head), released (KoreReleaseAllocNode), and its block is
+// dealloc'd through the sub-object's +0x0C heap object (used-bytes counter
+// at heap+0x04 -= size + 20, then the heap+0x0C dealloc fn with the
+// heap+0x10 context on node-4 / size + 20 / 0), the +0x6C charge being
+// decremented by 2 with the same limit / panic guard. On the way out the
+// final new head's header bit 0 is cleared, the +0x88 slot is zeroed, and
+// the (pre-zero) new-head value is returned. [NOT byte-identical]
+// placement-dependent (the relative calls to KoreReleaseAllocNode /
+// KoreHeapPanic) and a thiscall + retn 4 hybrid in the original
+// (declared object-first here).
 static int KoreReassignAllocHeap(int obj, int vmcore)
 {
-    (void)obj; (void)vmcore;
-    return 0;
+    int *L     = (int *)obj;
+    int node   = L[0x88 / 4];
+    if (node == 0)
+    {
+        node = *(int *)(*(int *)(L + 4) + 0xE0);   // the old-chain head
+        if (node == 0)
+            goto done;
+    }
+    int counter = 0;
+    for (;;)
+    {
+        int next = *(int *)(node + 8);
+        if ((*(int *)(node - 4) & 1) != 0)
+        {
+            int cur = L[0x88 / 4];
+            if (cur != 0 && cur != node)
+                *(int *)(cur - 4) &= ~1;
+            L[0x88 / 4] = node;
+            if (++counter == 3)
+            {
+                int b = L[0x6C / 4] - 1;
+                if (L[0x70 / 4] != -1)
+                {
+                    if (b <= 0)
+                        KoreHeapPanic(obj);
+                    L[0x6C / 4] = b;
+                }
+                counter = 0;
+            }
+            node = next;
+        }
+        else
+        {
+            int cur = L[0x88 / 4];
+            if (cur != 0)
+            {
+                *(int *)(cur + 8) = next;
+            }
+            else
+            {
+                int *oldHead = (int *)(*(int *)vmcore + 0xE0);
+                if (node == *oldHead)
+                    *oldHead = next;
+                else
+                {
+                    L[0x88 / 4] = *oldHead;
+                    *(int *)(*oldHead + 8) = next;
+                }
+            }
+            (void)KoreReleaseAllocNode(obj, node, vmcore);
+            int freed = node;
+            node = (L[0x88 / 4] != 0) ? next : *(int *)(*(int *)vmcore + 0xE0);
+            int heap  = L[0x0C / 4];
+            int bytes = *(int *)(freed + 0xC) + 20;
+            *(int *)(heap + 4) -= bytes;
+            ((void (*)(int, int, int, int))*(int *)(heap + 0xC))(
+                *(int *)(heap + 0x10), freed - 4, bytes, 0);
+            int b = L[0x6C / 4] - 2;
+            if (L[0x70 / 4] != -1)
+            {
+                if (b <= 0)
+                    KoreHeapPanic(obj);
+                L[0x6C / 4] = b;
+            }
+        }
+        if (node == 0)
+            break;
+    }
+done:
+    int result = L[0x88 / 4];
+    if (result != 0)
+    {
+        *(int *)(result - 4) &= ~1;
+        L[0x88 / 4] = 0;
+    }
+    return result;
 }
 
 // sub_5D9FC0 (0x5D9FC0 - 0x5DA09C) -- KoreRehashAllocTable: rebuild / refresh
