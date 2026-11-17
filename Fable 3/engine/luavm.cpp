@@ -430,7 +430,7 @@ static int    KoreFrameLocalEnd(int table, int frameIndex);             // sub_5
 // implemented; the rest remain documented stubs, not reached by the "Snlu"
 // flag string in the panic path):
 static void   KoreReallocValueStack(int thisObj, int vmcore, int extra); // sub_5DD730
-static int    KoreAllocHashTable(int table, int a2, int a3);            // sub_5DDC90
+static int    KoreAllocHashTable(int registry, int rows, int buckets);  // sub_5DDC90
 static int    KoreTableSet(int table, int vmcore, int key, int value);   // sub_5E7400
 static int    KoreTablePanic(int vmcore, const char *format, ...);      // sub_5E2580
 // The VM error-message / panic formatter closure (KoreTablePanic and friends):
@@ -454,6 +454,7 @@ static void   KoreArraySet(int table, int index, int value);             // sub_
 static void   KoreDebugMarkDirty(int flags, int key);                    // sub_5F7E10
 static int    KoreDebugTrackAppend(int table, int *value);              // sub_5F7D80
 // Existing VM-heap helpers defined later in this translation unit:
+static int    KoreHeapBlockAlloc(int obj, int size);                    // sub_5DA1C0
 static int    KoreGrowRegistry(int obj, int size, int vmcore);          // sub_5EE150
 static int    KoreVmAllocExpand(int vmcore, int size);                  // sub_5F6420
 static int    KoreVmHeapAlloc(int vmcore, int size);                    // sub_5EEAE0
@@ -1150,9 +1151,10 @@ static int KoreSourceVarName(int table, int *fr)
     return 0;
 }
 
-// ---- 'L' / 'f' local-dump table machinery: documented stubs.  These
-// are only reached through the uppercase 'L' (local dump) and 'f'
-// (push the function value) flag characters, which the panic path's
+// ---- 'L' / 'f' local-dump table machinery.  The 'L' flag's hash-table
+// allocation (KoreAllocHashTable, below) is implemented; the remaining
+// helpers are only reached through the uppercase 'L' (local dump) and
+// 'f' (push the function value) flag characters, which the panic path's
 // "Snlu" flag string never contains, so they are never executed in the
 // traceback.  They remain no-op stubs consistent with the other deep
 // KoreVM table internals already stubbed in this file.
@@ -1210,7 +1212,197 @@ static void KoreReallocValueStack(int thisObj, int vmcore, int extra)
         ((void (*)(int, int, int, int))hp[3])(hp[4], newBuf, bytes, 0);
     }
 }
-static int KoreAllocHashTable(int table, int a2, int a3) { (void)table; (void)a2; (void)a3; return 0; }
+// byte_1AE32B0 (0x01AE32B0) -- the 256-byte low-byte log2 table shared
+// by the VM's bit-length computations (this function and its other
+// original referrers): t[i] = floor(log2(i)), with t[0] = 0.
+static const unsigned char KoreLog2Byte[256] =
+{
+    0, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8
+};
+
+// sub_5DA240 (0x5DA240 - 0x5DA40A) -- KoreAllocTableParts: allocate the
+// three regions of a VM hash-table build in one shot (the vm-core registry
+// object in arg0 — a pointer whose first word is the heap object — the
+// block size in arg1, the two raw region sizes in arg2 / arg3, and the
+// 3-word out array in arg4): out[0] = the block (KoreHeapBlockAlloc, the
+// size + the 8-byte block header), out[1] / out[2] = the raw regions
+// (bump-allocated through the heap's +0x0C alloc-fn, no header). It first
+// decrements the heap's free-block counter (+0xA4) by 3 and, when the
+// pending-alloc high-water overruns the +0xA0 bound with the counter
+// drained and the +0x90 flag clear, re-seeds it to 317 and grows the
+// registry (KoreGrowRegistry over heap+0x2C). On a full hit it returns the
+// last allocated region; on any miss it frees the partial regions (the
+// block's header tag bit 0 cleared, the raw regions handed back through
+// the alloc-fn with the bump cursor rewound — the third free reuses the
+// arg2 size, the original's own quirk), grows the registry, and retries,
+// driving the last-resort expand (KoreVmAllocExpand with the total size)
+// after every third failed attempt and looping. [NOT byte-identical]
+// placement-dependent (the relative calls to the three heap helpers).
+static int __stdcall KoreAllocTableParts(int registry, int blockSize,
+                                         int sizeA, int sizeB, int *out)
+{
+    int *h = (int *)*(int *)registry;
+    h[0xA4 / 4] -= 3;
+    int total = blockSize + sizeA + sizeB;
+    if (*(int *)(h[0x38 / 4] + 4) > h[0xA0 / 4]
+        && h[0xA4 / 4] <= 0
+        && h[0x90 / 4] == 0)
+    {
+        int count   = h[0x8C / 4];
+        h[0xA4 / 4] = 317;
+        int newsize = (count == -1) ? 0 : 317 * count;
+        (void)KoreGrowRegistry((int)((char *)h + 0x2C), newsize, registry);
+    }
+    int attempts = 0;
+    for (;;)
+    {
+        int block = KoreHeapBlockAlloc((int)h, blockSize);
+        out[0] = block;
+        int ok = (block != 0);
+        int rawA = 0;
+        if (sizeA != 0)
+        {
+            int bump = h[1];
+            h[1] = bump + sizeA;
+            rawA = ((int (*)(int, int, int, int))h[3])(h[4], 0, 0, sizeA);
+            if (rawA != 0)
+                h[2] = (h[2] > h[1]) ? h[2] : h[1];
+            else
+                h[1] = bump;
+            out[1] = rawA;
+            if (rawA == 0)
+                ok = 0;
+        }
+        int rawB = 0;
+        if (sizeB != 0)
+        {
+            int bump = h[1];
+            h[1] = bump + sizeB;
+            rawB = ((int (*)(int, int, int, int))h[3])(h[4], 0, 0, sizeB);
+            if (rawB != 0)
+                h[2] = (h[2] > h[1]) ? h[2] : h[1];
+            else
+                h[1] = bump;
+            out[2] = rawB;
+            if (ok != 0 && rawB != 0)
+                return rawB;
+        }
+        else if (ok != 0)
+            return (sizeA != 0) ? rawA : block;
+        // free the partial regions
+        if (block != 0)
+        {
+            *(int *)(block - 8) &= ~1;
+            out[0] = 0;
+        }
+        if (rawA != 0)
+        {
+            h[1] -= sizeA;
+            ((void (*)(int, int, int, int))h[3])(h[4], rawA, sizeA, 0);
+            out[1] = 0;
+        }
+        if (rawB != 0)
+        {
+            h[1] -= sizeA; // the original reuses the arg2 size here too
+            ((void (*)(int, int, int, int))h[3])(h[4], rawB, sizeA, 0);
+            out[2] = 0;
+        }
+        (void)KoreGrowRegistry((int)((char *)h + 0x2C), -1, registry);
+        if (++attempts < 3)
+            continue;
+        (void)KoreVmAllocExpand(registry, total);
+        attempts = 0;
+    }
+}
+
+// sub_5D3190 (0x5D3190 - 0x5D3206) -- KoreInitHashTable: initialize a
+// freshly allocated 28-byte VM hash-table header (thiscall + retn 0x1C;
+// this = the header, arg1 = the vm-core registry — present in the
+// original's signature but unused, arg2 = the dense row count, arg3 = the
+// hash bucket count, arg4 = the bucket bit length, arg5 = the bucket-array
+// byte size, arg6 / arg7 = the bucket / row arrays). It writes +0x00 := 0,
+// +0x10 := the row count, +0x04 := the hash mask (2^bitLen - 1, or -1 when
+// the bucket count is 0), +0x14 := the bucket count (2^bitLen, or 0),
+// +0x0C := the row array (zeroed for 8 bytes per row when both the array
+// and the row count are non-zero), and +0x08 := the bucket array (zeroed
+// for the bucket-array byte size); it returns the bucket array (the caller
+// discards it). [NOT byte-identical] placement-dependent (the relative
+// call to _memset).
+static int KoreInitHashTable(int obj, int registry, int rows, int buckets,
+                             int bitLen, int bucketBytes, int bucketArray,
+                             int rowArray)
+{
+    (void)registry; // in the original's signature, unused
+    int *t = (int *)obj;
+    t[2] = 0;
+    t[0] = 0;
+    t[4] = rows;
+    int count = (buckets > 0) ? (1 << bitLen) : 0;
+    int mask  = count - 1;
+    t[1] = mask;
+    t[5] = mask + 1;
+    t[3] = rowArray;
+    if (rowArray != 0 && rows > 0)
+        (void)memset((void *)rowArray, 0, (size_t)8 * rows);
+    t[2] = bucketArray;
+    if (bucketArray != 0)
+        return (int)memset((void *)bucketArray, 0, (size_t)bucketBytes);
+    return 0;
+}
+
+// sub_5DDC90 (0x5DDC90 - 0x5DDD6E) -- KoreAllocHashTable: allocate and
+// initialize a new VM hash table (the vm-core registry object in arg0, the
+// dense row count in arg1, the hash bucket count in arg2). The bucket bit
+// length is the number of bits needed to hold bucketCount - 1 (the
+// byte_1AE32B0 log2 table + 8 per shifted-out byte), so the bucket count
+// rounds up to a power of two; the bucket array is 20 bytes per bucket and
+// the row array 8 bytes per row. It allocates the 28-byte header block +
+// the two arrays in one shot (KoreAllocTableParts), zeroes the 7-word
+// header, flags the block's free-list word at header-4 (bit 0 set, bit 2
+// cleared), runs the constructor (KoreInitHashTable), and clears the last
+// header word (+0x18); it returns the header. Sole in-project caller:
+// KoreFillLuaFrame's 'L' local-dump path. [NOT byte-identical]
+// placement-dependent (the relative calls to the two helpers).
+static int KoreAllocHashTable(int registry, int rows, int buckets)
+{
+    int bitLen = 0;
+    if (buckets != 0)
+    {
+        int v = buckets - 1;
+        while (v >= 0x100)
+        {
+            v >>= 8;
+            bitLen += 8;
+        }
+        bitLen += KoreLog2Byte[(unsigned char)v];
+    }
+    int bucketBytes = (buckets != 0) ? (int)(20u * (1u << bitLen)) : 0;
+    int parts[3] = {0, 0, 0};
+    (void)KoreAllocTableParts(registry, 28, bucketBytes, 8 * rows, parts);
+    int *t = (int *)parts[0];
+    for (int i = 0; i < 7; ++i)
+        t[i] = 0;
+    *(int *)(t - 4) = (*(int *)(t - 4) & 0xFFFFFFFD) | 1;
+    (void)KoreInitHashTable((int)t, registry, rows, buckets, bitLen,
+                            bucketBytes, parts[1], parts[2]);
+    t[6] = 0;
+    return (int)t;
+}
 static int KoreEnsureBackingTable(int table, int vmcore, int a3, int a4)
 { (void)table; (void)vmcore; (void)a3; (void)a4; return 0; }
 static void KoreArraySet(int table, int index, int value)
@@ -2016,22 +2208,150 @@ static void KoreInitAllocTable(int obj, int flags)
 extern "C" int KoreForEachAllocNode(int obj, int (*callback)(int, int));
 typedef int (__thiscall *KoreForEachAllocFn)(int, int (*callback)(int, int));
 
-// sub_5D59E0 (0x5D59E0 - 0x5D5A1D) -- KoreMarkAllocTree: mark the alloc node
-// at a2 (and its children, a2+20 count / a2+24 array) with the +(-8) bit.
-// [NOT byte-identical] remaining stub.
-static int KoreMarkAllocTree(int a1, int a2)
+// sub_5D59E0 (0x5D59E0 - 0x5D5A1D) -- KoreMarkAllocTree: the stage-1 mark
+// pass over the alloc-node tree rooted at a2. Set bit 0 of the node's
+// 4-byte block header (at a2 - 8 -- the same low "live" bit the per-type
+// adopt routines and the stage-3 chain reassign test), then, when the node
+// has children (signed count at a2 + 0x14, 4-byte child array at
+// a2 + 0x18), mark each child's block header and recurse into it. a1 is
+// the callback context the KoreForEachAllocNode registry walk threads
+// through (the registry's +0x0C word, or 0 from KoreHeapInitGrow's direct
+// call on the h[21] + 56 child) -- threaded into every recursion but
+// otherwise unused. Returns the last child's recursion result (0 when
+// childless). Plain cdecl int(int, int).
+// Byte-identical: __declspec(naked) inline asm of the original's exact
+// 61-byte sequence -- the self-recursive call's -0x30 relative
+// displacement and the two short jumps (0x29 / 0xDD) depend only on the
+// in-function layout, so the bytes match at any placement.
+static int __declspec(naked) KoreMarkAllocTree(int a1, int a2)
 {
     (void)a1; (void)a2;
-    return 0;
+    __asm {
+        push esi
+        push edi
+        mov  edi, [esp+10h]            ; a2, the node
+        or   dword ptr [edi-8], 1      ; mark the node's block header
+        xor  esi, esi
+        cmp  dword ptr [edi+14h], esi  ; the signed child count
+        jbe  kmat_done
+        push ebx
+        mov  ebx, [esp+10h]            ; a1, the context
+kmat_loop:
+        mov  eax, [edi+18h]            ; the child array
+        mov  eax, [eax+esi*4]          ; the child
+        or   dword ptr [eax-8], 1      ; mark the child's block header
+        mov  ecx, [edi+18h]
+        mov  edx, [ecx+esi*4]
+        sub  eax, 8
+        push edx
+        push ebx
+        call KoreMarkAllocTree
+        inc  esi
+        add  esp, 8
+        cmp  esi, [edi+14h]
+        jb   kmat_loop
+        pop  ebx
+kmat_done:
+        pop  edi
+        pop  esi
+        ret
+    }
 }
 
-// sub_5D5980 (0x5D5980 - 0x5D59D5) -- KoreSweepAllocNodes: sweep the heap's
-// alloc-node chain (obj+0x04 sub-object, its +76 list), dropping the unmarked
-// nodes and charging the marked ones against the alloc budget (obj+0x6C).
-// [NOT byte-identical] remaining stub.
+// sub_5D2950 (0x5D2950 - 0x5D29C0) -- KoreReleaseAllocRecords: the per-node
+// record release the sweep (KoreSweepAllocNodes, sub_5D5980) calls on each
+// unmarked alloc node, and which is also used directly by the VM hash /
+// table code (sub_5E9AA0, the 0x5D9390 dispatch thunk, KoreHashTableInsert).
+// Walks the node's own 16-byte-entry record list (head at node+0x2C; entries
+// linked via entry+0x0C) and splices out every entry whose key (entry+0x08,
+// a pointer) is >= the threshold (the node's +0x28 word).  For each such
+// entry it copies the pointed-to record's first two dwords into the entry,
+// self-references the entry (entry+0x08 = the entry itself) to mark it
+// detached, marks the record dirty for the debug GC
+// (KoreDebugMarkDirty(entry-8, entry)) when the table's (node[0]'s) +0x3C
+// debug flag is 1, and unlinks the entry (updating the head at node+0x2C if
+// it is the head, else the previous entry's +0x0C next pointer).  Takes
+// (node, threshold); returns nothing.  cdecl in the original (retn, two
+// stack args).
+// [NOT byte-identical] placement-dependent: the relative call to
+// KoreDebugMarkDirty (0x5F7E10) has a displacement that changes with the
+// build's placement.
+static void KoreReleaseAllocRecords(int node, int threshold)
+{
+    int *headSlot = (int *)(node + 0x2C);
+    int base   = *(int *)node;          // node[0]: the table base
+    int prev   = *headSlot;
+    int entry  = *headSlot;
+    while (entry != 0)
+    {
+        int *e = (int *)entry;
+        int key = e[2];                 // entry+0x08
+        if ((unsigned int)key < (unsigned int)threshold)
+        {
+            prev = entry;               // keep: advance prev
+        }
+        else
+        {
+            int *r = (int *)key;        // the pointed-to record
+            e[0] = r[0];
+            e[1] = r[1];
+            e[2] = entry;               // self-reference (detached)
+            if (*(int *)(base + 60) == 1)
+                KoreDebugMarkDirty(entry - 8, entry);
+            int head = *headSlot;       // re-read the head
+            if (entry == head)
+            {
+                int next = *(int *)(head + 0x0C);
+                *headSlot = next;
+                prev = next;
+            }
+            else
+            {
+                ((int *)prev)[3] = *(int *)(entry + 0x0C);   // prev[3] = entry[3]
+            }
+        }
+        entry = *(int *)(entry + 0x0C); // entry = entry[3] (next)
+    }
+}
+
+// sub_5D5980 (0x5D5980 - 0x5D59D5) -- KoreSweepAllocNodes: the stage-2 sweep
+// pass over the heap's alloc-node chain (the obj+0x04 sub-object's +0x4C
+// 4-byte list).  Each 19-dword node is checked for the live bit the stage-1
+// mark set in its 4-byte block header (node-8): a marked node is kept and
+// counted, with the sub-object's +0x6C charge decremented once every third
+// marked node; an unmarked node is released via KoreReleaseAllocRecords
+// (sub_5D2950, with the node's +0x28 word as the threshold) and unlinked from
+// the list (the previous node's +0x4C next pointer skips over it, the charge
+// -= 2).  No return value; thiscall in the original.
+// [NOT byte-identical] placement-dependent: the relative call to
+// KoreReleaseAllocRecords (0x5D2950) has a displacement that changes with the
+// build's placement.
 static void KoreSweepAllocNodes(int obj)
 {
-    (void)obj;
+    int *headSlot = (int *)(*(int *)(obj + 4) + 0x4C);   // the list-head slot
+    int count = 0;
+    int node = *headSlot;
+    while (node != 0)
+    {
+        int *n = (int *)node;
+        if ((*(unsigned char *)(node - 8) & 1) != 0)
+        {
+            ++count;                              // marked / live
+            headSlot = &n[19];                    // advance the prev-next slot
+            if (count == 3)
+            {
+                --*(int *)(obj + 0x6C);
+                count = 0;
+            }
+        }
+        else
+        {
+            KoreReleaseAllocRecords(node, n[10]); // unmarked: release it
+            *headSlot = n[19];                    // unlink (prev's next skips it)
+            *(int *)(obj + 0x6C) -= 2;
+        }
+        node = n[19];                             // advance to the next node
+    }
 }
 
 // ---- KoreRebindAllocNodes' callees: the VM's global-table enumeration ----
@@ -3652,8 +3972,8 @@ static int KoreAllocRecordTable(int obj)
 // setjmp/longjmp-guarded insert of a table entry (thiscall on the table,
 // the table also as the first stack arg): swap the table's +0x40 slot with a
 // 64-byte stack jmp buffer, run the table core (sub_5EC770), restore the
-// slot, and unwind through the saved chain (sub_407540 / sub_5D2950) on the
-// longjmp path; returns 0 on the no-exception path. Remaining stub (the
+// slot, and unwind through the saved chain (sub_407540 / KoreReleaseAllocRecords,
+// sub_5D2950) on the longjmp path; returns 0 on the no-exception path. Remaining stub (the
 // 459-byte table core + its resize/error cluster is out of scope); the no-op
 // returns 0 (the no-exception result) and leaves the table untouched.
 static int KoreHashTableInsert(int obj, int a1, int a2, int a3, int a4)
@@ -3750,10 +4070,36 @@ static int KoreFreeAllocList(int list)
     *(int *)(list + 8) = 0;
     return vmcore;
 }
-// sub_5DA690 (0x5DA690 - 0x5DA6D2) -- the VM finalise step (thiscall on the
-// VM's +0xBC object with the module as the second arg): the finalise loop over
-// the VM's remaining slots. Remaining stub (deep VM internals out of scope).
-static void KoreFinalizeVM(int obj, int a1) { (void)obj; (void)a1; }
+// sub_5DA690 (0x5DA690 - 0x5DA6D2) -- KoreFinalizeVM: the VM finalise step
+// (thiscall + retn 4 in the original: this = the VM's +0xBC alloc-table bucket
+// sub-object, arg 1 = the module wrapper). Walk the bucket table's count
+// (mask + 1) slots from cursor 0; a slot holds a node pointer, and when the
+// node's first word (flags/id) is >= 0 the slot is dropped + rehashed through
+// KoreRehashAllocNode (which also decrements the sub-object's node count and
+// re-inserts out-of-order neighbours), whose returned cursor continues the
+// walk; empty or negative-key slots just advance. A mask of -1 (0xFFFFFFFF,
+// the table never built) returns 0 without walking. Returns the final cursor
+// (ignored by its sole caller). [NOT byte-identical] a thiscall + retn 4
+// hybrid in the original (declared object-first here) and placement-dependent
+// (the relative call to KoreRehashAllocNode).
+static int KoreFinalizeVM(int obj, int wrapper)
+{
+    int *sub = (int *)obj;                    // the bucket sub-object (thiscall this)
+    int *B   = (int *)sub[0];                 // the bucket array
+    unsigned int mask = (unsigned int)sub[2];
+    unsigned int count = mask + 1u;
+    unsigned int i = 0;
+    if (sub[2] != -1)
+        do
+        {
+            int node = B[mask & i];
+            if (node != 0 && *(int *)node >= 0)
+                i = (unsigned int)KoreRehashAllocNode(obj, wrapper, (int)i);
+            else
+                ++i;
+        } while (i < count);
+    return (int)i;
+}
 // sub_5DA150 (0x5DA150 - 0x5DA1C0) -- detach the VM's heap: free the two
 // pending-allocation lists (KoreDeallocAllocNode each), zero the +0x28 slot, and pull
 // out the 3-word heap-dealloc context {vm[3] (the dealloc fn), vm[4], vm[5]}
