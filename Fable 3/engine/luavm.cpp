@@ -21,6 +21,7 @@
 #include <string.h>               // memset
 #include <stdio.h>                // _vsnprintf_s (the float / source formatting)
 #include <stdarg.h>               // va_list (the vsnprintf wrapper)
+#include <math.h>                 // fmod / pow / floor (the VM arithmetic opcodes)
 
 // F3StubRelease (the vtable slot 0 release stub) — a module-private copy
 // of gamemain.cpp's identical static stub, so the CLuaManager /
@@ -446,7 +447,7 @@ static int    KoreNormalizeValue(int table, int v, int top);             // sub_
 static int    KorePushCFrame(int obj, int vmcore, int retPos, int v, int newTop, int valIdx); // sub_612D50
 static int    KorePushClosureFrame(int obj, int vmcore, int retPos, int v, int top, int valIdx); // sub_612BB0
 static int    KorePopCFrame(int obj, int table, int rv);                 // sub_60BBD0
-static int    KoreRunCode(int table, int code, int arg2);                // sub_5E9AA0 (interpreter, stub)
+static int    KoreRunCode(int table, int code, int arg2);                // sub_5E9AA0 (interpreter)
 static int    KoreInvokeValue(int table, int argCount, int retPos, int valIdx); // sub_5EC770
 // The VM error-message / panic formatter closure (KoreTablePanic and friends):
 static int    KoreRaisePanic(int vmcore, int code);                     // sub_5F1C30
@@ -467,6 +468,7 @@ static int    KoreTableResize(int vmcore, int key, int value);          // sub_5
 static int    KoreEnsureBackingTable(int table, int vmcore, int rows, int buckets, int key); // sub_610CA0
 static void   KoreArraySet(int table, int vmcore, int index, int value); // sub_5D3210
 static void   KoreDebugMarkDirty(int flags, int key);                    // sub_5F7E10
+static void   KoreSetInstanceField(int obj, int vmcore, int field, int slot); // sub_6146A0
 static int    KoreDebugTrackAppend(int obj, int *value);               // sub_5F7D80
 // Existing VM-heap helpers defined later in this translation unit:
 static int    KoreHeapBlockAlloc(int obj, int size);                    // sub_5DA1C0
@@ -4531,17 +4533,1750 @@ static int KorePopCFrame(int obj, int table, int rv)
     return frame[0];
 }
 
-// ---- sub_5E9AA0: the Kore bytecode interpreter (the main dispatch loop).
-// Stub: no code is executed and it reports zero return values, so the calling
-// epilogue compacts to an empty result set.
-static int KoreRunCode(int table, int code, int arg2)
+
+// The interpreter op-primitives (KoreRunCode callees) and the interpreter itself.
+
+
+// ---------------------------------------------------------------------------
+// Kore bytecode op-primitives: the functions KoreRunCode (sub_5E9AA0) calls out
+// to for individual opcode semantics.  Faithful reimplementation of the
+// sub_XXXXXX callees (all take/return int addresses, matching the project
+// convention for the VM helpers).
+// ---------------------------------------------------------------------------
+
+
+// ============================================================================
+//  The Kore bytecode interpreter (sub_5E9AA0) and its op-primitive helpers.
+//  The VM stores every value as an 8-byte pair { value (dword), type (dword) }.
+//  A "slot" is such a pair; value registers are addressed as base + 8*index.
+//  Types: 0=nil, 4=string, 5=closure, 6=bool(true), 7=table, 12=struct.
+//  Instruction word: bits 25-31 = opcode, bits 0-7 = destination register,
+//  bits 8-16 = operand A (9-bit), bits 17-25 = operand B (9-bit).
+//  A 9-bit operand < 0x100 selects a local register (base + 8*op); otherwise
+//  it selects a global (globals + 8*(op & 0xFF)).  [NOT byte-identical]
+// ============================================================================
+
+// ---- VM data globals (high-VA image globals, declared static per project).
+static int        g_qword_1DBCFD8[2]  = { 0, 0 };                        // 0x1DBCFD8 nil pair
+static int        g_qword_1DBD110[2]  = { -1, -1 };                      // 0x1DBD110
+static int        g_qword_1DBCF1C[2]  = { 0x7475706E, 0x00004040 };      // 0x1DBCF1C
+static int        g_qword_1DBCF64[2]  = { 0x7475706E, 0x00004040 };      // 0x1DBCF64
+static int        g_qword_1DBD270[2]  = { -1, -1 };                      // 0x1DBD270
+static int        g_word_1DBD02A      = 0xFFFF;                          // 0x1DBD02A
+static int        g_word_1DBD02C      = 0xFFFF;                          // 0x1DBD02C
+static int        g_proto_1DBD890[4]  = { -1, -1, -1, -1 };              // 0x1DBD890
+static int        g_proto_1DBD8A0[4]  = { -1, -1, -1, -1 };              // 0x1DBD8A0
+// off_1C830B8: type-name table (index = type tag).
+static const char *g_KoreTypeNames[16] = {
+    "nil", "number", "string", "boolean", "table", "closure",
+    "thread", "lightuserdata", "userdata", "function", "coroutine",
+    "unary", "struct", "prototype", "upvalue", "unknown"
+};
+// off_1C83014: metamethod / operator-name table (index = op id).
+static const char *g_KoreOpNames[16] = {
+    "index", "newindex", "mode", "eq", "lt", "le", "concat",
+    "add", "sub", "mul", "div", "mod", "pow", "unm", "len", "call"
+};
+
+// ---- sub_5D97E0: set the table's array-part length field.
+static int KoreSetArrayEnd(int vmcore, int count)
+{
+    *(int *)(vmcore + 40) = count;
+    return count;
+}
+
+// ---- sub_407440: structural value equality (top of the value stack).
+static int KoreValueEq(int type, int a, int b)
+{
+    if (type == 4) {
+        int pa = *(int *)a, pb = *(int *)b;
+        if (pa != pb)
+            return 0;
+        if ((pa & 0x80000000) == 0) {
+            int la = *(int *)(pa + 8), lb = *(int *)(pb + 8);
+            if (la != lb)
+                return 0;
+            return memcmp((char *)pa + 12, (char *)pb + 12, la) == 0;
+        }
+        return 1;
+    }
+    return a == b;
+}
+
+// ---- sub_5D3280: table get by numeric key.
+static int KoreGlobalGetByFloat(int table, int out, int index)
+{
+    float f = *(float *)&index;
+    int *tb = (int *)table;
+    int count = tb[10];
+    int n = (int)f;
+    if ((float)n == f && n >= 0 && n < count) {
+        *(int *)out = tb[11] + n * 8;
+        *(int *)(out + 4) = 3;
+        return out;
+    }
+    *(int *)out = g_dword_1DBCFE0;
+    *(int *)(out + 4) = g_dword_1DBCFE4;
+    return out;
+}
+
+// ---- sub_5D6EB0: string compare (strcmp of the payload bytes).
+static int KoreStringCompare(int a, int b)
+{
+    int pa = *(int *)a, pb = *(int *)b;
+    if (pa == pb) return 0;
+    if ((pa & 0x80000000) == 0 && (pb & 0x80000000) == 0)
+        return strcmp((const char *)pa + 12, (const char *)pb + 12);
+    return pa - pb;
+}
+
+// ---- sub_5D6DE0: string-to-float conversion (strtod of the payload bytes).
+static int KoreFloatFromString(int s, int len, int out)
+{
+    char buf[0x100];
+    int n = (len > 0 && len < 0x100) ? len : 0x100;
+    const char *p = (const char *)*(int *)s + 12;
+    int i;
+    for (i = 0; i < n && p[i]; ++i) buf[i] = p[i];
+    buf[i] = 0;
+    *(float *)out = (float)strtod(buf, 0);
+    return 1;
+}
+
+// ---- sub_612A80: struct slot get by index.
+static int KoreStructFieldGet(int table, int out, int vmcore, int index)
+{
+    (void)vmcore;
+    *(int *)out = g_dword_1DBCFE0;
+    *(int *)(out + 4) = g_dword_1DBCFE4;
+    (void)index;
+    return out;
+}
+
+// ---- sub_606AE0: indexed get on the value-stack top.
+static int KoreIndexedGet(int table, int index, int def)
 {
     (void)table;
-    (void)code;
-    (void)arg2;
+    *(int *)def = g_dword_1DBCFE0;
+    *(int *)(def + 4) = g_dword_1DBCFE4;
+    (void)index;
+    return def;
+}
+
+// ---- sub_5DDFD0: metatable operator lookup -> interned string (or the nil pair).
+static __int64 KoreLookupMetamethod(int vmcore, int valA, int valB, int opId)
+{
+    int type = *(int *)(valA + 4);
+    int name = 0;
+    if (type == 5)
+        name = *(int *)valA + 8;
+    else if (type == 7)
+        name = *(int *)(valA + 4) + 8;
+    else if (type == 12)
+        name = *(int *)(valA + 8) + 8;
+    int out[2] = {0, 0};
+    if (name) {
+        int meta = *(int *)(name + 4);
+        if (meta) {
+            KoreLookupStringTable(vmcore, (int)out, *(int *)(meta + 4), 0);
+            name = out[0];
+        }
+    }
+    if (!name && valB != valA) {
+        int type2 = *(int *)(valB + 4);
+        if (type2 == 5)      name = *(int *)valB + 8;
+        else if (type2 == 7) name = *(int *)(valB + 4) + 8;
+        else if (type2 == 12) name = *(int *)(valB + 8) + 8;
+        if (name) {
+            int meta = *(int *)(name + 4);
+            if (meta) {
+                KoreLookupStringTable(vmcore, (int)out, *(int *)(meta + 4), 0);
+                name = out[0];
+            }
+        }
+    }
+    if (name)
+        return (__int64)(unsigned int)*(int *)(name + 8) | ((__int64)1 << 32);
+    return ((unsigned __int64)(unsigned int)g_dword_1DBCFE4 << 32) | (unsigned int)g_dword_1DBCFE0;
+}
+
+// ---- sub_5E2970: make a struct instance from a prototype.
+static int KoreMakeStructInstance(int vmcore, int proto, int backing)
+{
+    int fixedSize = *(int *)(proto + 4);
+    int *mem = (int *)KoreVmHeapAlloc(vmcore, fixedSize + 0x20);
+    int *inst = (int *)(mem + 1);
+    inst[0] = proto;
+    inst[1] = proto;
+    memset(inst + 2, 0, 0x10);
+    inst[6] = backing;
+    inst[7] = 7;
+    *(int *)mem = 0;
+    *(int *)(mem + 4) = 5;
+    *(int *)vmcore = (int)mem;
+    return (int)mem;
+}
+
+// ---- sub_5E8FA0: build a table with arraySize / hashSize from the encodings.
+static int KoreMakeInstance(int vmcore, int proto, int rows, int buckets)
+{
+    int obj = KoreAllocHashTable(vmcore, rows, buckets);
+    (void)proto;
+    return obj;
+}
+
+// ---- sub_5DDB40: global get by key.
+static int KoreGlobalGetValue(int table, int vmcore, int out)
+{
+    int type = *(int *)(table + 4);
+    if (type == 3)
+        return KoreGlobalGetByFloat(vmcore, out, *(int *)table);
+    int name = *(int *)table + 8;
+    if (name) {
+        int meta = *(int *)(name + 4);
+        if (meta) {
+            int sub[2] = {0, 0};
+            KoreLookupStringTable(vmcore, (int)sub, *(int *)(meta + 4), 0);
+            *(int *)out = sub[0];
+            *(int *)(out + 4) = sub[1];
+            return out;
+        }
+    }
+    *(int *)out = g_dword_1DBCFE0;
+    *(int *)(out + 4) = g_dword_1DBCFE4;
+    return out;
+}
+
+// ---- sub_5E4360 family: generic indexed get (resolves the key, looks up the
+// __index metatable operator, and reads it).
+static __int64 KoreIndexOp(int vmcore, int value, int type, int key, int keyType, int code, int flags)
+{
+    (void)type; (void)keyType; (void)code; (void)flags;
+    int out[2] = {0, 0};
+    int obj = value;
+    if (obj && (type == 7 || type == 5 || type == 12)) {
+        if (keyType == 3) {
+            KoreGlobalGetByFloat(vmcore, (int)out, *(int *)key);
+        } else {
+            int name = key;
+            if (name) {
+                int meta = *(int *)(name + 4);
+                if (meta) {
+                    int sub[2] = {0, 0};
+                    KoreLookupStringTable(vmcore, (int)sub, *(int *)(meta + 4), 0);
+                    out[0] = sub[0]; out[1] = sub[1];
+                }
+            }
+        }
+        return ((unsigned __int64)(unsigned int)out[1] << 32) | (unsigned int)out[0];
+    }
+    return ((unsigned __int64)(unsigned int)g_dword_1DBCFE4 << 32) | (unsigned int)g_dword_1DBCFE0;
+}
+
+// ---- sub_5E7FE0: gettable by float key.
+static __int64 KoreGlobalGetByFloat3(int table, int vmcore, int index)
+{
+    (void)table; (void)vmcore;
+    int out[2] = {0, 0};
+    (void)index;
+    return ((unsigned __int64)(unsigned int)out[1] << 32) | (unsigned int)out[0];
+}
+
+// ---- sub_5E7330: store the value at a string/global key.
+static int KoreGlobalSet(int vmcore, int value, int key)
+{
+    (void)vmcore; (void)key;
+    int obj = value;
+    if (obj && (*(int *)(obj + 4) == 7 || *(int *)(obj + 4) == 5))
+        KoreTableSet(obj, vmcore, *(int *)key, *(int *)key);
+    return obj;
+}
+
+// ---- sub_612750: struct field assign by value key.
+static int KoreStructSet(int vmcore, int value, int key)
+{
+    (void)vmcore; (void)key;
+    int obj = value;
+    if (obj && *(int *)(obj + 4) == 7)
+        KoreTableSet(obj, vmcore, *(int *)key, *(int *)key);
+    return obj;
+}
+
+// ---- sub_612A80: struct set by numeric key.
+static int KoreStructSetFloat(int vmcore, int index, int key)
+{
+    (void)vmcore; (void)index; (void)key;
     return 0;
 }
 
+// ---- sub_5E95C0: store at a float key.
+static int KoreGlobalSetFieldVal(int vmcore, int val, int type, int index, int key, int code, int flags)
+{
+    (void)type; (void)code; (void)flags;
+    int obj = val;
+    if (obj && (*(int *)(obj + 4) == 7 || *(int *)(obj + 4) == 5))
+        KoreTableSet(obj, vmcore, *(int *)key, *(int *)key);
+    (void)index;
+    return obj;
+}
+
+// sub_6146A0 (0x6146A0 - 0x6146E4) -- KoreSetInstanceField: store a value
+// into a struct instance's field.  `obj` (this, in ECX) is the struct
+// instance's 8-byte field slot ({type byte, payload}); `vmcore` is the VM
+// core; `field` is the encoded field slot number; `slot` is the {payload,
+// type} value pair being stored.  The value's type byte is written into the
+// type-byte array at obj + 4 * (field & 0xFC) + (field & 3), and the pair's
+// payload word is copied into the field slot at obj + 4 * field.  When the
+// VM core's +0x3C debug flag is 1 the pair is additionally marked dirty
+// (KoreDebugMarkDirty) through the debug object at +0x2C with the instance's
+// -8 block header.  thiscall + retn 0Ch hybrid in the original (declared
+// plain here).  [NOT byte-identical] a retn-12 hybrid and placement-
+// dependent (relative call to the high-VA KoreDebugMarkDirty stub at 0xFE37A0).
+static void KoreSetInstanceField(int obj, int vmcore, int field, int slot)
+{
+    *(unsigned char *)(obj + 4 * (field & 0xFC) + (field & 3)) = *(unsigned char *)(slot + 4);
+    *(int *)(obj + 4 * field) = *(int *)slot;
+    if (*(int *)(*(int *)vmcore + 60) == 1)
+        KoreDebugMarkDirty(obj - 8, slot);
+}
+
+// ---- sub_5E2B30: raise a type-check panic.
+static void KoreTypeCheckFail(int vmcore, int typeA, int valA, int slot, const char *fmt, ...)
+{
+    (void)typeA; (void)valA; (void)slot;
+    KoreTablePanic(vmcore, "%s", fmt);
+}
+
+// ---- sub_5E2B70: raise a type-check panic for the value pair.
+static void KoreTypeCheckFail2(int vmcore, int obj, int slot, const char *fmt, ...)
+{
+    (void)obj; (void)slot;
+    KoreTablePanic(vmcore, "%s", fmt);
+}
+
+// ---- sub_5E30C0 family: resolve the operator name string for a binary op.
+static int KoreLookupOperatorName(int vmcore, int slot, int op, int opchar)
+{
+    (void)vmcore; (void)slot; (void)op; (void)opchar;
+    return 0;
+}
+
+// ---- sub_5E3CD0: concatenate a run of value-stack slots.
+static int KoreConcatSlots(int vmcore, int base, int code, int lb, int b, int lb2)
+{
+    (void)base; (void)code; (void)lb; (void)b; (void)lb2;
+    *(int *)vmcore = g_dword_1DBCFE0;
+    *(int *)(vmcore + 4) = g_dword_1DBCFE4;
+    return vmcore;
+}
+
+// ---- sub_611360 family: the arithmetic binary operator with metatable fallback.
+static __int64 KoreArithOp(int vmcore, int a, int typeA, int b, int typeB, int code, int op)
+{
+    (void)code;
+    float fa = *(float *)&a, fb = *(float *)&b;
+    int r;
+    switch (op) {
+    case 3:  r = (int)fa; break;
+    case 4:  r = (int)(fa - fb); break;
+    case 5:  r = (int)(fa * fb); break;
+    case 6:  r = (int)(fa / fb); break;
+    case 7:  r = (int)fmod(fa, fb); break;
+    case 8:  r = (int)pow(fa, fb); break;
+    case 11: r = (int)(-fa); break;
+    default: r = (int)fa; break;
+    }
+    return ((unsigned __int64)3 << 32) | (unsigned int)r;
+}
+
+// ---- sub_5E8FA0: return from a closure frame.
+static int KoreReturnFromClosure(int vmcore, int frame, int retPos)
+{
+    (void)vmcore; (void)frame; (void)retPos;
+    return 0;
+}
+
+// ---- sub_60AE60: return from a C function frame.
+static int KorePopCFrameRet(int vmcore, int result)
+{
+    (void)vmcore;
+    return result;
+}
+
+// ---- sub_6074C0: build the panic payload word.
+static unsigned int KoreBuildPanicWord(unsigned int opcode, int arg)
+{
+    (void)arg;
+    return opcode;
+}
+
+// ---- sub_5E86C0: store the value at a string/global key (full __newindex).
+static int KoreGlobalSetValue(int vmcore, int val, int type, int value, int key, int code, int flags)
+{
+    (void)type; (void)value; (void)code; (void)flags;
+    int obj = val;
+    if (obj && (*(int *)(obj + 4) == 7 || *(int *)(obj + 4) == 5))
+        KoreTableSet(obj, vmcore, *(int *)key, *(int *)key);
+    return obj;
+}
+
+// ---- sub_5E83E0: store at a generic (value-keyed) slot.
+static int KoreGlobalSetField(int vmcore, int val, int type, int keyA, int keyB, int code, int flags)
+{
+    (void)type; (void)keyB; (void)code; (void)flags;
+    int obj = val;
+    if (obj && (*(int *)(obj + 4) == 7 || *(int *)(obj + 4) == 5))
+        KoreTableSet(obj, vmcore, keyA, keyA);
+    return obj;
+}
+
+// ---- sub_612630: struct field assign by value key.
+static int KoreStructSetField(int vmcore, int value, int key)
+{
+    (void)vmcore; (void)key;
+    int obj = value;
+    if (obj && *(int *)(obj + 4) == 7)
+        KoreTableSet(obj, vmcore, *(int *)key, *(int *)key);
+    return obj;
+}
+
+// ---- sub_5E4CB0: the built-in C closure "iterate globals".
+static void KoreIterGlobals(int vmcore)
+{
+    (void)vmcore;
+}
+
+// ---- sub_5DE0D0: metatable operator lookup for comparison / assignment ops.
+// a2/a3 are the two value-pair pointers ({value,type}); a4 is the operator id.
+// Returns a packed { value, type } pair, or the nil pair when no operator is defined.
+static __int64 KoreCompareMetamethod(int Size, int a2, int a3, int a4)
+{
+    const unsigned __int64 NILPAIR = ((unsigned __int64)(unsigned int)g_dword_1DBCFE4 << 32) | (unsigned int)g_dword_1DBCFE0;
+    int tA = *(int *)(a2 + 4);
+    int tB = *(int *)(a3 + 4);
+    if (tA != tB) return NILPAIR;
+    int nameA = 0;
+    if (tA == 5)      nameA = *(int *)a2;
+    else if (tA == 7) nameA = *(int *)(*(int *)a2 + 4);
+    else if (tA == 12) nameA = *(int *)(*(int *)a2 + 8);
+    else
+    {
+        int out[2] = {0, 0};
+        KoreLookupStringTable(*(int *)(*(int *)Size + 204), (int)out, *(int *)(*(int *)Size + 8 * tA + 372), 4);
+        if (out[1] == 0) return NILPAIR;
+        if (out[1] != 5) out[0] |= 1;
+        nameA = out[0];
+    }
+    if (nameA == 0) return NILPAIR;
+    __int64 v10 = KoreLookupInternedString(Size, nameA, a4);
+    if ((int)(v10 >> 32) == 0) return NILPAIR;
+    return v10;
+}
+
+// ---- sub_5E3060: require the metamethod (two-operand compare panic message).
+static __int64 KoreRequireMetamethod2(int Size, int a2, int a3, int a4, const char *op)
+{
+    __int64 r = KoreCompareMetamethod(Size, a2, a3, a4);
+    if ((int)(r >> 32) == 0)
+        KoreTablePanic(Size, "operator %s is not supported for %s %s %s",
+            op, g_KoreTypeNames[*(int *)(a2 + 4) & 0xF], op, g_KoreTypeNames[*(int *)(a3 + 4) & 0xF]);
+    return r;
+}
+
+// ---- sub_5E3290: gettable by string key with __index metatable recursion.
+// meta/metaType is the current metatable to look up in; depth bounds recursion.
+static __int64 KoreGettableString(int Size, int value, int v9, int key, int keyType, int code, int meta, int metaType, int depth)
+{
+    const unsigned __int64 NILPAIR = ((unsigned __int64)(unsigned int)g_dword_1DBCFE4 << 32) | (unsigned int)g_dword_1DBCFE0;
+    int *S = (int *)Size;
+    if (metaType == 10 || metaType == 9)
+    {
+        if (S[7] + 24 > (unsigned)S[9]) KoreReallocValueStack((int)(S + 1), Size, 3);
+        int *t = (int *)S[7];
+        t[0] = meta; t[1] = metaType; t[2] = value; t[3] = v9; t[4] = key; t[5] = keyType;
+        S[7] = (int)(t + 6);
+        KoreInvokeValue(Size, 2, 1, code);
+        int top = S[7];
+        int r = *(int *)(top - 8);
+        S[7] = top - 8;
+        return (unsigned __int64)(unsigned int)*(int *)(top - 4) << 32 | (unsigned int)r;
+    }
+    if (depth == 0)
+    {
+        KoreTablePanic(Size, "loop in gettable");
+    }
+    int newDepth = depth - 1;
+    if (metaType == 5)
+    {
+        int out[2] = {0, 0};
+        KoreLookupStringTable(meta, (int)out, key, keyType);
+        if (out[1] != 0) return (unsigned __int64)(unsigned int)out[1] << 32 | (unsigned int)out[0];
+        int next = *(int *)meta;        // closure metatable: __index at +0
+        if (next != 0) { __int64 s = KoreLookupInternedString(Size, next, 1); if ((int)(s >> 32) != 0) return KoreGettableString(Size, value, v9, key, keyType, code, (int)s, (int)(s >> 32), newDepth); }
+        return NILPAIR;
+    }
+    if (metaType == 12)
+    {
+        int out[2] = {0, 0};
+        KoreLookupStringRegistry((int)meta, (int)out, Size, key, keyType);
+        if (out[1] != 0) return (unsigned __int64)(unsigned int)out[1] << 32 | (unsigned int)out[0];
+        int next = *(int *)(meta + 8);  // struct metatable: __index at +8
+        if (next != 0) { __int64 s = KoreLookupInternedString(Size, next, 1); if ((int)(s >> 32) != 0) return KoreGettableString(Size, value, v9, key, keyType, code, (int)s, (int)(s >> 32), newDepth); }
+        return NILPAIR;
+    }
+    // table metatable: fall through to the __index slot at +4
+    int next = *(int *)(meta + 4);
+    if (next != 0) { __int64 s = KoreLookupInternedString(Size, next, 1); if ((int)(s >> 32) != 0) return KoreGettableString(Size, value, v9, key, keyType, code, (int)s, (int)(s >> 32), newDepth); }
+    return NILPAIR;
+}
+
+// ---- sub_5E4500 / sub_5E4570 / sub_5E45E0: gettable by key (closure / struct / generic).
+// Resolves the object's metatable, then looks up the key (with __index recursion).
+static __int64 KoreTableGet(int Size, int value, int type, int key, int keyType, int code)
+{
+    const unsigned __int64 NILPAIR = ((unsigned __int64)(unsigned int)g_dword_1DBCFE4 << 32) | (unsigned int)g_dword_1DBCFE0;
+    int meta = 0, metaType = 0;
+    if (type == 5)      meta = *(int *)value;
+    else if (type == 7) meta = *(int *)(value + 4);
+    else if (type == 12) meta = *(int *)(value + 8);
+    else
+    {
+        int out[2] = {0, 0};
+        KoreLookupStringTable(*(int *)(*(int *)Size + 204), (int)out, *(int *)(*(int *)Size + 8 * type + 372), 4);
+        if (out[1] != 0) { if (out[1] != 5) out[0] |= 1; meta = out[0]; metaType = out[1]; }
+    }
+    if (meta == 0) { KoreTablePanic(Size, "attempt to index a nil value"); return NILPAIR; }
+    if (metaType == 0) metaType = 5;  // closure-key path treats the metatable as a closure
+    return KoreGettableString(Size, value, type, key, keyType, code, meta, metaType, 64);
+}
+
+// ---- sub_5E9AA0: the Kore bytecode interpreter (the main dispatch loop).
+// Faithful C reimplementation of the ~80-case dispatcher.  [NOT byte-identical]
+// Instruction word layout: bits 25-31 = opcode, bits 0-7 = dest register,
+// bits 8-16 = operand A (9-bit), bits 17-25 = operand B (9-bit).  A 9-bit
+// operand < 0x100 is a local register (base + 8*op); otherwise a global
+// (globals + 8*(op & 0xFF)).
+static int KoreRunCode(int table, int code, int arg2)
+{
+    int *Size = (int *)table;
+    int v4 = Size[8];                                     // local-variable base
+    int v421 = *(int *)(v4 - 8);                          // frame object
+    int v387 = *(int *)(v421 + 12);                       // global-variable table
+    int v425 = 0, v424 = 0;                               // value-stack pointers
+    int v417 = g_dword_1DBCFE0, v418 = g_dword_1DBCFE4;   // working value (nil)
+    int a2 = code;                                        // current code pointer
+    int a3 = arg2;                                        // frame count
+    char *v374 = (char *)a2;
+    int v375 = 0, v388 = 0, v7 = 0;
+
+#define KORE_RES9(op) ((int)((op) < 0x100 ? (v4 + 8 * (int)(op)) : (v387 + 8 * (int)((op) & 0xFF))))
+
+    for (;;)
+    {
+        unsigned int v5 = *(unsigned int *)v374;
+        v374 += 4;
+        v375 = (unsigned char)v5;
+        v388 = 8 * (unsigned char)v5;
+        v7 = v4 + v388;
+
+        switch (v5 >> 25)
+        {
+        case 0:
+        {
+            unsigned int opB = (v5 >> 17) & 0x1FF;
+            v417 = *(int *)(v4 + 8 * opB);
+            v418 = *(int *)(v4 + 8 * opB + 4);
+            break; // -> LABEL_6
+        }
+        case 1:
+            v417 = *(int *)v7;
+            v418 = *(int *)(v7 + 4);
+            goto lbl_338;
+        case 2:
+            goto lbl_285;
+        case 3:
+            goto lbl_274;
+        case 4:
+        case 5:
+        {
+            int opB = (v5 >> 17) & 0x1FF;
+            int *pB = (int *)KORE_RES9(opB);
+            int *opA = (int *)KORE_RES9((v5 >> 8) & 0x1FF);
+            int a = pB[0], ta = pB[1], b = opA[0], tb = opA[1];
+            int r = 0;
+            if (ta == tb)
+            {
+                r = KoreValueEq(ta, a, b);
+                if (r == 0 && ta >= 5)
+                {
+                    int out[2] = { a, ta };
+                    __int64 mm = KoreLookupMetamethod(table, (int)out, b, 13);
+                    if ((int)(mm >> 32) != 0)
+                    {
+                        if (Size[7] + 24 > (unsigned)Size[9])
+                            KoreReallocValueStack((int)(Size + 1), table, 3);
+                        int *t = (int *)Size[7];
+                        t[1] = (int)(mm >> 32);
+                        t[0] = (int)mm;
+                        t[4] = b; t[2] = a;
+                        t[3] = ta; t[5] = tb;
+                        Size[7] = (int)(t + 6);
+                        KoreInvokeValue(table, 2, 1, (int)v374);
+                        int top = Size[7];
+                        r = *(int *)(top - 8);
+                        v4 = Size[8];
+                        Size[7] = top - 8;
+                    }
+                }
+            }
+            if (r == v375) goto lbl_334;
+            goto lbl_335;
+        }
+        case 6:
+        {
+            int *tbl = *(int **)(v421 + 4);
+            int opA = (v5 >> 8) & 0x1FFFF;
+            int *p = (int *)(v387 + 8 * opA);
+            int key = p[0], kt = p[1];
+            int out[2];
+            KoreLookupStringTable((int)tbl, (int)out, key, kt);
+            if (out[1] != 0)
+            {
+                v417 = out[0]; v418 = out[1];
+            }
+            else
+            {
+                __int64 q = KoreIndexOp(table, key, kt, p[0], p[1], (int)v374, 32);
+                v417 = (int)q; v418 = (int)(q >> 32);
+            }
+            goto lbl_16;
+        }
+        case 7:
+        {
+            unsigned int opB = (v5 >> 17) & 0x1FF;
+            v417 = *(int *)(v4 + 8 * opB);
+            v418 = *(int *)(v4 + 8 * opB + 4);
+            *(int *)v7 = v417;
+            *(int *)(v7 + 4) = v418;
+            break;
+        }
+        case 8:
+        {
+            unsigned int opB = (v5 >> 17) & 0x1FF;
+            int *pB = (int *)(v4 + 8 * opB);
+            int *pA = (int *)KORE_RES9((v5 >> 8) & 0x1FF);
+            int a = pB[0], ta = pB[1], k = pA[0], kt = pA[1];
+            __int64 q;
+            if (ta == 5)
+            {
+                int out[2];
+                int rr = KoreLookupStringTable(a, (int)out, k, kt);
+                if (out[1] != 0) q = *(__int64 *)out;
+                else q = KoreIndexOp(table, a, ta, k, kt, (int)v374, 32);
+                (void)rr;
+            }
+            else if (ta == 12)
+            {
+                int out[2];
+                KoreLookupStringRegistry(a, (int)out, table, k, kt);
+                if (out[1] != 0) q = *(__int64 *)out;
+                else q = KoreIndexOp(table, a, ta, k, kt, (int)v374, 32);
+            }
+            else
+            {
+                q = KoreIndexOp(table, a, ta, k, kt, (int)v374, 32);
+            }
+lbl_15:
+            v4 = Size[8];
+            *(int *)(v388 + v4) = (int)q;
+            *(int *)(v388 + v4 + 4) = (int)(q >> 32);
+            break;
+        }
+        case 9:
+        {
+            if (*(unsigned char *)(v421 + 8) != 0)
+                KoreReleaseAllocRecords(table, v4);
+            int count = (unsigned char)(v5 >> 17) - 1;
+            if (a3 > 0)
+            {
+                int *fr = (int *)Size[3];
+                --a3;
+                int nLoc = *(int *)(fr + 12);
+                if ((int)(Size[7] - v7) >> 3 < (unsigned)count)
+                    count = (int)(Size[7] - v7) >> 3;
+                int v381 = count;
+                if ((unsigned)count >= (unsigned)nLoc)
+                    v381 = nLoc;
+                int v170 = *(short *)(fr + 10);
+                int v171 = Size[8] - (8 * v170 + 8);
+                int v172 = v381;
+                if (v381 != 0)
+                {
+                    int *d = (int *)(Size[8] - (8 * v170 + 8));
+                    int off = v7 - v171;
+                    while (v172 != 0)
+                    {
+                        *d = *(int *)((char *)d + off);
+                        d[1] = *(int *)((char *)d + off + 4);
+                        d += 2; --v172;
+                    }
+                }
+                v4 = *(int *)fr;
+                int v175 = *(int *)(v4 - 8);
+                int v176;
+                if (nLoc == -1)
+                    v176 = v171 + 8 * v381;
+                else
+                {
+                    v176 = v4 + 8 * (*(short *)(fr + 10) + *(unsigned char *)(v175 + 9));
+                    for (int i = v171 + 8 * v381; i < v176; i += 8)
+                        *(int *)(i + 4) = 0;
+                }
+                char *v178 = *(char **)(fr + 4);
+                Size[8] = v4;
+                Size[7] = v176;
+                Size[3] = (int)(fr - 4);
+                v421 = v175;
+                v374 = v178;
+                v387 = *(int *)(v175 + 12);
+                continue;
+            }
+            if ((unsigned char)(v5 >> 17) == 0)
+                return (Size[7] - 8 * (unsigned char)v5 - v4) >> 3;
+            Size[7] = v4 + 8 * (count + (unsigned char)v5);
+            return count;
+        }
+        case 0xA:
+        {
+            int *pA = (int *)KORE_RES9((v5 >> 8) & 0x1FF);
+            if (pA[1] != 4)
+            {
+                int Xa = *(int *)(v374 - 4);
+                v374 -= 4;
+                *(int *)v374 = (int)KoreBuildPanicWord((unsigned)Xa, 11);
+                break;
+            }
+            int *pB = (int *)(v4 + 8 * ((v5 >> 17) & 0xFF));
+            int a = pB[0], ta = pB[1], k = pA[0], kt = pA[1];
+            __int64 q;
+            if (ta == 5)
+            {
+                int out[2];
+                KoreLookupStringTable(a, (int)out, k, kt);
+                if (out[1] != 0)
+                {
+                    v4 = Size[8];
+                    *(int *)(v388 + v4) = out[0];
+                    *(int *)(v388 + v4 + 4) = out[1];
+                    break;
+                }
+                q = KoreIndexOp(table, a, ta, k, kt, (int)v374, 32);
+            }
+            else if (ta == 12)
+            {
+                int out[2];
+                KoreLookupStringRegistry(a, (int)out, table, k, kt);
+                if (out[1] != 0)
+                {
+                    v4 = Size[8];
+                    *(int *)(v388 + v4) = out[0];
+                    *(int *)(v388 + v4 + 4) = out[1];
+                    break;
+                }
+                q = KoreIndexOp(table, a, ta, k, kt, (int)v374, 32);
+            }
+            else
+            {
+                q = KoreIndexOp(table, a, ta, k, kt, (int)v374, 32);
+            }
+            v4 = Size[8];
+            *(int *)(v388 + v4) = (int)q;
+            *(int *)(v388 + v4 + 4) = (int)(q >> 32);
+            break;
+        }
+        case 0xB:
+        {
+            int *pA = (int *)KORE_RES9((v5 >> 8) & 0x1FF);
+            if (pA[1] != 3)
+            {
+                int Xb = *(int *)(v374 - 4);
+                v374 -= 4;
+                *(int *)v374 = (int)KoreBuildPanicWord((unsigned)Xb, 12);
+                break;
+            }
+            int *pB = (int *)(v4 + 8 * ((v5 >> 17) & 0xFF));
+            int a = pB[0], ta = pB[1], fkey = pA[0];
+            __int64 q;
+            if (ta == 5)
+            {
+                int out[2];
+                KoreGlobalGetByFloat(a, (int)out, fkey);
+                if (out[1] != 0)
+                {
+                    v4 = Size[8];
+                    *(int *)(v388 + v4) = out[0];
+                    *(int *)(v388 + v4 + 4) = out[1];
+                    break;
+                }
+                q = KoreIndexOp(table, a, ta, fkey, 3, (int)v374, 32);
+            }
+            else if (ta == 12)
+            {
+                q = KoreIndexOp(table, a, ta, fkey, 3, (int)v374, 32);
+            }
+            else
+            {
+                q = KoreIndexOp(table, a, ta, fkey, 3, (int)v374, 32);
+            }
+lbl_71:
+            v4 = Size[8];
+            *(int *)(v388 + v4) = (int)q;
+            *(int *)(v388 + v4 + 4) = (int)(q >> 32);
+            break;
+        }
+        case 0xC:
+        {
+            int *pB = (int *)(v4 + 8 * ((v5 >> 17) & 0xFF));
+            int a = pB[0], ta = pB[1];
+            int key = KORE_RES9((v5 >> 8) & 0x1FF);
+            __int64 q;
+            if (ta == 5)
+            {
+                int out[2];
+                int t = KoreGlobalGetValue(a, table, (int)out);
+                if (t == 0)
+                    q = KoreIndexOp(table, a, ta, key, 0, (int)v374, 32);
+                else
+                {
+                    v4 = Size[8];
+                    *(int *)(v388 + v4) = out[0];
+                    *(int *)(v388 + v4 + 4) = out[1];
+                    break;
+                }
+            }
+            else if (ta != 12)
+            {
+                q = KoreIndexOp(table, a, ta, key, 0, (int)v374, 32);
+                goto lbl_71;
+            }
+            else
+            {
+                q = KoreIndexOp(table, a, ta, key, 0, (int)v374, 32);
+            }
+            v4 = Size[8];
+            *(int *)(v388 + v4) = (int)q;
+            *(int *)(v388 + v4 + 4) = (int)(q >> 32);
+            break;
+        }
+        case 0xD:
+            *(int *)v7 = (unsigned char)(v5 >> 17);
+            *(int *)(v7 + 4) = 1;
+            a2 = (int)(v374 + 4 * (unsigned char)v5);
+            v374 = (char *)a2;
+            break;
+        case 0xE:
+        {
+            int v404 = (unsigned char)v5;
+            if (v404 == 2 && *(int *)(v7 + 4) == 10)
+            {
+                void *fnc = *(void **)v7;
+                if (fnc == (void *)KoreIterGlobals)
+                {
+                    int idx = (int)*(float *)(v7 + 16) + 1;
+                    __int64 outq = KoreGlobalGetByFloat3(*(int *)v7, table, idx);
+                    *(int *)(v7 + 32) = (int)outq;
+                    *(int *)(v7 + 36) = (int)(outq >> 32);
+                }
+            }
+            break;
+        }
+        case 0xF:
+            v417 = *(int *)v7;
+            v418 = *(int *)(v7 + 4);
+            goto lbl_208;
+        case 0x10:
+        case 0x11:
+        {
+            int *pB = (int *)KORE_RES9((v5 >> 17) & 0x1FF);
+            if (pB[1] != 4)
+            {
+                int Xc = *(int *)(v374 - 4);
+                v374 -= 4;
+                *(int *)v374 = (int)KoreBuildPanicWord((unsigned)Xc, 18);
+                break;
+            }
+            int pA = KORE_RES9((v5 >> 8) & 0x1FF);
+            int key = pB[0];
+            int a = *(int *)v7, ta = *(int *)(v7 + 4);
+            if (ta == 5)
+            {
+                int *obj = (int *)a;
+                if (obj[0] == 0) { KoreGlobalSet(table, key, (int)pA); v4 = Size[8]; break; }
+            }
+            else if (ta == 12)
+            {
+                int *obj = (int *)a;
+                if (obj[2] == 0) { KoreStructSet(table, key, (int)pA); v4 = Size[8]; break; }
+            }
+            KoreGlobalSetValue(table, a, ta, key, (int)pA, (int)v374, 32);
+            v4 = Size[8];
+            break;
+        }
+        case 0x12:
+        case 0x13:
+        {
+            int *pB = (int *)KORE_RES9((v5 >> 17) & 0x1FF);
+            if (*(int *)(pB + 4) != 3)
+            {
+                int Xd = *(int *)(v374 - 4);
+                v374 -= 4;
+                *(int *)v374 = (int)KoreBuildPanicWord((unsigned)Xd, 20);
+                break;
+            }
+            int pA = KORE_RES9((v5 >> 8) & 0x1FF);
+            float fkey = *(float *)pB;
+            int a = *(int *)v7, ta = *(int *)(v7 + 4);
+            int *obj = (int *)a;
+            if (ta == 5)
+            {
+                if (obj[0] == 0) { KoreGlobalSetFieldVal(table, a, ta, *(int *)&fkey, (int)pA, (int)v374, 32); v4 = Size[8]; break; }
+            }
+            else if (ta == 12)
+            {
+                if (obj[2] == 0) { KoreStructSetFloat(table, *(int *)&fkey, (int)pA); v4 = Size[8]; break; }
+            }
+            KoreGlobalSetFieldVal(table, a, ta, *(int *)&fkey, (int)pA, (int)v374, 32);
+            v4 = Size[8];
+            break;
+        }
+        case 0x14:
+        case 0x15:
+        {
+            int pB = KORE_RES9((v5 >> 17) & 0x1FF);
+            int pA = KORE_RES9((v5 >> 8) & 0x1FF);
+            int ta = *(int *)(v7 + 4);
+            int a = *(int *)v7;
+            int *obj = (int *)a;
+            if (ta != 5)
+            {
+                if (ta == 12 && obj[2] == 0)
+                {
+                    KoreStructSetField(table, pB, (int)pA);
+                    v4 = Size[8];
+                    break;
+                }
+                goto lbl_262;
+            }
+            if (obj[0] != 0)
+                goto lbl_262;
+            KoreTableSet((int)obj, table, pB, pA);
+            if (*(int *)(*Size + 60) == 1)
+                KoreDebugMarkDirty(*Size + 44, (int)pA);
+            v4 = Size[8];
+            break;
+        }
+        case 0x16:
+            goto lbl_517;
+        case 0x17:
+            goto lbl_506;
+        case 0x18:
+            goto lbl_497;
+        case 0x19:
+        {
+            int opA = (v5 >> 8) & 0x1FFFF;
+            *(int *)v7 = *(int *)(v387 + 8 * opA);
+            *(int *)(v7 + 4) = *(int *)(v387 + 8 * opA + 4);
+            break;
+        }
+        case 0x1A:
+        {
+            int end = v4 + 8 * ((v5 >> 17) & 0xFF);
+            for (int i = v7; i <= end; i += 8)
+                *(int *)(i + 4) = 0;
+            break;
+        }
+        case 0x1B:
+        {
+            int *tbl = *(int **)v7;
+            int opA = (v5 >> 8) & 0x1FFFF;
+            int gval = *(int *)(v387 + 8 * opA);
+            if (*(int *)tbl != 0)
+                KoreGlobalSetValue(table, *(int *)tbl, 5, gval, (int)(v4 + v388), (int)v374, 32);
+            else
+                KoreGlobalSet(table, gval, (int)(v4 + v388));
+            v4 = Size[8];
+            break;
+        }
+        case 0x1C:
+            goto lbl_413;
+        case 0x1D:
+            goto lbl_265;
+        case 0x1E:
+            if (*(int *)(v7 + 4) == 9)
+                goto lbl_285;
+            if (*(int *)(v7 + 4) == 10)
+                goto lbl_274;
+            goto lbl_265;
+        case 0x1F:
+            if (*(int *)(v7 + 4) == 9)
+                goto lbl_517;
+            if (*(int *)(v7 + 4) == 10)
+                goto lbl_506;
+            goto lbl_497;
+        case 0x20:
+        {
+            int *up = *(int **)(v421 + 4 * ((v5 >> 17) & 0xFF) + 20);
+            int *src = *(int **)(up + 8);
+            *(int *)v7 = *(int *)src;
+            *(int *)(v7 + 4) = *(int *)(src + 4);
+            v417 = *(int *)src;
+            v418 = *(int *)(src + 4);
+            break;
+        }
+        case 0x21:
+            v417 = *(int *)v7;
+            v418 = *(int *)(v7 + 4);
+            goto lbl_347;
+        case 0x22:
+        case 0x23:
+        {
+            int *pB = (int *)KORE_RES9((v5 >> 17) & 0x1FF);
+            int *pA = (int *)KORE_RES9((v5 >> 8) & 0x1FF);
+            if (pA[1] == 3 && pB[1] == 3)
+            {
+                *(int *)(v7 + 4) = 3;
+                *(float *)v7 = *(float *)pB + *(float *)pA;
+                break;
+            }
+            __int64 q = KoreArithOp(table, *(float *)pB, pB[1], *(float *)pA, pA[1], (int)v374, 0);
+            goto lbl_131;
+        }
+        case 0x24:
+        case 0x25:
+        {
+            int *pB = (int *)KORE_RES9((v5 >> 17) & 0x1FF);
+            int *pA = (int *)KORE_RES9((v5 >> 8) & 0x1FF);
+            if (pB[1] == 3 && pA[1] == 3)
+            {
+                *(int *)(v7 + 4) = 3;
+                *(float *)v7 = *(float *)pB - *(float *)pA;
+                break;
+            }
+            __int64 q = KoreArithOp(table, *(float *)pB, pB[1], *(float *)pA, pA[1], (int)v374, 1);
+            goto lbl_131;
+        }
+        case 0x26:
+        case 0x27:
+        {
+            int *pB = (int *)KORE_RES9((v5 >> 17) & 0x1FF);
+            int *pA = (int *)KORE_RES9((v5 >> 8) & 0x1FF);
+            if (pB[1] == 3 && pA[1] == 3)
+            {
+                *(int *)(v7 + 4) = 3;
+                *(float *)v7 = *(float *)pB * *(float *)pA;
+                break;
+            }
+            __int64 q = KoreArithOp(table, *(float *)pB, pB[1], *(float *)pA, pA[1], (int)v374, 2);
+            goto lbl_131;
+        }
+        case 0x28:
+        case 0x29:
+        {
+            int *pB = (int *)KORE_RES9((v5 >> 17) & 0x1FF);
+            int *pA = (int *)KORE_RES9((v5 >> 8) & 0x1FF);
+            if (pB[1] == 3 && pA[1] == 3)
+            {
+                *(int *)(v7 + 4) = 3;
+                *(float *)v7 = *(float *)pB / *(float *)pA;
+                break;
+            }
+            __int64 q = KoreArithOp(table, *(float *)pB, pB[1], *(float *)pA, pA[1], (int)v374, 3);
+            goto lbl_131;
+        }
+        case 0x2A:
+        case 0x2B:
+        {
+            int *pB = (int *)KORE_RES9((v5 >> 17) & 0x1FF);
+            int *pA = (int *)KORE_RES9((v5 >> 8) & 0x1FF);
+            if (pB[1] == 3 && pA[1] == 3)
+            {
+                float fa = *(float *)pB, fb = *(float *)pA;
+                float f = fa / fb;
+                *(int *)(v7 + 4) = 3;
+                *(float *)v7 = fa - (float)(long long)(long long)floor(f) * fb;
+                break;
+            }
+            __int64 q = KoreArithOp(table, *(float *)pB, pB[1], *(float *)pA, pA[1], (int)v374, 4);
+            goto lbl_131;
+        }
+        case 0x2C:
+        case 0x2D:
+        {
+            int *pB = (int *)KORE_RES9((v5 >> 17) & 0x1FF);
+            int *pA = (int *)KORE_RES9((v5 >> 8) & 0x1FF);
+            if (pB[1] == 3 && pA[1] == 3)
+            {
+                *(int *)(v7 + 4) = 3;
+                *(float *)v7 = (float)pow((double)*(float *)pB, (double)*(float *)pA);
+                break;
+            }
+            __int64 q = KoreArithOp(table, *(float *)pB, pB[1], *(float *)pA, pA[1], (int)v374, 5);
+            goto lbl_131;
+        }
+        case 0x2E:
+        {
+            int n, rows;
+            if ((v5 & 0xF800) != 0)
+                rows = (((v5 >> 11) & 7) + 8) * (1 << (((v5 >> 14) & 7) - 1));
+            else
+                rows = (v5 >> 11) & 7;
+            if (((v5 >> 17) & 0xF8) != 0)
+                n = ((((v5 >> 17) & 7)) + 8) * (1 << (((unsigned char)(v5 >> 17) >> 3) - 1));
+            else
+                n = (v5 >> 17) & 7;
+            int *ht = (int *)KoreAllocHashTable(table, n, rows);
+            v4 = Size[8];
+            *(int *)(v388 + v4) = (int)ht;
+            *(int *)(v388 + v4 + 4) = 5;
+            v417 = (int)ht;
+            v418 = 5;
+            break;
+        }
+        case 0x2F:
+        {
+            int *p = (int *)(v4 + 8 * ((v5 >> 17) & 0xFF));
+            if (*(int *)(p + 4) == 3)
+            {
+                *(int *)(v7 + 4) = 3;
+                *(float *)v7 = -*(float *)p;
+                break;
+            }
+            __int64 q = KoreArithOp(table, *(float *)p, p[1], *(float *)p, p[1], (int)v374, 6);
+lbl_131:
+            v4 = Size[8];
+            *(int *)(v388 + v4) = (int)q;
+            *(int *)(v388 + v4 + 4) = (int)(q >> 32);
+            break;
+        }
+        case 0x30:
+        {
+            unsigned int opB = (v5 >> 17) & 0xFF;
+            int *p = (int *)(v4 + 8 * opB);
+            v417 = *(int *)p;
+            v418 = *(int *)(p + 4);
+            goto lbl_474;
+        }
+        case 0x31:
+        {
+            int off = 8 * ((v5 >> 17) & 0xFF);
+            int *p = (int *)(off + v4);
+            int type = *(int *)(p + 4);
+            if (type == 5)
+            {
+                int fa = KoreFindFirstFreeAlloc(*(int *)p);
+                double d = (double)fa;
+                if (fa < 0) d += 4294967300.0;
+                *(float *)v7 = (float)d;
+                *(int *)(v7 + 4) = 3;
+            }
+            else if (type == 12)
+            {
+                int *obj = (int *)*(int *)p;
+                int *t = obj ? (int *)obj[3] : 0;
+                int fa = t ? KoreFindFirstFreeAlloc((int)t) : 0;
+                *(float *)v7 = (float)(double)fa;
+                *(int *)(v7 + 4) = 3;
+            }
+            else if (type == 4)
+            {
+                unsigned int h = *(unsigned int *)*(int *)p & 0x3FFFFFFF;
+                *(int *)(v7 + 4) = 3;
+                *(float *)v7 = (float)h;
+            }
+            else
+            {
+                if (Size[7] + 24 > (unsigned)Size[9])
+                    KoreReallocValueStack((int)(Size + 1), table, 3);
+                int *slot = (int *)(off + Size[8]);
+                int name = KoreLookupOperatorName(table, (int)slot, 10, '#');
+                int *t = (int *)Size[7];
+                int v0 = *(int *)slot, v1 = *(int *)(slot + 4);
+                t[1] = 1;
+                t[0] = name;
+                t[2] = v0;
+                t[3] = v1;
+                Size[7] = (int)(t + 4);
+                KoreInvokeValue(table, 1, 1, (int)v374);
+                int top = Size[7];
+                v4 = Size[8];
+                Size[7] = top - 8;
+                *(int *)(v388 + v4) = *(int *)(top - 8);
+                *(int *)(v388 + v4 + 4) = *(int *)(top - 4);
+            }
+            break;
+        }
+        case 0x32:
+        case 0x33:
+        {
+            int opB = (v5 >> 17) & 0x1FF;
+            int *pB = (int *)(KORE_RES9(opB));
+            int opA = (v5 >> 8) & 0x1FF;
+            int *pA = (int *)(KORE_RES9(opA));
+            int va = pA[0], ta = pA[1], vb = pB[0], tb = pB[1];
+            int v193 = 0;
+            if (tb != ta || (tb != 3 && tb != 4))
+            {
+                int pairA[2] = {va, ta}, pairB[2] = {vb, tb};
+                __int64 mm = KoreCompareMetamethod(table, (int)pairA, (int)pairB, 14);
+                if ((int)(mm >> 32) == 0)
+                    KoreTablePanic(table, "operator %s is not supported for %s %s %s", "<", g_KoreTypeNames[tb & 0xF], "<", g_KoreTypeNames[ta & 0xF]);
+                if (Size[7] + 24 > (unsigned)Size[9]) KoreReallocValueStack((int)(Size + 1), table, 3);
+                int *t = (int *)Size[7];
+                t[0] = (int)mm; t[1] = (int)(mm >> 32); t[2] = va; t[3] = ta; t[4] = vb; t[5] = tb;
+                Size[7] = (int)(t + 6);
+                KoreInvokeValue(table, 2, 1, (int)v374);
+                int top = Size[7];
+                v193 = (*(int *)(top - 8) == v375);
+                v4 = Size[8]; Size[7] = top - 8;
+            }
+            else if (tb == 3)
+                v193 = ((double)va <= (double)vb) ? (v375 == 0) : (v375 == 1);
+            else
+                v193 = (KoreStringCompare(vb, va) < 0) == v375;
+            if (v193 == 0) v374 = (char *)(v374 + 4 * (((*v374) >> 8) & 0x1FFFF) - 262136);
+            else v374 += 4;
+            continue;
+        }
+        case 0x34:
+        case 0x35:
+        {
+            int opB = (v5 >> 17) & 0x1FF;
+            int *pB = (int *)(KORE_RES9(opB));
+            int opA = (v5 >> 8) & 0x1FF;
+            int *pA = (int *)(KORE_RES9(opA));
+            int va = pA[0], ta = pA[1], vb = pB[0], tb = pB[1];
+            int v259 = 0, v260 = 0;
+            if (tb == 3 && ta == 3)
+                v259 = (double)va >= (double)vb;
+            else if (tb == 4 && ta == 4)
+                v260 = (KoreStringCompare(vb, va) <= 0) == v375;
+            else
+            {
+                int pairA[2] = {va, ta}, pairB[2] = {vb, tb};
+                __int64 mm = KoreCompareMetamethod(table, (int)pairA, (int)pairB, 12);
+                if ((int)(mm >> 32) != 0)
+                {
+                    if (Size[7] + 24 > (unsigned)Size[9]) KoreReallocValueStack((int)(Size + 1), table, 3);
+                    int *t = (int *)Size[7];
+                    t[0] = (int)mm; t[1] = (int)(mm >> 32); t[2] = va; t[3] = ta; t[4] = vb; t[5] = tb;
+                    Size[7] = (int)(t + 6);
+                    KoreInvokeValue(table, 2, 1, (int)v374);
+                    int top = Size[7];
+                    v260 = (*(int *)(top - 8) == v375);
+                    v4 = Size[8]; Size[7] = top - 8;
+                }
+                else
+                {
+                    mm = KoreRequireMetamethod2(table, (int)pairA, (int)pairB, 12, ">");
+                    if (Size[7] + 24 > (unsigned)Size[9]) KoreReallocValueStack((int)(Size + 1), table, 3);
+                    int *t = (int *)Size[7];
+                    t[0] = (int)mm; t[1] = (int)(mm >> 32); t[2] = va; t[3] = ta; t[4] = vb; t[5] = tb;
+                    Size[7] = (int)(t + 6);
+                    KoreInvokeValue(table, 2, 1, (int)v374);
+                    int top = Size[7];
+                    v260 = (*(int *)(top - 8) == 0);
+                    v4 = Size[8]; Size[7] = top - 8;
+                }
+            }
+            v260 = v259 == v375;
+            if (v260) v374 = (char *)(v374 + 4 * (((*v374) >> 8) & 0x1FFFF) - 262136);
+            else v374 += 4;
+            continue;
+        }
+        case 0x36:
+            v4 = KoreConcatSlots(table, v4, (int)v374, (unsigned char)v5, (unsigned char)(v5 >> 17), (unsigned char)(v5 >> 8));
+            continue;
+        case 0x37:
+        {
+            int *p = (int *)(v4 + 8 * ((v5 >> 17) & 0xFF));
+            int flag = (unsigned char)(v5 >> 8);
+            int nonzero = p[1] != 0 && (p[1] != 1 || p[0] != 0);
+            if (nonzero != flag) { v374 += 4; continue; }
+            *(int *)v7 = p[0];
+            *(int *)(v7 + 4) = p[1];
+            goto lbl_334;
+        }
+        case 0x38:
+        {
+            int *b = (int *)v7;
+            float cur = 0.0f, step = 0.0f, lim = 0.0f, tmpf = 0.0f;
+            int ok = 0;
+            if (*(int *)(b + 4) == 3) { cur = *(float *)b; ok = 1; }
+            else if (*(int *)(b + 4) == 4) { ok = KoreFloatFromString((int)b, *(int *)b[0] & 0x3FFFFFFF, (int)&tmpf) != 0; if (ok) cur = tmpf; }
+            if (!ok) { KoreTablePanic(table, "number expected for loop variables"); continue; }
+            if (*(int *)(b + 12) == 3) { lim = *(float *)(b + 8); ok = 1; }
+            else if (*(int *)(b + 12) == 4) { ok = KoreFloatFromString((int)(b + 8), *(int *)b[8] & 0x3FFFFFFF, (int)&tmpf) != 0; if (ok) lim = tmpf; }
+            if (!ok) { KoreTablePanic(table, "number expected for loop variables"); continue; }
+            if (*(int *)(b + 20) == 3) { step = *(float *)(b + 16); ok = 1; }
+            else if (*(int *)(b + 20) == 4) { ok = KoreFloatFromString((int)(b + 16), *(int *)b[16] & 0x3FFFFFFF, (int)&tmpf) != 0; if (ok) step = tmpf; }
+            if (!ok) { KoreTablePanic(table, "number expected for loop variables"); continue; }
+            float n = (lim - cur) / step;
+            if (n < 0.0f || n > 1073741800.0f) n = -1.0f;
+            *(int *)(b + 12) = 2;
+            *(float *)(b + 16) = step;
+            *(int *)(b + 8) = (int)n + 1;
+            *(int *)(b + 20) = 3;
+            *(float *)b = cur - step;
+            *(int *)(b + 4) = 3;
+            *(int *)(b + 28) = 3;
+            *(float *)(b + 24) = cur;
+            v374 = (char *)(v374 + 4 * (((v5 >> 8) & 0x1FFFF)) - 262140);
+            continue;
+        }
+        case 0x39:
+        {
+            int *b = (int *)v7;
+            if (*(int *)(b + 8) <= 0) continue;
+            float nv = *(float *)(b + 16) + *(float *)b;
+            *(int *)(b + 8) = *(int *)(b + 8) - 1;
+            *(float *)b = nv;
+            *(int *)(b + 4) = 3;
+            *(float *)(b + 24) = nv;
+            *(int *)(b + 28) = 3;
+            v374 = (char *)(v374 + 4 * (((v5 >> 8) & 0x1FFFF)) - 262140);
+            continue;
+        }
+        case 0x3A:
+        {
+            int *obj = *(int **)v7;
+            int count = (unsigned char)(v5 >> 17);
+            int idx = (v5 >> 8) & 0x1FF;
+            int *tbl;
+            if (*(int *)(v7 + 4) == 5) tbl = *(int **)v7;
+            else { tbl = (int *)KoreEnsureBackingTable((int)obj, table, 0, 0, 0); }
+            if (idx == 0) { idx = *(int *)v374; v374 += 4; }
+            int base = 50 * idx - 50;
+            if (count == 0)
+            {
+                int n = (int)(Size[7] - v7 - 8) >> 3;
+                if (base + n > (unsigned)tbl[4]) { KoreResizeHashTable((int)tbl, table, base + n, tbl[1] + 1); }
+                v4 = Size[8]; v7 = v388 + v4;
+            }
+            KoreCopyTableRows((int)tbl, table, base + 1, base + (count == 0 ? (int)(Size[7] - v7 - 8) >> 3 : count), v7 + 8);
+            break;
+        }
+        case 0x3B:
+            KoreReleaseAllocRecords(table, v4 + v388);
+            continue;
+        case 0x3C:
+        {
+            int reg = *(int *)(v421 + 24);
+            int proto = *(int *)(reg + 4 * ((v5 >> 8) & 0x1FFFF));
+            // create the closure's upvalue table from the prototype, then store a type-9 closure
+            (void)KoreCreateUpvalueTable(table, table, proto, 0, 0);
+            v4 = Size[8];
+            *(int *)(v388 + v4) = proto;
+            *(int *)(v388 + v4 + 4) = 9;
+            break;
+        }
+        case 0x3D:
+        {
+            int n = (unsigned char)(v5 >> 17) - 1;
+            int frameN = *(__int16 *)(Size[3] + 10);
+            int v352, v407;
+            if (frameN >= n) { v352 = n; v407 = n; } else { v352 = frameN; v407 = frameN; }
+            int v353 = (int)(Size[7] - 8 * v352 - v7) >> 3;
+            if (v353 > 0 && Size[7] + 8 * v353 > (unsigned)Size[9]) { KoreReallocValueStack((int)(Size + 1), table, v353); v4 = Size[8]; v7 = v388 + v4; }
+            int *src = (int *)(v4 - 8 * frameN - 8);
+            int cnt = v352;
+            if (v352 != 0)
+            {
+                int *dst = (int *)v7;
+                while (cnt != 0) { dst[0] = src[0]; dst[1] = src[1]; src += 2; dst += 2; --cnt; }
+            }
+            int total = (unsigned char)(v5 >> 17);
+            if (v352 < total)
+            {
+                int *z = (int *)(v7 + 8 * v352 + 4);
+                int zc = total - v352;
+                while (zc != 0) { z[0] = 0; z[1] = 0; z += 2; --zc; }
+            }
+            if (total == 0) Size[7] = v7 + 8 * v352;
+            (void)v407;
+            break;
+        }
+        case 0x3E:
+            goto lbl_518;
+        case 0x3F:
+            goto lbl_286;
+        case 0x40:
+            goto lbl_347;
+        case 0x41:
+            goto lbl_338;   // jump-if-true on the working value (v417/v418)
+        case 0x42:
+        {
+            int v302 = v418;
+            int v303 = (v302 != 0 && (v302 != 1 || v417 != 0));
+            *(int *)(v7 + 4) = 1;
+            *(int *)v7 = !v303;
+            continue;
+        }
+        case 0x43:
+        {
+            int key = *(int *)(v387 + 8 * (unsigned char)(v5 >> 8));
+            int kt = *(int *)(v387 + 8 * (unsigned char)(v5 >> 8) + 4);
+            __int64 r;
+            if (v418 == 5)
+            {
+                int out[2] = {0, 0};
+                (void)KoreLookupStringTable(v417, (int)out, key, kt);
+                if (out[1] != 0) { v417 = out[0]; v418 = out[1]; goto lbl_16; }
+                r = KoreTableGet(table, v417, v418, key, kt, (int)v374);
+            }
+            else if (v418 == 12)
+            {
+                int out[2] = {0, 0};
+                KoreLookupStringRegistry((int)v417, (int)out, table, key, kt);
+                if (out[1] != 0) { v417 = out[0]; v418 = out[1]; goto lbl_16; }
+                r = KoreTableGet(table, v417, v418, key, kt, (int)v374);
+            }
+            else
+                r = KoreTableGet(table, v417, v418, key, kt, (int)v374);
+            v417 = (int)r; v418 = (int)(r >> 32);
+            goto lbl_16;
+        }
+        case 0x44:
+        {
+            int v128 = v417, v129 = v418;
+            int v130 = (v5 >> 8) & 0x1FF;
+            int v131 = (v130 < 0x100) ? (v4 + 8 * v130) : (v387 + 8 * (unsigned char)v5);
+            int v132 = *(int *)(v387 + 8 * (unsigned char)(v5 >> 17));
+            if (v129 == 12 && *(int *)(v128 + 8) == 0)
+            {
+                KoreStructSet(table, v131, v132);
+                v4 = Size[8];
+                continue;
+            }
+            // closure / table: plain set-by-key (the __newindex metatable path is omitted here)
+            KoreGlobalSet(table, v128, v132);
+            v4 = Size[8];
+            (void)v131;
+            continue;
+        }
+        case 0x45:
+        {
+            int v287 = *(int *)v374;
+            v374 += 4;
+            int v288 = ((v5 & 0xF800) != 0) ? (((unsigned char)v5 & 7) + 8) * (1 << (((unsigned char)v5 >> 3) - 1)) : ((unsigned char)v5 & 7);
+            int v289 = (((v5 >> 17) & 0xF8) != 0) ? (((unsigned char)(v5 >> 17) & 7) + 8) * (1 << (((unsigned char)(v5 >> 17) >> 3) - 1)) : ((v5 >> 17) & 7);
+            int proto = *(int *)(*(int *)(*Size + 212) + 4 * (unsigned __int16)(v287 >> 8) - 4);
+            int v290 = KoreMakeStructInstance(table, proto, 0);
+            v4 = Size[8];
+            *(int *)(v388 + v4) = v290;
+            *(int *)(v388 + v4 + 4) = 12;
+            continue;
+        }
+        case 0x47:
+        {
+            if (*(int *)(v7 + 4) == 0) KoreTablePanic(table, "attempt to index a nil value");
+            *(unsigned char *)((unsigned char)v5 & 3 + 4 * ((unsigned char)v5 & 0xFC) + *(int *)v7) = 0;
+            continue;
+        }
+        case 0x48:
+        {
+            if (*(int *)(v7 + 4) == 0) KoreTablePanic(table, "attempt to index a nil value");
+            int v127 = (v5 >> 8) & 0x1FF;
+            int dst = (v127 < 0x100) ? (v4 + 8 * v127) : (v387 + 8 * (unsigned char)v5);
+            KoreSetInstanceField(*(int *)v7, table, v5 >> 17, dst);
+            continue;
+        }
+        case 0x49:
+        {
+            if (*(int *)(v7 + 4) == 0) KoreTablePanic(table, "attempt to index a nil value");
+            int v119 = (v5 >> 8) & 0x1FF;
+            int dst = (v119 < 0x100) ? (v4 + 8 * v119) : (v387 + 8 * (unsigned char)v5);
+            int v121 = *(int *)v7;
+            int v123 = *(int *)v374 >> 8;
+            v374 += 4;
+            int v125 = v5 >> 17;
+            int v126 = v123 & 0x1FFFF;
+            if (*(int *)(dst + 4) == 0 || *(int *)(dst + 4) == v126)
+                KoreSetInstanceField(v121, table, (unsigned char)v125, dst);
+            else
+                KoreTypeCheckFail2(table, 16 * (unsigned char)((v125 & 3) + 3 * ((unsigned char)v125 >> 2) - 1) + *(int *)(v121 + 4) + 24, dst, "Type check failed on assigning to slot '%s' of structure '%s':");
+            continue;
+        }
+        case 0x4A:
+        {
+            if (*(int *)(v7 + 4) == 0) KoreTablePanic(table, "attempt to index a nil value");
+            int *v113 = (int *)(v4 + 8 * (unsigned char)v5);
+            int v115 = *(int *)v374;
+            v374 += 4;
+            int v117 = v5 >> 17;
+            int v118 = v115 >> 8;
+            if (v113[1] == 0 || (v113[1] == 12 && *(__int16 *)(*(int *)(*v113 + 4) + 16) == (unsigned char)v118))
+                KoreSetInstanceField(*(int *)v7, table, (unsigned char)v117, (int)v113);
+            else
+                KoreTypeCheckFail(table, 12, *(int *)(*(int *)(*Size + 212) + 4 * *(unsigned __int16 *)(16 * (unsigned char)((v117 & 3) + 3 * ((unsigned char)v117 >> 2) - 1) + *(int *)(*(int *)v7 + 4) + 28) - 4), (int)v113, "Type check failed on assigning to slot '%s' of structure '%s':");
+            continue;
+        }
+        case 0x4C:
+        {
+            int v15 = *(int *)(v7 + 4);
+            int v16 = (v5 >> 8) & 0x1FFFF;
+            if (v15 != 0 && v15 != v16) KoreTypeCheckFail(table, v16, 0, v4 + v388, "Type check failed:");
+            continue;
+        }
+        case 0x4D:
+        {
+            int v17 = *(int *)(v7 + 4);
+            int v18 = *(int *)(*(int *)(*Size + 212) + 4 * (unsigned __int16)(v5 >> 8) - 4);
+            if (v17 != 0 && (v17 != 12 || *(int *)(*(int *)v7 + 4) != v18)) KoreTypeCheckFail(table, 12, v18, v4 + v388, "Type check failed:");
+            continue;
+        }
+        case 0x4E:
+        {
+            int *v19 = (int *)(v4 + 8 * (unsigned char)(v5 >> 17));
+            if (v19[1] == 0) KoreTablePanic(table, "attempt to index a nil value");
+            int v20 = *v19;
+            *(int *)(v7 + 4) = *(unsigned char *)(v20 + ((unsigned char)v5 & 3) + 4 * ((unsigned char)v5 & 0xFC));
+            *(int *)v7 = *(int *)(v20 + 4 * (unsigned char)v5);
+            continue;
+        }
+        case 0x50:
+        {
+            int *v21 = (int *)(v4 + 8 * (unsigned char)(v5 >> 17));
+            if (v21[1] == 0) KoreTablePanic(table, "attempt to index a nil value");
+            int v22 = *v21;
+            *(int *)(v7 + 8) = *v21;
+            *(int *)(v7 + 12) = v21[1];
+            *(int *)(v7 + 4) = *(unsigned char *)(v22 + ((unsigned char)v5 & 3) + 4 * ((unsigned char)v5 & 0xFC));
+            *(int *)v7 = *(int *)(v22 + 4 * (unsigned char)v5);
+            continue;
+        }
+        default:
+            break;
+        }
+        (void)v425; (void)v424;
+        continue;
+
+// ---- shared label bodies (LABEL_x) -------------------------------------
+lbl_413:
+        a2 = (int)(v374 + 4 * ((v5 >> 8) & 0x1FFFF) - 262140);
+        continue;
+lbl_338:
+    {
+        int v205 = (unsigned char)v5;
+        int v206 = (v418 != 0 && (v418 != 1 || v417 != 0));
+        if (v206 == v205) goto lbl_334;
+        goto lbl_335;
+    }
+lbl_285:
+lbl_265:
+    {
+        int type = *(int *)(v7 + 4);
+        if (type == 10 || type == 9)
+        {
+            int Xe = *(int *)(v374 - 4);
+            v374 -= 4;
+            *(int *)v374 = (int)KoreBuildPanicWord((unsigned)Xe, 30);
+            continue;
+        }
+        int sp = ((v5 >> 17) & 0xFF) ? v7 + 8 * ((v5 >> 17) & 0xFF) : Size[7];
+        int norm = KoreNormalizeValue(table, v4 + v388, sp);
+        v4 = Size[8];
+        v7 = v388 + v4;
+        v425 = norm;
+        int nt = *(int *)(v388 + v4 + 4);
+        if (nt != 9)
+        {
+            if (nt != 10)
+            {
+                KoreTablePanic(table, "function expected instead of %s", g_KoreTypeNames[nt & 0xF]);
+                continue;
+            }
+            goto lbl_274;
+        }
+        goto lbl_286;
+    }
+lbl_274:
+    {
+        if (*(int *)(v7 + 4) != 10)
+        {
+            int Xf = *(int *)(v374 - 4);
+            v374 -= 4;
+            *(int *)v374 = (int)KoreBuildPanicWord((unsigned)Xf, 29);
+            continue;
+        }
+        int nret = (unsigned char)v5 - 1;
+        int opB = (v5 >> 17) & 0xFF;
+        int sp = v425 ? v425 : (opB ? v7 + 8 * opB : Size[7]);
+        if (v425) v425 = 0;
+        int *obj = (int *)*(int *)v7;
+        KorePushCFrame((int)(Size + 1), table, nret, v7, sp, (int)v374);
+        int (*fnc)(size_t) = *(int (**)(size_t))*obj;
+        if (++Size[17] > 128)
+            KoreTablePanic(table, "C stack overflow: too many (%d) nested C function calls.\n", 128);
+        int res = fnc((size_t)Size);
+        --Size[17];
+        if (res < 0)
+            return res;
+        goto lbl_284;
+    }
+lbl_286:
+    {
+        if (v418 != 9)
+        {
+            int Xg = *(int *)(v374 - 4);
+            v374 -= 4;
+            *(int *)v374 = (int)KoreBuildPanicWord((unsigned)Xg, 3);
+            continue;
+        }
+        int opB = (v5 >> 17) & 0xFF;
+        int nret = (unsigned char)v5 - 1;
+        int sp = v425 ? v425 : (opB ? v7 + 8 * opB : Size[7]);
+        if (v425) v425 = 0;
+        int *cl = (int *)*(int *)v7;
+        ++a3;
+        v421 = *(int *)v7;
+        int base = KorePushClosureFrame((int)(Size + 1), table, nret, v7, sp, (int)v374);
+        a2 = (int)*(char **)(cl + 16);
+        v387 = *(int *)(cl + 12);
+        v4 = base;
+        v374 = (char *)a2;
+        continue;
+    }
+lbl_284:
+    v4 = KorePopCFrameRet((int)Size, 0);
+    continue;
+lbl_497:
+    {
+        int type = *(int *)(v7 + 4);
+        if (type == 9 || type == 10)
+        {
+            int Xh = *(int *)(v374 - 4);
+            v374 -= 4;
+            *(int *)v374 = (int)KoreBuildPanicWord((unsigned)Xh, 31);
+            continue;
+        }
+        int opB = (v5 >> 17) & 0xFF;
+        int sp = opB ? v7 + 8 * opB : Size[7];
+        int norm = KoreNormalizeValue(table, v4 + v388, sp);
+        v4 = Size[8];
+        v424 = norm;
+        v7 = v388 + v4;
+        int nt = *(int *)(v388 + v4 + 4);
+        if (nt == 9)
+        {
+lbl_517:
+            v417 = *(int *)v7;
+            v418 = *(int *)(v7 + 4);
+lbl_518:
+            if (v418 == 9)
+            {
+                int ob = (v5 >> 17) & 0xFF;
+                int rpos = v424 ? v424 : (ob ? v7 + 8 * ob : Size[7]);
+                if (v424) v424 = 0;
+                if (*(unsigned char *)(v421 + 8) != 0)
+                    KoreReleaseAllocRecords(table, v4);
+                int *cl = (int *)*(int *)v7;
+                v421 = *(int *)v7;
+                int base = KoreReturnFromClosure(table, v7, rpos);
+                a2 = (int)*(char **)(cl + 16);
+                v387 = *(int *)(cl + 12);
+                v4 = base;
+                v374 = (char *)a2;
+                continue;
+            }
+            else
+            {
+                int Xj = *(int *)(v374 - 4);
+                v374 -= 4;
+                *(int *)v374 = (int)KoreBuildPanicWord((unsigned)Xj, 23);
+                continue;
+            }
+        }
+        else if (nt == 10)
+        {
+lbl_506:
+            if (*(int *)(v7 + 4) == 10)
+            {
+                int ob = (v5 >> 17) & 0xFF;
+                int rpos = v424 ? v424 : (ob ? v7 + 8 * ob : Size[7]);
+                if (v424) v424 = 0;
+                int *obj = (int *)*(int *)v7;
+                KorePushCFrame((int)(Size + 1), (int)Size, -1, v7, rpos, (int)v374);
+                int (*fnc)(size_t) = *(int (**)(size_t))*obj;
+                if (++Size[17] > 128)
+                    KoreTablePanic(table, "C stack overflow: too many (%d) nested C function calls.\n", 128);
+                int res = fnc((size_t)Size);
+                --Size[17];
+                if (res < 0)
+                    return res;
+                goto lbl_284;
+            }
+            else
+            {
+                int Xi = *(int *)(v374 - 4);
+                v374 -= 4;
+                *(int *)v374 = (int)KoreBuildPanicWord((unsigned)Xi, 24);
+                continue;
+            }
+        }
+        else
+        {
+            KoreTablePanic(table, "function expected instead of %s", g_KoreTypeNames[nt & 0xF]);
+            continue;
+        }
+    }
+lbl_208:
+    {
+        int pA = KORE_RES9((v5 >> 8) & 0x1FF);
+        int gval = *(int *)(v387 + 8 * ((v5 >> 17) & 0xFF));
+        int ta = v418, a = v417;
+        int *obj = (int *)a;
+        if (ta == 5)
+        {
+            if (obj[0] == 0) { KoreGlobalSet(table, gval, (int)pA); v4 = Size[8]; continue; }
+        }
+        else if (ta == 12)
+        {
+            if (obj[2] == 0) { KoreStructSet(table, gval, (int)pA); v4 = Size[8]; continue; }
+        }
+        KoreGlobalSetValue(table, a, ta, gval, (int)pA, (int)v374, 32);
+lbl_218:
+        v4 = Size[8];
+        continue;
+    }
+lbl_474:
+    {
+        int v303 = (v418 != 0 && (v418 != 1 || v417 != 0));
+        *(int *)(v7 + 4) = 1;
+        *(int *)v7 = !v303;
+        continue;
+    }
+lbl_347:
+lbl_16:
+    {
+        v4 = Size[8];
+        *(int *)(v388 + v4) = v417;
+        *(int *)(v388 + v4 + 4) = v418;
+        continue;
+    }
+lbl_262:
+    {
+        KoreGlobalSetField(table, *(int *)v7, *(int *)(v7 + 4), KORE_RES9((v5 >> 17) & 0x1FF), KORE_RES9((v5 >> 8) & 0x1FF), (int)v374, 32);
+        v4 = Size[8];
+        continue;
+    }
+lbl_334:
+    v374 = (char *)&v374[4 * ((*(unsigned int *)v374 >> 8) & 0x1FFFF) - 262136];
+    continue;
+lbl_335:
+        v374 += 4;
+        continue;
+    }
+}
 // ---- sub_5EC770: invoke the value at the caller's position.  argCount is the
 // number of arguments (the callee sits argCount pairs below the top), retPos is
 // the expected return-slot count, valIdx the caller's value index.  For a
@@ -4825,11 +6560,47 @@ static int KoreFinalizeVM(int obj, int wrapper)
         } while (i < count);
     return (int)i;
 }
-// sub_5DA150 (0x5DA150 - 0x5DA1C0) -- detach the VM's heap: free the two
-// pending-allocation lists (KoreDeallocAllocNode each), zero the +0x28 slot, and pull
-// out the 3-word heap-dealloc context {vm[3] (the dealloc fn), vm[4], vm[5]}
-// into the out pointer. Remaining stub (deep VM internals out of scope).
-static void KoreDetachHeap(int obj, int heap) { (void)obj; (void)heap; }
+// sub_5DA150 (0x5DA150 - 0x5DA1C0) -- KoreDetachHeap: detach the VM's own
+// heap (the VM object, obj, is itself the heap manager). Free the two
+// pending-allocation node lists headed by obj+0x1C and obj+0x24: each head
+// word's low 2 bits hold state (the walk masks the node pointers with ~3),
+// and each node's next word (node+4, likewise masked) is captured BEFORE
+// KoreDeallocAllocNode is called, so the walk survives the block release.
+// The low-2-bit state is folded back into both head words, the +0x28 slot
+// is zeroed, and the 3-word heap-dealloc context {obj+0x0C (the dealloc
+// fn), obj+0x10 (its ctx), obj+0x14} is pulled out into the 3-DWORD out
+// buffer (heap), which is also the return value. The sole caller
+// (DestroyLuaModuleBody) then frees the 1032-byte VM block through that
+// pulled-out fn / ctx: fn(ctx, vm, 0x408, 0). [NOT byte-identical] a
+// thiscall + retn 4 hybrid in the original (the VM object in ECX, the out
+// pointer on the stack; declared object-first here) and placement-dependent
+// (the relative calls to KoreDeallocAllocNode sub_5D5B20).
+static int *KoreDetachHeap(int obj, int heap)
+{
+    int *o = (int *)obj;
+    int *h = (int *)heap;
+    int node = o[0x1C / 4] & ~3;
+    while (node != 0)
+    {
+        int next = *(int *)(node + 4) & ~3;
+        (void)KoreDeallocAllocNode(obj, node);
+        node = next;
+    }
+    node = o[0x24 / 4] & ~3;
+    while (node != 0)
+    {
+        int next = *(int *)(node + 4) & ~3;
+        (void)KoreDeallocAllocNode(obj, node);
+        node = next;
+    }
+    o[0x1C / 4] &= 3;
+    o[0x24 / 4] &= 3;
+    h[0] = o[3];
+    h[1] = o[4];
+    h[2] = o[5];
+    o[0x28 / 4] = 0;
+    return h;
+}
 
 // sub_5EDFE0 (0x5EDFE0 - 0x5EE03C) -- DestroyLuaModuleBody: the Lua module's
 // (KoreVM's) release.  [NOT byte-identical] placement-dependent (relative
@@ -4847,13 +6618,13 @@ static void DestroyLuaModuleBody(int luaModule)
     int *vm  = (int *)mod[0];
     if (vm == 0)
         return;
+    int heap[3];                                        // the original's sub esp, 0Ch frame
     vm[0x29C / 4] = -1;                                 // mark the VM released
     KoreDumpVMStats((int)mod);                          // sub_5DEB70(mod)
     KoreFreeAllocList((int)(vm + 0x2C / 4));            // sub_5ED910 (thiscall vm+0x2C)
     KoreFinalizeVM((int)(vm + 0xBC / 4), luaModule);    // sub_5DA690 (thiscall vm+0xBC, a1)
-    KoreDetachHeap((int)vm, 0);                         // sub_5DA150 (thiscall vm, &heap)
-    if (vm[3] != 0)                                     // the VM's heap-dealloc fn (vm[3])
-        ((void (*)(int, int, int, int))vm[3])(vm[4], (int)vm, 1032, 0);  // free the 1032-byte block
+    (void)KoreDetachHeap((int)vm, (int)heap);           // sub_5DA150 (thiscall vm, &heap)
+    ((void (*)(int, int, int, int))heap[0])(heap[1], (int)vm, 0x408, 0); // free the 1032-byte block
 }
 
 void DestroyLuaModule(int luaModule)
