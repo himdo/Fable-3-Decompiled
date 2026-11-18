@@ -19,6 +19,7 @@
 #include <float.h>                // _controlfp (the FPU round-toward-zero in KoreHeapInitGrow)
 #include <intrin.h>               // __rdtsc (the QPC span accounting in KoreHeapInitGrow)
 #include <string.h>               // memset
+#include <malloc.h>               // _aligned_malloc / _aligned_free (the VM aligned allocator)
 #include <stdio.h>                // _vsnprintf_s (the float / source formatting)
 #include <stdarg.h>               // va_list (the vsnprintf wrapper)
 #include <math.h>                 // fmod / pow / floor (the VM arithmetic opcodes)
@@ -76,18 +77,477 @@ static F3SharedBuffer *g_unk_1DBDA6C = 0;   // 0x1DBDA6C
 static int * sub_1A02260(int *a1, int *a2, const char ***a3)
 { (void)a2; (void)a3; *a1 = 0; return a1; }
 
-// sub_629570 (0x629570 - 0x629655) -- CreateLuaModule: build the
-// 1032-byte "Fable 3" Lua module (sub_5F7FA0) -- the sub_628DB0 Lua
-// allocator, the sub_628100 panic handler ("PANIC: unprotected error
-// in call to Lua API"), the 200x200 buffer words and the 512 / 0x10000
-// limits -- then register its six callbacks (sub_5FD2D0).  Remaining
-// stub: allocate + zero the 1032-byte block and return it.
+// ----------------------------------------------------------------
+//  CreateLuaModule  (0x629570) and its build family: the 18-word config
+//  record, the 1032-byte "Fable 3" module builder (sub_5F7FA0) and its
+//  112-byte handle block, the module query/set dispatcher (sub_5EE1A0),
+//  the builtin-library callback registration (sub_5FD2D0) and the builtin
+//  function install (sub_629460).  Forward decls for the two later-defined
+//  KoreVM helpers this family reaches (both defined further down):
+// ----------------------------------------------------------------
+static int    KorePanicTraceback(int table);                          // sub_5F1A20
+static int    KoreSetupRecordTableBuffers(int obj);                    // sub_5DEA70
+static int    KoreHeapBlockAlloc(int obj, int size);                   // sub_5DA1C0
+static int    KoreVmHeapAlloc(int vmcore, int size);                   // sub_5EEAE0
+static int    KoreVmAllocExpand(int vmcore, int size);                 // sub_5F6420
+static int    KoreAllocHashTable(int registry, int rows, int buckets); // sub_5DDC90
+static int    KoreHeapInitGrow(int obj, int size);                     // sub_5EDAC0
+static int    KoreGrowRegistry(int obj, int size, int vmcore);         // sub_5EE150
+static int    KoreHashTableInsert(int table, int a2, int a3, int a4);  // sub_5EC960
+static int    KoreAppendString(int vmcore, const void *src, int len);  // sub_407070
+// (defined just below, in this same block)
+static int    KoreSetupContinuation(int handle);                        // sub_5D7F50
+static int    KoreRegisterBuiltinTable(int handle, int *row);           // sub_5DE9D0
+static int   *KoreInternStateName(int handle, const char *src);         // sub_5EF690
+static void   KorePushClosureValue(int mod, int fn, int count, unsigned short tag); // sub_5FA400
+static void   KoreBuiltinInitStack(int mod);                                       // sub_629100
+static void   KoreRegisterBuiltinClosure(int mod, int fn, int v);                  // sub_5FD310
+static void   KoreRegisterBuiltinName(int mod, int key, const char *name);         // sub_4076D0
+static void   KoreRegisterBuiltinName2(int mod, const char *name);                 // sub_407760
+static int    KoreBuiltinStringOp(int mod, int a, int b, int c, int d);            // sub_5E4EE0
+static int    KoreBuiltinA(void);                                                  // sub_629200
+static int    KoreBuiltinB(void);                                                  // sub_629370
+
+// ---- the engine-specific config / allocator-context globals ----
+// 0x1DC26E4: the one-time VM-heap object slot that KoreEnsureLuaHeapObject
+// (sub_717A80) allocates (LHAlloc(80)) and constructs (sub_717370).
+static int *g_dword_1DC26E4 = 0;   // 0x1DC26E4
+// 0x1C841D4 / 0x1C841D8: the two "Main State" registry words KoreInitModuleConfig
+// (sub_5F1BB0) seeds into the config record before CreateLuaModule overwrites
+// its neighbours.
+static int g_dword_1C841D4 = 0;    // 0x1C841D4
+static int g_dword_1C841D8 = 0;    // 0x1C841D8
+// 0x1DBDB98: the Lua allocator's user/context word (the config a1[15] word,
+// stored into the module host's +0x29C).  Reads 0 in this build.
+static int g_dword_1DBDB98 = 0;    // 0x1DBDB98
+
+// sub_5D7970 (0x5D7970 - 0x5D79B2) -- KoreVmAllocFreeAligned: the VM's 16-byte
+// aligned allocator (the module's a1[4] allocator slot).  It _aligned_malloc's
+// the requested block (sub_151D61B(a4, 16) in the original), copies any existing
+// source over it, and frees the old block (_aligned_free) -- the "allocate or
+// replace" contract the VM heap bump allocator drives through.  `a1` (the
+// allocator context, e.g. the sub_628DB0 Lua allocator) is carried but unused.
+// [NOT byte-identical] placement-dependent + refs the CRT aligned-alloc slots.
+static void *KoreVmAllocFreeAligned(int a1, void *src, size_t size, int aligned)
+{
+    void *dst = 0;
+    if (aligned != 0)
+    {
+        dst = _aligned_malloc((size_t)aligned, 16);   // sub_151D61B(a4, 16)
+        if (src == 0)
+            return dst;
+        memcpy(dst, src, size);
+    }
+    if (src != 0)
+        _aligned_free(src);
+    return dst;
+}
+
+// sub_5D7A10 (0x5D7A10 - 0x5D7A16) -- KoreReturnsOne: the VM's trivial
+// "already initialised / succeed" flag handler (the record-table descriptor's
+// +0x94 handler slot; always returns 1).
+static int KoreReturnsOne(void) { return 1; }
+
+// sub_5DBFC0 (0x5DBFC0 - 0x5DBFD7) -- no-op config handler (the a1[3] word,
+// stored into the module host's +0x294).  Remaining stub: an unreachable
+// error-report leaf in this build.
+static int KoreNoopStub0(int a1) { (void)a1; return 0; }
+// nullsub_3 -- no-op config handler (the a1[7] word, the module host's +0x2B4
+// slot before CreateLuaModule rewrites it to the sub_628100 panic handler).
+static int KoreNoopRet0(void) { return 0; }
+
+// sub_717370 (0x717370 - 0x717414) -- KoreLuaHeapObjectCtor: construct the
+// 80-byte VM-heap object (the size-class / free-list / record-table init).
+// Remaining stub: the one-time heap-object bring-up is unreached in the test
+// (its deep size-class init callees are unimplemented), so it returns the
+// object pointer unchanged.
+static void *KoreLuaHeapObjectCtor(void *obj) { return obj; }
+
+// sub_717A80 (0x717A80 - 0x717AAF) -- KoreEnsureLuaHeapObject: the one-time
+// lazy init of the VM-heap object (LHAlloc(80) + KoreLuaHeapObjectCtor) that
+// CreateLuaModule runs before building the module.
+static void KoreEnsureLuaHeapObject(void)
+{
+    if (g_dword_1DC26E4 == 0)
+    {
+        int v0 = (int)LHAlloc(80);
+        g_dword_1DC26E4 = (v0 != 0) ? (int *)KoreLuaHeapObjectCtor((void *)v0) : 0;
+    }
+}
+
+// sub_5F1BB0 (0x5F1BB0 - 0x5F1C2E) -- KoreInitModuleConfig: seed the 18-word
+// config record with the "Main State" defaults -- the two registry pointers
+// (dword_1C841D4 / dword_1C841D8, the a1[12] / a1[13] words), the a1[4]
+// aligned allocator (KoreVmAllocFreeAligned, sub_5D7970), the a1[6] panic
+// traceback, the a1[7] nullsub_3, the a1[3] no-op handler, the "Main State"
+// name, and the 100 / 10 / 0x200000 / 8 / 8 / 128 / -1 words.  CreateLuaModule
+// then overwrites the engine-specific fields on top of these.  thiscall in the
+// original (the record in ECX); a plain free function here.
+static int *KoreInitModuleConfig(int *cfg)
+{
+    cfg[4]  = (int)KoreVmAllocFreeAligned;
+    cfg[5]  = 0;
+    cfg[2]  = 0x200000;
+    cfg[0]  = 100;
+    cfg[1]  = 10;
+    cfg[6]  = (int)KorePanicTraceback;
+    cfg[7]  = (int)KoreNoopRet0;
+    cfg[3]  = (int)KoreNoopStub0;
+    cfg[8]  = (int)"Main State";
+    cfg[9]  = 8;
+    cfg[10] = 8;
+    cfg[11] = 128;
+    cfg[15] = -1;
+    cfg[16] = 0;
+    cfg[14] = 0;
+    cfg[12] = g_dword_1C841D4;
+    cfg[13] = g_dword_1C841D8;
+    cfg[17] = 0;
+    return cfg;
+}
+
+// sub_5F7CB0 (0x5F7CB0 - 0x5F7D0F) -- KoreBuildValueStack: grow the record-table
+// descriptor's (obj = the 1032-byte host's +0x2C block) 768-byte backing buffer
+// via KoreHeapBlockAlloc (retrying through the last-resort expand, KoreVmAlloc
+// Expand, on a miss) and initialise its count (-1) / capacity (32) words.
+static void *KoreBuildValueStack(int obj)
+{
+    int *t = (int *)obj;
+    int buf = KoreHeapBlockAlloc(t[3], 768);
+    t[5] = buf;                          // obj + 0x14
+    if (buf == 0)
+    {
+        do
+        {
+            (void)KoreVmAllocExpand(t[1], 0x300);
+            buf = KoreHeapBlockAlloc(t[3], 768);
+            t[5] = buf;
+        } while (buf == 0);
+    }
+    memset((void *)buf, 0, 0x300);
+    t[6] = -1;                           // obj + 0x18
+    t[7] = 32;                           // obj + 0x1C
+    return (void *)buf;
+}
+
+// sub_5F7FA0 (0x5F7FA0 - 0x5F81C5) -- KoreCreateLuaModule: build the "Fable 3"
+// Lua module from the 18-word config record (a1).  It allocates the 1032-byte
+// host block through the config allocator (a1[4], with the a1[5] context),
+// stamps the host's header / allocator / panic / context words, allocates the
+// 112-byte handle block (KoreHeapBlockAlloc), links them (*handle = host,
+// host + 0xE4 = handle), builds the value-stack + record-table buffers (sub_5F7CB0
+// / sub_5DEA70), the VM heap word table (KoreVmHeapAlloc, 4 * a1[11]) and the
+// hash-table / backing-table cluster (KoreAllocHashTable), interning the a1[8]
+// state name.  Returns the 112-byte handle block.  [NOT byte-identical]
+// placement-dependent (relative calls) + refs high-VA rdata / the config code
+// pointers.
+static int *KoreCreateLuaModule(int *a1)
+{
+    int v2 = a1[5];                              // allocator context
+    int v3 = a1[4];                              // allocator fn
+    int v4 = ((int (*)(int, void *, int, int))v3)(v2, 0, 0, 1032);
+    if (v4 == 0)
+        return 0;
+    memset((void *)v4, 0, 0x408);
+    *(int *)(v4 + 0x29C) = a1[15];
+    *(int *)(v4 + 0x2B4) = a1[7];
+    *(int *)(v4 + 0x290) = a1[6];
+    *(int *)(v4 + 0x294) = a1[3];
+    *(int *)(v4 + 0x288) = a1[12];
+    *(int *)(v4 + 0x28C) = a1[13];
+    memset((void *)v4, 0, 0x2C);
+    *(int *)(v4 + 0x0C) = v3;
+    *(int *)(v4 + 0x10) = v2;
+    *(int *)(v4 + 0x1C) &= 3;
+    *(int *)(v4 + 0x24) &= 3;
+    *(int *)(v4 + 0x28) = 0;
+    *(int *)(v4 + 0x04) = 1032;
+
+    int v5 = KoreHeapBlockAlloc(v4, 112);
+    if (v5 == 0)
+        return 0;
+    *(int *)(v5 - 4) = (*(int *)(v5 - 4) & 0xFFFFFFFC) | 2;
+    memset((void *)v5, 0, 0x70);
+    *(int *)(v4 + 0xE4) = v5;
+    *(int *)v5 = v4;
+
+    int v11 = a1[1];
+    int v12 = a1[16];
+    int v14 = a1[0];
+    int *base = (int *)(v4 + 0x2C);
+    memset(base, 0, 0x90);
+    base[1]  = v5;                          // v4 + 0x30
+    base[3]  = *(int *)v5;                 // v4 + 0x38 = host
+    base[4]  = 6;                           // v4 + 0x3C
+    base[0x5C / 4] = v14;                   // v4 + 0x88
+    base[0x64 / 4] = 1;                     // v4 + 0x90
+    base[0x60 / 4] = v11;                   // v4 + 0x8C
+    base[0x6C / 4] = v11;                   // v4 + 0x98
+    base[0x70 / 4] = v11;                   // v4 + 0x9C
+    base[0x78 / 4] = 317;                   // v4 + 0xA4
+    base[0x8C / 4] = v12;                   // v4 + 0xB8
+    base[0x68 / 4] = (int)KoreReturnsOne;   // v4 + 0x94 = sub_5D7A10
+    (void)KoreBuildValueStack((int)base);           // sub_5F7CB0(base)
+    (void)KoreSetupRecordTableBuffers(v5);          // sub_5DEA70 (usercall, ESI=v5)
+
+    int v7 = a1[11];
+    *(int *)(v4 + 0xC0) = 0;
+    *(int *)(v4 + 0xC4) = v7 - 1;
+    int wbuf = KoreVmHeapAlloc(v5, 4 * v7);
+    *(int *)(v4 + 0xBC) = wbuf;
+    if (wbuf != 0)
+        memset((void *)wbuf, 0, 4 * v7);
+    *(int *)(v4 + 0xC8) = 0;
+    if (a1[14] != 0)
+        (void)KoreSetupContinuation(v5);           // sub_5D7F50 (dead: a1[14] == 0)
+
+    *(int *)(v4 + 0xD0) = 5;
+    *(int *)(v4 + 0xCC) = KoreAllocHashTable(v5, 0, a1[9]);
+    *(int *)(v4 + 0xDC) = KoreAllocHashTable(v5, 0, 0x10);
+    *(int *)(v4 + 0xD4) = KoreVmHeapAlloc(v5, 0x40);
+    *(unsigned short *)(v4 + 0xD8) = 0;
+    *(unsigned short *)(v4 + 0xDA) = 0x10;
+    *(int *)(v5 + 0x34) = 5;
+    *(int *)(v5 + 0x30) = KoreAllocHashTable(v5, 0, a1[10]);
+    (void)KoreRegisterBuiltinTable(v5, (int *)(v4 + 0xE8));   // sub_5DE9D0
+    (void)KoreInternStateName(v5, (const char *)a1[8]);       // sub_5EF690
+    *(int *)(v4 + 0x94) = a1[17];
+    *(unsigned char *)(v4 + 0x90) = 0;
+    return (int *)v5;
+}
+
+// sub_5D7F50 (0x5D7F50 - 0x5D7FC5) -- KoreSetupContinuation: build the module's
+// 776-byte continuation-stack block (host + 0x290 / + 0x294 chain) and dispatch
+// through the host's +0x94 handler.  Remaining stub: dead in this build (the
+// config a1[14] word is 0, so KoreCreateLuaModule never calls it).
+static int KoreSetupContinuation(int handle) { (void)handle; return 0; }
+
+// sub_5DE9D0 (0x5DE9D0 - 0x5DEA6A) -- KoreRegisterBuiltinTable: intern the ~48
+// builtin-library global names into the module's registry row (sub_5D6A40) and
+// the ~10 builtins into the second row.  Remaining stub: the name-table fill
+// (its intern / rdata-row callees) is unimplemented and unreached -- the VM is
+// not running Lua in this build.
+static int KoreRegisterBuiltinTable(int handle, int *row) { (void)handle; (void)row; return 0; }
+
+// sub_5EF690 (0x5EF690 - 0x5EF8A3) -- KoreInternStateName: intern the module's
+// state-name string (the a1[8] "Main State" / "Fable 3" literal) with the CRC32
+// "kore" hash and publish the interned entry at the handle's +0x48 word.  The
+// full CRC32 + intern body is a remaining stub: it only stores the literal
+// (the published word is never dereferenced while the VM is not running).
+static int *KoreInternStateName(int handle, const char *src)
+{
+    ((int *)handle)[18] = (int)src;
+    return (int *)src;
+}
+
+// sub_5FA400 (0x5FA400 - 0x5FA507) -- KorePushClosureValue: push a closure value
+// (fn, count, tag) onto the module's value stack (the Size[7] top) through the
+// VM-heap allocation + debug-track path.  Remaining stub: unimplemented (the
+// value-stack machinery is unreached while the VM is not running).
+static void KorePushClosureValue(int mod, int fn, int count, unsigned short tag)
+{ (void)mod; (void)fn; (void)count; (void)tag; }
+
+// sub_5EE1A0 (0x5EE1A0 - 0x5EE2D4) -- KoreModuleSetParam: the module's command
+// dispatcher (host = *handle, a2 the command, a3 the payload).  cmd 0 / 1 set /
+// clear the host's +0x90 "Main State" flag; cmd 2 drives the registry heap grow
+// (KoreHeapInitGrow, saving / restoring the +0x70 / +0x6C words); cmd 3 / 4
+// return the host's +0x04 word split into KB / sub-KB; cmd 5 grows the registry
+// (KoreGrowRegistry); cmd 6 / 7 swap the host's +0x88 / +0x8C slot and (for 7)
+// mirror the value into the value-stack's +0x60 / +0x6C words.  [NOT
+// byte-identical] placement-dependent (relative calls to KoreHeapInitGrow /
+// KoreGrowRegistry).
+static int KoreModuleSetParam(int mod, int cmd, int a3)
+{
+    int *h = *(int **)mod;     // the 1032-byte host
+    switch (cmd)
+    {
+    case 0:  *(h + 144) = 1;  return 0;
+    case 1:  *(h + 144) = 0;  return 0;
+    case 2:
+    {
+        int inited;
+        do
+        {
+            int (*f)(int) = (int (*)(int))(*(int *)(h + 148));
+            int *v9 = (int *)(h + 44);
+            do
+            {
+                f  = (int (*)(int))(*(int *)(h + 148));
+                v9 = (int *)(h + 44);
+            } while (f != 0 && f(*(h + 48)) != 0);
+            int v10  = v9[28];
+            v9[28] = 10000;
+            v9[27] = 10000;
+            inited  = KoreHeapInitGrow((int)v9, mod);
+            v9[28]  = v10;
+        } while (inited != 1);
+        return 0;
+    }
+    case 3:  return *(h + 4) / 1024;
+    case 4:  return *(h + 4) % 1024;
+    case 5:  return KoreGrowRegistry((int)(h + 44), mod, a3);
+    case 6:  { int v = *(h + 136); *(h + 136) = a3; return v; }
+    case 7:  {
+        int v5 = a3;
+        int v6 = *(h + 140);
+        int v7 = (int)(h + 44);
+        if (a3 <= 0) v5 = -1;
+        *(h + 156) = v5;
+        *(int *)(v7 + 96) = v5;
+        *(int *)(v7 + 108) = v5;
+        return v6;
+    }
+    default: return -1;
+    }
+}
+
+// sub_5FD2D0 (0x5FD2D0 - 0x5FD30B) -- KoreRegisterLuaCallback: register a
+// builtin-library callback on the module: push the closure (sub_5FA400) onto the
+// value stack, store the (val, 2) pair at the Size[7] top, and insert the key-1
+// row (KoreHashTableInsert).  Guarded: the module's Lua value-stack base
+// (Size[7] = handle + 0x1C) is not (re)initialised in this build (KoreCreateLua
+// Module leaves it 0), so the registration is a no-op here.
+static int KoreRegisterLuaCallback(int mod, int fn, int val)
+{
+    int *Size = (int *)mod;
+    if (Size[7] == 0)
+        return 0;
+    KorePushClosureValue(mod, fn, 0, 0);              // sub_5FA400 (stub)
+    int *v3 = (int *)Size[7];
+    *v3 = val;
+    v3[1] = 2;
+    Size[7] = (int)(v3 + 2);
+    // The original's final step (sub_5EC960) invokes the just-pushed closure to
+    // run the library's setup.  Here the closure push (sub_5FA400) is a stub and
+    // the value slot is empty, and the VM does not run Lua in this build, so the
+    // invocation is a no-op.
+    (void)fn;
+    return 0;
+}
+
+// sub_629460 (0x629460 - 0x629563) -- KoreRegisterBuiltins: install the module's
+// builtin Lua functions (dofile / pairs / string.find / regfind, the two builtin
+// closures sub_629200 / sub_629370, and the string.find C-function via
+// sub_5E4EE0), then zero the value-stack tail.  Guarded: a no-op while the module's
+// Lua value stack (Size[7]) is not initialised in this build.
+static unsigned int KoreRegisterBuiltins(int mod)
+{
+    int *Size = (int *)mod;
+    if (Size[7] == 0)
+        return 0;
+    KoreBuiltinInitStack(mod);                        // sub_629100 (stub)
+    KoreRegisterBuiltinClosure(mod, (int)KoreBuiltinA, 0);   // sub_5FD310(mod, sub_629200, 0)
+    KoreRegisterBuiltinName(mod, -10002, "dofile");          // sub_4076D0
+    KoreRegisterBuiltinName2(mod, "kpairs");                 // sub_407760
+    int v1 = *(Size + 7) - 8;
+    if ((unsigned int)v1 >= (unsigned int)Size[8] && (*(int *)(v1 + 4) == 10 || *(int *)(v1 + 4) == 9))
+        KoreRegisterBuiltinName(mod, -10002, "pairs");
+    else
+        *(Size + 7) -= 8;
+    KoreRegisterBuiltinName2(mod, "string");                 // sub_407760
+    int v3 = Size[7];
+    int v4 = *(int *)(v3 - 8);
+    int v5 = *(int *)(v3 - 4);
+    KoreAppendString(mod, "find", 4);                     // sub_407070
+    int v6 = KoreBuiltinStringOp(mod, v4, v5, *(int *)(Size[7] - 8), *(int *)(Size[7] - 4)); // sub_5E4EE0
+    int *v7 = (int *)(Size[7] - 8);
+    *v7 = v6;
+    v7[1] = 0;                                            // edx (second return, stub)
+    Size[7] = (int)(v7 + 2);
+    KoreRegisterBuiltinName(mod, -2, "regfind");           // sub_4076D0
+    KoreRegisterBuiltinClosure(mod, (int)KoreBuiltinB, 0);   // sub_5FD310(mod, sub_629370, 0)
+    KoreRegisterBuiltinName(mod, -2, "find");              // sub_4076D0
+    unsigned int result = (unsigned int)Size[7];
+    unsigned int i = (unsigned int)Size[8];
+    for (; result < i; result += 8)
+        *(int *)(result + 4) = 0;
+    Size[7] = (int)i;
+    return result;
+}
+
+// ---- sub_629460's builtin-registration leaves (stubs; the value-stack
+//      machinery is unreached while the VM is not running) ----
+static void  KoreBuiltinInitStack(int mod) { (void)mod; }                            // sub_629100
+static void  KoreRegisterBuiltinClosure(int mod, int fn, int v) { (void)mod; (void)fn; (void)v; } // sub_5FD310
+static void  KoreRegisterBuiltinName(int mod, int key, const char *name) { (void)mod; (void)key; (void)name; } // sub_4076D0
+static void  KoreRegisterBuiltinName2(int mod, const char *name) { (void)mod; (void)name; } // sub_407760
+static int   KoreBuiltinStringOp(int mod, int a, int b, int c, int d) { (void)mod; (void)a; (void)b; (void)c; (void)d; return 0; } // sub_5E4EE0
+static int   KoreBuiltinA(void) { return 0; }                                          // sub_629200
+static int   KoreBuiltinB(void) { return 0; }                                          // sub_629370
+
+// ---- the six builtin-library registration callbacks CreateLuaModule hands to
+//      sub_5FD2D0: they are stored as function pointers (invoked later when the
+//      Lua module runs the corresponding library setup), so they exist here only
+//      to be addressable.  Remaining stubs (the VM is not running in the test). ----
+static int KoreLibBase(void)    { return 2; }      // sub_601EF0 (base library: _G / _VERSION / coroutine)
+static int KoreLibTable(void)   { return 1; }      // sub_600530 (table library)
+static int KoreLibString(void)  { return 1; }      // sub_6003E0 (string library)
+static int KoreLibMath(void)    { return 1; }      // sub_5FFD10 (math library)
+static int KoreLibPackage(void) { return 1; }      // sub_5FFF00 (package library)
+static int KoreLibDebug(void)   { return 1; }      // sub_5FED80 (debug library)
+
+// ---- the module host's config-referenced code words (addressable stubs) ----
+// sub_628DB0 (0x628DB0 - 0x628E49) -- KoreLuaAlloc: the module host's allocator
+// (the config a1[4] slot, called as alloc(ctx, src, size, dstSize)).  It routes
+// through the game heap (sub_717960 in the original); a (src==0 && dstSize==0)
+// request is a no-op (returns 0), otherwise it allocates dstSize bytes.  The
+// OOM expand path (sub_673C50 / sub_673F30 / sub_6F0070 / sub_627FC0 re-alloc,
+// then a sub_627A30() + DebugBreak on a second miss) is a remaining stub: the
+// game heap is not under pressure in this build.
+static int KoreLuaAlloc(int a1, void *src, size_t srcSize, size_t dstSize)
+{
+    if (src == 0 && dstSize == 0)
+        return 0;
+    int v6 = (int)LHAlloc((unsigned int)dstSize);   // sub_717960
+    (void)a1; (void)srcSize;
+    return v6;
+}
+static int KoreLuaPanic(int a1) { (void)a1; return 0; }                                                        // sub_628100 (the panic handler)
+static int KoreLocD00000(void) { return 0; }                                                                  // loc_D00000 (config a1[3] code ref)
+
+// sub_629570 (0x629570 - 0x629655) -- CreateLuaModule: build the engine's
+// "Fable 3" Lua module (the 1032-byte KoreVM host + 112-byte handle) and
+// register its builtin libraries.  [NOT byte-identical] placement-dependent
+// (relative calls to the module builder / callback-register / builtin-register
+// helpers) and refs high-VA rdata (the "Fable 3" literal, loc_D00000, and the
+// dword_1DBDB98 allocator-context word).
+//
+//  void *CreateLuaModule(void)
+//
+//  Runs the one-time VM-heap object init (KoreEnsureLuaHeapObject, sub_717A80),
+//  seeds the 18-word config record (KoreInitModuleConfig, sub_5F1BB0) and
+//  overwrites the engine-specific fields (the two 200-word buffer words, the
+//  loc_D00000 / sub_628DB0 / sub_628100 code refs, the "Fable 3" state name,
+//  the 512 / 0x10000 limits and the dword_1DBDB98 allocator context).  The
+//  module is then built (KoreCreateLuaModule, sub_5F7FA0), the "Main State"
+//  flag set (KoreModuleSetParam(mod, 0, 0), sub_5EE1A0), the six builtin-library
+//  callbacks registered (KoreRegisterLuaCallback, sub_5FD2D0) and the builtin
+//  functions installed (KoreRegisterBuiltins, sub_629460).  Returns the 112-byte
+//  handle block (whose first word is the 1032-byte host).
 static void *CreateLuaModule(void)
 {
-    void *m = LHAlloc(1032);
-    if (m != 0)
-        memset(m, 0, 1032);
-    return m;
+    int cfg[18];
+    KoreEnsureLuaHeapObject();              // sub_717A80
+    (void)KoreInitModuleConfig(cfg);        // sub_5F1BB0
+    cfg[0]  = 200;
+    cfg[1]  = 200;
+    cfg[2]  = (int)KoreLocD00000;           // loc_D00000
+    cfg[4]  = (int)KoreLuaAlloc;            // sub_628DB0 (the Lua allocator)
+    cfg[6]  = (int)KoreLuaPanic;            // sub_628100 (the panic handler)
+    cfg[8]  = (int)"Fable 3";
+    cfg[10] = 0x200;                        // 512
+    cfg[11] = 0x10000;
+    cfg[14] = g_dword_1DBDB98;
+    int *mod = KoreCreateLuaModule(cfg);    // sub_5F7FA0
+    (void)KoreModuleSetParam((int)mod, 0, 0);   // sub_5EE1A0
+    (void)KoreRegisterLuaCallback((int)mod, (int)KoreLibBase, 0);     // sub_5FD2D0(mod, sub_601EF0, 0)
+    (void)KoreRegisterLuaCallback((int)mod, (int)KoreLibTable, 0);    // sub_5FD2D0(mod, sub_600530, 0)
+    (void)KoreRegisterLuaCallback((int)mod, (int)KoreLibString, 0);   // sub_5FD2D0(mod, sub_6003E0, 0)
+    (void)KoreRegisterLuaCallback((int)mod, (int)KoreLibMath, 0);     // sub_5FD2D0(mod, sub_5FFD10, 0)
+    (void)KoreRegisterLuaCallback((int)mod, (int)KoreLibPackage, 0);  // sub_5FD2D0(mod, sub_5FFF00, 0)
+    (void)KoreRegisterLuaCallback((int)mod, (int)KoreLibDebug, 0);    // sub_5FD2D0(mod, sub_5FED80, 0)
+    (void)KoreRegisterBuiltins((int)mod);             // sub_629460
+    return (void *)mod;
 }
 
 // ============================================================
@@ -4802,11 +5262,68 @@ static int KoreStructSet(int vmcore, int value, int key)
     return obj;
 }
 
-// ---- sub_612A80: struct set by numeric key.
-static int KoreStructSetFloat(int vmcore, int index, int key)
+// sub_6112D0 (0x6112D0 - 0x611353) -- KoreStructEnsureBackingTable: lazily
+// create and cache the backing hash table for a struct instance's numeric
+// (float-keyed) fields. `obj` (this, in ECX in the original) is the struct
+// instance (+0x04 the type descriptor, +0x0C the backing-table slot): a
+// non-null slot is returned as-is.  Otherwise, when the type descriptor's
+// +0x08 "allows a backing table" flag is 0, it panics (KoreTablePanic) with
+// "Cannot set value for a numeric key %0.14g on instances of '%s' as it
+// doesn't allow a backing table." (the key, and the type name from the
+// descriptor's +0x14 word + 8); else it allocates a fresh hash table
+// (KoreAllocHashTable(vmcore, rows, buckets)), stores it in the slot, and --
+// when the vm-core object's +0x3C debug byte is 1 -- marks the new {table, 5}
+// value pair dirty (KoreDebugMarkDirty) with the instance's -8 block header;
+// returns the backing table.  The sole in-tree caller passes rows = buckets =
+// 0.  thiscall + retn 10h in the original (the struct instance in ECX; the
+// vm-core wrapper / rows / buckets / float key on the stack; declared plain,
+// object-first, here).  [NOT byte-identical] a thiscall + retn-16 hybrid,
+// placement-dependent (the three relative calls), and refs the high-VA
+// panic-format string (0x01AE42B8).
+static int KoreStructEnsureBackingTable(int obj, int vmcore, int rows, int buckets, float fkey)
 {
-    (void)vmcore; (void)index; (void)key;
-    return 0;
+    int *t = (int *)obj;
+    int bt = t[3];
+    if (bt != 0)
+        return bt;
+    int td = t[1];
+    if (*(int *)(td + 8) == 0)
+        KoreTablePanic(vmcore, "Cannot set value for a numeric key %0.14g on instances of '%s' as it doesn't allow a backing table.",
+                       fkey, *(int *)(td + 20) + 8);
+    bt = KoreAllocHashTable(vmcore, rows, buckets);
+    t[3] = bt;
+    int *vm = (int *)(*(int *)vmcore + 0x2C);
+    int pair[2] = {bt, 5};
+    if (*(int *)(vm + 0x10) == 1)
+        KoreDebugMarkDirty(obj - 8, (int)pair);
+    return bt;
+}
+
+// sub_612A80 (0x612A80 - 0x612AB0) -- KoreStructSetFloat: set the float-
+// (numeric-)keyed value of a struct instance.  `obj` (this, in ECX in the
+// original) is the struct instance; `vmcore` is the VM-core wrapper; `fkey`
+// is the float key; `value` is the {payload, type} value pair to store.  It
+// ensures the instance's backing hash table (KoreStructEnsureBackingTable,
+// rows = buckets = 0) and stores the pair at `fkey` (KoreArraySet: dense row
+// when (int)fkey - 1 is within the dense count, else a hash entry with a
+// {float, 3} numeric key, plus KoreDebugMarkDirty when the vm's +0x3C debug
+// byte is 1); returns the instance.  The original is a thiscall + retn 0Ch
+// hybrid with the float key passed through the x87 FPU (declared plain,
+// object-first, here).  [NOT byte-identical] a thiscall + retn-12 hybrid with
+// a broken x87 float-argument slot in the original (the compiler's fstp
+// spills target the wrong stack offsets -- the callee re-reads the adjacent
+// stack words, so the effective float operands at runtime are the neighboring
+// pointer values rather than the caller's float), plus placement-dependent
+// relative calls to sub_6112D0 (KoreStructEnsureBackingTable) and
+// KoreGlobalSetFloat (sub_5E7FE0, the same dense-row / hash-set store the
+// project implements as KoreArraySet).  This implementation follows the
+// intended semantics: store `value` at float key `fkey` in the instance's
+// backing table.
+static int KoreStructSetFloat(int obj, int vmcore, float fkey, int value)
+{
+    int backing = KoreStructEnsureBackingTable(obj, vmcore, 0, 0, fkey);
+    (void)KoreArraySet(backing, vmcore, (int)fkey, value);
+    return obj;
 }
 
 // ---- sub_5E95C0: store at a float key.
@@ -5443,7 +5960,7 @@ lbl_71:
             }
             else if (ta == 12)
             {
-                if (obj[2] == 0) { KoreStructSetFloat(table, *(int *)&fkey, (int)pA); v4 = Size[8]; break; }
+                if (obj[2] == 0) { KoreStructSetFloat(a, table, fkey, (int)pB); v4 = Size[8]; break; }
             }
             KoreGlobalSetFieldVal(table, a, ta, *(int *)&fkey, (int)pA, (int)v374, 32);
             v4 = Size[8];
