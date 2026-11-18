@@ -433,6 +433,21 @@ static void   KoreReallocValueStack(int thisObj, int vmcore, int extra); // sub_
 static int    KoreAllocHashTable(int registry, int rows, int buckets);  // sub_5DDC90
 static int    KoreTableSet(int table, int vmcore, int key, int value);   // sub_5E7400
 static int    KoreTablePanic(int vmcore, const char *format, ...);      // sub_5E2580
+// The setjmp/longjmp-guarded "call a value" handler cluster (implemented with
+// KoreHashTableInsert / sub_5EC960 below):
+static void   KoreRotateValueStackTop(int table, int n);                 // sub_407540
+static int    KoreGrowContinuationStack(int obj, int vmcore);            // sub_5DD8C0
+static void   KoreReverseValuePairs(int p, int count);                   // sub_60F9C0
+static int    KoreGrowHashTableRows(int obj, int vmcore, int newCount);  // sub_5DDC20
+static int    KoreResizeHashTable(int obj, int vmcore, int newRows, int hashBits); // sub_5E2BD0
+static int    KoreCopyTableRows(int obj, int vmcore, int start, int count, int src); // sub_5E4FC0
+static int    KoreCreateUpvalueTable(int obj, int vmcore, int closure, int dst, int src); // sub_5E7EF0
+static int    KoreNormalizeValue(int table, int v, int top);             // sub_5DDED0
+static int    KorePushCFrame(int obj, int vmcore, int retPos, int v, int newTop, int valIdx); // sub_612D50
+static int    KorePushClosureFrame(int obj, int vmcore, int retPos, int v, int top, int valIdx); // sub_612BB0
+static int    KorePopCFrame(int obj, int table, int rv);                 // sub_60BBD0
+static int    KoreRunCode(int table, int code, int arg2);                // sub_5E9AA0 (interpreter, stub)
+static int    KoreInvokeValue(int table, int argCount, int retPos, int valIdx); // sub_5EC770
 // The VM error-message / panic formatter closure (KoreTablePanic and friends):
 static int    KoreRaisePanic(int vmcore, int code);                     // sub_5F1C30
 static void   KoreFormatMessage(int vmcore, const char *format, const char *suffix, va_list args); // sub_5E24E0
@@ -449,10 +464,10 @@ static int    KoreTableEnsureRow(int table, int vmcore, int key, int value); // 
 static int    KoreFindEmptyRow(int table);                              // sub_5D3640
 static int    KoreRowRelocateHash(int mask, int key, int type);         // sub_5D3120
 static int    KoreTableResize(int vmcore, int key, int value);          // sub_5E3F20
-static int    KoreEnsureBackingTable(int table, int vmcore, int a3, int a4); // sub_610CA0
-static void   KoreArraySet(int table, int index, int value);             // sub_5D3210
+static int    KoreEnsureBackingTable(int table, int vmcore, int rows, int buckets, int key); // sub_610CA0
+static void   KoreArraySet(int table, int vmcore, int index, int value); // sub_5D3210
 static void   KoreDebugMarkDirty(int flags, int key);                    // sub_5F7E10
-static int    KoreDebugTrackAppend(int table, int *value);              // sub_5F7D80
+static int    KoreDebugTrackAppend(int obj, int *value);               // sub_5F7D80
 // Existing VM-heap helpers defined later in this translation unit:
 static int    KoreHeapBlockAlloc(int obj, int size);                    // sub_5DA1C0
 static int    KoreGrowRegistry(int obj, int size, int vmcore);          // sub_5EE150
@@ -1403,11 +1418,121 @@ static int KoreAllocHashTable(int registry, int rows, int buckets)
     t[6] = 0;
     return (int)t;
 }
-static int KoreEnsureBackingTable(int table, int vmcore, int a3, int a4)
-{ (void)table; (void)vmcore; (void)a3; (void)a4; return 0; }
-static void KoreArraySet(int table, int index, int value)
-{ (void)table; (void)index; (void)value; }
-static int KoreDebugTrackAppend(int table, int *value) { (void)table; (void)value; return 0; }
+// sub_610CA0 (0x610CA0 - 0x610D1E) -- KoreEnsureBackingTable: lazily create
+// and cache the backing hash table for a numeric-keyed table descriptor.
+// `table` is the 16-byte descriptor (+0x04 the key's type descriptor, +0x0C
+// the backing-table slot): a non-null slot is returned as-is.  Otherwise, when
+// the type descriptor's +0x08 "allows a backing table" flag is 0, it panics
+// (KoreTablePanic) with "Cannot set value for a numeric key %d on instances of
+// '%s' as it doesn't allow a backing table." (the key, and the type name from
+// the descriptor's +0x14 word + 8); else it allocates a fresh hash table
+// (KoreAllocHashTable(vmcore, rows, buckets)), stores it in the slot, and --
+// when the vm-core object's +0x3C debug byte is 1 -- marks the new {table, 5}
+// value pair dirty (KoreDebugMarkDirty); returns the backing table.  Every
+// in-tree caller passes rows = buckets = 0.  thiscall + retn 10h in the
+// original (the table descriptor in ECX; declared plain, object-first, here).
+// [NOT byte-identical] a thiscall + retn 10h hybrid, placement-dependent (the
+// three relative calls), and refs the high-VA panic-format string (0x01AE4180).
+static int KoreEnsureBackingTable(int table, int vmcore, int rows, int buckets, int key)
+{
+    int *t = (int *)table;
+    int bt = t[3];
+    if (bt != 0)
+        return bt;
+    int td = t[1];
+    if (*(int *)(td + 8) == 0)
+        KoreTablePanic(vmcore, "Cannot set value for a numeric key %d on instances of '%s' as it doesn't allow a backing table.",
+                       key, *(int *)(td + 20) + 8);
+    bt = KoreAllocHashTable(vmcore, rows, buckets);
+    t[3] = bt;
+    int *vm = (int *)(*(int *)vmcore + 0x2C);
+    int pair[2] = {bt, 5};
+    if (*(int *)(vm + 0x10) == 1)
+        KoreDebugMarkDirty(table - 8, (int)pair);
+    return bt;
+}
+// sub_5D3210 (0x5D3210 - 0x5D3278) -- KoreArraySet: set element `index` of a
+// numeric-keyed table descriptor to the {value, size} pair `value`.  When
+// (index-1) is within the table's dense count (this+0x10) the pair is written
+// straight into the dense row (this+0x0C, (index-1)*2); otherwise an 8-byte
+// {float(index), 3} numeric key is built and the entry is set through
+// KoreTableSet (which inserts it into the hash part when it is out of the dense
+// range).  Afterward, when the vm-core object's +0x3C debug byte is 1 the new
+// {value, size} pair is marked dirty (KoreDebugMarkDirty).  thiscall + retn 0Ch
+// in the original (the table descriptor in ECX; the vm-core wrapper, the 1-based
+// index and the value pair on the stack; declared plain, object-first, here).
+// [NOT byte-identical] a thiscall + retn 0Ch hybrid, placement-dependent (the
+// relative calls to KoreTableSet / KoreDebugMarkDirty) and it uses the x87 FPU
+// for the int->float key conversion.
+static void KoreArraySet(int table, int vmcore, int index, int value)
+{
+    int *t = (int *)table;
+    int *v = (int *)value;
+    int i = index - 1;
+    if ((unsigned int)i >= (unsigned int)t[4])
+    {
+        int key[2];
+        *(float *)key = (float)index;   // {float(index), 3} numeric key
+        key[1] = 3;
+        (void)KoreTableSet(table, vmcore, (int)key, value);
+    }
+    else
+    {
+        int *dense = (int *)t[3];
+        dense[i * 2 + 0] = v[0];
+        dense[i * 2 + 1] = v[1];
+    }
+    if (*(int *)(*(int *)vmcore + 0x3C) == 1)
+        KoreDebugMarkDirty(table - 8, value);
+}
+// sub_5F7D80 (0x5F7D80 - 0x5F7E0F) -- KoreDebugTrackAppend: append the
+// {payload, type} pair `value` to the debug track, the growable
+// 8-bytes-per-entry record array of the debug-flag object (the table's -8
+// header object the table-set / alloc-record paths mark dirty through).
+// Object (`obj`) layout: +0x04 the vm-core (the KoreVmAllocExpand
+// last-resort growth target), +0x0C the heap object (the
+// KoreHeapBlockAlloc allocator), +0x20 the record buffer, +0x24 the entry
+// count, +0x28 the entry capacity.  When the count equals the capacity the
+// buffer is reallocated at double the capacity (32 when the capacity was
+// 0): a first KoreHeapBlockAlloc miss retries through the
+// KoreVmAllocExpand expand until a block is carved, the old records (8
+// bytes per entry, 8 * old capacity) are copied into the new buffer, and
+// the capacity is updated.  The pair is then written at count*8, the count
+// is bumped, and the record buffer is returned.  thiscall + retn 4 hybrid
+// in the original (declared plain, object-first, here).  [NOT
+// byte-identical] placement-dependent (the relative E8 calls to
+// KoreHeapBlockAlloc / KoreVmAllocExpand) and refs the IAT _memcpy slot.
+static int KoreDebugTrackAppend(int obj, int *value)
+{
+    int *t = (int *)obj;
+    int cap = t[10];
+    if (t[9] == cap)
+    {
+        int newCap = (cap != 0) ? cap + cap : 32;
+        int oldBuf = t[8];
+        int newBuf = KoreHeapBlockAlloc(t[3], 8 * newCap);
+        t[8] = newBuf;
+        if (newBuf == 0)
+        {
+            do
+            {
+                (void)KoreVmAllocExpand(t[1], 8 * newCap);
+                newBuf = KoreHeapBlockAlloc(t[3], 8 * newCap);
+                t[8] = newBuf;
+            }
+            while (newBuf == 0);
+        }
+        if (oldBuf != 0)
+            memcpy((void *)t[8], (const void *)oldBuf, 8 * (size_t)cap);
+        t[10] = newCap;
+    }
+    int count = t[9];
+    int *buf = (int *)t[8];
+    buf[count * 2 + 0] = value[0];
+    buf[count * 2 + 1] = value[1];
+    t[9] = count + 1;
+    return (int)buf;
+}
 // KoreTableSet (sub_5E7400) and KoreDebugMarkDirty (sub_5F7E10), along with
 // their insert-path closure (KoreTablePanic / KoreTableEnsureRow /
 // KoreFindEmptyRow / KoreRowRelocateHash / KoreTableResize), are implemented
@@ -1538,8 +1663,8 @@ static int KoreFillLuaFrame(int *fr, int table, int desc, const char *flags)
                     }
                     else
                     {
-                        KoreEnsureBackingTable(table, 0, 0, v14);
-                        KoreArraySet(table, v14, v16);
+                        int v21 = KoreEnsureBackingTable(v17, table, 0, 0, v14);
+                        KoreArraySet(v21, table, v14, v16);
                     }
                     *(int *)(table + 28) -= 8;
                     ++v12;
@@ -2862,7 +2987,7 @@ static int KoreTableResize(int vmcore, int key, int value)
 // bit 0 is clear, and (for type 4) the payload's high bit is clear, the
 // payload's header byte (payload-4 for type 4 / 7, else payload-8) has bit 0
 // set; for a non-type-4 payload it then appends to the debug track
-// (KoreDebugTrackAppend, a remaining stub).  thiscall + retn 8 hybrid in the
+// (KoreDebugTrackAppend).  thiscall + retn 8 hybrid in the
 // original (declared plain here).  [NOT byte-identical] a retn-8 hybrid and
 // placement-dependent.
 static void KoreDebugMarkDirty(int flags, int key)
@@ -3968,16 +4093,616 @@ static int KoreAllocRecordTable(int obj)
     return table;
 }
 
-// sub_5EC960 (0x5EC960 - 0x5ECACA) -- KoreHashTableInsert: the
-// setjmp/longjmp-guarded insert of a table entry (thiscall on the table,
-// the table also as the first stack arg): swap the table's +0x40 slot with a
-// 64-byte stack jmp buffer, run the table core (sub_5EC770), restore the
-// slot, and unwind through the saved chain (sub_407540 / KoreReleaseAllocRecords,
-// sub_5D2950) on the longjmp path; returns 0 on the no-exception path. Remaining stub (the
-// 459-byte table core + its resize/error cluster is out of scope); the no-op
-// returns 0 (the no-exception result) and leaves the table untouched.
-static int KoreHashTableInsert(int obj, int a1, int a2, int a3, int a4)
-{ (void)obj; (void)a1; (void)a2; (void)a3; (void)a4; return 0; }
+
+
+
+// =====================================================================
+// The setjmp/longjmp-guarded "call a value" handler cluster (sub_5EC960 and
+// its callees).  The VM installs a jmp buffer at table+0x40 (a 68-byte stack
+// region: a 44-byte setjmp context plus a next-in-chain pointer at +0x40); a
+// panic (KoreRaisePanic) pops the chain (table+0x40 <- jmpbuf+0x40) and
+// longjmps back here.  A value-stack entry is an 8-byte {low, high} pair where
+// "high" (the +4 word) is the value's type/size tag.  table fields: +0x1C top,
+// +0x20 base, +0x24 end (usable limit), +0x28 start (raw buffer), +0x0C array
+// end, +0x04 array base, +0x44 C-call depth, +0x40 jmp buffer.
+// =====================================================================
+
+// ---- sub_407540: rotate the value-stack window up by one pair.  n is the
+// window length in pairs (negative n = -n pairs, positive n = the distance from
+// the base in pairs).  The top pair is saved, the n-1 pairs below it are shifted
+// up by one (toward the end), and the saved pair is written at the bottom of
+// the window; the top pointer is left untouched.
+static void KoreRotateValueStackTop(int table, int n)
+{
+    int *v = (int *)table;
+    int k;
+    if (n > 0)
+        k = ((v[0x1C / 4] - v[0x20 / 4]) >> 3) - n + 1;
+    else
+        k = -n;
+    if (k <= 1)
+        return;
+    int *top = (int *)v[0x1C / 4];
+    int *a = top - 8 * (k - 1);
+    int saveLo = top[0];
+    int saveHi = top[1];
+    while (a < top)
+    {
+        a[2] = a[0];
+        a[3] = a[1];
+        a += 2;
+    }
+    top[-2 * k] = saveLo;
+    top[-2 * k + 1] = saveHi;
+}
+
+// ---- sub_5DD8C0: grow the continuation stack (a 16-byte-slot vector at
+// +0x00 start / +0x04 end / +0x08 top).  Doubles the slot count, copies the
+// used slots into a fresh VM block, advances the top, and frees the old block.
+// Returns the VM free's result (callers ignore it).
+static int KoreGrowContinuationStack(int obj, int vmcore)
+{
+    int *t = (int *)obj;
+    int oldStart = t[0];
+    int oldEnd = t[1];
+    int oldTop = t[2];
+    int oldSlots = (oldEnd - oldStart) >> 4;
+    int newSlots = oldSlots * 2;
+    int newStart = KoreVmAlloc(vmcore, newSlots * 16);
+    memcpy((void *)newStart, (void *)oldStart, oldTop + 16 - oldStart);
+    t[0] = newStart;
+    t[2] = newStart + newSlots * 16 - 16;
+    int copySize = oldStart != 0 ? 16 * (oldEnd - oldStart) / 16 : 0;
+    int *global = (int *)(*(int *)vmcore);
+    global[1] -= copySize;
+    return ((int (*)(int, int, int, int))global[3])(global[4], oldStart, copySize, 0);
+}
+
+// ---- sub_60F9C0: in-place reversal of `count` 8-byte value pairs (swap i with
+// count-1-i).  count <= 0 is a no-op.
+static void KoreReverseValuePairs(int p, int count)
+{
+    int n = (count - (int)((unsigned)count >> 31)) >> 1;
+    int *a = (int *)p;
+    int *b = (int *)(p + 8 * (count - 1));
+    while (n > 0)
+    {
+        int t0 = a[0], t1 = a[1];
+        a[0] = b[0]; a[1] = b[1];
+        b[0] = t0;   b[1] = t1;
+        a += 2;
+        b -= 2;
+        --n;
+    }
+}
+
+// ---- sub_5DDC20: grow the hash table's row array (8-byte {key, type} entries)
+// to newCount, copying the old rows and freeing the old array.  Returns the new
+// array pointer.
+static int KoreGrowHashTableRows(int obj, int vmcore, int newCount)
+{
+    int *t = (int *)obj;
+    int oldArray = t[3];
+    int oldCount = t[4];
+    int newArray = KoreVmAlloc(vmcore, newCount * 8);
+    memset((void *)newArray, 0, newCount * 8);
+    memcpy((void *)newArray, (void *)oldArray, oldCount * 8);
+    t[3] = newArray;
+    t[4] = newCount;
+    if (oldCount != 0)
+    {
+        int *global = (int *)(*(int *)vmcore);
+        global[1] -= oldCount * 8;
+        ((void (*)(int, int, int, int))global[3])(global[4], oldArray, oldCount * 8, 0);
+    }
+    return newArray;
+}
+
+// ---- sub_5E2BD0: resize a hash table to a new hash size and (optionally) row
+// count.  Recomputes the power-of-two hashsize from the requested bit length,
+// allocates the new hash block, re-inserts every live row, and frees the old
+// block.  Panics if the hash part would exceed 2^24 slots.
+static int KoreResizeHashTable(int obj, int vmcore, int newRows, int hashBits)
+{
+    int *t = (int *)obj;
+    int oldRowCount = t[4];
+    int oldMask = t[1];
+    int oldHashSize = oldMask + 1;
+    int oldHashBlock = t[2];
+    int *global = (int *)(*(int *)vmcore);
+
+    if (newRows > oldRowCount)
+    {
+        int oldArray = t[3];
+        int newArray = KoreVmAlloc(vmcore, newRows * 8);
+        t[3] = newArray;
+        t[4] = newRows;
+        memset((void *)newArray, 0, newRows * 8);
+        memcpy((void *)newArray, (void *)oldArray, newRows * 8);
+    }
+
+    if (hashBits == 0)
+    {
+        t[2] = 0;
+        t[1] = -1;
+        t[5] = 0;
+        return 0;
+    }
+
+    int norm = hashBits - 1;
+    int shift = 0;
+    while (norm >= 0x100)
+    {
+        norm >>= 8;
+        shift += 8;
+    }
+    int bitLen = (int)KoreLog2Byte[norm] + shift + 1;
+    int hashsize = 1 << bitLen;
+    if (bitLen > 0x18)
+        KoreTablePanic(vmcore, "Table overflow (hash part too big)");
+    int newHashBlock = KoreVmAlloc(vmcore, hashsize * 20);
+    memset((void *)newHashBlock, 0, hashsize * 20);
+    t[1] = hashsize - 1;
+    t[2] = newHashBlock;
+    t[5] = hashsize;
+
+    if (hashsize > 0)
+    {
+        for (int i = oldHashSize - 1; i >= 0; --i)
+        {
+            int *slot = (int *)(oldHashBlock + i * 20);
+            int key = slot[0];
+            int type = slot[1];
+            int rowKey = slot[2];
+            int rowType = slot[3];
+            if (rowType == 0)
+                continue;
+            if (type == 3)
+            {
+                double d = *(double *)&key;
+                long l = (long)d;
+                if ((double)l == d && l > 0 && (unsigned)(l - 1) < (unsigned)newRows)
+                {
+                    int *rowArray = (int *)t[3];
+                    rowArray[(l - 1) * 2] = rowKey;
+                    rowArray[(l - 1) * 2 + 1] = rowType;
+                    continue;
+                }
+            }
+            int pair[2] = { key, type };
+            int index = KoreTableEnsureRow(obj, vmcore, (int)pair, 0);
+            int *block = (int *)t[2];
+            block[index * 5 + 2] = rowKey;
+            block[index * 5 + 3] = rowType;
+        }
+    }
+
+    if (oldHashSize > 0)
+    {
+        global[1] -= oldHashSize * 20;
+        ((void (*)(int, int, int, int))global[3])(global[4], oldHashBlock, oldHashSize * 20, 0);
+    }
+    return 0;
+}
+
+// ---- sub_5E4FC0: copy `count` 8-byte value pairs from src into the row array
+// starting at slot `start - 1`, growing the row array (and hash) to fit if
+// needed.
+static int KoreCopyTableRows(int obj, int vmcore, int start, int count, int src)
+{
+    int *t = (int *)obj;
+    if (count > t[4] && count + 1 > t[4])
+        KoreResizeHashTable(obj, vmcore, count + 1, t[1] + 1);
+    int *rowArray = (int *)t[3];
+    int *s = (int *)src;
+    int *d = (int *)(rowArray + 8 * (start - 1));
+    for (int i = 0; i < count; ++i)
+    {
+        d[0] = s[0];
+        d[1] = s[1];
+        d += 2;
+        s += 2;
+    }
+    return 0;
+}
+
+// ---- sub_5E7EF0: capture `upcount` upvalue pairs from src into a fresh hash
+// table, store {table, 5} at dst, set the table's "upvalue count" field, and
+// mark it dirty.
+static int KoreCreateUpvalueTable(int obj, int vmcore, int closure, int dst, int src)
+{
+    int *t = (int *)obj;
+    int *g = (int *)(*(int *)vmcore);
+    int upcount = *(int *)(closure + 0xB);
+    int table = KoreAllocHashTable(vmcore, upcount, 1);
+    *(int *)(dst) = table;
+    *(int *)(dst + 4) = 5;
+    double d = (double)upcount;
+    int valpair[2];
+    *(double *)&valpair[0] = d;
+    valpair[1] = 3;
+    KoreTableSet(table, vmcore, g[0x13C / 4], (int)valpair);
+    KoreCopyTableRows(table, vmcore, 1, upcount, src);
+    if (g[0x2C / 4 + 4] == 1)
+        KoreDebugMarkDirty((int)((char *)obj - 8), src);
+    return table;
+}
+
+// ---- sub_5DDED0: make the value at v resolvable as a callable.  Inserts an
+// 8-byte gap before v (shifting [v, top) up), then, for the non-special value
+// types, looks up the metatable entry and re-interns the resolved value in
+// place.  Returns the new top (v + 8).
+static int KoreNormalizeValue(int table, int v, int top)
+{
+    int *tv = (int *)table;
+    if (top + 8 > tv[0x24 / 4])
+    {
+        int start = tv[0x28 / 4];
+        int *v2 = (int *)(start + 8 * ((v - start) / 8));
+        int top2 = start + 8 * ((top - start) / 8);
+        KoreReallocValueStack(table + 4, table, 1);
+        v = (int)v2;
+        top = top2;
+    }
+    int *vp = (int *)v;
+    int *tp = (int *)top;
+    int *p = tp - 2;
+    while (p >= vp)
+    {
+        p[2] = p[0];
+        p[3] = p[1];
+        p -= 2;
+    }
+    int type = *(int *)(v + 4);
+    int val;
+    switch (type)
+    {
+    case 5:
+        val = *(int *)(vp[0]);
+        break;
+    case 7:
+        val = *(int *)(vp[0] + 4);
+        break;
+    case 0xC:
+        val = *(int *)(vp[0] + 8);
+        break;
+    default:
+    {
+        int *g = (int *)(*(int *)table);
+        int key = g[type * 2 + 0x174 / 4];
+        int out[2] = { 0, 0 };
+        if (KoreLookupStringTable(g[0x1CC / 4], (int)out, key, 4) == 0)
+            return top;
+        val = out[0];
+        if (out[1] == 0)
+            return top;
+        if (out[1] != 5)
+            val |= 1;
+        break;
+    }
+    }
+    if (val != 0)
+    {
+        int *g = (int *)(*(int *)table);
+        int hash = g[0x128 / 4];
+        int out2[2] = { 0, 0 };
+        if (val & 1)
+            KoreLookupStringRegistry(val & ~1, (int)out2, table, hash, 4);
+        else
+            KoreLookupStringTable(val, (int)out2, hash, 4);
+        if (out2[1] != 0)
+        {
+            vp[0] = out2[0];
+            vp[1] = out2[1];
+        }
+    }
+    return v + 8;
+}
+
+// ---- sub_612D50: push a C-function call frame onto the continuation stack and
+// set the value-stack base/top for the C call.  Returns the new base (v + 8).
+static int KorePushCFrame(int obj, int vmcore, int retPos, int v, int newTop, int valIdx)
+{
+    int *t = (int *)obj;
+    int *tv = (int *)vmcore;
+    if (t[2] + 16 == t[1])
+        KoreGrowContinuationStack(obj, vmcore);
+    int *frame = (int *)t[2];
+    t[2] += 16;
+    frame[0] = tv[0x20 / 4];
+    frame[1] = valIdx;
+    frame[2] = 0;
+    frame[3] = retPos;
+    tv[0x20 / 4] = v + 8;
+    tv[0x1C / 4] = newTop;
+    if (((tv[0x24 / 4] - newTop) & ~7) < 0xA0)
+        KoreReallocValueStack(obj, vmcore, 0x14);
+    return tv[0x20 / 4];
+}
+
+// ---- sub_612BB0: push a closure call frame.  Relocates upvalues into place,
+// materializes them into a hash table when requested, and sets the base/top.
+// Returns the new base (p).
+static int KorePushClosureFrame(int obj, int vmcore, int retPos, int v, int top, int valIdx)
+{
+    int *tv = (int *)vmcore;
+    int *closure = (int *)(*(int *)v);
+    int upcount = *(unsigned char *)(closure + 0xB);
+    int argcount = *(unsigned char *)(closure + 9);
+    int newEnd = top + 8 * argcount + 8;
+    int nslots = (top - v) >> 3;
+    if (newEnd > tv[0x24 / 4])
+    {
+        int extra = (newEnd - top) >> 3;
+        int start = tv[0x28 / 4];
+        int *v2 = (int *)(start + 8 * ((v - start) / 8));
+        int top2 = start + 8 * ((top - start) / 8);
+        KoreReallocValueStack(obj, vmcore, extra);
+        v = (int)v2;
+        top = top2;
+    }
+    int p = v + 8;
+    int *t = (int *)obj;
+    if (t[2] + 16 == t[1])
+        KoreGrowContinuationStack(obj, vmcore);
+    int *frame = (int *)t[2];
+    t[2] += 16;
+    frame[0] = newEnd;
+    frame[1] = valIdx;
+    frame[2] = 0;
+    frame[3] = retPos;
+
+    if (*(int *)(closure + 0xA) & 2)
+    {
+        int m = (top - 8 * upcount - p) >> 3;
+        if (m < 0)
+            m = 0;
+        if (m != 0)
+        {
+            frame[2] = m;
+            int *vp = (int *)v;
+            KoreReverseValuePairs(v, nslots - m);
+            KoreReverseValuePairs(v + 8 * (nslots - m), m);
+            KoreReverseValuePairs(v, nslots);
+            p = top + 8 * m;
+            (void)vp;
+        }
+    }
+    if (*(int *)(closure + 0xA) & 4)
+        KoreCreateUpvalueTable(obj, vmcore, (int)closure, p + 8 * upcount, v);
+    else
+        *(int *)(p + 8 * upcount + 4) = 0;
+    tv[0x20 / 4] = p;
+    if (newEnd < p + 8 * upcount)
+    {
+        int *z = (int *)newEnd + 1;
+        int *ze = (int *)(p + 8 * upcount) + 1;
+        while (z < ze)
+        {
+            *z = 0;
+            z += 2;
+        }
+    }
+    tv[0x1C / 4] = v + 8 * argcount;
+    return p;
+}
+
+// ---- sub_60BBD0: pop a C-function call frame, compacting the value stack to
+// hold the `rv` returned pairs and restoring the pre-call base.  Returns the
+// saved base (frame[0]).
+static int KorePopCFrame(int obj, int table, int rv)
+{
+    int *t = (int *)obj;
+    int *tv = (int *)table;
+    int *frame = (int *)t[2];
+    t[2] -= 16;
+    int retPos = frame[3];
+    int base = tv[0x20 / 4];
+    int top = tv[0x1C / 4];
+    int minv;
+    if ((unsigned)rv < (unsigned)retPos)
+        minv = rv;
+    else
+        minv = retPos;
+    int *src = (int *)(top - rv * 8);
+    int *dst = (int *)(base - 8);
+    for (int i = 0; i < minv; ++i)
+    {
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst += 2;
+        src += 2;
+    }
+    if (retPos != -1 && minv < retPos)
+    {
+        int *z = (int *)(base - 8 + minv * 8) + 1;
+        int *ze = (int *)(base - 8 + retPos * 8) + 1;
+        while (z < ze)
+        {
+            *z = 0;
+            z += 2;
+        }
+    }
+    if (retPos == -1)
+        tv[0x1C / 4] = base - 8 + minv * 8;
+    else
+        tv[0x1C / 4] = base - 8 + retPos * 8;
+    tv[0x20 / 4] = frame[0];
+    return frame[0];
+}
+
+// ---- sub_5E9AA0: the Kore bytecode interpreter (the main dispatch loop).
+// Stub: no code is executed and it reports zero return values, so the calling
+// epilogue compacts to an empty result set.
+static int KoreRunCode(int table, int code, int arg2)
+{
+    (void)table;
+    (void)code;
+    (void)arg2;
+    return 0;
+}
+
+// ---- sub_5EC770: invoke the value at the caller's position.  argCount is the
+// number of arguments (the callee sits argCount pairs below the top), retPos is
+// the expected return-slot count, valIdx the caller's value index.  For a
+// closure (type 9) it pushes a closure frame and runs the code; for a C
+// function (type 10) it pushes a C frame and calls it; otherwise it resolves
+// the value via a metatable __call lookup and, if still not callable, panics.
+static int KoreInvokeValue(int table, int argCount, int retPos, int valIdx)
+{
+    int *tv = (int *)table;
+    int obj = table + 4;
+    int top = tv[0x1C / 4];
+    if (retPos > 0 && top + retPos * 8 > tv[0x24 / 4])
+        KoreReallocValueStack(obj, table, retPos);
+    int *v = (int *)(top - 8 * (argCount + 1));
+    int type = v[1];
+    if (type == 9)
+    {
+        int *closure = (int *)v[0];
+        int base = KorePushClosureFrame(obj, table, retPos, (int)v, top, valIdx);
+        int n = KoreRunCode(table, closure[0x10 / 4], 0);
+        int *frame = (int *)tv[0x0C / 4];
+        int rpos = n;
+        int cap = (int)((top - base) >> 3);
+        if (rpos > cap)
+            rpos = cap;
+        if (rpos > frame[3])
+            rpos = frame[3];
+        int upcount = *(unsigned short *)(frame + 2);
+        int *dstBase = (int *)(tv[0x20 / 4] - 8 * upcount - 8);
+        int *dst = dstBase;
+        int *src = (int *)(tv[0x1C / 4] - n * 8);
+        for (int i = 0; i < rpos; ++i)
+        {
+            dst[0] = src[0];
+            dst[1] = src[1];
+            dst += 2;
+            src += 2;
+        }
+        if (rpos < frame[3] && frame[3] != -1)
+        {
+            int *z = dstBase + 2 * rpos + 1;
+            int *ze = dstBase + 2 * frame[3] + 1;
+            while (z < ze)
+            {
+                *z = 0;
+                z += 2;
+            }
+        }
+        tv[0x20 / 4] = frame[0];
+        if (frame[3] == -1)
+            tv[0x1C / 4] = (int)(dstBase - 2);
+        else
+            tv[0x1C / 4] = (int)(dstBase + 2 * frame[3]);
+        tv[0x0C / 4] = (int)frame - 16;
+        return 0;
+    }
+    if (type == 10)
+    {
+        int *slot = (int *)(tv[0x28 / 4] + 8 * valIdx);
+        int *func = (int *)slot[0];
+        int newTop = tv[0x1C / 4];
+        int base = KorePushCFrame(obj, table, retPos, (int)v, newTop, valIdx);
+        int *slot2 = (int *)(tv[0x28 / 4] + 8 * valIdx);
+        int *func2 = (int *)slot2[0];
+        int depth = tv[0x44 / 4] + 1;
+        tv[0x44 / 4] = depth;
+        if (depth > 0x80)
+            KoreTablePanic(table, "C stack overflow: too many (%d) nested C function calls.\n", depth);
+        int rv = ((int (*)(int))func2)(table);
+        tv[0x44 / 4] = depth - 1;
+        return KorePopCFrame(obj, table, rv);
+    }
+    // Not callable: resolve via a metatable __call lookup (may change the type).
+    top = KoreNormalizeValue(table, (int)v, top);
+    int *tv2 = (int *)table;
+    int *v2 = (int *)(tv2[0x28 / 4] + 8 * valIdx);
+    type = v2[1];
+    if (type == 9)
+        return KoreInvokeValue(table, argCount, retPos, valIdx);
+    if (type == 10)
+        return KoreInvokeValue(table, argCount, retPos, valIdx);
+    int *g = (int *)(*(int *)table);
+    const char *name = (const char *)g[type];
+    KoreTablePanic(table, "Attempt to call a %s value", name);
+    return 0;
+}
+
+// ---- sub_5EC960 (KoreHashTableInsert): the setjmp/longjmp-guarded call
+// handler.  Installs a jmp buffer at table+0x40, dispatches the call via
+// KoreInvokeValue, and on a panic longjmps back here to unwind the call/return
+// bookkeeping (restoring the C depth, array end and base, releasing any
+// pending allocation records, and dropping the arguments off the value stack).
+// Returns 0 on the normal path; on a panic it returns the panic code, or -300
+// if the guarded "call the resolved __call method" re-raise itself panicked.
+static int KoreHashTableInsert(int table, int a2, int a3, int a4)
+{
+    int *tv = (int *)table;
+    int start = tv[0x28 / 4];
+    int var8 = (tv[0x20 / 4] - start) >> 3;      // base-start in qwords
+    int varC = (tv[0x1C / 4] - start) >> 3;      // top-start in qwords
+    int var10 = tv[0x44 / 4];                    // C-call depth
+    int var14 = (tv[0x0C / 4] - tv[0x04 / 4]) >> 4; // array count
+    int jmpBuf[17];                              // setjmp context + chain link at [16]
+    jmpBuf[16] = tv[0x40 / 4];                   // next-in-chain (old jmp buffer)
+    tv[0x40 / 4] = (int)jmpBuf;                  // install
+    int r = setjmp(jmpBuf);
+    if (r == 0)
+    {
+        int rv = KoreInvokeValue(table, a2, a3, 0);
+        tv[0x40 / 4] = jmpBuf[16];               // restore the old jmp buffer
+        return rv;
+    }
+    // A panic longjmped back in (table+0x40 already points at the old buffer).
+    if (a4 != 0)
+    {
+        int off;
+        if (a4 >= 0)
+            off = var8 - 1;
+        else
+            off = varC;
+        int *src = (int *)(start + 8 * (off + a4));
+        int *tp = (int *)tv[0x1C / 4];
+        tp[0] = src[0];
+        tp[1] = src[1];
+        tv[0x1C / 4] = (int)tp + 8;
+        KoreRotateValueStackTop(table, -2);
+        jmpBuf[16] = tv[0x40 / 4];               // re-link the chain
+        tv[0x40 / 4] = (int)jmpBuf;              // reinstall for the guarded re-raise
+        if (setjmp(jmpBuf) == 0)
+        {
+            int rv2 = KoreInvokeValue(table, 1, 1, 0);
+            tv[0x40 / 4] = jmpBuf[16];
+            (void)rv2;
+        }
+        else
+        {
+            r = -300;
+        }
+    }
+    // Unwind the call/return bookkeeping.
+    tv[0x44 / 4] = var10;
+    int arg;
+    if (var14 == -1)
+        arg = start;
+    else
+        arg = tv[0x04 / 4] + var14 * 16;
+    KoreReleaseAllocRecords(table, arg);
+    tv[0x0C / 4] = tv[0x04 / 4] + var14 * 16;
+    tv[0x20 / 4] = start + var8 * 8;
+    int newTop = start + 8 * (varC - a2) - 8;
+    tv[0x1C / 4] = newTop;
+    int *src2 = (int *)(tv[0x1C / 4] - 8);
+    int *dst2 = (int *)newTop;
+    dst2[0] = src2[0];
+    dst2[1] = src2[1];
+    tv[0x1C / 4] = newTop + 8;
+    return r;
+}
+
+
+
 
 // sub_5ED860 (0x5ED860 - 0x5ED90E) -- KoreReleaseAllocNode: the per-node
 // step of the allocation-list free (thiscall on the list + retn 8: stack
@@ -4015,7 +4740,7 @@ static int KoreReleaseAllocNode(int list, int node, int vmcore)
     ent[3] = 7;
     *(int *)(vmcore + 0x1C) = (int)(ent + 4);
     *(int *)(list + 0x30) = 1;
-    int r2 = KoreHashTableInsert(vmcore, vmcore, 1, 0, 0);
+    int r2 = KoreHashTableInsert(vmcore, 1, 0, 0);
     *(int *)(list + 0x30) = 0;
     if (r2 != 0)
     {
