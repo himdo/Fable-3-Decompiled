@@ -276,12 +276,6 @@
 "source": "gamethread"
 },
 {
-"name": "?sub_1A02260@@YAPAHPAH0PAPAPBD@Z",
-"rva": 23077472,
-"size": 50,
-"source": "luavm"
-},
-{
 "name": "?sub_18F0850@@YAHXZ",
 "rva": 21956688,
 "size": 119,

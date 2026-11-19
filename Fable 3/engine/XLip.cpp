@@ -46,8 +46,8 @@
 //     lazily initializes the lip runtime (InitLipRuntime, sub_17CA130).
 //  2. Loads the culture list file: settings-path base slot (dword_1DC2744)
 //     + "\" via MakeSettingsFilePath, concatenated with the
-//     "cultures_win32.txt" name slot (sub_1A02260 = the 2-source path concat
-//     over a fresh slot), loaded through XLipLoadCultures (sub_17CC7C0);
+//     "cultures_win32.txt" name slot (SharedSlotConcat, 0x1A02260 = the
+//     2-source path concat over a fresh slot), loaded through XLipLoadCultures (sub_17CC7C0);
 //     on failure retries with "\\cultures.txt" (each failure touches
 //     GetLastError, as the original does through its EDX IAT slot).
 //  3. Registers the base path as the default lip component (CreateLipFSRoot,
@@ -421,11 +421,6 @@ static void InitLipRuntime(void)
     *LipDwordVecAt(&g_unk_1E2C6B8, 5) = 5;
     g_byte_1E2C6B4 = 1;
 }
-// sub_1A02260 (0x1A02260 - 0x1A02292) -- the 2-source shared-slot path
-// concat: zero dst, ref (CopySharedSlot) src1, append src2 (sub_1A01940);
-// returns the dst slot address.
-static int * sub_1A02260(int *a1, int *a2, const char ***a3)
-{ (void)a2; (void)a3; *a1 = 0; return a1; }
 // ============================================================
 //  XLipCultures load-from-file cluster (XLipCultures.cpp): the culture
 //  list object (unk_1E2C6D4 / unk_1E2C6D8), the two culture maps
@@ -3636,7 +3631,7 @@ long InitLipCultures(void)
 
     SetSharedSlot(&cultureName, "cultures_win32.txt", -1);
     MakeSettingsFilePath(&path, (F3SharedBuffer **)&g_dword_1DC2744, "\\");
-    sub_1A02260((int *)&fullPath, (int *)&path, (const char ***)&cultureName);
+    SharedSlotConcat(&fullPath, &path, &cultureName);
     int rc = XLipLoadCultures(GetSlotString(&fullPath));
     ReleaseSharedSlot(&fullPath);
     ReleaseSharedSlot(&path);

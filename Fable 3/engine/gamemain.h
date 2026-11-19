@@ -55,6 +55,10 @@ void *CVersionTableGetVersion1(void *obj);
 // (this / src are both the addresses of F3SharedBuffer * fields).
 F3SharedBuffer **CopySharedSlot(F3SharedBuffer **thisSlot, F3SharedBuffer **srcSlot);
 
+// 0x1A02260 - concat two source slots into a fresh dst (zero dst, g_Addend++,
+// copy src1, append src2; returns the dst slot address).  cdecl.
+F3SharedBuffer **SharedSlotConcat(F3SharedBuffer **dst, F3SharedBuffer **src1, F3SharedBuffer **src2);
+
 // 0x19FFAB0 - build a fresh ANSI slot from the low byte of each wide code
 // unit of the source wide block and store it in the out slot.
 F3SharedBuffer **AnsiFromWideSlot(F3SharedBuffer **wide, F3SharedBuffer **out);

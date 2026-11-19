@@ -154,4 +154,51 @@ f3_kfen_exit_ebp:
     ret     4
 _KoreForEachAllocNode ENDP
 
+; ============================================================
+;  KoreFlagAllocRefs  (0x5D9F80 - 0x5D9FBE)  -- mark the adopted /
+;  in-use bit (bit 0 of the header word 4 bytes before the payload)
+;  for the reference list described by a1: a1[0] = the reference
+;  count, a1[5] (a1+0x14) = the first reference pointer, and
+;  a1[6..] (a1+0x18 + 4*i, the index masked to a byte) = the
+;  remaining reference pointers. Each reference p is flagged only
+;  when the pointed-at word is signed non-negative (a live payload,
+;  not a sentinel). Returns the last reference pointer read (the
+;  first one when the count is 0). Original convention: stdcall
+;  (retn 4); the C side declares `extern "C" int __stdcall
+;  KoreFlagAllocRefs(int)`.
+;
+;  Byte-identical: the original's exact instruction sequence -- the
+;  body is call- and reference-free, so it matches at any
+;  placement. The 7-byte `lea esp, [esp+0]` (8D A4 24 00 00 00 00)
+;  is emitted as raw bytes because ml normalizes the zero-
+;  displacement lea to the 2-byte form; the loop restarts at the
+;  movzx (the lea nop sits outside it).
+; ============================================================
+_KoreFlagAllocRefs@4 PROC    ; __stdcall int(int) -> _KoreFlagAllocRefs@4
+    mov     edx, [esp+4]
+    mov     eax, [edx+14h]
+    test    dword ptr [eax], 80000000h
+    jnz     short f3_kfrefs_first
+    or      dword ptr [eax-4], 1
+f3_kfrefs_first:
+    xor     ecx, ecx
+    cmp     dword ptr [edx], ecx
+    jbe     short f3_kfrefs_done
+    db      8Dh, 0A4h, 24h, 00h, 00h, 00h, 00h    ; lea esp, [esp+0]
+f3_kfrefs_loop:
+    movzx   eax, cl
+    shl     eax, 4
+    mov     eax, [eax+edx*1+18h]    ; 8B 44 10 18 (base+index form)
+
+    test    dword ptr [eax], 80000000h
+    jnz     short f3_kfrefs_next
+    or      dword ptr [eax-4], 1
+f3_kfrefs_next:
+    inc     ecx
+    cmp     ecx, [edx]
+    jb      short f3_kfrefs_loop
+f3_kfrefs_done:
+    ret     4
+_KoreFlagAllocRefs@4 ENDP
+
 END

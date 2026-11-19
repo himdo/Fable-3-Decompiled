@@ -12,6 +12,7 @@
 
 #include "luavm.h"                // DestroyLuaModule / ReinitEngineLua decls
 #include "common/common.h"        // LHAlloc / F3SharedBuffer / ReleaseSharedSlot
+#include "gamemain.h"             // SharedSlotConcat (the 2-source slot concat)
 #include "netinit.h"              // GetNetManager / CNetLuaEventManagerListReset
 
 #include <windows.h>
@@ -56,8 +57,8 @@ static void F3StubRelease(void *obj, int freeIt) { (void)obj; (void)freeIt; }
 //  dispatch) and the net manager's +0x1C sub-object list is cleared
 //  (CNetManagerSlot1C + CNetLuaEventManagerListReset).  When the +0xC0 slot was already
 //  empty (first-time init), the two startup-script path slots
-//  (unk_1DBE2B4 + unk_1DBDA6C via the sub_1A02260 2-source concat) are
-//  built and the Lua startup scripts are run (sub_616710).  Register
+//  (unk_1DBE2B4 + unk_1DBDA6C via the SharedSlotConcat, 0x1A02260,
+//  2-source concat) are built and the Lua startup scripts are run (sub_616710).  Register
 //  EngineLuaFunctions (sub_6169D0: the ~40 Set*/Get* engine Lua
 //  functions) is called on the fresh Lua module; when `flag` is set the
 //  "EngineTest" module is registered too (nullsub_28 + sub_70DDB0), and
@@ -65,17 +66,9 @@ static void F3StubRelease(void *obj, int freeIt) { (void)obj; (void)freeIt; }
 //  return value (the new +0xC4) is discarded by both callers.
 // ============================================================
 // 0x1DBE2B4 / 0x1DBDA6C: the two shared slots ReinitEngineLua concats
-// into the Lua startup-script path (sub_1A02260).
+// into the Lua startup-script path (SharedSlotConcat, 0x1A02260).
 static F3SharedBuffer *g_unk_1DBE2B4 = 0;   // 0x1DBE2B4
 static F3SharedBuffer *g_unk_1DBDA6C = 0;   // 0x1DBDA6C
-
-// sub_1A02260 (0x1A02260 - 0x1A02292) -- the 2-source shared-slot path
-// concat (the same helper as the XLip.cpp copy): zero dst, ref
-// (CopySharedSlot) src1, append src2 (sub_1A01940); returns the dst
-// slot address.  Both source slots are empty in this build, so the
-// stub just zeroes dst.
-static int * sub_1A02260(int *a1, int *a2, const char ***a3)
-{ (void)a2; (void)a3; *a1 = 0; return a1; }
 
 // ----------------------------------------------------------------
 //  CreateLuaModule  (0x629570) and its build family: the 18-word config
@@ -924,7 +917,9 @@ static int   *KoreInsertInterned(int *table, int vmcore, int *buf, int len); // 
 static int    KoreTableEnsureRow(int table, int vmcore, int key, int value); // sub_5E5040
 static int    KoreFindEmptyRow(int table);                              // sub_5D3640
 static int    KoreRowRelocateHash(int mask, int key, int type);         // sub_5D3120
-static int    KoreTableResize(int vmcore, int key, int value);          // sub_5E3F20
+static int    KoreProfileIntegerKey(int pair, int counters);            // sub_5D2FB0
+static int    KoreScanResizeProfile(int counters, int *total);          // sub_5D37B0
+static int    KoreTableResize(int table, int vmcore, int key);          // sub_5E3F20
 static int    KoreEnsureBackingTable(int table, int vmcore, int rows, int buckets, int key); // sub_610CA0
 static void   KoreArraySet(int table, int vmcore, int index, int value); // sub_5D3210
 static void   KoreDebugMarkDirty(int flags, int key);                    // sub_5F7E10
@@ -1689,9 +1684,10 @@ static void KoreReallocValueStack(int thisObj, int vmcore, int extra)
         ((void (*)(int, int, int, int))hp[3])(hp[4], newBuf, bytes, 0);
     }
 }
-// byte_1AE32B0 (0x01AE32B0) -- the 256-byte low-byte log2 table shared
-// by the VM's bit-length computations (this function and its other
-// original referrers): t[i] = floor(log2(i)), with t[0] = 0.
+// byte_1AE32B0 (0x01AE32B0) -- the 256-byte low-byte bit-length table
+// shared by the VM's bit-length computations (this function and its
+// other original referrers): t[i] = the number of bits needed to hold
+// i (floor(log2(i)) + 1), with t[0] = 0.
 static const unsigned char KoreLog2Byte[256] =
 {
     0, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4,
@@ -2587,69 +2583,1018 @@ static int KoreDrainFreeList(int obj, int table, int claim, int budget)
     return 1;
 }
 
-// sub_5DF740 (0x5DF740 - 0x5DFF46) -- KoreInitAllocNode8: adopt / register a
-// type-8 (heap-block) alloc node. In re-adopt mode (node != 0) it finishes by
-// popping one node off the table (--*(obj+24)). [NOT byte-identical]
-// remaining stub (keeps the pop so the KoreHeapInitGrow table walk ends).
+// sub_5D9F80 (0x5D9F80 - 0x5D9FBE) -- KoreFlagAllocRefs: mark the adopted /
+// in-use bit (bit 0 of the header word 4 bytes before the payload) for the
+// reference list described by a1 -- a1[0] = the reference count, a1[5]
+// (a1+0x14) = the first reference pointer, and a1[6..] (a1+0x18 + 4*i, the
+// index masked to a byte) = the remaining reference pointers. Each reference
+// p is flagged only when the pointed-at word is signed non-negative (a live
+// payload, not a sentinel). Returns the last reference pointer read (the
+// first one when the count is 0). Original convention: stdcall (retn 4).
+// Byte-identical: the original's exact instruction sequence is assembled in
+// engine/luavm_asm.asm (ml.exe, linked as luavm_asm.obj) because the
+// 7-byte `lea esp, [esp+0]` nop (8D A4 24 00 00 00 00) and the
+// `mov eax, [eax+edx+18h]` (8B 44 10 18) form cannot be emitted by the C
+// inline assembler; the body is call- and reference-free, so it matches at
+// any placement.
+extern "C" int __stdcall KoreFlagAllocRefs(int a1);
+
+// sub_5DF740 (0x5DF740 - 0x5DF9C6) -- KoreInitAllocNode8: adopt / register a
+// type-8 (heap-block) alloc node, recursing through the node's sub-objects.
+// Two modes: in new mode (node == 0) it registers the payload (ptr) by
+// first checking the node flag byte at ptr-8 (already set: bail with a null
+// return), then growing the primary alloc-node table (obj+0x20 list of
+// 24-byte entries, cursor obj+0x24, capacity obj+0x28) by one slot --
+// re-carving the table buffer (KoreHeapBlockAlloc, retrying through the
+// last-resort KoreVmAllocExpand expand) at tripled-plus-96-word capacity
+// (capacity += 32, old buffer copied with _memcpy and its flag bit cleared)
+// when the slot would overflow -- and stamping the entry {type = 8, payload,
+// stage = 0, first child = payload+0x2C}. It then charges the alloc budget
+// (obj+0x6C) one per node (plus one more when the payload's +0x48 sub-node
+// word is non-null, flagging that sub-node when its pointed-at word is
+// signed non-negative), zeroes payload+0x50, links the payload into the
+// obj+0x3C / obj+0x40 secondary chain (published at the previous node's
+// +0x50), panics (KoreHeapPanic) when the guard (obj+0x70) is not -1 and the
+// budget drains to 0 or below, and panics again when flags > 0x40. In
+// re-adopt mode (node != 0) it resumes adoption of that node's payload from
+// the saved stage word (node[2]). Both modes then run the staged adoption
+// switch on the entry's stage word: stage 0 walks the entry's child node
+// chain (entry[3], each child {flag at child-8, node pair at child+8, next
+// at child+12}), flagging each child, charging the budget, re-adopting it
+// through KoreInitAllocNode with flags - 2, and repointing entry[3] at the
+// remaining chain; stage 1 adopts the payload's +0x30 list through
+// KoreInitAllocNode5; stage 2 verifies the payload's +0xE4 back-link points
+// at the payload (else skips straight to the pop); stage 3 adopts the
+// +0xCC list, flags the +0xD4 payload block, and flags every reference in
+// its +0xD4 block (count at +0xD8) through KoreFlagAllocRefs; stage 4
+// adopts the +0xDC list, flags the +0xBC payload block and charges the
+// budget; stage 6 recurses on the obj+0x08 node with the original flags.
+// Every path that reaches the switch pops one slot off the table
+// (--obj+0x24) and returns the current table entry pointer. [NOT
+// byte-identical] placement-dependent (relative calls into
+// KoreHeapBlockAlloc / KoreVmAllocExpand / KoreHeapPanic / KoreInitAllocNode
+// / KoreInitAllocNode5 / KoreFlagAllocRefs and itself, plus an IAT _memcpy
+// slot); a thiscall + retn 0Ch hybrid in the original (declared object-first
+// here). Note: the new-mode early bailout (the flag at ptr-8 already set)
+// shares the original's epilogue, where the decrement addend register is
+// left undefined by the compiler, so it is treated as a plain null return.
+// The per-type helpers the staged adoption forwards to (defined further down
+// in this file):
+static void   KoreInitAllocNode5(int obj, int ptr, int node, int flags);  // sub_5E0C30
+static void   KoreInitAllocNode7(int obj, int ptr, int node, int flags);  // sub_5E1770
+static int    KoreInitAllocNode9(int obj, int ptr, int node, int flags);  // sub_5DF9F0
+static void   KoreInitAllocNode10(int obj, int ptr, int node, int flags); // sub_5DFB80
+static int    KoreInitAllocNode12(int obj, int ptr, int node, int flags); // sub_5DFCE0
+static void   KoreInitAllocNode(int obj, int node, int flags);            // sub_5E21E0
+static int   *KoreMarkNodeRefs(int obj, int a2);                          // sub_5D5840
+// The adopt primitives the per-type routines build on (defined just above the
+// type-5 routine):
+static void   KoreAdoptAllocNode(int obj, int ptr, int type, int flags);          // sub_5E0A00
+static void   KoreReadoptAllocEntry(int obj, int ptr, int entry, int flags);      // sub_5E0B00
+static int   *KoreAppendAllocRecord(int obj, int stringPtr, int flags);           // sub_5DDDD0
 static int KoreInitAllocNode8(int obj, int ptr, int node, int flags)
 {
-    (void)ptr; (void)flags;
+    int *h = (int *)obj;
+    int *result = (int *)node;
+    int *v6;
     if (node != 0)
-        --*(int *)(obj + 24);
-    return node;
+    {
+        v6 = (int *)result[1];
+    }
+    else
+    {
+        v6 = (int *)ptr;
+        if ((*(unsigned char *)(ptr - 8) & 1) != 0)
+            return node;                     // 0: already registered
+        int cursor = h[6];                   // obj+0x24
+        int cap    = h[7];                   // obj+0x28
+        h[6] = cursor + 1;
+        if (!(cursor + 1 < cap))             // signed: overflow the table
+        {
+            int size = 8 * (3 * cap + 96);
+            int i = KoreHeapBlockAlloc(h[3], size);
+            while (i == 0)
+            {
+                (void)KoreVmAllocExpand(h[1], size);   // last-resort expand
+                i = KoreHeapBlockAlloc(h[3], size);
+            }
+            memcpy((void *)i, (const void *)h[5], 24 * (unsigned)cap);
+            *(int *)(h[5] - 8) &= ~1;        // clear the old buffer's flag
+            h[7] += 32;
+            h[5] = i;
+        }
+        result = (int *)(h[5] + 8 * (3 * cursor + 3));
+        result[0] = 8;
+        result[1] = (int)v6;
+        result[2] = 0;
+        result[3] = v6[11];                  // first child, payload+0x2C
+        *(int *)(v6 - 2) |= 1;               // flag the node
+        --h[27];                             // charge the alloc budget
+        int sub = v6[18];                    // payload+0x48 sub-node
+        if (sub != 0)
+        {
+            if (*(int *)sub >= 0)
+                *(int *)((int)sub - 4) |= 1;
+            --h[27];
+        }
+        v6[20] = 0;                          // payload+0x50
+        if (h[15] != 0)                      // obj+0x3C secondary chain
+            *(int *)(h[16] + 20) = (int)v6;  // previous node's +0x50
+        else
+            h[15] = (int)v6;
+        h[16] = (int)v6;                     // obj+0x40 current node
+        if (h[28] != -1 && h[27] <= 0)       // guard armed, budget drained
+            KoreHeapPanic(obj);
+        if ((unsigned)flags > 0x40)   // original jbe 40h (unsigned)
+            KoreHeapPanic(obj);
+    }
+    switch (result[2])
+    {
+        case 0:
+        {
+            int child = result[3];
+            if (child != 0)
+            {
+                do
+                {
+                    *(int *)(child - 8) |= 1;
+                    --h[27];
+                    KoreInitAllocNode(obj, child + 8, flags - 2);
+                    child = *(int *)(child + 12);
+                    result = (int *)(h[5] + 24 * h[6]);
+                    result[3] = child;
+                } while (child != 0);
+            }
+            result[2] = 1;
+            /* fallthrough */
+        }
+        case 1:
+            result[2] = 2;
+            KoreInitAllocNode5(obj, v6[12], 0, flags - 1);  // payload+0x30
+            result = (int *)(h[5] + 24 * h[6]);
+            /* fallthrough */
+        case 2:
+            if (*(int *)(v6[0] + 228) != (int)v6)   // +0xE4 back-link
+                break;                              // skip to the pop
+            result[2] = 3;
+            KoreInitAllocNode5(obj, *(int *)(v6[0] + 204), 0, flags - 1);
+            result = (int *)(h[5] + 24 * h[6]);
+            /* fallthrough */
+        case 3:
+            result[2] = 4;
+            *(int *)(*(int *)(v6[0] + 212) - 8) |= 1;      // +0xD4 block
+            for (int j = 0;; ++j)
+            {
+                int p = v6[0];
+                if ((unsigned)j >= (unsigned)(*(unsigned short *)(p + 216)))
+                    break;   // +0xD8 reference count
+                (void)KoreFlagAllocRefs(*(int *)(*(int *)(p + 212) + 4 * (j & 0xFF)));
+            }
+            KoreInitAllocNode5(obj, *(int *)(v6[0] + 220), 0, flags - 1);
+            result = (int *)(h[5] + 24 * h[6]);
+            /* fallthrough */
+        case 4:
+            result[2] = 5;
+            *(int *)(*(int *)(v6[0] + 188) - 8) |= 1;      // +0xBC block
+            --h[27];
+            /* fallthrough */
+        case 5:
+            result[2] = 6;
+            /* fallthrough */
+        case 6:
+        {
+            int next = h[2];                   // obj+0x08 node
+            if (next != 0)
+                result = (int *)KoreInitAllocNode8(obj, next, 0, flags);
+            break;
+        }
+        default:
+            break;
+    }
+    --h[6];                                    // pop the slot off the table
+    return (int)result;
+}
+
+// sub_5E0A00 (0x5E0A00 - 0x5E0ACE) -- KoreAdoptAllocNode: adopt a single
+// alloc node given the payload pointer and its type explicitly (the
+// {ptr,type} pair is split; cf. KoreInitAllocNode, which reads the pair from
+// a node word). Switches on the type: 4 (scalar) sets the 4-byte block
+// header's adopted bit (at ptr-4, only when the 4-byte value at ptr is signed
+// non-negative and the bit is not already set) and, when the guard (obj+0x70)
+// is not -1, charges the alloc budget one (panicking through KoreHeapPanic
+// when the budget drains to 0 or below); 5 / 7 / 8 / 9 / 10 / 12 forward to
+// the per-type adopt routine with node = 0; any other type is a no-op.
+// Original convention: thiscall + retn 0Ch (object-first in ECX here), no
+// frame. [NOT byte-identical] placement-dependent (jumptable dispatch plus
+// relative calls into the per-type routines and KoreHeapPanic).
+static void KoreAdoptAllocNode(int obj, int ptr, int type, int flags)
+{
+    switch (type)
+    {
+    case 4:
+        if (*(int *)ptr >= 0 && (*(unsigned char *)(ptr - 4) & 1) == 0)
+        {
+            *(int *)(ptr - 4) |= 1;
+            if (*(int *)(obj + 0x70) != -1)
+            {
+                int budget = *(int *)(obj + 0x6C) - 1;
+                if (budget <= 0)
+                    KoreHeapPanic(obj);
+                *(int *)(obj + 0x6C) = budget;
+            }
+        }
+        break;
+    case 5:  KoreInitAllocNode5(obj, ptr, 0, flags);   break;
+    case 7:  KoreInitAllocNode7(obj, ptr, 0, flags);   break;
+    case 8:  (void)KoreInitAllocNode8(obj, ptr, 0, flags);  break;
+    case 9:  (void)KoreInitAllocNode9(obj, ptr, 0, flags);  break;
+    case 10: KoreInitAllocNode10(obj, ptr, 0, flags);  break;
+    case 12: (void)KoreInitAllocNode12(obj, ptr, 0, flags); break;
+    default: break;
+    }
+}
+
+// sub_5E0B00 (0x5E0B00 - 0x5E0C27) -- KoreReadoptAllocEntry: resume adoption
+// of the children of the payload described by a 24-byte alloc-table entry.
+// The entry's +0x10 flags word carries two suppress bits: bit 0 set skips the
+// non-type-4 adoptions of the child-pair list (the 8-byte {ptr,type} array at
+// ptr+0x0C, count at ptr+0x10) and of the 20-byte entries' second field;
+// bit 1 set skips the non-type-4 adoptions of the 20-byte entries' first
+// field (the array at ptr+0x08, count at ptr+0x04 + 1). Adoption of the child
+// list resumes from the entry's +0x08 index and of the 20-byte entries from
+// the entry's +0x0C index, republishing the running index into the entry (the
+// entry is re-fetched after every adopt because the table may grow) and
+// adopting each node through KoreAdoptAllocNode with the flags decremented.
+// Finishes by popping one entry off the table (--obj+0x18). Original
+// convention: thiscall + retn 0Ch (object-first here). [NOT byte-identical]
+// placement-dependent (relative calls into KoreAdoptAllocNode).
+static void KoreReadoptAllocEntry(int obj, int ptr, int entry, int flags)
+{
+    int *h = (int *)obj;
+    int *p = (int *)ptr;
+    int *e = (int *)entry;
+    int adoptAll0 = (e[4] & 1) == 0;   // bit 0 clear -> adopt all (list + field 2)
+    int adoptAll1 = (e[4] & 2) == 0;   // bit 1 clear -> adopt all (field 1)
+    int f = flags - 1;
+
+    int i = e[2];
+    if (i < p[4])
+    {
+        int count = p[4];
+        do
+        {
+            int *base = (int *)p[3];
+            if (adoptAll0 || base[2 * i + 1] == 4)
+                KoreAdoptAllocNode(obj, base[2 * i], base[2 * i + 1], f);
+            ++i;
+            e = (int *)(h[5] + 24 * h[6]);
+            e[2] = i;
+        } while (i < count);
+    }
+    int j = e[3];
+    if (j < p[1] + 1)
+    {
+        int count = p[1] + 1;
+        int *base = (int *)(p[2] + 20 * j);
+        do
+        {
+            if (base[1] != 0)
+            {
+                if (adoptAll1 || base[1] == 4)
+                    KoreAdoptAllocNode(obj, base[0], base[1], f);
+                if (adoptAll0 || base[3] == 4)
+                    KoreAdoptAllocNode(obj, base[2], base[3], f);
+            }
+            ++j;
+            base += 5;
+            e = (int *)(h[5] + 24 * h[6]);
+            e[3] = j;
+        } while (j < count);
+    }
+    --h[6];
+}
+
+// sub_5DDDD0 (0x5DDDD0 - 0x5DDE1A) -- KoreAppendAllocRecord: allocate a
+// 12-byte record (KoreHeapBlockAlloc on the obj+0x0C heap, retrying through
+// the last-resort KoreVmAllocExpand expand on the obj+0x04 vm-core) and push
+// it onto the linked list headed at obj+0x2C: the record is {flags, ptr,
+// previous head} and the counter at obj+0x58 is incremented. Returns the new
+// record. Original convention: thiscall + retn 8 (object-first here).
+// [NOT byte-identical] placement-dependent (relative calls into
+// KoreHeapBlockAlloc / KoreVmAllocExpand).
+static int *KoreAppendAllocRecord(int obj, int stringPtr, int flags)
+{
+    int *h = (int *)obj;
+    int *r;
+    for (r = (int *)KoreHeapBlockAlloc(h[3], 12); r == 0; r = (int *)KoreHeapBlockAlloc(h[3], 12))
+        (void)KoreVmAllocExpand(h[1], 12);
+    r[0] = flags;
+    r[1] = stringPtr;
+    r[2] = h[11];
+    ++h[22];
+    h[11] = (int)r;
+    return r;
 }
 
 // sub_5E0C30 (0x5E0C30 - 0x5E0ED8) -- KoreInitAllocNode5: adopt / register a
-// type-5 (interned key/value string) alloc node (same shape as the type-8
-// routine; re-adopt mode pops one node off the table). [NOT byte-identical]
-// remaining stub.
+// type-5 (interned key/value string) alloc node. Two modes: in new mode
+// (node == 0) it registers the payload (ptr) by first checking the node flag
+// byte at ptr-8 (already set: bail out), then scanning the payload's interned
+// key (KoreLookupInternedString on obj+0x04 with the payload's +0x00 key; the
+// 64-bit result's high word must be 4 and the low word's 30-bit length
+// non-zero) for 'k' / 'v' characters, ORing bits 2 / 1 into a local flag word
+// (bit 1 = key has a 'v', bit 2 = key has a 'k'). It then grows the primary
+// alloc-node table (obj+0x20 list of 24-byte entries, cursor obj+0x18,
+// capacity obj+0x1C) by one slot -- re-carving the table buffer
+// (KoreHeapBlockAlloc, retrying through the last-resort KoreVmAllocExpand
+// expand) at tripled-plus-96-word capacity (capacity += 32, old buffer copied
+// with memcpy and its flag bit cleared) when the slot would overflow -- and
+// stamps the entry {type = 5, payload, index 0, index 0, flag word,
+// payload+0x18}. When the flag word is non-zero it also appends a {flags,
+// payload, old head} record through KoreAppendAllocRecord, flags the payload
+// (ptr-8 |= 1), and, when the payload's +0x00 child word is non-zero,
+// re-adopts it through KoreInitAllocNode12 (odd: tagged, & ~1) or
+// KoreInitAllocNode5 (even) with the flags decremented, re-fetching the
+// entry afterwards. It charges the alloc budget (obj+0x6C) one per node
+// (panicking when the guard obj+0x70 is not -1 and the budget drains),
+// panics when flags > 0x40, and, when the flag word is non-zero, hands the
+// entry to KoreReadoptAllocEntry and returns. In re-adopt mode (node != 0)
+// it re-syncs the entry (+0x14 must equal payload+0x18, else +0x08 / +0x0C
+// reset to 0 and +0x14 re-stamped), and, when +0x10 is non-zero, calls
+// KoreReadoptAllocEntry and returns. Both modes that reach the tail run the
+// staged child adoption: adopt the payload's child-pair list (+0x0C array of
+// 8-byte {ptr,type} pairs, count at +0x10) and its 20-byte entries (+0x08
+// array, count at +0x04 + 1) through KoreAdoptAllocNode with the flags
+// decremented, resuming from the entry's +0x08 / +0x0C progress indices and
+// republishing them, then pop one entry off the table (--obj+0x18). [NOT
+// byte-identical] placement-dependent (relative calls into
+// KoreLookupInternedString / KoreHeapBlockAlloc / KoreVmAllocExpand /
+// KoreAppendAllocRecord / KoreInitAllocNode12 / itself / KoreHeapPanic /
+// KoreReadoptAllocEntry / KoreAdoptAllocNode plus an IAT _memcpy slot); a
+// thiscall + retn 0Ch hybrid in the original (declared object-first here).
 static void KoreInitAllocNode5(int obj, int ptr, int node, int flags)
 {
-    (void)ptr; (void)flags;
+    int *h = (int *)obj;
+    int *p = (int *)ptr;
+    int *payload;
+    int *entry;
+
     if (node != 0)
-        --*(int *)(obj + 24);
+    {
+        // re-adopt mode: resume adoption of this entry's payload
+        int *n = (int *)node;
+        payload = (int *)n[1];
+        if (n[5] != payload[6])
+        {
+            n[2] = 0;
+            n[3] = 0;
+            n[5] = payload[6];
+        }
+        if (n[4] != 0)
+        {
+            KoreReadoptAllocEntry(obj, (int)payload, (int)n, flags - 1);
+            return;
+        }
+        entry = n;
+    }
+    else
+    {
+        // new mode: register the payload as a fresh type-5 entry
+        if ((*(unsigned char *)(ptr - 8) & 1) != 0)
+            return;                          // already registered
+        int keyFlags = 0;
+        if (p[0] != 0)
+        {
+            unsigned __int64 r = KoreLookupInternedString(h[1], p[0], 0);
+            if ((r >> 32) == 4)
+            {
+                int *s = (int *)r;
+                int len = s[0] & 0x3FFFFFFF;
+                for (int i = 0; i < len; ++i)
+                {
+                    char c = *((char *)s + 8 + i);
+                    if (c == 'k')
+                        keyFlags |= 2;
+                    else if (c == 'v')
+                        keyFlags |= 1;
+                }
+            }
+        }
+        int cursor = h[6];
+        int cap = h[7];
+        h[6] = cursor + 1;
+        if (cursor + 1 >= cap)               // signed: overflow the table
+        {
+            int size = 8 * (3 * cap + 96);
+            int i = KoreHeapBlockAlloc(h[3], size);
+            while (i == 0)
+            {
+                (void)KoreVmAllocExpand(h[1], size);   // last-resort expand
+                i = KoreHeapBlockAlloc(h[3], size);
+            }
+            memcpy((void *)i, (const void *)h[5], 24 * (unsigned)cap);
+            *(int *)(h[5] - 8) &= ~1;        // clear the old buffer's flag
+            h[7] += 32;
+            h[5] = i;
+        }
+        entry = (int *)(h[5] + 24 * h[6]);
+        entry[0] = 5;
+        entry[1] = ptr;
+        entry[2] = 0;
+        entry[3] = 0;
+        entry[4] = keyFlags;
+        entry[5] = p[6];
+        if (keyFlags != 0)
+            (void)KoreAppendAllocRecord(obj, ptr, keyFlags);
+        *(int *)(ptr - 8) |= 1;              // flag the node
+        int child = p[0];
+        if (child != 0)
+        {
+            if (child & 1)
+                (void)KoreInitAllocNode12(obj, child & ~1, 0, flags - 1);
+            else
+                KoreInitAllocNode5(obj, child, 0, flags - 1);
+            entry = (int *)(h[5] + 24 * h[6]);
+        }
+        int budget = h[27] - 1;
+        if (h[28] != -1)
+        {
+            if (budget <= 0)
+                KoreHeapPanic(obj);
+            h[27] = budget;
+        }
+        if ((unsigned)flags > 0x40)
+            KoreHeapPanic(obj);
+        if (keyFlags != 0)
+        {
+            KoreReadoptAllocEntry(obj, ptr, (int)entry, flags - 1);
+            return;
+        }
+        payload = p;
+    }
+    // tail: adopt the payload's children (the shared adoption epilogue)
+    int f = flags - 1;
+    int i = entry[2];
+    if (i < payload[4])
+    {
+        int count = payload[4];
+        do
+        {
+            int *base = (int *)payload[3];
+            KoreAdoptAllocNode(obj, base[2 * i], base[2 * i + 1], f);
+            ++i;
+            entry = (int *)(h[5] + 24 * h[6]);
+            entry[2] = i;
+        } while (i < count);
+    }
+    int j = entry[3];
+    if (j < payload[1] + 1)
+    {
+        int count = payload[1] + 1;
+        int *base = (int *)(payload[2] + 20 * j);
+        do
+        {
+            if (base[1] != 0)
+            {
+                KoreAdoptAllocNode(obj, base[0], base[1], f);
+                KoreAdoptAllocNode(obj, base[2], base[3], f);
+            }
+            ++j;
+            base += 5;
+            entry = (int *)(h[5] + 24 * h[6]);
+            entry[3] = j;
+        } while (j < count);
+    }
+    --h[6];                                  // pop the entry off the table
 }
 
 // sub_5E1770 (0x5E1770 - 0x5E189B) -- KoreInitAllocNode7: adopt / register a
-// type-7 alloc node (same shape as the type-8 routine; re-adopt mode pops one
-// node off the table). [NOT byte-identical] remaining stub.
+// type-7 alloc node. Two modes: in new mode (node == 0) it registers the
+// payload (ptr) by first checking the node flag at ptr-4 (already set: bail
+// out), then growing the primary alloc-node table (obj+0x20 list of 24-byte
+// entries, cursor obj+0x24, capacity obj+0x28) by one slot -- re-carving the
+// table buffer (KoreHeapBlockAlloc, retrying through the last-resort
+// KoreVmAllocExpand expand) at 8*(3*cap + 96) bytes (capacity += 32, old
+// buffer copied with memcpy and its flag bit cleared) when the slot would
+// overflow -- and stamping the 2-word entry {type = 7, payload}. It then flags
+// the payload (ptr-4 |= 1), charges the alloc budget (obj+0x6C) one, re-adopts
+// the payload's +0x00 child through KoreInitAllocNode5 with flags - 1 (when
+// non-zero), panics (KoreHeapPanic) when the guard (obj+0x70) is not -1 and the
+// budget drains to 0 or below, and panics again when flags > 0x40. In
+// re-adopt mode (node != 0) it resumes from the payload saved at node+4. Both
+// modes finish by popping one slot off the table (--obj+0x24) and re-adopting
+// the payload's +0x04 child through KoreInitAllocNode12 (odd: tagged, & ~1) or
+// KoreInitAllocNode5 (even) with the flags decremented. [NOT byte-identical]
+// placement-dependent (relative calls into KoreHeapBlockAlloc /
+// KoreVmAllocExpand / KoreInitAllocNode5 / KoreInitAllocNode12 /
+// KoreHeapPanic, plus an IAT _memcpy slot); a thiscall + retn 0Ch hybrid in
+// the original (declared object-first here).
 static void KoreInitAllocNode7(int obj, int ptr, int node, int flags)
 {
-    (void)ptr; (void)flags;
+    int *h = (int *)obj;
+    int payload;
+
     if (node != 0)
-        --*(int *)(obj + 24);
+    {
+        // re-adopt mode: resume adoption of this entry's payload
+        payload = *(int *)(node + 4);
+    }
+    else
+    {
+        // new mode: register the payload as a fresh type-7 entry
+        payload = ptr;
+        if ((*(unsigned char *)(ptr - 4) & 1) != 0)
+            return;                          // already registered
+        int cursor = h[6];                   // obj+0x24
+        int cap    = h[7];                   // obj+0x28
+        h[6] = cursor + 1;
+        if (cursor + 1 >= cap)               // signed: overflow the table
+        {
+            int size = 8 * (3 * cap + 96);
+            int i = KoreHeapBlockAlloc(h[3], size);
+            while (i == 0)
+            {
+                (void)KoreVmAllocExpand(h[1], size);   // last-resort expand
+                i = KoreHeapBlockAlloc(h[3], size);
+            }
+            memcpy((void *)i, (const void *)h[5], 24 * (unsigned)cap);
+            *(int *)(h[5] - 8) &= ~1;        // clear the old buffer's flag
+            h[7] += 32;
+            h[5] = i;
+        }
+        int *entry = (int *)(h[5] + 8 * (3 * cursor + 3));
+        entry[0] = 7;
+        entry[1] = payload;
+        *(int *)(payload - 4) |= 1;          // flag the node
+        --h[27];                             // charge the alloc budget (obj+0x6C)
+        if (*(int *)payload != 0)
+            KoreInitAllocNode5(obj, *(int *)payload, 0, flags - 1);
+        if (h[28] != -1 && h[27] <= 0)       // guard armed, budget drained
+            KoreHeapPanic(obj);
+        if ((unsigned)flags > 0x40)          // original jbe 40h (unsigned)
+            KoreHeapPanic(obj);
+    }
+    --h[6];                                  // pop the slot off the table
+    int child = *(int *)(payload + 4);
+    if (child != 0)
+    {
+        if ((child & 1) != 0)
+            (void)KoreInitAllocNode12(obj, child & ~1, 0, flags - 1);
+        else
+            KoreInitAllocNode5(obj, child, 0, flags - 1);
+    }
+}
+
+// sub_5D5840 (0x5D5840 - 0x5D5971) -- KoreMarkNodeRefs: mark every alloc
+// pointer referenced by a payload node as live.  For the payload (a2) it sets
+// bit 0 of the 4-byte header word just before each referenced pointer (ptr-4)
+// when the value the pointer refers to is non-negative (signed), over: the two
+// single slots (a2+0x34 / a2+0x38), the 12-byte-stride reference chain (count
+// a2+0x3C, base a2+0x40 -- each reference is the 4 bytes at the start of a
+// slot), and the 4-byte pointer array (count a2+0x2C, base a2+0x30).  It then
+// walks the 8-byte {ptr, type} entry array (count a2+0x0C, base a2+0x10)
+// backward from index (count-1) to 0, marking the entry's ptr when its type
+// word is 4 and the referenced value is non-negative.  The "counted marks"
+// (the two single slots + the 4-byte array, i.e. the v3 total) are charged off
+// the alloc budget (obj+0x6C): either one per child while recursing over the
+// child chain (count a2+0x14, base a2+0x18: each child flagged at child-8,
+// the budget charged one, then the child re-adopted through itself) plus the
+// counted total, or the plain counted total when childless.  thiscall +
+// retn 4 in the original (declared object-first here). [NOT byte-identical] a
+// self-recursive thiscall hybrid (the C++ translation uses a different frame
+// and cannot match the original's byte-for-byte).
+static int *KoreMarkNodeRefs(int obj, int a2)
+{
+    int *p = (int *)a2;
+    int *h = (int *)obj;
+    int v3 = 0;                          // running "counted mark" total
+    int *result = (int *)p[14];          // eax's default carry (a2+0x38)
+
+    int *e = (int *)p[13];               // a2+0x34
+    if (e != 0)
+    {
+        if (*e >= 0)
+            *(e - 1) |= 1;
+        v3 = 1;
+    }
+    if (result != 0)                     // a2+0x38
+    {
+        if (*result >= 0)
+            *(result - 1) |= 1;
+        v3 += 1;
+    }
+    if (p[16] != 0 && p[15] > 0)         // a2+0x40 base, a2+0x3C count (12-byte stride)
+    {
+        int count = p[15];
+        int idx = 12 * count;
+        do
+        {
+            result = (int *)*(int *)(p[16] + idx - 12);
+            idx -= 12;
+            --count;
+            if (*result >= 0)
+                *(result - 1) |= 1;
+        } while (count != 0);
+    }
+    if (p[12] != 0 && p[11] > 0)         // a2+0x30 base, a2+0x2C count (4-byte)
+    {
+        int i = 0;
+        do
+        {
+            result = (int *)*(int *)(p[12] + 4 * i);
+            v3 += 1;
+            if (*result >= 0)
+                *(result - 1) |= 1;
+            ++i;
+        } while (i < p[11]);
+    }
+    if (p[4] != 0 && p[3] > 0)           // a2+0x10 base, a2+0x0C count (8-byte {ptr,type})
+    {
+        int r = p[3];
+        do
+        {
+            --r;
+            if (*(int *)(p[4] + 8 * r + 4) == 4)
+            {
+                int *ce = (int *)*(int *)(p[4] + 8 * r);
+                if (*ce >= 0)
+                    *(ce - 1) |= 1;
+            }
+        } while (r != 0);
+        result = 0;                      // eax = 0 at the loop exit
+    }
+    if (p[6] != 0 && p[5] > 0)           // a2+0x18 base, a2+0x14 count (child chain, recurse)
+    {
+        int count = p[5];
+        int *base = (int *)p[6];
+        do
+        {
+            int elem = base[count - 1];
+            *(int *)(elem - 8) |= 1;
+            --h[27];
+            --count;
+            result = KoreMarkNodeRefs(obj, elem);
+        } while (count != 0);
+        h[27] -= v3;                     // v3 == v15 (the counted total)
+    }
+    else
+    {
+        h[27] -= v3;
+    }
+    return result;
 }
 
 // sub_5DF9F0 (0x5DF9F0 - 0x5DFB80) -- KoreInitAllocNode9: adopt / register a
-// type-9 alloc node (same shape as the type-8 routine; re-adopt mode pops one
-// node off the table). [NOT byte-identical] remaining stub.
+// type-9 alloc node.  Two modes.  New mode (node == 0): bail when the
+// payload's "adopted" flag byte (ptr-8, bit 0) is already set; otherwise grow
+// the primary alloc-node table (obj+0x14 buffer of 24-byte entries, cursor
+// obj+0x18, capacity obj+0x1C) by one slot -- re-carving the buffer
+// (KoreHeapBlockAlloc, retrying through the last-resort KoreVmAllocExpand
+// expand) at 8*(3*cap + 96) bytes (capacity += 32, the old buffer copied with
+// memcpy and its flag bit cleared) when the slot would overflow -- and stamp
+// the 3-word entry {type = 9, payload = ptr, state = -2}.  It then flags the
+// payload (ptr-8 |= 1), and -- only when the guard (obj+0x70) is not -1 --
+// decrements the alloc budget (obj+0x6C), panicking (KoreHeapPanic) when it
+// drains to 0 or below; it panics again when flags > 0x40.  Re-adopt mode
+// (node != 0) resumes from the payload (node[1]) using the entry's state word
+// (node[2]).  Both modes share a tail: state -2 sets the state to -1 and
+// re-adopts the payload's +4 child through KoreInitAllocNode5 with flags - 1
+// (when non-zero, then repointing the tracked entry at buffer + 24*cursor);
+// state -1 (and the state -2 path) read the payload's +0 child count (the byte
+// at payload[0]) into the entry state; a positive count walks the payload's
+// child array (payload+0x14, 4-byte pointers, `count` of them) backward,
+// flagging each non-null child (child-8 |= 1), charging the budget one, and
+// re-adopting it through KoreInitAllocNode with the child's +8 state word and
+// flags - 2.  Finally the cursor (obj+0x18) is popped, and the payload's +0
+// pointer is returned when its flag byte (payload[0]-8) is already set, else
+// it is flagged, the budget is charged, and KoreMarkNodeRefs (sub_5D5840) is
+// invoked and returned.  [NOT byte-identical] placement-dependent (relative
+// calls into KoreHeapBlockAlloc / KoreVmAllocExpand / KoreHeapPanic /
+// KoreInitAllocNode5 / KoreInitAllocNode / KoreMarkNodeRefs, plus an IAT
+// _memcpy slot); a thiscall + retn 0Ch hybrid in the original (declared
+// object-first here). Replaces the pop-only stub.
 static int KoreInitAllocNode9(int obj, int ptr, int node, int flags)
 {
-    (void)ptr; (void)flags;
-    if (node != 0)
-        --*(int *)(obj + 24);
-    return node;
+    int *h = (int *)obj;
+    int nodePtr, payload, state;
+
+    if (node == 0)
+    {
+        // new mode: register the payload as a fresh type-9 entry
+        if ((*(unsigned char *)(ptr - 8) & 1) != 0)
+            return node;                       // already adopted
+        int cursor = h[6];                     // obj+0x18
+        int cap    = h[7];                     // obj+0x1C
+        h[6] = cursor + 1;
+        if (cursor + 1 >= cap)                 // signed: overflow the table
+        {
+            int size = 8 * (3 * cap + 96);
+            int i = KoreHeapBlockAlloc(h[3], size);
+            while (i == 0)
+            {
+                (void)KoreVmAllocExpand(h[1], size);   // last-resort expand
+                i = KoreHeapBlockAlloc(h[3], size);
+            }
+            memcpy((void *)i, (const void *)h[5], 24 * (unsigned)cap);
+            *(int *)(h[5] - 8) &= ~1;          // clear the old buffer's flag
+            h[7] += 32;
+            h[5] = i;
+        }
+        int *entry = (int *)(h[5] + 8 * (3 * cursor + 3));
+        entry[0] = 9;
+        entry[1] = ptr;
+        entry[2] = -2;
+        *(int *)(ptr - 8) |= 1;                // flag the payload
+        if (h[28] != -1)                       // guard armed: account the budget
+        {
+            int budget = h[27] - 1;
+            if (budget <= 0)
+                KoreHeapPanic(obj);
+            h[27] = budget;
+        }
+        if ((unsigned)flags > 0x40)
+            KoreHeapPanic(obj);
+        nodePtr = (int)entry;
+        payload = ptr;
+        state   = -2;                          // into the state -2 tail
+    }
+    else
+    {
+        // re-adopt mode: resume from this entry's payload
+        nodePtr = node;
+        payload = *(int *)(node + 4);
+        state   = *(int *)(node + 8);
+    }
+
+    int counter;
+    if (state == -2)
+    {
+        *(int *)(nodePtr + 8) = -1;            // entry state = -1
+        int child = *(int *)(payload + 4);
+        if (child != 0)
+        {
+            KoreInitAllocNode5(obj, child, 0, flags - 1);
+            nodePtr = h[5] + 24 * h[6];        // buffer + 24*cursor
+        }
+        int c0 = *(int *)payload;
+        counter = *(unsigned char *)c0;
+        *(int *)(nodePtr + 8) = counter;       // entry state = child count
+    }
+    else if (state == -1)
+    {
+        int c0 = *(int *)payload;
+        counter = *(unsigned char *)c0;
+        *(int *)(nodePtr + 8) = counter;
+    }
+    else
+    {
+        counter = state;
+    }
+
+    if (counter > 0)                           // walk the payload's child array
+    {
+        int *cur = (int *)(payload + 4 * counter + 0x14);
+        do
+        {
+            --counter;
+            --cur;
+            *(int *)(nodePtr + 8) = counter;   // entry state = running index
+            int cp = *cur;
+            if (cp != 0)
+            {
+                *(int *)(cp - 8) |= 1;
+                --h[27];
+                KoreInitAllocNode(obj, *(int *)(cp + 8), flags - 2);
+                nodePtr = h[5] + 24 * h[6];    // buffer + 24*cursor
+            }
+        } while (counter != 0);
+    }
+
+    --h[6];                                    // pop the entry off the table
+    int c0 = *(int *)payload;
+    if ((*(unsigned char *)(c0 - 8) & 1) != 0)
+        return c0;                             // already live
+    *(int *)(c0 - 8) |= 1;
+    --h[27];
+    return (int)KoreMarkNodeRefs(obj, c0);     // sub_5D5840
 }
 
 // sub_5DFB80 (0x5DFB80 - 0x5DFCD7) -- KoreInitAllocNode10: adopt / register a
-// type-10 alloc node (same shape as the type-8 routine; re-adopt mode pops
-// one node off the table). [NOT byte-identical] remaining stub.
+// type-10 alloc node.  Two modes.  New mode (node == 0): bail when the
+// payload's "adopted" flag byte (ptr-8, bit 0) is already set; otherwise grow
+// the primary alloc-node table (obj+0x14 buffer of 24-byte entries, cursor
+// obj+0x18, capacity obj+0x1C) by one slot -- re-carving the buffer
+// (KoreHeapBlockAlloc, retrying through the last-resort KoreVmAllocExpand
+// expand) at 8*(3*cap + 96) bytes (capacity += 32, the old buffer copied with
+// memcpy and its flag bit cleared) when the slot would overflow -- and stamp
+// the 3-word entry {type = 10, payload = ptr, state = the payload's +0x08
+// signed word (the child slot count)}.  It flags the payload (ptr-8 |= 1)
+// and decrements the alloc budget (obj+0x6C) unconditionally (no flags > 0x40
+// check, unlike the type-8 / type-9 routines).  Re-adopt mode (node != 0)
+// resumes from the entry's payload (node[1]) using the entry's state word
+// (node[2]).  Both modes share a tail: a positive state stores the budget and
+// walks the payload's child slots (payload + 8*i + 4, i = state down to 1),
+// storing the running index into the entry state before re-adopting each slot
+// through KoreInitAllocNode with flags - 1 (re-locating the tracked entry at
+// buffer + 24*cursor after each recurse in case the table grew); a
+// non-positive state skips the walk.  It panics (KoreHeapPanic) when the
+// guard (obj+0x70) is not -1 and the budget is 0 or below, pops the slot off
+// the table (--obj+0x18), stores the budget back, and, when the payload's
+// +0x04 child is non-null, adopts it through KoreInitAllocNode5 with flags -
+// 1.  [NOT byte-identical] placement-dependent (relative calls into
+// KoreHeapBlockAlloc / KoreVmAllocExpand / KoreHeapPanic / KoreInitAllocNode
+// / KoreInitAllocNode5, plus an IAT _memcpy slot); a thiscall + retn 0Ch
+// hybrid in the original (declared object-first here). Replaces the pop-only
+// stub.
 static void KoreInitAllocNode10(int obj, int ptr, int node, int flags)
 {
-    (void)ptr; (void)flags;
+    int *h = (int *)obj;
+    int budget = h[27];                 // obj+0x6C alloc budget
+    int payload, state;
+
     if (node != 0)
-        --*(int *)(obj + 24);
+    {
+        // re-adopt mode: resume from this entry's payload / state
+        payload = *(int *)(node + 4);
+        state   = *(int *)(node + 8);
+    }
+    else
+    {
+        // new mode: register the payload as a fresh type-10 entry
+        payload = ptr;
+        if ((*(unsigned char *)(ptr - 8) & 1) != 0)
+            return;                     // already adopted
+        int cursor = h[6];              // obj+0x18
+        int cap    = h[7];              // obj+0x1C
+        state = *(short *)(ptr + 8);    // the payload's +0x08 signed word
+        h[6] = cursor + 1;
+        if (cursor + 1 >= cap)          // signed: overflow the table
+        {
+            int size = 8 * (3 * cap + 96);
+            int i = KoreHeapBlockAlloc(h[3], size);
+            while (i == 0)
+            {
+                (void)KoreVmAllocExpand(h[1], size);   // last-resort expand
+                i = KoreHeapBlockAlloc(h[3], size);
+            }
+            memcpy((void *)i, (const void *)h[5], 24 * (unsigned)cap);
+            *(int *)(h[5] - 8) &= ~1;          // clear the old buffer's flag
+            h[7] += 32;
+            h[5] = i;
+        }
+        int *entry = (int *)(h[5] + 8 * (3 * cursor + 3));
+        entry[0] = 10;
+        entry[1] = payload;
+        entry[2] = state;
+        *(int *)(payload - 8) |= 1;        // flag the payload
+        --budget;                           // charge the alloc budget
+    }
+
+    int *entry = (int *)node;
+    if (state > 0)                           // walk the child slot chain
+    {
+        if (node == 0)
+            entry = (int *)(h[5] + 24 * h[6]);   // the just-adopted entry
+        h[27] = budget;
+        do
+        {
+            int child = payload + 8 * state + 4;
+            --state;
+            entry[2] = state;                // entry state = running index
+            KoreInitAllocNode(obj, child, flags - 1);
+            entry = (int *)(h[5] + 24 * h[6]);   // re-locate the entry
+        } while (state > 0);
+        budget = h[27];
+    }
+    if (h[28] != -1 && budget <= 0)          // guard armed, budget drained
+        KoreHeapPanic(obj);
+    --h[6];                                    // pop the slot off the table
+    h[27] = budget;
+    int child = *(int *)(payload + 4);
+    if (child != 0)
+        KoreInitAllocNode5(obj, child, 0, flags - 1);
 }
 
 // sub_5DFCE0 (0x5DFCE0 - 0x5DFE81) -- KoreInitAllocNode12: adopt / register a
-// type-12 (table) alloc node (same shape as the type-8 routine; re-adopt mode
-// pops one node off the table). [NOT byte-identical] remaining stub.
+// type-12 (table) alloc node.  Two modes.  New mode (node == 0): bail with a
+// zero return when the payload's "adopted" flag byte (ptr-8, bit 0) is already
+// set; otherwise grow the primary alloc-node table (obj+0x14 buffer of
+// 24-byte entries, cursor obj+0x18, capacity obj+0x1C) by one slot --
+// re-carving the buffer (KoreHeapBlockAlloc, retrying through the last-resort
+// KoreVmAllocExpand expand) at 8*(3*cap + 96) bytes (capacity += 32, the old
+// buffer copied with memcpy and its flag bit cleared) when the slot would
+// overflow -- and stamp the 3-word entry {type = 12, payload = ptr, state =
+// 0}.  It flags the payload (ptr-8 |= 1) and decrements the alloc budget
+// (obj+0x6C) unconditionally (no guard / flags > 0x40 checks, unlike the
+// type-5 / 7 / 8 routines).  Re-adopt mode (node != 0) resumes from the
+// entry's payload (node[1]) using the entry's state word (node[2]).  Both
+// modes share the record walk: the payload's +0x04 word is the table pointer,
+// whose +0x00 word is the record count and whose +0x18 word starts an array
+// of 16-byte records {word, word, kind, index16}.  For each record from state
+// up to count - 1 (record index = state & 0xFF, kind at record+8, index byte
+// at record+13): kind 0 (leaf slot) reads the payload's slot index byte and,
+// when the slot's type byte (payload + (i & 3) + 4*(i & 0xFC)) is non-zero,
+// re-adopts the {slot pointer (payload + 4*i), type} pair through
+// KoreInitAllocNode with flags - 1; kind 1 re-adopts the payload's +0x08 word
+// through KoreInitAllocNode12 (odd: tagged, & ~1) or KoreInitAllocNode5
+// (even) with flags - 1 when non-zero; kind 2 re-adopts the payload's slot i
+// (payload + 4*i) through KoreInitAllocNode5 with flags - 1 when non-null;
+// any other kind is a no-op.  After each record the running index is stored
+// into the current entry's state word (re-located at buffer + 24*cursor in
+// case the table grew).  Finishes by popping the slot off the table
+// (--obj+0x18) and returning the table buffer base -- or the record count
+// when the state was already at / above the count, or 0 on the new-mode early
+// bail (the callers discard the result).  [NOT byte-identical]
+// placement-dependent (relative calls into KoreHeapBlockAlloc /
+// KoreVmAllocExpand / KoreInitAllocNode / KoreInitAllocNode5 / itself, plus
+// an IAT _memcpy slot); a thiscall + retn 0Ch hybrid in the original
+// (declared object-first here).  Replaces the pop-only stub -- the last of
+// the seventeen alloc-node bookkeeping helpers.
 static int KoreInitAllocNode12(int obj, int ptr, int node, int flags)
 {
-    (void)ptr; (void)flags;
-    if (node != 0)
-        --*(int *)(obj + 24);
-    return node;
+    int *h = (int *)obj;
+    int payload, state, count, result;
+
+    if (node == 0)
+    {
+        // new mode: register the payload as a fresh type-12 entry
+        payload = ptr;
+        if ((*(unsigned char *)(ptr - 8) & 1) != 0)
+            return 0;                      // already registered
+        int cursor = h[6];                 // obj+0x18
+        int cap    = h[7];                 // obj+0x1C
+        h[6] = cursor + 1;
+        if (cursor + 1 >= cap)             // signed: overflow the table
+        {
+            int size = 8 * (3 * cap + 96);
+            int i = KoreHeapBlockAlloc(h[3], size);
+            while (i == 0)
+            {
+                (void)KoreVmAllocExpand(h[1], size);   // last-resort expand
+                i = KoreHeapBlockAlloc(h[3], size);
+            }
+            memcpy((void *)i, (const void *)h[5], 24 * (unsigned)cap);
+            *(int *)(h[5] - 8) &= ~1;      // clear the old buffer's flag
+            h[7] += 32;
+            h[5] = i;
+        }
+        node = (int)(h[5] + 8 * (3 * cursor + 3));
+        *(int *)node = 12;                 // entry {type, payload, state}
+        *(int *)(node + 4) = payload;
+        *(int *)(node + 8) = 0;
+        *(int *)(payload - 8) |= 1;        // flag the payload
+        --h[27];                           // charge the alloc budget (obj+0x6C)
+    }
+    else
+        payload = *(int *)(node + 4);      // re-adopt mode
+
+    state = *(int *)(node + 8);
+    int *table = *(int **)(payload + 4);
+    count   = *(int *)table;
+    if (state < count)
+    {
+        do
+        {
+            int *rec = (int *)((char *)table + 0x18 + 16 * (state & 0xFF));
+            int kind = *(int *)(rec + 8);
+            int idx  = ((unsigned char *)rec)[13];
+            if (kind == 0)
+            {
+                // leaf slot: adopt the payload's slot idx
+                int slotType = *(unsigned char *)(payload + (idx & 3)
+                                                           + 4 * (idx & 0xFC));
+                if (slotType != 0)
+                {
+                    int pair[2] = { *(int *)(payload + 4 * idx), slotType };
+                    KoreInitAllocNode(obj, (int)pair, flags - 1);
+                }
+            }
+            else if (kind == 1)
+            {
+                int child = *(int *)(payload + 8);
+                if (child != 0)
+                {
+                    if ((child & 1) != 0)
+                        (void)KoreInitAllocNode12(obj, child & ~1, 0, flags - 1);
+                    else
+                        KoreInitAllocNode5(obj, child, 0, flags - 1);
+                }
+            }
+            else if (kind == 2)
+            {
+                int child = *(int *)(payload + 4 * idx);
+                if (child != 0)
+                    KoreInitAllocNode5(obj, child, 0, flags - 1);
+            }
+            ++state;
+            *(int *)((char *)h[5] + 8 * (3 * h[6]) + 8) = state;  // entry state
+        } while (state < count);
+        result = (int)h[5];                // the table buffer base
+    }
+    else
+        result = count;
+    --h[6];                                // pop the slot off the table
+    return result;
 }
 
 // sub_5E21E0 (0x5E21E0 - 0x5E229F) -- KoreInitAllocNode: the alloc-node
@@ -3431,16 +4376,161 @@ static int KoreRowRelocateHash(int mask, int key, int type)
     return (int)((((unsigned int)key >> 2) * 0x9E3779B1u) & (unsigned int)mask);
 }
 
-// sub_5E3F20 (0x5E3F20 - 0x5E406F) -- KoreTableResize: grow / rehash the
-// table's 20-byte row hash array (the deep resize taken when no free row is
-// available), charging the alloc budget.  Only reached when a table grows
-// during a set, which the panic path never does, so it is a documented no-op
-// stub.  [NOT byte-identical] remaining stub.
-static int KoreTableResize(int vmcore, int key, int value)
+// sub_5D2FB0 (0x5D2FB0 - 0x5D301A) -- KoreProfileIntegerKey: the resize
+// profile helper.  If the {payload, type} pair is an exact positive integer
+// key (type 3, 1 <= key <= 2^24; the x87 round-to-int + exactness test, the
+// sign test, and the 2^24 bound), bump the profile bucket for the key's
+// magnitude (bucket 0 holds key 1, bucket b > 0 holds keys in (2^(b-1),
+// 2^b] -- bitlen(key-1) through the byte_1AE32B0 table, the -1 shift seed
+// putting key 1 into bucket 0) and return 1; any other pair returns 0
+// without touching the profile.  usercall in the original (the pair in EAX,
+// the counters in ECX).  [NOT byte-identical] a reimplementation of the x87
+// float-to-int round / exactness test.
+static int KoreProfileIntegerKey(int pair, int counters)
 {
-    (void)vmcore; (void)key; (void)value;
-    return 0;
+    int *p = (int *)pair;
+    if (p[1] != 3)
+        return 0;
+    float f = *(float *)p;
+    int k = (int)f;
+    if ((float)k != f || k <= 0 || k > 0x1000000)
+        return 0;
+    unsigned x = (unsigned)k - 1u;
+    int shift = -1;
+    while (x >= 0x100)
+    {
+        x >>= 8;
+        shift += 8;
+    }
+    ++((int *)counters)[shift + (int)KoreLog2Byte[(unsigned char)x] + 1];
+    return 1;
 }
+
+// sub_5D37B0 (0x5D37B0 - 0x5D3806) -- KoreScanResizeProfile: walk the
+// resize profile (KoreTableResize's 25-bucket magnitude counts) from
+// bucket 0 upward, *total holding the entry count.  *total <= 0: *total :=
+// 0, return 0.  Otherwise accumulate the bucket counts while doubling the
+// size (1, 2, 4, ...), remembering the size + running count each time the
+// running count passes half the size, and stop at the first bucket that
+// holds every entry or once the size reaches the total; *total becomes the
+// remembered size (0 when the running count never passed half a size) and
+// the running count at that remembered size is returned.  stdcall (retn 8)
+// in the original.  [NOT byte-identical] a straightforward reimplementation.
+static int KoreScanResizeProfile(int counters, int *total)
+{
+    int *c = (int *)counters;
+    int n = *total;
+    int acc = 0;
+    int result = 0;
+    int size = 1;
+    int bucket = 0;
+    if (n > 0)
+    {
+        for (;;)
+        {
+            int k = *c++;
+            if (k > 0)
+            {
+                acc += k;
+                if (acc > size >> 1)
+                {
+                    bucket = size;
+                    result = acc;
+                }
+            }
+            if (acc == n)
+                break;
+            size <<= 1;
+            if (size >> 1 >= n)
+                break;
+        }
+    }
+    *total = bucket;
+    return result;
+}
+
+// sub_5E3F20 (0x5E3F20 - 0x5E406F) -- KoreTableResize: the deep resize
+// taken when a table insert finds no free hash row.  Bumps the table's
+// +0x18 word and builds the 25-bucket magnitude profile: the 8-byte dense
+// rows ({value, tag}) are counted non-nil in doubling chunks (chunk 0
+// covers index 1, chunk b > 0 covers indices (2^(b-1), 2^b]), then the
+// 20-byte hash rows (size word 0 = unused) are counted, each integer
+// (type 3) row's key profiled (KoreProfileIntegerKey), and so is the
+// incoming key pair.  KoreScanResizeProfile then sizes the new dense part
+// from the profile (overwriting the total with the remembered size) and
+// the hash part gets (dense non-nil + used hash rows) - rememberedCount +
+// 1 bits; it returns KoreResizeHashTable's result.  thiscall + retn 8 in
+// the original (declared plain here: the table, the vm-core holder, the
+// key pair).  [NOT byte-identical] a thiscall + retn-8 hybrid with
+// placement-dependent relative calls.
+static int KoreTableResize(int table, int vmcore, int key)
+{
+    int *t = (int *)table;
+    ++t[6];
+    int counters[25];
+    memset((void *)counters, 0, sizeof(counters));
+    int total = 0;
+    int start = 1;   // 1-based dense index where the chunk begins
+    int chunk = 1;   // the chunk's nominal size (doubles per bucket)
+    for (int v5 = 0; v5 < 24; ++v5)
+    {
+        int count = t[4];
+        int nonNil = 0;
+        int end = chunk <= count ? chunk : count;
+        if (chunk > count)
+        {
+            if (start > count)
+                break;
+        }
+        else if (start > chunk)
+        {
+            // the previous chunk was truncated: nothing to count here
+        }
+        else
+        {
+            int v10 = end - start + 1;
+            int *row = (int *)(t[3] + 8 * start - 8);
+            start += v10;
+            do
+            {
+                if (row[1] != 0)
+                    ++nonNil;
+                row += 2;
+                --v10;
+            }
+            while (v10 != 0);
+        }
+        counters[v5] += nonNil;
+        total += nonNil;
+        chunk *= 2;
+    }
+    int mask = t[1];
+    int profiled = 0;   // integer-keyed hash rows that profiled
+    int used = 0;       // hash rows in use (size word != 0)
+    int i = mask + 1;
+    while (i != 0)
+    {
+        int *row = (int *)(t[2] + 20 * (i - 1));
+        --i;
+        if (row[3] != 0)
+        {
+            if (row[1] == 3)
+            {
+                int pair[2] = { row[0], row[1] };
+                if (KoreProfileIntegerKey((int)pair, (int)counters))
+                    ++profiled;
+            }
+            ++used;
+        }
+    }
+    int usedTotal = total + used;
+    int newRows = total + profiled;
+    if (KoreProfileIntegerKey(key, (int)counters))
+        ++newRows;
+    int dense = KoreScanResizeProfile((int)counters, &newRows);
+    return KoreResizeHashTable(table, vmcore, newRows, usedTotal - dense + 1);
+}
+
 
 // sub_5F7E10 (0x5F7E10 - 0x5F7E6F) -- KoreDebugMarkDirty: mark a referenced
 // global as dirty for the debug GC.  `flags` is a pointer to a debug-flag
@@ -3558,7 +4648,7 @@ static int KoreTableEnsureRow(int table, int vmcore, int key, int value)
         // no free row: stash the value and resize the table
         *(int *)(*(int *)vmcore + 0x60) = vp[0];
         *(int *)(*(int *)vmcore + 0x64) = vp[1];
-        (void)KoreTableResize(vmcore, key, value);
+        (void)KoreTableResize(table, vmcore, key);
         *(int *)(*(int *)vmcore + 0x64) = 0;
         int idx = (int)(float)kp[0];
         if (kp[1] == 3 && (double)idx == (double)(float)kp[0] && idx > 0 &&
@@ -7255,8 +8345,7 @@ int ReinitEngineLua(void *obj, int flag)
     if (wasEmpty)
     {
         int startup = 0;
-        sub_1A02260(&startup, (int *)&g_unk_1DBE2B4,
-                    (const char ***)(void *)&g_unk_1DBDA6C);
+        SharedSlotConcat((F3SharedBuffer **)&startup, &g_unk_1DBE2B4, &g_unk_1DBDA6C);
         RunLuaStartupScripts((int)dw[0xBC / 4], startup);
         ReleaseSharedSlot((F3SharedBuffer **)&startup);
     }

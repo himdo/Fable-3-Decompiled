@@ -92581,7 +92581,7 @@
     },
     "0x005d5840": {
       "size": 307,
-      "name": "sub_5D5840"
+      "name": "KoreMarkNodeRefs"
     },
     "0x005d5980": {
       "size": 85,
@@ -660293,7 +660293,7 @@
     },
     "0x01a02260": {
       "size": 50,
-      "name": "sub_1A02260"
+      "name": "SharedSlotConcat"
     },
     "0x01a022a0": {
       "size": 164,

@@ -6585,6 +6585,27 @@ static F3SharedBuffer **SharedSlotConcatLiteral(F3SharedBuffer **dst, const char
     return dst;
 }
 
+// sub_1A02260 (0x1A02260 - 0x1A02292): concat two source slots into a fresh dst
+//
+//  F3SharedBuffer **SharedSlotConcat(F3SharedBuffer **dst, F3SharedBuffer **src1, F3SharedBuffer **src2)
+//
+//  cdecl. Zeroes dst, bumps the live-slot count (g_Addend), copy-assigns src1
+//  (CopySharedSlot, 0x1A01270), then appends src2 (SharedSlotAppendSlot,
+//  0x1A01940); returns the dst slot address.  The two-source sibling of
+//  SharedSlotConcatLiteral (0x1A02200, literal + slot) and of
+//  MakeSettingsFilePath (0x1A02230, slot + literal).  [NOT byte-identical]
+//  (placement-dependent relative calls to CopySharedSlot /
+//  SharedSlotAppendSlot, the Interlocked IAT slot, and the high-VA global
+//  g_Addend, 0x02075C48).
+F3SharedBuffer **SharedSlotConcat(F3SharedBuffer **dst, F3SharedBuffer **src1, F3SharedBuffer **src2)
+{
+    *dst = 0;
+    InterlockedIncrement(&g_Addend);
+    CopySharedSlot(dst, src1);
+    SharedSlotAppendSlot(dst, src2);
+    return dst;
+}
+
 // sub_1A15800 (0x1A15800 - 0x1A15855): CRC-32 of a slot's C string
 //
 //  unsigned int SharedSlotCrc32(const F3SharedBuffer **slot, unsigned int seed)
