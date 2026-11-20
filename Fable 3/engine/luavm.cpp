@@ -12,7 +12,8 @@
 
 #include "luavm.h"                // DestroyLuaModule / ReinitEngineLua decls
 #include "common/common.h"        // LHAlloc / F3SharedBuffer / ReleaseSharedSlot
-#include "gamemain.h"             // SharedSlotConcat (the 2-source slot concat)
+#include "gamemain.h"             // SharedSlotConcat / SharedSlotConcatLiteral / F3WString / F3WStringFromAnsi
+#include "xlip.h"                 // MakeSettingsFilePath / GetSlotString (shared-slot helpers)
 #include "netinit.h"              // GetNetManager / CNetLuaEventManagerListReset
 
 #include <windows.h>
@@ -48,7 +49,7 @@ static void F3StubRelease(void *obj, int freeIt) { (void)obj; (void)freeIt; }
 //           (CreateLuaModule, sub_629570; the old one is released via
 //           DestroyLuaModule (sub_6281B0) -> DestroyLuaModuleBody (sub_5EDFE0))
 //    +0xC0  the CLuaManager -- the 8-byte wrapper (CLuaManagerCtor,
-//           sub_6F9890; its impl wraps the Lua module and the engine's
+//           0x6F9890; its impl wraps the Lua module and the engine's
 //           +0x98 sorted map), followed by
 //           CLuaManagerRunSerialiseScript (sub_6F9880)
 //    +0xC4  the CEntityScriptHandleManager -- 80 bytes (sub_6E9620),
@@ -59,16 +60,29 @@ static void F3StubRelease(void *obj, int freeIt) { (void)obj; (void)freeIt; }
 //  empty (first-time init), the two startup-script path slots
 //  (unk_1DBE2B4 + unk_1DBDA6C via the SharedSlotConcat, 0x1A02260,
 //  2-source concat) are built and the Lua startup scripts are run (sub_616710).  Register
-//  EngineLuaFunctions (sub_6169D0: the ~40 Set*/Get* engine Lua
-//  functions) is called on the fresh Lua module; when `flag` is set the
-//  "EngineTest" module is registered too (nullsub_28 + sub_70DDB0), and
-//  the nullsub_27 no-op is called when the new +0xC0 is set.  The
+//  EngineLuaFunctions (sub_6169D0: the 100 Set*/Get* engine Lua builtins
+//  -- see the engine Lua builtin block below) is called on the fresh Lua
+//  module; when `flag` is set the
+//  "EngineTest" module is registered too (ResetEngineTest +
+//  RegisterEngineTest, 0x70DBB0 + sub_70DDB0), and the nullsub_27 no-op
+//  is called when the new +0xC0 is set.  The
 //  return value (the new +0xC4) is discarded by both callers.
 // ============================================================
 // 0x1DBE2B4 / 0x1DBDA6C: the two shared slots ReinitEngineLua concats
-// into the Lua startup-script path (SharedSlotConcat, 0x1A02260).
-static F3SharedBuffer *g_unk_1DBE2B4 = 0;   // 0x1DBE2B4
-static F3SharedBuffer *g_unk_1DBDA6C = 0;   // 0x1DBDA6C
+// into the Lua startup-script path (SharedSlotConcat, 0x1A02260): the
+// "Data\Scripts\Startup\" directory slot (the sub_1A5D110 static
+// initializer) + the "startup.lua" filename slot (sub_1A5C6C0).  Zero in
+// this build (the original's static initializers do not run here).
+static F3SharedBuffer *g_unk_1DBE2B4 = 0;   // 0x1DBE2B4: "Data\Scripts\Startup\" slot
+static F3SharedBuffer *g_unk_1DBDA6C = 0;   // 0x1DBDA6C: "startup.lua" slot
+
+// 0x1DBE2B0 / 0x1DC2680: the two shared slots CLuaManagerImplRunSerialiseScript
+// concats into the Lua serialise-script path (SharedSlotConcat, 0x1A02260) --
+// the serialise-script directory (0x1DBE2B0, the word just before the
+// startup-script slot g_unk_1DBE2B4) + the serialise-script filename
+// (0x1DC2680).  Zero in this build (populated by the real game's init).
+static F3SharedBuffer *g_dword_1DBE2B0 = 0;   // 0x1DBE2B0: serialise-script dir slot
+static F3SharedBuffer *g_dword_1DC2680 = 0;   // 0x1DC2680: serialise-script name slot
 
 // ----------------------------------------------------------------
 //  CreateLuaModule  (0x629570) and its build family: the 18-word config
@@ -88,6 +102,7 @@ static int    KoreHeapInitGrow(int obj, int size);                     // sub_5E
 static int    KoreGrowRegistry(int obj, int size, int vmcore);         // sub_5EE150
 static int    KoreHashTableInsert(int table, int a2, int a3, int a4);  // sub_5EC960
 static int    KoreAppendString(int vmcore, const void *src, int len);  // sub_407070
+static int    KoreGlobalGetValue(int table, int out, int hint, int key);  // sub_5DDB40
 // (defined just below, in this same block)
 static int    KoreSetupContinuation(int handle);                        // sub_5D7F50
 static int    KoreRegisterBuiltinTable(int handle, int *row);           // sub_5DE9D0
@@ -484,7 +499,7 @@ static int KoreLibDebug(void)   { return 1; }      // sub_5FED80 (debug library)
 // (the config a1[4] slot, called as alloc(ctx, src, size, dstSize)).  It routes
 // through the game heap (sub_717960 in the original); a (src==0 && dstSize==0)
 // request is a no-op (returns 0), otherwise it allocates dstSize bytes.  The
-// OOM expand path (sub_673C50 / sub_673F30 / sub_6F0070 / sub_627FC0 re-alloc,
+// OOM expand path (sub_673C50 / sub_673F30 / sub_6F0070 / KoreModulePacing re-alloc,
 // then a sub_627A30() + DebugBreak on a second miss) is a remaining stub: the
 // game heap is not under pressure in this build.
 static int KoreLuaAlloc(int a1, void *src, size_t srcSize, size_t dstSize)
@@ -6153,17 +6168,70 @@ static int KoreValueEq(int type, int a, int b)
     return a == b;
 }
 
-// ---- sub_5D3280: table get by numeric key.
+// ---- sub_5D3280: table get by numeric key. (0x5D3280 - 0x5D336E)
+// The original is a thiscall + retn 8 hybrid (the table in ECX, the out
+// slot and the float key on the stack). An integer-valued key (the
+// __ftol2_sse truncation round-trips exactly) reads dense row n - 1 of the
+// 8-byte row array ({value, type}) at the table's +0x0C (the row count is
+// at +0x10); the dense array pointer being 0 skips straight to the 20-byte
+// hash rows at +0x08: the bucket is (the key rounded toward +infinity by
+// the FPU, saturating to INT_MIN / INT_MAX) & the +0x04 mask, and the row
+// chain ({key, key type, value, type, next absolute row pointer}) is walked
+// until a type-3 row whose key equals the key, returning that row's
+// {value, type} pair; on exhaustion (or no bucket array) the
+// zero-initialized nil pair globals are written. [NOT byte-identical]
+// placement-dependent (the relative call to __ftol2_sse); the original's
+// x87 flag tests read the ambient FPU status word and its row-key
+// comparison duplicates the key instead of the row key, so this implements
+// the intended semantics (round-trip / key equality, NaN never hits).
 static int KoreGlobalGetByFloat(int table, int out, int index)
 {
     float f = *(float *)&index;
-    int *tb = (int *)table;
-    int count = tb[10];
-    int n = (int)f;
-    if ((float)n == f && n >= 0 && n < count) {
-        *(int *)out = tb[11] + n * 8;
-        *(int *)(out + 4) = 3;
+    int *t = (int *)table;
+    // __ftol2_sse: truncate toward zero, saturating NaN / out-of-range to INT_MIN.
+    int n;
+    if (f != f || f >= 2147483648.0f || f < -2147483648.0f)
+        n = 0x80000000;
+    else
+        n = (int)f;
+    int rows = t[3];
+    if (rows != 0 && (float)n == f && (unsigned)(n - 1) < (unsigned)t[4])
+    {
+        int *r = (int *)(rows + 8 * n - 8);
+        *(int *)out = r[0];
+        *(int *)(out + 4) = r[1];
         return out;
+    }
+    int buckets = t[2];
+    if (buckets != 0)
+    {
+        int idx;                          // fistp, RC = +infinity (saturating)
+        if (f != f)
+            idx = 0x80000000;
+        else if (f >= 2147483648.0f)
+            idx = 0x7FFFFFFF;
+        else if (f <= -2147483648.0f)
+            idx = 0x80000000;
+        else
+        {
+            idx = (int)f;                 // truncate toward zero
+            if ((float)idx < f)
+                idx++;                    // round toward +infinity
+        }
+        int *r = (int *)(buckets + 20 * ((unsigned)idx & (unsigned)t[1]));
+        for (;;)
+        {
+            if (r[1] == 3 && *(float *)r == f)
+            {
+                *(int *)out = r[2];
+                *(int *)(out + 4) = r[3];
+                return out;
+            }
+            int next = r[4];
+            if (next == 0)
+                break;
+            r = (int *)next;
+        }
     }
     *(int *)out = g_dword_1DBCFE0;
     *(int *)(out + 4) = g_dword_1DBCFE4;
@@ -6193,24 +6261,101 @@ static int KoreFloatFromString(int s, int len, int out)
     return 1;
 }
 
-// ---- sub_612A80: struct slot get by index.
-static int KoreStructFieldGet(int table, int out, int vmcore, int index)
+// ---- sub_610BA0: struct field get by {value, type} key. (0x610BA0 - 0x610C56)
+// The type-12 (struct) arm of the VM's gettable-by-value-key opcode (0x0C),
+// the direct getter counterpart of KoreStructSetField (0x612630). The
+// original is a thiscall + retn 0x0C hybrid (the instance in ECX, the out
+// slot, the vm-core and the key slot on the stack). A string key (type 4)
+// linearly scans the instance's prototype / descriptor table (the +0x04
+// pointer): the +0x00 field count and the 16-byte rows from +0x18, each
+// keyed by its +0x00 interned id; on a match the row's +13 descriptor byte
+// is the field slot -- the value is the instance's +4 * slot word and the
+// type the packed byte at +4 * (slot & 0xFC) + (slot & 3) (the same layout
+// KoreStructSetField writes). A non-string key or a scan miss falls back to
+// the instance's +0x0C backing hash table via KoreGlobalGetValue; a null
+// backing table yields the zero-initialized nil pair globals.
+// [NOT byte-identical] placement-dependent (the relative call to
+// KoreGlobalGetValue) and refs the two high-VA nil pair globals.
+static int KoreStructFieldGet(int obj, int out, int vmcore, int key)
 {
-    (void)vmcore;
+    int *inst = (int *)obj;
+    if (*(int *)(key + 4) == 4)
+    {
+        int *reg = (int *)inst[1];
+        int count = reg ? reg[0] : 0;
+        if (count > 0)
+        {
+            int *row = (int *)(reg + 6);
+            for (int i = 0; i < count; ++i, row += 4)
+            {
+                if (row[0] == *(int *)key)
+                {
+                    if ((int)row != 0)
+                    {
+                        int slot = *(unsigned char *)(row + 13);
+                        *(int *)out = inst[slot];
+                        *(int *)(out + 4) = *(unsigned char *)((char *)inst + 4 * (slot & 0xFC) + (slot & 3));
+                        return out;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    int backing = inst[3];
+    if (backing != 0)
+    {
+        int tmp[2] = {0, 0};
+        KoreGlobalGetValue(backing, (int)tmp, vmcore, key);
+        *(int *)out = tmp[0];
+        *(int *)(out + 4) = tmp[1];
+        return out;
+    }
     *(int *)out = g_dword_1DBCFE0;
     *(int *)(out + 4) = g_dword_1DBCFE4;
-    (void)index;
     return out;
 }
 
-// ---- sub_606AE0: indexed get on the value-stack top.
-static int KoreIndexedGet(int table, int index, int def)
+// sub_606AE0 (0x606AE0 - 0x606B10) -- KoreStructFindSlot: linear lookup of a
+// struct prototype / descriptor table's 16-byte field-slot row by its +0x00
+// interned field id. The object (ECX) is the same table KoreStructFieldGet /
+// KoreMakeStructInstance use: the +0x00 field count, the 16-byte rows from
+// +0x18 keyed by their +0x00 interned id. Returns a pointer to the matching
+// row, or 0 for a zero count or a scan miss. Thiscall + retn 4 hybrid.
+// Byte-identical: __declspec(naked) inline asm of the original's exact 48-byte
+// sequence -- no calls and no data references, so the bytes match at any
+// placement.
+static int __declspec(naked) KoreStructFindSlot(int obj, int key)
 {
-    (void)table;
-    *(int *)def = g_dword_1DBCFE0;
-    *(int *)(def + 4) = g_dword_1DBCFE4;
-    (void)index;
-    return def;
+    (void)obj; (void)key;
+    __asm {
+        push esi
+        mov  esi, [ecx]
+        xor  eax, eax
+        push edi
+        test esi, esi
+        jna  kfs_done
+        mov  edi, [esp+0Ch]           ; key
+        lea  edx, [ecx+18h]           ; first slot row
+kfs_loop:
+        cmp  dword ptr [edx], edi
+        jz   kfs_hit
+        inc  eax
+        add  edx, 10h
+        cmp  eax, esi
+        jb   kfs_loop
+kfs_done:
+        pop  edi
+        xor  eax, eax
+        pop  esi
+        retn 4
+kfs_hit:
+        shl  eax, 4
+        pop  edi
+        lea  eax, [eax+ecx+18h]
+        pop  esi
+        retn 4
+    }
 }
 
 // ---- sub_5DDFD0: metatable operator lookup -> interned string (or the nil pair).
@@ -6250,21 +6395,46 @@ static __int64 KoreLookupMetamethod(int vmcore, int valA, int valB, int opId)
     return ((unsigned __int64)(unsigned int)g_dword_1DBCFE4 << 32) | (unsigned int)g_dword_1DBCFE0;
 }
 
-// ---- sub_5E2970: make a struct instance from a prototype.
-static int KoreMakeStructInstance(int vmcore, int proto, int backing)
+// ---- sub_5E2970: make a struct instance from a prototype. (0x5E2970)
+// The block is 4 * BYTE1(proto[4 * count + 5]) + 4 bytes: word 0 = 0, word
+// 1 = the prototype (the descriptor table the field get / set routines
+// scan), words 2.. zeroed, word 3 = the backing table. With a backing table
+// (rows / buckets nonzero) the prototype must have its +0x08 backing-table
+// flag (else the VM panics); the table is registered in the vm-core's
+// +44+72 slot (type 5 at +76) and the vm-core's +120 counter is zeroed.
+// The no-backing-table path (rows == buckets == 0) is the sub_5D2D70 helper
+// inlined here. [NOT byte-identical] placement-dependent (the relative
+// calls to the allocation / panic helpers).
+static int KoreMakeStructInstance(int vmcore, int proto, int rows, int buckets)
 {
-    int fixedSize = *(int *)(proto + 4);
-    int *mem = (int *)KoreVmHeapAlloc(vmcore, fixedSize + 0x20);
-    int *inst = (int *)(mem + 1);
-    inst[0] = proto;
+    int count = *(int *)proto;
+    int size = 4 * (int)(*(unsigned char *)(proto + 16 * count + 21) & 0xFF) + 4;
+    if (rows != 0 || buckets != 0)
+    {
+        if (*(int *)(proto + 8) == 0)
+            KoreTablePanic(vmcore, "Attempt to create a struct instance with a backing table, which isn't enabled in the prototype.");
+        int backing = KoreAllocHashTable(vmcore, rows, buckets);
+        int base = *(int *)vmcore;
+        *(int *)(base + 44 + 72) = backing;
+        *(int *)(base + 44 + 76) = 5;
+        int *inst = (int *)KoreVmHeapAlloc(vmcore, size);
+        if (inst != 0)
+        {
+            inst[1] = proto;
+            inst[0] = 0;
+            memset(inst + 2, 0, size - 8);
+            inst[3] = backing;
+        }
+        *(int *)(base + 120) = 0;
+        return inst ? (int)inst : 0;
+    }
+    int *inst = (int *)KoreVmHeapAlloc(vmcore, size);
+    if (inst == 0)
+        return 0;
     inst[1] = proto;
-    memset(inst + 2, 0, 0x10);
-    inst[6] = backing;
-    inst[7] = 7;
-    *(int *)mem = 0;
-    *(int *)(mem + 4) = 5;
-    *(int *)vmcore = (int)mem;
-    return (int)mem;
+    inst[0] = 0;
+    memset(inst + 2, 0, size - 8);
+    return (int)inst;
 }
 
 // ---- sub_5E8FA0: build a table with arraySize / hashSize from the encodings.
@@ -6275,25 +6445,34 @@ static int KoreMakeInstance(int vmcore, int proto, int rows, int buckets)
     return obj;
 }
 
-// ---- sub_5DDB40: global get by key.
-static int KoreGlobalGetValue(int table, int vmcore, int out)
+// ---- sub_5DDB40: table get by {value, type} key. (0x5DDB40 - 0x5DDBCF)
+// The original is a thiscall + retn 0x0C hybrid (the table in ECX, the out
+// slot, the vm-core hint and the key slot on the stack). A string key
+// (type 4) is a string-table lookup (KoreLookupStringTable, hash 4); a
+// number key (type 3) is the float-key read (KoreGlobalGetByFloat); any
+// other key type finds its 20-byte row through KoreFindGlobalRow (the
+// vm-core hint is dead there) and returns that row's {+0x08 value, +0x0C
+// type} pair read from the hash rows at the table's +0x08; the -1 miss
+// writes the zero-initialized nil pair globals. [NOT byte-identical]
+// placement-dependent (the relative calls) and refs the two high-VA nil
+// pair globals.
+static int KoreGlobalGetValue(int table, int out, int hint, int key)
 {
-    int type = *(int *)(table + 4);
+    int type = *(int *)(key + 4);
+    if (type == 4)
+        return KoreLookupStringTable(table, out, *(int *)key, 4);
     if (type == 3)
-        return KoreGlobalGetByFloat(vmcore, out, *(int *)table);
-    int name = *(int *)table + 8;
-    if (name) {
-        int meta = *(int *)(name + 4);
-        if (meta) {
-            int sub[2] = {0, 0};
-            KoreLookupStringTable(vmcore, (int)sub, *(int *)(meta + 4), 0);
-            *(int *)out = sub[0];
-            *(int *)(out + 4) = sub[1];
-            return out;
-        }
+        return KoreGlobalGetByFloat(table, out, *(int *)key);
+    int row = KoreFindGlobalRow(table, hint, (int *)key);
+    if (row == -1)
+    {
+        *(int *)out = g_dword_1DBCFE0;
+        *(int *)(out + 4) = g_dword_1DBCFE4;
+        return out;
     }
-    *(int *)out = g_dword_1DBCFE0;
-    *(int *)(out + 4) = g_dword_1DBCFE4;
+    int *r = (int *)((int *)*(int *)(table + 8) + 20 * row);
+    *(int *)out = r[2];
+    *(int *)(out + 4) = r[3];
     return out;
 }
 
@@ -6306,7 +6485,7 @@ static __int64 KoreIndexOp(int vmcore, int value, int type, int key, int keyType
     int obj = value;
     if (obj && (type == 7 || type == 5 || type == 12)) {
         if (keyType == 3) {
-            KoreGlobalGetByFloat(vmcore, (int)out, *(int *)key);
+            KoreGlobalGetByFloat(value, (int)out, key);
         } else {
             int name = key;
             if (name) {
@@ -6323,13 +6502,106 @@ static __int64 KoreIndexOp(int vmcore, int value, int type, int key, int keyType
     return ((unsigned __int64)(unsigned int)g_dword_1DBCFE4 << 32) | (unsigned int)g_dword_1DBCFE0;
 }
 
-// ---- sub_5E7FE0: gettable by float key.
-static __int64 KoreGlobalGetByFloat3(int table, int vmcore, int index)
+// ---- sub_5E30C0 (0x5E30C0 - 0x5E3290): the recursive __index / gettable
+// metamethod resolver. Switches on the {value,type} pair's type word (the
+// interned name's type flag, the 7th arg): 10/9 invoke the metamethod, 5
+// (closure) does a closure gettable + recurse, 12 (struct) does a struct
+// gettable + recurse, any other type falls through to the name resolver
+// (KoreGettableByName, sub_5E4420). Panics "loop in gettable" when the
+// recursion depth (8th arg) is 0. cdecl, 8 args. [STUB] Not yet reimplemented;
+// returns the zero nil pair.
+static __int64 KoreGettableResolve(int vmcore, int value, int type, int key, int code, int nameValue, int nameType, int depth)
 {
-    (void)table; (void)vmcore;
-    int out[2] = {0, 0};
-    (void)index;
+    (void)vmcore; (void)value; (void)type; (void)key; (void)code;
+    (void)nameValue; (void)nameType; (void)depth;
+    return ((unsigned __int64)(unsigned int)g_dword_1DBCFE4 << 32) | (unsigned int)g_dword_1DBCFE0;
+}
+
+// ---- sub_5E4420 (0x5E4420 - 0x5E44F4): the gettable name resolver. Resolves
+// the metatable lookup "name" for a value of a given type: types 5/7/12 read
+// the name from the value's own fields (+0x00/+0x04/+0x08); any other type
+// looks the type's name up in the global string table (base = *vmcore, key at
+// base + 8*type + 372, the string table at base + 204, hash 4) and ORs in the
+// low bit of the name when the resolved type word is not 5. Panics "attempt to
+// index a nil value" when the name is 0, interns it (KoreLookupInternedString
+// -> the {value, type} qword; panics "error in gettable_event" when the type
+// word is 0), and delegates to the recursive __index resolver
+// (KoreGettableResolve, sub_5E30C0). cdecl, 6 args (vmcore, value, type, key,
+// code, depth), returns the resolver's {value,type} qword. [NOT byte-identical]
+// placement-dependent (the relative calls) and refs the two high-VA
+// panic-format strings (0x01AE15D4 / 0x01AE15F4).
+static __int64 KoreGettableByName(int vmcore, int value, int type, int key, int code, int depth)
+{
+    int *v = (int *)value;
+    int name;
+    switch (type)
+    {
+    case 5:  name = v[0]; break;
+    case 7:  name = v[1]; break;
+    case 12: name = v[2]; break;
+    default:
+    {
+        int base = *(int *)vmcore;
+        int out[2] = {0, 0};
+        (void)KoreLookupStringTable(*(int *)(base + 204), (int)out, *(int *)(base + 8 * type + 372), 4);
+        if (out[1] != 0)
+        {
+            if (out[1] != 5)
+                out[0] |= 1;
+            name = out[0];
+        }
+        else
+            name = 0;
+        break;
+    }
+    }
+    if (name == 0)
+        KoreTablePanic(vmcore, "attempt to index a nil value");
+    unsigned __int64 r = KoreLookupInternedString(vmcore, name, 1);
+    int nameValue = (int)r;       // low 32: the interned value/pointer
+    int nameType  = (int)(r >> 32); // high 32: the interned type word
+    if (nameType == 0)
+        KoreTablePanic(vmcore, "error in gettable_event");
+    return KoreGettableResolve(vmcore, value, type, key, code, nameValue, nameType, depth);
+}
+
+// ---- sub_610B50 (0x610B50 - 0x610B9E): get a global by integer index from a
+// table object. Fast path: the (idx - 1)-th 8-byte dense row of the row array at
+// tableObj + 0x0C (count at tableObj + 0x10). On a miss, falls back to the general
+// value lookup (KoreGlobalGetValue) with a number key { (float)idx, 3 }. Returns a
+// packed { value, type } pair (value in low 32, type in high 32). The first arg is
+// the vm-core hint threaded to the miss fallback. Shared by the 0xE iterate-globals
+// opcode and the value-stack / upvalue helpers.
+static __int64 KoreGlobalGetByInt(int hint, int tableObj, int idx)
+{
+    if ((unsigned)(idx - 1) < (unsigned)*(int *)(tableObj + 0x10))
+        return *(unsigned __int64 *)(*(int *)(tableObj + 0x0C) + 8 * (idx - 1));
+    float fv = (float)idx;
+    int key[2] = { *(int *)&fv, 3 };
+    int out[2] = { 0, 0 };
+    KoreGlobalGetValue(tableObj, (int)out, hint, (int)key);
     return ((unsigned __int64)(unsigned int)out[1] << 32) | (unsigned int)out[0];
+}
+
+// ---- sub_610C60 (0x610C60 - 0x610CA0): thiscall wrapper over KoreGlobalGetByInt.
+// The object's +0x0C field is the inner row base; when it is nonzero it is passed
+// straight to KoreGlobalGetByInt, otherwise the nil pair is written. The result is
+// stored through *out (two dwords: value, then type) and *out is returned.
+static int *KoreGlobalGetByIntIndirect(int thisobj, int *out, int hint, int idx)
+{
+    int rowbase = *(int *)(thisobj + 0x0C);
+    if (rowbase != 0)
+    {
+        __int64 r = KoreGlobalGetByInt(hint, rowbase, idx);
+        out[0] = (int)r;
+        out[1] = (int)(r >> 32);
+    }
+    else
+    {
+        out[0] = g_dword_1DBCFE0;
+        out[1] = g_dword_1DBCFE4;
+    }
+    return out;
 }
 
 // ---- sub_5E7330: store the value at a string/global key.
@@ -6461,7 +6733,9 @@ static void KoreTypeCheckFail2(int vmcore, int obj, int slot, const char *fmt, .
     KoreTablePanic(vmcore, "%s", fmt);
 }
 
-// ---- sub_5E30C0 family: resolve the operator name string for a binary op.
+// ---- resolve the operator name string for a binary op (small stub; this is
+// a distinct operator-name lookup, NOT sub_5E30C0 -- that is the recursive
+// __index gettable resolver, now KoreGettableResolve).
 static int KoreLookupOperatorName(int vmcore, int slot, int op, int opchar)
 {
     (void)vmcore; (void)slot; (void)op; (void)opchar;
@@ -6935,7 +7209,6 @@ lbl_15:
             {
                 q = KoreIndexOp(table, a, ta, fkey, 3, (int)v374, 32);
             }
-lbl_71:
             v4 = Size[8];
             *(int *)(v388 + v4) = (int)q;
             *(int *)(v388 + v4 + 4) = (int)(q >> 32);
@@ -6950,21 +7223,28 @@ lbl_71:
             if (ta == 5)
             {
                 int out[2];
-                int t = KoreGlobalGetValue(a, table, (int)out);
-                if (t == 0)
-                    q = KoreIndexOp(table, a, ta, key, 0, (int)v374, 32);
-                else
+                KoreGlobalGetValue(a, (int)out, table, key);
+                if (out[1] != 0)
                 {
                     v4 = Size[8];
                     *(int *)(v388 + v4) = out[0];
                     *(int *)(v388 + v4 + 4) = out[1];
                     break;
                 }
-            }
-            else if (ta != 12)
-            {
                 q = KoreIndexOp(table, a, ta, key, 0, (int)v374, 32);
-                goto lbl_71;
+            }
+            else if (ta == 12)
+            {
+                int out[2];
+                KoreStructFieldGet(a, (int)out, table, key);
+                if (out[1] != 0)
+                {
+                    v4 = Size[8];
+                    *(int *)(v388 + v4) = out[0];
+                    *(int *)(v388 + v4 + 4) = out[1];
+                    break;
+                }
+                q = KoreIndexOp(table, a, ta, key, 0, (int)v374, 32);
             }
             else
             {
@@ -6986,13 +7266,40 @@ lbl_71:
             int v404 = (unsigned char)v5;
             if (v404 == 2 && *(int *)(v7 + 4) == 10)
             {
-                void *fnc = *(void **)v7;
-                if (fnc == (void *)KoreIterGlobals)
+                // The value is the "iterate globals" C closure: *(v7+0) points at the
+                // closure object whose first word is the function pointer (sub_5E4CB0).
+                if (*(int *)(*(int *)v7) == (int)KoreIterGlobals)
                 {
                     int idx = (int)*(float *)(v7 + 16) + 1;
-                    __int64 outq = KoreGlobalGetByFloat3(*(int *)v7, table, idx);
-                    *(int *)(v7 + 32) = (int)outq;
-                    *(int *)(v7 + 36) = (int)(outq >> 32);
+                    __int64 outq;
+                    if (*(int *)(v7 + 12) == 5)
+                    {
+                        // type 5: read the dense row straight off the closure's +0x08 table object.
+                        outq = KoreGlobalGetByInt(table, *(int *)(v7 + 8), idx);
+                    }
+                    else
+                    {
+                        // otherwise go through the closure's +0x08 object's +0x0C row base.
+                        int o[2] = { 0, 0 };
+                        KoreGlobalGetByIntIndirect(*(int *)(v7 + 8), o, table, idx);
+                        outq = ((unsigned __int64)(unsigned int)o[1] << 32) | (unsigned int)o[0];
+                    }
+                    *(int *)(v7 + 0x20) = (int)outq;
+                    *(int *)(v7 + 0x24) = (int)(outq >> 32);
+                    if ((int)(outq >> 32) == 0)
+                    {
+                        // nil result: reset the iterator state block.
+                        *(int *)(v7 + 0x14) = 0;
+                        *(int *)(v7 + 0x18) = *(int *)(v7 + 16);
+                        *(int *)(v7 + 0x1C) = 0;
+                    }
+                    else
+                    {
+                        // non-nil: advance the float iterator by 1.0.
+                        *(int *)(v7 + 0x1C) = *(int *)(v7 + 0x14);
+                        *(float *)(v7 + 16) = *(float *)(v7 + 16) + 1.0f;
+                        *(int *)(v7 + 0x18) = *(int *)(v7 + 16);
+                    }
                 }
             }
             break;
@@ -7577,7 +7884,7 @@ lbl_131:
             int v288 = ((v5 & 0xF800) != 0) ? (((unsigned char)v5 & 7) + 8) * (1 << (((unsigned char)v5 >> 3) - 1)) : ((unsigned char)v5 & 7);
             int v289 = (((v5 >> 17) & 0xF8) != 0) ? (((unsigned char)(v5 >> 17) & 7) + 8) * (1 << (((unsigned char)(v5 >> 17) >> 3) - 1)) : ((v5 >> 17) & 7);
             int proto = *(int *)(*(int *)(*Size + 212) + 4 * (unsigned __int16)(v287 >> 8) - 4);
-            int v290 = KoreMakeStructInstance(table, proto, 0);
+            int v290 = KoreMakeStructInstance(table, proto, 0, 0);
             v4 = Size[8];
             *(int *)(v388 + v4) = v290;
             *(int *)(v388 + v4 + 4) = 12;
@@ -8248,59 +8555,1607 @@ void DestroyLuaModule(int luaModule)
 // copy; GetNetManager is canonical in netinit.h).
 static void *CNetManagerSlot1C(void *obj) { return *(void **)((char *)obj + 0x1C); }
 
-// Placeholder vtables for the Lua-environment members built by the stub
-// ctors below (the same trick as the g_CLoadingScreenVtable set): slot 0
-// must be a callable no-op so the deleting-dtor dispatch (vt[0](obj, 1))
-// in ReinitEngineLua and CGameEngineDestroy never dereferences an
-// unconstructed table.
-static void *g_CLuaManagerVtable[2]                = { (void *)F3StubRelease, 0 };
+// NTools base-class helpers (module-private copies of the gamethread.cpp
+// statics, the same pattern as netinit.cpp's CNetBaseClassDtor):
+// CBaseClassNonCopyableCtor (0x18984D0) / CBaseClassDtor (0x18984C0).
+// [NOT byte-identical] each -- they store the base-class vtable at its
+// original high VA, not present in this build.
+static void *g_NToolsCBaseClassNonCopyableVtable[1] = { 0 };
+static void *g_NToolsCBaseClassVtable[1]             = { 0 };
+static void *CBaseClassNonCopyableCtor(void *obj)
+{ *(void **)obj = g_NToolsCBaseClassNonCopyableVtable; return obj; }
+static void CBaseClassDtor(void *obj)
+{ *(void **)obj = g_NToolsCBaseClassVtable; }
+
+// sub_6F7F60 (0x6F7F60 - 0x6F844A) -- CLuaManagerImplCtor: the 708-byte
+// (0x2C4) CLuaManager implementation object (thiscall: the impl in ECX,
+// then the Lua module, the engine's +0x98 sorted map, and the back-pointer
+// to the CLuaManager).  +0 the Lua module, +4 the back-pointer, then the
+// script-table cluster: the four 4-byte owner wrappers (this+2 / this+9 /
+// this+16 / this+45), the 12- / 28-byte script-handle tables (this+28 /
+// this+35 / this+42 / this+56), 16 InitSharedSlot'd shared slots, five
+// Concurrency reader-writer locks, the two handle-map objects (sub_708370 /
+// sub_6ECEC0), the script-handle table (sub_18F5E10 over the Lua module),
+// the byte flags at +604..+611, and the sub_18F2DB0 (sub_6EF380) /
+// sub_18F2DA0 (sub_6EF390) registrations.  Remaining stub: the LHAlloc'd
+// block is left as LHAlloc leaves it and the whole init is skipped (the
+// CLuaManagerImplDtor stub pairs with it -- nothing constructed, nothing
+// released).
+static void *CLuaManagerImplCtor(void *obj, void *luaModule, void *sortedMap, void *manager)
+{ (void)luaModule; (void)sortedMap; (void)manager; return obj; }
+
+// sub_6F7680 (0x6F7680 - 0x6F7F60) -- CLuaManagerImplDtor: the impl
+// destructor -- zeroes +0 / +4, releases the +0x3C8 script-handle table
+// (vt[0](obj, 1)), the +0x24C / +0x22C handle maps (sub_707A60 / sub_70BE70
+// + LHFree), and walks the shared-slot / lock / owner-wrapper cluster in
+// reverse (sub_7088A0 / sub_70A460 / sub_707690 / sub_707570 / sub_7031C0 /
+// sub_55F120 / ReleaseSharedSlot / the SEH-block InterlockedDecrement
+// releases), LHFree'ing every member.  Remaining stub: no-op (pairs with
+// the CLuaManagerImplCtor stub above).
+static void CLuaManagerImplDtor(void *obj) { (void)obj; }
+
+// sub_70DB40 (0x70DB40 - 0x70DB7E) -- CLuaManagerDeletingDtor: the
+// CLuaManager vtable slot 0 (the one-slot 0x1AF41A4 vtable) -- release the
+// +4 impl (CLuaManagerImplDtor + LHFree) when set, clear it, CBaseClassDtor,
+// and LHFree the 8-byte wrapper when the free-flag bit 0 is set.
+// [NOT byte-identical] placement-dependent (relative calls to
+// CLuaManagerImplDtor / CBaseClassDtor / LHFree).
+//
+//  void *CLuaManagerDeletingDtor(void *obj, int freeIt)
+static void *CLuaManagerDeletingDtor(void *obj, int freeIt)
+{
+    void **impl = (void **)((char *)obj + 4);
+    if (*impl != 0)
+    {
+        CLuaManagerImplDtor(*impl);
+        LHFree(*impl);
+    }
+    *impl = 0;
+    CBaseClassDtor(obj);
+    if (freeIt & 1)
+        LHFree(obj);
+    return obj;
+}
+
+// The CLuaManager vtable (0x1AF41A4 in the original -- a one-slot table
+// holding the deleting-dtor, followed immediately by rdata strings).  The
+// CEntityScriptHandleManager vtable is still the placeholder (the same
+// trick as the g_CLoadingScreenVtable set): slot 0 a callable no-op so the
+// deleting-dtor dispatch (vt[0](obj, 1)) in ReinitEngineLua and
+// CGameEngineDestroy never dereferences an unconstructed table.
+static void *g_CLuaManagerVtable[2]                = { (void *)CLuaManagerDeletingDtor, 0 };
 static void *g_CEntityScriptHandleManagerVtable[2] = { (void *)F3StubRelease, 0 };
 
-// sub_6F9890 (0x6F9890 - 0x6F98F2) -- CLuaManagerCtor: CBaseClassNon
-// CopyableCtor, store &CLuaManager::`vftable', zero the +4 impl slot,
-// LHAlloc(708) + build the impl via sub_6F7F60(luaModule, sortedMap).
-// Remaining stub: store the placeholder vtable + zero the impl slot.
+// ============================================================
+//  CLuaManagerCtor  (0x6F9890 - 0x6F98F2)  -- the 8-byte CLuaManager ctor
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  CBaseClassNonCopyableCtor / LHAlloc / CLuaManagerImplCtor /
+//  CLuaManagerImplDtor) and it references the high-VA CLuaManager::
+//  `vftable' (0x1AF41A4).
+//
+//  void *CLuaManagerCtor(void *obj, void *luaModule, void *sortedMap)
+//
+//  thiscall + `retn 8` in the original: the 8-byte wrapper in ECX, the
+//  Lua module (the 1032-byte "Fable 3" block) as stack arg 0 and the
+//  engine's +0x98 sorted map as stack arg 1.  It builds the wrapper:
+//  CBaseClassNonCopyableCtor base init, the CLuaManager vtable, the +4
+//  impl slot zeroed, then LHAlloc(708) (0x2C4) + CLuaManagerImplCtor
+//  (sub_6F7F60) building the impl over (luaModule, sortedMap, this) -- a
+//  null allocation leaves the slot empty.  If the +4 slot held an old
+//  impl it is released (CLuaManagerImplDtor sub_6F7680 + LHFree) -- dead
+//  here since the slot was just zeroed.  ReinitEngineLua (0x61A4F5) is
+//  the sole caller.  The 8-byte wrapper is freed by the deleting-dtor
+//  (CLuaManagerDeletingDtor, the vtable slot 0) with free-flag 1.
+// ============================================================
 static void *CLuaManagerCtor(void *obj, void *luaModule, void *sortedMap)
-{ (void)luaModule; (void)sortedMap;
-  *(void **)obj = g_CLuaManagerVtable; *(void **)((char *)obj + 4) = 0; return obj; }
+{
+    CBaseClassNonCopyableCtor(obj);
+    *(void **)obj = g_CLuaManagerVtable;        // CLuaManager::`vftable' (0x1AF41A4)
+    void *impl    = LHAlloc(708);               // 0x2C4
+    *(void **)((char *)obj + 4) = 0;
+    void *newImpl = (impl != 0) ? CLuaManagerImplCtor(impl, luaModule, sortedMap, obj)
+                                : 0;
+    if (*(void **)((char *)obj + 4) != 0)
+    {
+        CLuaManagerImplDtor(*(void **)((char *)obj + 4));
+        LHFree(*(void **)((char *)obj + 4));
+    }
+    *(void **)((char *)obj + 4) = newImpl;
+    return obj;
+}
+
+// ============================================================
+//  The six VM-internal callees of CLuaManagerImplRunSerialiseScript.  All are
+//  deep VM / Kore / localisation internals (out of scope for this module), so
+//  each is a documented no-op stub -- the same pattern as the
+//  CLuaManagerImplCtor / CLuaManagerImplDtor stubs above.  Each keeps its
+//  original IDA address in the comment.
+// ============================================================
+
+// sub_56DFD0 (0x56DFD0 - 0x56E023) -- GetWideStringHash: the cached FNV-1a
+// 32-bit hash of a wide path string, stored in the string's own +28 word.  The
+// original returns the cached hash at +28; when it is 0 and the +20 length is
+// non-zero it computes sub_56DFA0 (FNV-1a, offset basis 0x81000005) over the
+// string's data (the SSO buffer at +4, or the heap pointer, up to 0x800 wchars
+// via wcsnlen), caches and returns it (0 for an empty string).  VM-internal --
+// out of scope.  Stub: returns 0 (empty/uncached).
+static int GetWideStringHash(const F3WString *s) { (void)s; return 0; }
+
+// sub_180AF10 (0x180AF10 - 0x180AF64) -- ScriptHashHasError: test a Lua script
+// hash for a recorded error.  The original builds a small stack query
+// ({0, 0, hash, 0}, count 7) and virtual-calls the +48 slot of the global
+// table object (dword_1E2D864), freeing the local buffer (LHFree) when it grew
+// past 8, and returns the 0/1 result byte.  VM-internal -- out of scope.
+// Stub: returns 0 (no error, so the caller's error branch is not taken).
+static int ScriptHashHasError(int hash) { (void)hash; return 0; }
+
+// sub_629660 (0x629660 - 0x629732) -- LogScriptError: report an error against a
+// Lua module.  The original builds a localised message (sub_17FDC40 +
+// sub_17FE290(a2, 1, 2)), and when it resolves (sub_17FDD60 / sub_17FDD50 /
+// sub_17FDD90 / sub_17FDE20) emits it via sub_6281C0(luaModule, fmt, arg, a2)
+// (the 3rd arg a3 is the fully-formed message slot, cf. the sibling
+// RunLuaStartupScripts, sub_616710, which calls sub_629660(lua, path, msg)).
+// Returns that result byte.  VM-internal -- out of scope.  Stub: returns 0.
+static int LogScriptError(int luaModule, F3SharedBuffer **pathSlot, F3SharedBuffer **msgSlot)
+{ (void)luaModule; (void)pathSlot; (void)msgSlot; return 0; }
+
+// sub_6F0BF0 (0x6F0BF0 - 0x6F0D12) -- CLuaManagerImplInitialisePermanents:
+// initialise the "Permanents" save/load tables for the serialise run:
+// sub_67C390(luaModule) over the impl's +0, then look up the
+// "InitialisePermanentsSaveTable" / "InitialisePermanentsLoadTable" entries
+// (sub_700140) and, when present, run them (sub_6FD290), releasing the looked-
+// up slots + the SEH-block references (InterlockedDecrement + LHFree).  thiscall
+// (the impl in ECX).  VM-internal -- out of scope.  Stub.
+static void CLuaManagerImplInitialisePermanents(void *impl) { (void)impl; }
+
+// sub_6F9690 (0x6F9690 - 0x6F978B) -- CLuaManagerImplInitialiseSerialise:
+// run the ~30 per-component serialise initialisers in sequence (sub_6F87C0,
+// sub_E60EB0, sub_62CD50, sub_629910, sub_629AD0, sub_637B20, sub_6E9A10, ...,
+// sub_E9AAA0, sub_A13350) over the impl's +0; returns the last one's eax.
+// thiscall (the impl in ECX).  VM-internal -- out of scope.  Stub: returns 0.
+static int CLuaManagerImplInitialiseSerialise(void *impl) { (void)impl; return 0; }
+
+// sub_627FC0 (0x627FC0 - 0x6280FA) -- KoreModulePacing: pace / throttle a Kore
+// module: build a local guard object (sub_1A22480
+// over stru_1DC4B40), set byte_1DBDB9C = 1, read param 3 (KoreModuleSetParam),
+// and -- when the flag is set or the param exceeds 1.1x the cached
+// dword_1C8B12C -- stamp the engine time (GetEngineTime) and reset params 2 / 0
+// / 3; otherwise set param 5 (250) in a busy-wait until GetEngineTime() +
+// dbl_1C8B100 elapses (param 5 = 250), then clear byte_1DBDB9C and release the
+// guard (sub_1A22460).  cdecl (the Kore module in a1, the flag in a2).  VM-
+// internal -- out of scope.  Stub.
+static void KoreModulePacing(int koreModule, int flag) { (void)koreModule; (void)flag; }
+
+// sub_6F9790 (0x6F9790 - 0x6F9875) -- CLuaManagerImplRunSerialiseScript:
+// the impl method the CLuaManager::RunSerialiseScript wrapper (0x6F9880)
+// forwards to -- the impl object is the CLuaManager's +4 slot (thiscall).  It
+// builds the serialise-script path (SharedSlotConcat of the two serialise-
+// script globals g_dword_1DBE2B0 / g_dword_1DC2680), converts it to wide
+// (F3WStringFromAnsi), hashes it (GetWideStringHash, sub_56DFD0) and tests the
+// hash for a recorded error (ScriptHashHasError, sub_180AF10); on an error it
+// builds the message "Lua serialise script \"<path>\" has an error in it"
+// (SharedSlotConcatLiteral + MakeSettingsFilePath) and logs it (LogScriptError,
+// sub_629660, over *impl / the impl's +0 + the path slot + the message slot),
+// releasing the two message slots.  It then finalises the run with
+// CLuaManagerImplInitialisePermanents(impl) (sub_6F0BF0) /
+// CLuaManagerImplInitialiseSerialise(impl) (sub_6F9690) /
+// KoreModulePacing(*impl, 1) (sub_627FC0), frees the wide string's heap
+// buffer (when it grew past the SSO), and releases the path slot -- the return
+// value is that slot's new live-slot count (ReleaseSharedSlot's eax).  Sole
+// caller: the CLuaManagerRunSerialiseScript wrapper (0x6F9883).
+// [NOT byte-identical] placement-dependent (the relative calls to the shared-
+// slot / wide-string / release helpers + the __security_check_cookie) and it
+// reads the high-VA serialise-script globals; the six VM-internal callees are
+// the documented no-op stubs above.
+//
+//  int CLuaManagerImplRunSerialiseScript(void *impl)
+static int CLuaManagerImplRunSerialiseScript(void *impl)
+{
+    F3SharedBuffer *pathSlot = 0;   // the serialise-script path (v12)
+    F3SharedBuffer *litSlot  = 0;   // "Lua serialise script \"<path>"  (v9)
+    F3SharedBuffer *msgSlot  = 0;   // the full error message          (v8)
+    F3WString       wstr;           // the wide path, 36 bytes         (v10 / v11)
+
+    // Build the serialise-script path from the two global slots.
+    SharedSlotConcat(&pathSlot, &g_dword_1DBE2B0, &g_dword_1DC2680);
+    const char *pathStr = GetSlotString(&pathSlot);
+
+    // Convert to wide, hash it, and test the hash for a recorded error.
+    F3WStringFromAnsi(&wstr, pathStr);
+    int hash     = GetWideStringHash(&wstr);
+    int hasError = ScriptHashHasError(hash);
+
+    // Drop the wide string's heap buffer when it grew past the SSO.
+    if (wstr.cap >= 8)
+        LHFree((void *)wstr.u.ptr);
+
+    // On an error, log "Lua serialise script \"<path>\" has an error in it".
+    if (hasError != 0)
+    {
+        SharedSlotConcatLiteral(&litSlot, "Lua serialise script \"", &pathSlot);
+        MakeSettingsFilePath(&msgSlot, &litSlot, "\" has an error in it");
+        LogScriptError(*(int *)impl, &pathSlot, &msgSlot);
+        ReleaseSharedSlot(&msgSlot);
+        ReleaseSharedSlot(&litSlot);
+    }
+
+    // Finalise the run.
+    CLuaManagerImplInitialisePermanents(impl);    // sub_6F0BF0
+    CLuaManagerImplInitialiseSerialise(impl);     // sub_6F9690
+    KoreModulePacing(*(int *)impl, 1);            // sub_627FC0
+
+    // Release the path slot; return its new live-slot count.
+    return (int)ReleaseSharedSlot(&pathSlot);
+}
 
 // sub_6F9880 (0x6F9880 - 0x6F9888) -- CLuaManagerRunSerialiseScript:
-// forward to the impl (sub_6F9790: the "Lua serialise script ... has an
-// error in it" path check + sub_6F0BF0 / sub_6F9690 / sub_627FC0).
-// Remaining stub.
-static void CLuaManagerRunSerialiseScript(void *obj) { (void)obj; }
+// the 8-byte CLuaManager wrapper (thiscall: the 8-byte wrapper in ECX) that
+// forwards to the impl: `mov ecx, [ecx+4]; jmp sub_6F9790` -- i.e. tail-call
+// CLuaManagerImplRunSerialiseScript on the CLuaManager's +4 impl slot and
+// return its eax.  ReinitEngineLua (0x61A51A) is the sole caller (the return
+// value is discarded).
+// [NOT byte-identical] placement-dependent (the relative `jmp` to
+// CLuaManagerImplRunSerialiseScript is a 32-bit displacement that depends on
+// where the thunk lands).
+//
+//  int CLuaManagerRunSerialiseScript(void *obj)
+static int CLuaManagerRunSerialiseScript(void *obj)
+{ return CLuaManagerImplRunSerialiseScript(*(void **)((char *)obj + 4)); }
 
-// sub_6169D0 (0x6169D0 - 0x6171A5) -- RegisterEngineLuaFunctions:
-// register the ~40 engine Set*/Get* Lua functions (SetApplicationName,
-// SetScreenResolution, SetInitialWorldName, ..., GetDemoMode) on the
-// Lua module.  Remaining stub.
-static void RegisterEngineLuaFunctions(int luaModule) { (void)luaModule; }
+// ============================================================================
+//  RegisterEngineLuaFunctions  (0x6169D0 - 0x6171A5) and its 100 engine Lua
+//  builtin wrappers (0x615B30 - 0x6169C0)
+//
+//  RegisterEngineLuaFunctions(luaModule) -- called from ReinitEngineLua
+//  (0x61A526) on the freshly built Lua module -- installs the 100 engine
+//  Set*/Get* Lua builtins (SetApplicationName, SetScreenResolution,
+//  SetInitialWorldName, ..., SpotCheckSuccessful_6) on the module's
+//  global table.  It first builds a 2-dword "GlobalTable" accessor on the
+//  caller's stack (EngineLuaGlobalTable, sub_67C390), then for every
+//  builtin calls the signature-matched registration helper (one of the
+//  11 sub_6182xx/618x.. variants below: 124 bytes each, identical except
+//  for the upvalue-marshalling function sub_617AD0..sub_618790 handed to
+//  KoreRegisterBuiltinClosure) with ("LuaName", wrapper-fn) -- each helper
+//  reserves 8 bytes on the VM value stack, writes the wrapper pointer,
+//  installs the builtin closure, stores the name in the global table
+//  (sub_67C540) and registers it with the builtin-name registry
+//  (KoreRegisterBuiltinName, -2).  The tail releases the accessor's
+//  refcounted control block (InterlockedDecrement; on zero, dispatch its
+//  release callback + LHFree).  All the registration machinery is VM-
+//  internal (Kore VM builtin-closure / global-table code) -- the helpers
+//  are documented no-op stubs.  [NOT byte-identical] placement-dependent
+//  (100+ relative calls) and it references the high-VA .rdata name
+//  strings + the high-VA engine state globals below.
+//
+//  The 100 wrapper functions (0x615B30 - 0x6169C0) are the engine
+//  implementations of the builtins: tiny C functions named for their Lua
+//  name, backed by the engine Lua state globals 0x1DBD01C-0x1DBD118
+//  (flags + shared-name slots) and 0x1C86BD5-0x1C86C58 (renderer /
+//  spot-check state).  SetUseRetailFrontEnd / SetToCreateNewSaveFilePerSave
+//  / SetFrontEndDemoMode register one-byte `retn` no-ops (nullsub_6 / 5 / 4).
+//  SetLevelNameStartsWithACS (sub_6166C0) is also called from code
+//  (sub_677010, 0x677151); AddAudioBank (sub_616910) likewise (sub_71A230,
+//  0x71A33B).
+// ============================================================================
 
-// sub_616710 (0x616710 - 0x616894) -- RunLuaStartupScripts: run the
-// startup .lua script (error path "Lua startup script has an error in
-// it" via sub_629660) plus the optional per-locale startup scripts.
-// Remaining stub.
-static void RunLuaStartupScripts(int luaModule, int scriptPath)
-{ (void)luaModule; (void)scriptPath; }
+// ---- the engine Lua builtin state globals -------------------------------
+// 0x1DBD048-0x1DBD0D0: the engine Lua name slots (F3SharedBuffer*) --
+// application/level/scenario/start-point names for the initial, GUI, PVP
+// and front-end contexts, the hero / henchman setup, the script names and
+// the gameflow state (shared with the frontend: gamemain.cpp keeps its own
+// module-local copy of the 0x1DBD048 object).
+static F3SharedBuffer *g_slot_1DBD048 = 0;   // 0x1DBD048: ApplicationName
+static F3SharedBuffer *g_slot_1DBD04C = 0;   // 0x1DBD04C: AIScriptName
+static F3SharedBuffer *g_slot_1DBD050 = 0;   // 0x1DBD050: CameraScriptName
+static F3SharedBuffer *g_slot_1DBD054 = 0;   // 0x1DBD054: QuestScriptName
+static F3SharedBuffer *g_slot_1DBD058 = 0;   // 0x1DBD058: GeneralSetupScriptName
+static F3SharedBuffer *g_slot_1DBD05C = 0;   // 0x1DBD05C: InitialWorldName
+static F3SharedBuffer *g_slot_1DBD060 = 0;   // 0x1DBD060: InitialLevelName
+static F3SharedBuffer *g_slot_1DBD064 = 0;   // 0x1DBD064: InitialScenarioName
+static F3SharedBuffer *g_slot_1DBD068 = 0;   // 0x1DBD068: InitialStartPointName
+static F3SharedBuffer *g_slot_1DBD06C = 0;   // 0x1DBD06C: InitialSaveGameName
+static F3SharedBuffer *g_slot_1DBD070 = 0;   // 0x1DBD070: InitialClientSaveGameName
+static F3SharedBuffer *g_slot_1DBD074 = 0;   // 0x1DBD074: GUIWorldName
+static F3SharedBuffer *g_slot_1DBD078 = 0;   // 0x1DBD078: GUILevelName
+static F3SharedBuffer *g_slot_1DBD07C = 0;   // 0x1DBD07C: GUIScenarioName
+static F3SharedBuffer *g_slot_1DBD080 = 0;   // 0x1DBD080: GUIStartPointName
+static F3SharedBuffer *g_slot_1DBD084 = 0;   // 0x1DBD084: PVPWorldName
+static F3SharedBuffer *g_slot_1DBD088 = 0;   // 0x1DBD088: PVPLevelName
+static F3SharedBuffer *g_slot_1DBD08C = 0;   // 0x1DBD08C: PVPScenarioName
+static F3SharedBuffer *g_slot_1DBD090 = 0;   // 0x1DBD090: PVPStartPointName
+static F3SharedBuffer *g_slot_1DBD094 = 0;   // 0x1DBD094: FrontEndWorldName
+static F3SharedBuffer *g_slot_1DBD098 = 0;   // 0x1DBD098: FrontEndLevelName
+static F3SharedBuffer *g_slot_1DBD09C = 0;   // 0x1DBD09C: FrontEndScenarioName
+static F3SharedBuffer *g_slot_1DBD0A0 = 0;   // 0x1DBD0A0: FrontEndStartPointName
+static F3SharedBuffer *g_unk_1DBD0A4 = 0;    // 0x1DBD0A4: ControlSystemRecordName
+static F3SharedBuffer *g_slot_1DBD0A8 = 0;   // 0x1DBD0A8: InitialHeroEntityName
+static F3SharedBuffer *g_slot_1DBD0AC = 0;   // 0x1DBD0AC: InitialHenchmanEntityName
+static F3SharedBuffer *g_slot_1DBD0B0 = 0;   // 0x1DBD0B0: InitialHeroMeleeWeapon
+static F3SharedBuffer *g_slot_1DBD0B4 = 0;   // 0x1DBD0B4: InitialHeroRangedWeapon
+static F3SharedBuffer *g_slot_1DBD0B8 = 0;   // 0x1DBD0B8: InitialHenchmanMeleeWeapon
+static F3SharedBuffer *g_slot_1DBD0BC = 0;   // 0x1DBD0BC: InitialHenchmanRangedWeapon
+static F3SharedBuffer *g_slot_1DBD0C0 = 0;   // 0x1DBD0C0: InitialHeroScriptTypeIdentifier
+static F3SharedBuffer *g_slot_1DBD0C4 = 0;   // 0x1DBD0C4: OverriddenDogCharacterRecordName
+static F3SharedBuffer *g_slot_1DBD0C8 = 0;   // 0x1DBD0C8: OverriddenClientDogCharacterRecordName
+static F3SharedBuffer *g_slot_1DBD0CC = 0;   // 0x1DBD0CC: GameflowScriptEnum
+static F3SharedBuffer *g_slot_1DBD0D0 = 0;   // 0x1DBD0D0: GameflowScriptState
+// 0x1DBD0EC: the level-name slot SetLevelNameStartsWithACS copies the arg
+// slot over (the "ACS"-prefix level fallback name).
+static F3SharedBuffer *g_slot_1DBD0EC = 0;   // 0x1DBD0EC: level name slot
+// 0x1DBD104 / 0x1DBD118 / 0x1DBD11C: the optional-startup-script list
+// (head node, tail node, tail's next pointer) appended by
+// AddOptionalStartupScript (sub_55EAF0 list nodes, 12 bytes each).
+static int g_list_1DBD104 = 0;   // 0x1DBD104: optional startup-script list head node
+static int g_list_1DBD118 = 0;   // 0x1DBD118: list tail node
+static int g_list_1DBD11C = 0;   // 0x1DBD11C: tail node's next pointer
+// 0x1DBDD4C: the Kore VM core object SetLevelNameStartsWithACS probes
+// (sub_673C50 returns it; 0 = no live VM).
+static int g_dword_1DBDD4C = 0;   // 0x1DBDD4C: the Kore VM core object
+// 0x1DBD0F0: the audio-bank registry AddAudioBank adds banks into
+// (sub_619520's this object).
+static int g_unk_1DBD0F0 = 0;     // 0x1DBD0F0: the audio-bank registry object
 
-// sub_6E9620 (0x6E9620 - 0x6E96DF) -- CEntityScriptHandleManagerCtor:
-// the 80-byte object (&CEntityScriptHandleManager::`vftable') with
-// +0x4C = -2 and +0x50 = the Lua module, wiring the Lua references.
-// Remaining stub: store the placeholder vtable + zero the rest.
-static void *CEntityScriptHandleManagerCtor(void *obj, void *luaModule)
-{ (void)luaModule;
-  *(void **)obj = g_CEntityScriptHandleManagerVtable;
-  memset((char *)obj + 4, 0, 76);
-  return obj; }
+// 0x1C86BD5-0x1C86C58: the engine Lua renderer / gameplay flags and the
+// SpotCheck expected/actual pairs.  (byte_1DBD02A / byte_1DBD02B live in
+// the word g_word_1DBD02A already declared with the VM globals above.)
+static unsigned char g_byte_1DBD019 = 0;    // 0x1DBD019: SetOpeningLoadingScreen
+static unsigned char g_byte_1DBD01C = 0;    // 0x1DBD01C: SetAllowAllSkipStates
+static unsigned char g_byte_1DBD01D = 0;    // 0x1DBD01D: IsToStartGameflow
+static unsigned char g_byte_1DBD01E = 0;    // 0x1DBD01E: IsToStartPVPMode
+static int           g_dword_1DBD020 = 0;   // 0x1DBD020: GetDemoMode
+static unsigned char g_byte_1DBD036 = 0;    // 0x1DBD036: GetDifficultySetToHard
+static unsigned char g_byte_1DBD03F = 0;    // 0x1DBD03F: (set/get)LiveFunctionalityDisabled
+static unsigned char g_byte_1C86BD5 = 0;    // 0x1C86BD5: SetStartMusicAndAtmosOnLevelLoad
+static unsigned char g_byte_1C86BD9 = 0;    // 0x1C86BD9: GetUseRetailFrontEnd
+static unsigned char g_byte_1C86BDF = 0;    // 0x1C86BDF: SetVSync
+static int           g_dword_1C86BE0 = 0;   // 0x1C86BE0: GetMillisecondsToWaitForLuaDebugger
+static int           g_dword_1C86BF0 = 0;   // 0x1C86BF0: SetVSyncThreshold
+static int           g_dword_1C86BF4 = 0;   // 0x1C86BF4: SetMSToShowLegalScreen
+static int           g_dword_1C86C08 = 0;   // 0x1C86C08: SetPresentationInterval
+static unsigned char g_byte_1C86C0F = 0;    // 0x1C86C0F: SetDoFinalMarketplaceOfferCheck
+static unsigned char g_byte_1C86C15 = 0;    // 0x1C86C15: SetDevFrontendSignin
+static unsigned char g_byte_1C86C16 = 0;    // 0x1C86C16: SetAllowMultiplayerJoining
+static int           g_dword_1C86C18[12] = { 0 };  // 0x1C86C18-0x1C86C48: 6 SpotCheck expected/actual pairs
+static int           g_dword_1C86C54 = 0;   // 0x1C86C54: screen width (Set/GetScreenResolution)
+static int           g_dword_1C86C58 = 0;   // 0x1C86C58: screen height
+
+// ----------------------------------------------------------------
+//  The 11 builtin registration helpers (all 0x618290 + n*0x80, 124 bytes
+//  each).  Shared body (thiscall on the 2-dword GlobalTable accessor,
+//  ("LuaName", wrapper-fn) on the stack): when the accessor's +0 is set,
+//  reserve 8 bytes on the VM value stack (sub_5DF650 + sub_5DC450), memcpy
+//  the wrapper pointer in, KoreRegisterBuiltinClosure(vm, <upvalue fn>, 1)
+//  (the upvalue fn sub_617AD0..sub_618790 marshals the Lua args -- a string
+//  to a shared slot, a bool, a float, ... -- per the builtin's signature),
+//  sub_67C540 (hash the name + store it in the global table),
+//  KoreRegisterBuiltinName(vm, -2, name), then roll the stack back.  VM-
+//  internal -- out of scope; no-op stubs (the 11 variants differ ONLY in
+//  the upvalue-marshalling function they hand KoreRegisterBuiltinClosure).
+// ----------------------------------------------------------------
+static void   EngineLuaGlobalTable(int *obj, int luaModule) { (void)obj; (void)luaModule; }   // sub_67C390
+static void   EngineLuaRegisterString(int *obj, const char *name, void *fn) { (void)obj; (void)name; (void)fn; }   // sub_618290 (upvalue sub_617AD0: one string arg)
+static void   EngineLuaRegisterPair(int *obj, const char *name, void *fn) { (void)obj; (void)name; (void)fn; }     // sub_618310 (upvalue sub_617B40: two string args)
+static void   EngineLuaRegisterBoolGet(int *obj, const char *name, void *fn) { (void)obj; (void)name; (void)fn; }  // sub_618390 (upvalue sub_617BC0: no args -> bool)
+static void   EngineLuaRegisterNumGet(int *obj, const char *name, void *fn) { (void)obj; (void)name; (void)fn; }   // sub_618410 (upvalue sub_617C10: no args -> number)
+static void   EngineLuaRegisterFlagSet(int *obj, const char *name, void *fn) { (void)obj; (void)name; (void)fn; }  // sub_618490 (upvalue sub_617C60: one bool/nil arg)
+static void   EngineLuaRegisterPairGet(int *obj, const char *name, void *fn) { (void)obj; (void)name; (void)fn; }  // sub_618510 (upvalue sub_617CD0: no args -> two numbers)
+static void   EngineLuaRegisterIntGet(int *obj, const char *name, void *fn) { (void)obj; (void)name; (void)fn; }   // sub_618590 (upvalue sub_617D40: no args -> number)
+static void   EngineLuaRegisterNoopSet(int *obj, const char *name, void *fn) { (void)obj; (void)name; (void)fn; }  // sub_618610 (upvalue sub_617D90: one bool arg, no-op body)
+static void   EngineLuaRegisterIntSet(int *obj, const char *name, void *fn) { (void)obj; (void)name; (void)fn; }   // sub_618690 (upvalue sub_617E00: one number arg)
+static void   EngineLuaRegisterMultiSet(int *obj, const char *name, void *fn) { (void)obj; (void)name; (void)fn; } // sub_618710 (upvalue sub_617E70: several args)
+static void   EngineLuaRegisterStringGet(int *obj, const char *name, void *fn) { (void)obj; (void)name; (void)fn; }// sub_6189D0 (upvalue sub_618790: no args -> string)
+
+// ----------------------------------------------------------------
+//  The 100 engine Lua builtin wrappers (named for their Lua function;
+//  only referenced as the function pointers the registration list pushes).
+// ----------------------------------------------------------------
+
+// ---- 1-string-arg name setters: CopySharedSlot(&engineSlot, argSlot) ----
+// sub_615B30 (0x615B30 - 0x615B40) -- SetApplicationName: copy the arg slot into the ApplicationName slot.
+static F3SharedBuffer **SetApplicationName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD048, arg); }
+// sub_615B80 (0x615B80 - 0x615B90) -- SetInitialWorldName.
+static F3SharedBuffer **SetInitialWorldName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD05C, arg); }
+// sub_615B90 (0x615B90 - 0x615BA0) -- SetInitialLevelName.
+static F3SharedBuffer **SetInitialLevelName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD060, arg); }
+// sub_615BA0 (0x615BA0 - 0x615BB0) -- SetInitialScenarioName.
+static F3SharedBuffer **SetInitialScenarioName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD064, arg); }
+// sub_615BB0 (0x615BB0 - 0x615BC0) -- SetInitialStartPointName.
+static F3SharedBuffer **SetInitialStartPointName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD068, arg); }
+// sub_615BC0 (0x615BC0 - 0x615BD0) -- SetInitialSaveGameName.
+static F3SharedBuffer **SetInitialSaveGameName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD06C, arg); }
+// sub_615BD0 (0x615BD0 - 0x615BE0) -- SetInitialClientSaveGameName.
+static F3SharedBuffer **SetInitialClientSaveGameName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD070, arg); }
+// sub_615BE0 (0x615BE0 - 0x615BF0) -- SetGameflowScriptEnum.
+static F3SharedBuffer **SetGameflowScriptEnum(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD0CC, arg); }
+// sub_615BF0 (0x615BF0 - 0x615C00) -- SetGameflowScriptState.
+static F3SharedBuffer **SetGameflowScriptState(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD0D0, arg); }
+// sub_615C00 (0x615C00 - 0x615C10) -- SetGUIWorldName.
+static F3SharedBuffer **SetGUIWorldName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD074, arg); }
+// sub_615C10 (0x615C10 - 0x615C20) -- SetGUILevelName.
+static F3SharedBuffer **SetGUILevelName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD078, arg); }
+// sub_615C20 (0x615C20 - 0x615C30) -- SetGUIScenarioName.
+static F3SharedBuffer **SetGUIScenarioName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD07C, arg); }
+// sub_615C30 (0x615C30 - 0x615C40) -- SetGUIStartPointName.
+static F3SharedBuffer **SetGUIStartPointName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD080, arg); }
+// sub_615C40 (0x615C40 - 0x615C50) -- SetPVPWorldName.
+static F3SharedBuffer **SetPVPWorldName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD084, arg); }
+// sub_615C50 (0x615C50 - 0x615C60) -- SetPVPLevelName.
+static F3SharedBuffer **SetPVPLevelName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD088, arg); }
+// sub_615C60 (0x615C60 - 0x615C70) -- SetPVPScenarioName.
+static F3SharedBuffer **SetPVPScenarioName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD08C, arg); }
+// sub_615C70 (0x615C70 - 0x615C80) -- SetPVPStartPointName.
+static F3SharedBuffer **SetPVPStartPointName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD090, arg); }
+// sub_615C80 (0x615C80 - 0x615C90) -- SetFrontEndWorldName.
+static F3SharedBuffer **SetFrontEndWorldName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD094, arg); }
+// sub_615C90 (0x615C90 - 0x615CA0) -- SetFrontEndLevelName.
+static F3SharedBuffer **SetFrontEndLevelName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD098, arg); }
+// sub_615CA0 (0x615CA0 - 0x615CB0) -- SetFrontEndScenarioName.
+static F3SharedBuffer **SetFrontEndScenarioName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD09C, arg); }
+// sub_615CB0 (0x615CB0 - 0x615CC0) -- SetFrontEndStartPointName.
+static F3SharedBuffer **SetFrontEndStartPointName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD0A0, arg); }
+// sub_615FC0 (0x615FC0 - 0x615FD0) -- SetInitialHeroEntityName.
+static F3SharedBuffer **SetInitialHeroEntityName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD0A8, arg); }
+// sub_615FD0 (0x615FD0 - 0x615FE0) -- SetInitialHenchmanEntityName.
+static F3SharedBuffer **SetInitialHenchmanEntityName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD0AC, arg); }
+// sub_615FE0 (0x615FE0 - 0x615FF0) -- SetInitialHeroMeleeWeapon.
+static F3SharedBuffer **SetInitialHeroMeleeWeapon(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD0B0, arg); }
+// sub_615FF0 (0x615FF0 - 0x616000) -- SetInitialHeroRangedWeapon.
+static F3SharedBuffer **SetInitialHeroRangedWeapon(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD0B4, arg); }
+// sub_616000 (0x616000 - 0x616010) -- SetInitialHenchmanMeleeWeapon.
+static F3SharedBuffer **SetInitialHenchmanMeleeWeapon(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD0B8, arg); }
+// sub_616010 (0x616010 - 0x616020) -- SetInitialHenchmanRangedWeapon.
+static F3SharedBuffer **SetInitialHenchmanRangedWeapon(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD0BC, arg); }
+// sub_616020 (0x616020 - 0x616030) -- SetInitialHeroScriptTypeIdentifier.
+static F3SharedBuffer **SetInitialHeroScriptTypeIdentifier(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD0C0, arg); }
+// sub_616030 (0x616030 - 0x616040) -- SetOverriddenDogCharacterRecordName.
+static F3SharedBuffer **SetOverriddenDogCharacterRecordName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD0C4, arg); }
+// sub_616040 (0x616040 - 0x616050) -- SetOverriddenClientDogCharacterRecordName.
+static F3SharedBuffer **SetOverriddenClientDogCharacterRecordName(F3SharedBuffer **arg) { return CopySharedSlot(&g_slot_1DBD0C8, arg); }
+// sub_6166A0 (0x6166A0 - 0x6166B5) -- SetScreenResolution: store (width, height) from the 2-dword arg.
+static void SetScreenResolution(int *out) { g_dword_1C86C54 = out[0]; g_dword_1C86C58 = out[1]; }
+
+// ---- no-arg getters --------------------------------------------------------
+// sub_615D60 (0x615D60 - 0x615D65) -- IsToStartGameflow: byte_1DBD01D.
+static int IsToStartGameflow(void) { return (int)g_byte_1DBD01D; }
+// sub_615D70 (0x615D70 - 0x615D75) -- IsToStartPVPMode: byte_1DBD01E.
+static int IsToStartPVPMode(void) { return (int)g_byte_1DBD01E; }
+// sub_615D90 (0x615D90 - 0x615D95) -- GetDemoMode: dword_1DBD020.
+static int GetDemoMode(void) { return g_dword_1DBD020; }
+// sub_616070 (0x616070 - 0x616075) -- GetApplicationName: the ApplicationName slot.
+static F3SharedBuffer **GetApplicationName(void) { return &g_slot_1DBD048; }
+// sub_616080 (0x616080 - 0x616085) -- GetScreenResolution: write (width, height) into the 2-dword arg.
+static int *GetScreenResolution(int *out) { out[0] = g_dword_1C86C54; out[1] = g_dword_1C86C58; return out; }
+// sub_6160A0 (0x6160A0 - 0x6160A5) -- GetAIScriptName.
+static F3SharedBuffer **GetAIScriptName(void) { return &g_slot_1DBD04C; }
+// sub_6160B0 (0x6160B0 - 0x6160B5) -- GetCameraScriptName.
+static F3SharedBuffer **GetCameraScriptName(void) { return &g_slot_1DBD050; }
+// sub_6160C0 (0x6160C0 - 0x6160C5) -- GetQuestScriptName.
+static F3SharedBuffer **GetQuestScriptName(void) { return &g_slot_1DBD054; }
+// sub_6160D0 (0x6160D0 - 0x6160D5) -- GetGeneralSetupScriptName.
+static F3SharedBuffer **GetGeneralSetupScriptName(void) { return &g_slot_1DBD058; }
+// sub_6160E0 (0x6160E0 - 0x6160E5) -- GetInitialWorldName.
+static F3SharedBuffer **GetInitialWorldName(void) { return &g_slot_1DBD05C; }
+// sub_6160F0 (0x6160F0 - 0x6160F5) -- GetInitialLevelName.
+static F3SharedBuffer **GetInitialLevelName(void) { return &g_slot_1DBD060; }
+// sub_616100 (0x616100 - 0x616105) -- GetInitialScenarioName.
+static F3SharedBuffer **GetInitialScenarioName(void) { return &g_slot_1DBD064; }
+// sub_616110 (0x616110 - 0x616115) -- GetInitialStartPointName.
+static F3SharedBuffer **GetInitialStartPointName(void) { return &g_slot_1DBD068; }
+// sub_616120 (0x616120 - 0x616125) -- GetInitialSaveGameName.
+static F3SharedBuffer **GetInitialSaveGameName(void) { return &g_slot_1DBD06C; }
+// sub_616130 (0x616130 - 0x616135) -- GetInitialClientSaveGameName.
+static F3SharedBuffer **GetInitialClientSaveGameName(void) { return &g_slot_1DBD070; }
+// sub_616140 (0x616140 - 0x616145) -- GetGameflowScriptEnum.
+static F3SharedBuffer **GetGameflowScriptEnum(void) { return &g_slot_1DBD0CC; }
+// sub_616150 (0x616150 - 0x616155) -- GetGameflowScriptState.
+static F3SharedBuffer **GetGameflowScriptState(void) { return &g_slot_1DBD0D0; }
+// sub_616160 (0x616160 - 0x616165) -- GetGUIWorldName.
+static F3SharedBuffer **GetGUIWorldName(void) { return &g_slot_1DBD074; }
+// sub_616170 (0x616170 - 0x616175) -- GetGUILevelName.
+static F3SharedBuffer **GetGUILevelName(void) { return &g_slot_1DBD078; }
+// sub_616180 (0x616180 - 0x616185) -- GetGUIScenarioName.
+static F3SharedBuffer **GetGUIScenarioName(void) { return &g_slot_1DBD07C; }
+// sub_616190 (0x616190 - 0x616195) -- GetGUIStartPointName.
+static F3SharedBuffer **GetGUIStartPointName(void) { return &g_slot_1DBD080; }
+// sub_6161A0 (0x6161A0 - 0x6161A5) -- GetPVPWorldName.
+static F3SharedBuffer **GetPVPWorldName(void) { return &g_slot_1DBD084; }
+// sub_6161B0 (0x6161B0 - 0x6161B5) -- GetPVPLevelName.
+static F3SharedBuffer **GetPVPLevelName(void) { return &g_slot_1DBD088; }
+// sub_6161C0 (0x6161C0 - 0x6161C5) -- GetPVPScenarioName.
+static F3SharedBuffer **GetPVPScenarioName(void) { return &g_slot_1DBD08C; }
+// sub_6161D0 (0x6161D0 - 0x6161D5) -- GetPVPStartPointName.
+static F3SharedBuffer **GetPVPStartPointName(void) { return &g_slot_1DBD090; }
+// sub_6161E0 (0x6161E0 - 0x6161E5) -- GetFrontEndWorldName.
+static F3SharedBuffer **GetFrontEndWorldName(void) { return &g_slot_1DBD094; }
+// sub_6161F0 (0x6161F0 - 0x6161F5) -- GetFrontEndLevelName.
+static F3SharedBuffer **GetFrontEndLevelName(void) { return &g_slot_1DBD098; }
+// sub_616200 (0x616200 - 0x616205) -- GetFrontEndScenarioName.
+static F3SharedBuffer **GetFrontEndScenarioName(void) { return &g_slot_1DBD09C; }
+// sub_616210 (0x616210 - 0x616215) -- GetFrontEndStartPointName.
+static F3SharedBuffer **GetFrontEndStartPointName(void) { return &g_slot_1DBD0A0; }
+// sub_616230 (0x616230 - 0x616235) -- GetControlSystemRecordName.
+static F3SharedBuffer **GetControlSystemRecordName(void) { return &g_unk_1DBD0A4; }
+// sub_616240 (0x616240 - 0x616245) -- GetInitialHeroEntityName.
+static F3SharedBuffer **GetInitialHeroEntityName(void) { return &g_slot_1DBD0A8; }
+// sub_616250 (0x616250 - 0x616255) -- GetInitialHenchmanEntityName.
+static F3SharedBuffer **GetInitialHenchmanEntityName(void) { return &g_slot_1DBD0AC; }
+// sub_616260 (0x616260 - 0x616265) -- GetInitialHeroMeleeWeapon.
+static F3SharedBuffer **GetInitialHeroMeleeWeapon(void) { return &g_slot_1DBD0B0; }
+// sub_616270 (0x616270 - 0x616275) -- GetInitialHeroRangedWeapon.
+static F3SharedBuffer **GetInitialHeroRangedWeapon(void) { return &g_slot_1DBD0B4; }
+// sub_616280 (0x616280 - 0x616285) -- GetInitialHenchmanMeleeWeapon.
+static F3SharedBuffer **GetInitialHenchmanMeleeWeapon(void) { return &g_slot_1DBD0B8; }
+// sub_616290 (0x616290 - 0x616295) -- GetInitialHenchmanRangedWeapon.
+static F3SharedBuffer **GetInitialHenchmanRangedWeapon(void) { return &g_slot_1DBD0BC; }
+// sub_6162A0 (0x6162A0 - 0x6162A5) -- GetInitialHeroScriptTypeIdentifier.
+static F3SharedBuffer **GetInitialHeroScriptTypeIdentifier(void) { return &g_slot_1DBD0C0; }
+// sub_6162B0 (0x6162B0 - 0x6162B5) -- GetOverriddenDogCharacterRecordName.
+static F3SharedBuffer **GetOverriddenDogCharacterRecordName(void) { return &g_slot_1DBD0C4; }
+// sub_6162C0 (0x6162C0 - 0x6162C5) -- GetOverriddenClientDogCharacterRecordName.
+static F3SharedBuffer **GetOverriddenClientDogCharacterRecordName(void) { return &g_slot_1DBD0C8; }
+// sub_6162D0 (0x6162D0 - 0x6162D5) -- GetMillisecondsToWaitForLuaDebugger.
+static int GetMillisecondsToWaitForLuaDebugger(void) { return g_dword_1C86BE0; }
+// sub_6162E0 (0x6162E0 - 0x6162E5) -- IsReleaseBuild: always 1 in this build.
+static int IsReleaseBuild(void) { return 1; }
+// sub_6162F0 (0x6162F0 - 0x6162F5) -- GetUseRetailFrontEnd: byte_1C86BD9.
+static int GetUseRetailFrontEnd(void) { return (int)g_byte_1C86BD9; }
+// sub_616640 (0x616640 - 0x616645) -- IsLiveFunctionalityDisabled: byte_1DBD03F.
+static int IsLiveFunctionalityDisabled(void) { return (int)g_byte_1DBD03F; }
+// sub_616550 (0x616550 - 0x616555) -- GetDifficultySetToHard: byte_1DBD036.
+static int GetDifficultySetToHard(void) { return (int)g_byte_1DBD036; }
+
+// ---- the six SpotCheck expected/actual comparisons (each 0x12 bytes) ----
+// sub_616470 (0x616470 - 0x616482) -- SpotCheckSuccessful_1: dword_1C86C18 == dword_1C86C1C.
+static int SpotCheckSuccessful_1(void) { return g_dword_1C86C18[0] == g_dword_1C86C18[1]; }
+// sub_616490 (0x616490 - 0x6164A2) -- SpotCheckSuccessful_2: 0x1C86C20 == 0x1C86C24.
+static int SpotCheckSuccessful_2(void) { return g_dword_1C86C18[2] == g_dword_1C86C18[3]; }
+// sub_6164B0 (0x6164B0 - 0x6164C2) -- SpotCheckSuccessful_3: 0x1C86C28 == 0x1C86C2C.
+static int SpotCheckSuccessful_3(void) { return g_dword_1C86C18[4] == g_dword_1C86C18[5]; }
+// sub_6164D0 (0x6164D0 - 0x6164E2) -- SpotCheckSuccessful_4: 0x1C86C30 == 0x1C86C34.
+static int SpotCheckSuccessful_4(void) { return g_dword_1C86C18[6] == g_dword_1C86C18[7]; }
+// sub_6164F0 (0x6164F0 - 0x616502) -- SpotCheckSuccessful_5: 0x1C86C38 == 0x1C86C3C.
+static int SpotCheckSuccessful_5(void) { return g_dword_1C86C18[8] == g_dword_1C86C18[9]; }
+// sub_616510 (0x616510 - 0x616522) -- SpotCheckSuccessful_6: 0x1C86C40 == 0x1C86C44.
+static int SpotCheckSuccessful_6(void) { return g_dword_1C86C18[10] == g_dword_1C86C18[11]; }
+
+// ---- one-arg flag / number setters (store the arg byte, return it) -------
+// sub_615DE0 (0x615DE0 - 0x615DE9) -- SetRunFromDVD: byte_1DBD02A (the low byte of word_1DBD02A).
+static int SetRunFromDVD(int flag) { g_word_1DBD02A = (g_word_1DBD02A & 0xFFFFFF00) | (flag & 0xFF); return flag & 0xFF; }
+// sub_615DF0 (0x615DF0 - 0x615DF9) -- SetIgnoreCheckLocalDLCVersionFile: byte_1DBD02B (the high byte of word_1DBD02A).
+static int SetIgnoreCheckLocalDLCVersionFile(int flag) { g_word_1DBD02A = (g_word_1DBD02A & 0xFFFF00FF) | ((flag & 0xFF) << 8); return flag & 0xFF; }
+// sub_616590 (0x616590 - 0x616599) -- SetDoFinalMarketplaceOfferCheck: byte_1C86C0F.
+static int SetDoFinalMarketplaceOfferCheck(int flag) { g_byte_1C86C0F = (unsigned char)flag; return flag & 0xFF; }
+// sub_616320 (0x616320 - 0x616329) -- SetOpeningLoadingScreen: byte_1DBD019.
+static int SetOpeningLoadingScreen(int flag) { g_byte_1DBD019 = (unsigned char)flag; return flag & 0xFF; }
+// sub_616390 (0x616390 - 0x616399) -- SetAllowAllSkipStates: byte_1DBD01C.
+static int SetAllowAllSkipStates(int flag) { g_byte_1DBD01C = (unsigned char)flag; return flag & 0xFF; }
+// sub_616300 (0x616300 - 0x616309) -- SetStartMusicAndAtmosOnLevelLoad: byte_1C86BD5.
+static int SetStartMusicAndAtmosOnLevelLoad(int flag) { g_byte_1C86BD5 = (unsigned char)flag; return flag & 0xFF; }
+// sub_616400 (0x616400 - 0x616409) -- SetVSync: byte_1C86BDF.
+static int SetVSync(int flag) { g_byte_1C86BDF = (unsigned char)flag; return flag & 0xFF; }
+// sub_616610 (0x616610 - 0x616619) -- SetDevFrontendSignin: byte_1C86C15.
+static int SetDevFrontendSignin(int flag) { g_byte_1C86C15 = (unsigned char)flag; return flag & 0xFF; }
+// sub_616620 (0x616620 - 0x616629) -- SetAllowMultiplayerJoining: byte_1C86C16.
+static int SetAllowMultiplayerJoining(int flag) { g_byte_1C86C16 = (unsigned char)flag; return flag & 0xFF; }
+// sub_616630 (0x616630 - 0x616639) -- SetDisableLiveFunctionality: byte_1DBD03F.
+static int SetDisableLiveFunctionality(int flag) { g_byte_1DBD03F = (unsigned char)flag; return flag & 0xFF; }
+// sub_616410 (0x616410 - 0x616415) -- SetVSyncThreshold: dword_1C86BF0.
+static int SetVSyncThreshold(int v) { g_dword_1C86BF0 = v; return v; }
+// sub_616440 (0x616440 - 0x616445) -- SetMSToShowLegalScreen: dword_1C86BF4.
+static int SetMSToShowLegalScreen(int v) { g_dword_1C86BF4 = v; return v; }
+// sub_616450 (0x616450 - 0x616455) -- SetPresentationInterval: dword_1C86C08.
+static int SetPresentationInterval(int v) { g_dword_1C86C08 = v; return v; }
+
+// ---- the three no-op builtin bodies (`retn` thunks) ----------------------
+// nullsub_6 (0x616380 - 0x616381) -- the SetUseRetailFrontEnd no-op body.
+static void EngineLuaNoop_616380(void) { }
+// nullsub_5 (0x615F30 - 0x615F31) -- the SetToCreateNewSaveFilePerSave no-op body.
+static void EngineLuaNoop_615F30(void) { }
+// nullsub_4 (0x615DA0 - 0x615DA1) -- the SetFrontEndDemoMode no-op body.
+static void EngineLuaNoop_615DA0(void) { }
+
+// sub_673E80 + VM string ctor + sub_6477E0 (sub_646560): the VM-internal
+// string-object probe SetLevelNameStartsWithACS drives -- build the string
+// object for the arg text from the VM's string-ctor slot (*(vmcore+0xC)+0x1C)
+// and look it up in the VM global table.  No-op stub.
+static int KoreVmStringOp(const char *name) { (void)name; return 0; }
+// sub_6166C0 (0x6166C0 - 0x6166FB) -- SetLevelNameStartsWithACS: when the
+// Kore VM is live (g_dword_1DBDD4C, sub_673C50), build the string object
+// for the arg slot's text (sub_673E80 + the VM's string ctor slot) and
+// probe it against the global table (sub_6477E0 / sub_646560); when the
+// probe fails (or there is no VM) copy the 0x1DBD0EC level-name slot over
+// the arg.  Also called from code: sub_677010 (0x677151).
+// [NOT byte-identical] placement-dependent + the VM-internal string /
+// global-table helpers are documented no-op stubs.
+static F3SharedBuffer **SetLevelNameStartsWithACS(F3SharedBuffer **slot)
+{
+    if (g_dword_1DBDD4C != 0)
+    {
+        const char *name = (slot[0] != 0) ? GetSlotString(slot) : "";   // Str1 = ""
+        if (KoreVmStringOp(name) != 0)   // sub_673E80 + VM string ctor + sub_6477E0 (stubs)
+            return slot;                // the probe passed: keep the arg slot as-is
+    }
+    return CopySharedSlot(slot, &g_slot_1DBD0EC);
+}
+
+// ---- the optional-startup-script list appenders (VM-internal stubs) ------
+// sub_618960 (0x618960 - 0x6189AC) -- F3ListProbe: build the 8-byte
+// (head, tail) list probe over the optional-startup-script list.
+static void   F3ListProbe(int *probe, int *head, int tailNode, int slot) { (void)probe; (void)head; (void)tailNode; (void)slot; }
+// sub_55F1E0 (0x55F1E0) -- F3ListBump: the list append's one-word bump.
+static void   F3ListBump(int v) { (void)v; }
+// sub_55EAF0 (0x55EAF0 - 0x55EF2A) -- F3ListAppend: append a shared slot to
+// the (head, tail, next) list: LHAlloc(12) node { tail variable, old next,
+// slot ref }, link it in and return the old next node.
+static int F3ListAppend(int headVar, int tailVar, int slot)
+{
+    int   next  = *(int *)(tailVar + 4);   // the tail's next pointer (0x1DBD11C)
+    int  *node  = (int *)LHAlloc(12);
+    if (node == 0)
+        return next;
+    node[0]  = tailVar;
+    node[1]  = next;
+    RefSharedSlot((F3SharedBuffer **)&node[2], (F3SharedBuffer **)(size_t)slot);
+    F3ListBump(1);                          // sub_55F1E0
+    *(int *)(tailVar + 4) = (int)node;
+    if (node[1] != 0)
+        *(int *)node[1] = (int)node;
+    (void)headVar;
+    return next;
+}
+// sub_6168A0 (0x6168A0 - 0x616904) -- AddOptionalStartupScript: probe the
+// optional-startup-script list (sub_618960) and, when the probe matches
+// (head, tail), append the script slot (F3ListAppend / sub_55EAF0).
+// [NOT byte-identical] placement-dependent; the list-probe / bump are VM-
+// internal stubs.
+static void AddOptionalStartupScript(int slot)
+{
+    int probe[2] = { 0, 0 };   // the 8-byte list probe (var_8)
+    F3ListProbe(probe, (int *)&g_list_1DBD104, g_list_1DBD118, slot);
+    if (probe[0] == g_list_1DBD104 && probe[1] == g_list_1DBD118)
+        F3ListAppend((int)&g_list_1DBD104, (int)&g_list_1DBD118, slot);
+}
+
+// sub_619520 (0x619520 - 0x6195A2) -- AudioBankRegistryAdd: the registry
+// insert the AddAudioBank wrapper drives (VM-internal -- no-op stub).
+static long   AudioBankRegistryAdd(int *registry, int *entry) { (void)registry; (void)entry; return 0; }
+// sub_616910 (0x616910 - 0x6169C0) -- AddAudioBank: build the 32-byte bank
+// entry { arg-2 slot, arg-1 slot, 12 pad, int[3], 2 flag bytes } on the
+// caller's stack (the var_28 / var_24 slots), add the entry to the
+// audio-bank registry (sub_619520, over g_unk_1DBD0F0), free the payload
+// the registry stashed in the entry (the first extra dword, when set), and
+// release both slots (var_24 first, then var_28).  Also called from code:
+// sub_71A230 (0x71A33B).
+// [NOT byte-identical] placement-dependent + the registry insert is a VM-
+// internal stub.
+static long AddAudioBank(int bankSlot, int nameSlot, int a3, int a4)
+{
+    F3SharedBuffer *slots[2];   // +0x00: var_28 slot (arg 2), +0x04: var_24 slot (arg 1)
+    char            pad[12];    // +0x08
+    int             extra[3];   // +0x14
+    unsigned char   bytes[2];   // +0x20
+    (void)pad;
+    InitSharedSlot(&slots[0]);   // var_28
+    InitSharedSlot(&slots[1]);   // var_24
+    extra[0] = extra[1] = extra[2] = 0;
+    CopySharedSlot(&slots[1], (F3SharedBuffer **)(size_t)bankSlot);   // var_24 <- arg 1
+    CopySharedSlot(&slots[0], (F3SharedBuffer **)(size_t)nameSlot);   // var_28 <- arg 2
+    bytes[1] = (unsigned char)a4;   // arg 4 -> +0x21
+    bytes[0] = (unsigned char)a3;   // arg 3 -> +0x20
+    AudioBankRegistryAdd(&g_unk_1DBD0F0, (int *)(size_t)slots);      // sub_619520
+    if (extra[0] != 0)
+        LHFree((void *)(size_t)extra[0]);
+    extra[0] = extra[1] = extra[2] = 0;
+    ReleaseSharedSlot(&slots[1]);   // var_24 first
+    return ReleaseSharedSlot(&slots[0]);   // var_28 (the return value)
+}
+
+//  RegisterEngineLuaFunctions  (0x6169D0 - 0x6171A5)  -- register the 100
+//  engine Set*/Get* Lua builtins on the Lua module (see the block header
+//  above).  [NOT byte-identical] placement-dependent + high-VA .rdata name
+//  strings.
+//
+//  void RegisterEngineLuaFunctions(int luaModule)
+static void RegisterEngineLuaFunctions(int luaModule)
+{
+    if (luaModule == 0)
+        return;
+
+    int local[2] = { 0, 0 };   // var_C / var_8: the 2-dword GlobalTable accessor
+    EngineLuaGlobalTable(local, luaModule);                          // sub_67C390
+
+    EngineLuaRegisterString(local, "SetApplicationName", (void *)SetApplicationName);
+    EngineLuaRegisterPair(local, "SetScreenResolution", (void *)SetScreenResolution);
+    EngineLuaRegisterString(local, "SetInitialWorldName", (void *)SetInitialWorldName);
+    EngineLuaRegisterString(local, "SetInitialLevelName", (void *)SetInitialLevelName);
+    EngineLuaRegisterString(local, "SetInitialScenarioName", (void *)SetInitialScenarioName);
+    EngineLuaRegisterString(local, "SetInitialStartPointName", (void *)SetInitialStartPointName);
+    EngineLuaRegisterString(local, "SetInitialSaveGameName", (void *)SetInitialSaveGameName);
+    EngineLuaRegisterString(local, "SetInitialClientSaveGameName", (void *)SetInitialClientSaveGameName);
+    EngineLuaRegisterString(local, "SetGameflowScriptEnum", (void *)SetGameflowScriptEnum);
+    EngineLuaRegisterString(local, "SetGameflowScriptState", (void *)SetGameflowScriptState);
+    EngineLuaRegisterString(local, "SetGUIWorldName", (void *)SetGUIWorldName);
+    EngineLuaRegisterString(local, "SetGUILevelName", (void *)SetGUILevelName);
+    EngineLuaRegisterString(local, "SetGUIScenarioName", (void *)SetGUIScenarioName);
+    EngineLuaRegisterString(local, "SetGUIStartPointName", (void *)SetGUIStartPointName);
+    EngineLuaRegisterString(local, "SetPVPWorldName", (void *)SetPVPWorldName);
+    EngineLuaRegisterString(local, "SetPVPLevelName", (void *)SetPVPLevelName);
+    EngineLuaRegisterString(local, "SetPVPScenarioName", (void *)SetPVPScenarioName);
+    EngineLuaRegisterString(local, "SetPVPStartPointName", (void *)SetPVPStartPointName);
+    EngineLuaRegisterString(local, "SetFrontEndWorldName", (void *)SetFrontEndWorldName);
+    EngineLuaRegisterString(local, "SetFrontEndLevelName", (void *)SetFrontEndLevelName);
+    EngineLuaRegisterString(local, "SetFrontEndScenarioName", (void *)SetFrontEndScenarioName);
+    EngineLuaRegisterString(local, "SetFrontEndStartPointName", (void *)SetFrontEndStartPointName);
+    EngineLuaRegisterBoolGet(local, "IsToStartGameflow", (void *)IsToStartGameflow);
+    EngineLuaRegisterBoolGet(local, "IsToStartPVPMode", (void *)IsToStartPVPMode);
+    EngineLuaRegisterNumGet(local, "GetDemoMode", (void *)GetDemoMode);
+    EngineLuaRegisterString(local, "SetInitialHeroEntityName", (void *)SetInitialHeroEntityName);
+    EngineLuaRegisterString(local, "SetInitialHenchmanEntityName", (void *)SetInitialHenchmanEntityName);
+    EngineLuaRegisterString(local, "SetInitialHeroMeleeWeapon", (void *)SetInitialHeroMeleeWeapon);
+    EngineLuaRegisterString(local, "SetInitialHeroRangedWeapon", (void *)SetInitialHeroRangedWeapon);
+    EngineLuaRegisterString(local, "SetInitialHenchmanMeleeWeapon", (void *)SetInitialHenchmanMeleeWeapon);
+    EngineLuaRegisterString(local, "SetInitialHenchmanRangedWeapon", (void *)SetInitialHenchmanRangedWeapon);
+    EngineLuaRegisterString(local, "SetInitialHeroScriptTypeIdentifier", (void *)SetInitialHeroScriptTypeIdentifier);
+    EngineLuaRegisterString(local, "SetOverriddenDogCharacterRecordName", (void *)SetOverriddenDogCharacterRecordName);
+    EngineLuaRegisterString(local, "SetOverriddenClientDogCharacterRecordName", (void *)SetOverriddenClientDogCharacterRecordName);
+    EngineLuaRegisterString(local, "SetLevelNameStartsWithACS", (void *)SetLevelNameStartsWithACS);
+    EngineLuaRegisterFlagSet(local, "SetOpeningLoadingScreen", (void *)SetOpeningLoadingScreen);
+    EngineLuaRegisterStringGet(local, "GetApplicationName", (void *)GetApplicationName);
+    EngineLuaRegisterPairGet(local, "GetScreenResolution", (void *)GetScreenResolution);
+    EngineLuaRegisterStringGet(local, "GetAIScriptName", (void *)GetAIScriptName);
+    EngineLuaRegisterStringGet(local, "GetCameraScriptName", (void *)GetCameraScriptName);
+    EngineLuaRegisterStringGet(local, "GetQuestScriptName", (void *)GetQuestScriptName);
+    EngineLuaRegisterStringGet(local, "GetGeneralSetupScriptName", (void *)GetGeneralSetupScriptName);
+    EngineLuaRegisterStringGet(local, "GetInitialWorldName", (void *)GetInitialWorldName);
+    EngineLuaRegisterStringGet(local, "GetInitialLevelName", (void *)GetInitialLevelName);
+    EngineLuaRegisterStringGet(local, "GetInitialScenarioName", (void *)GetInitialScenarioName);
+    EngineLuaRegisterStringGet(local, "GetInitialStartPointName", (void *)GetInitialStartPointName);
+    EngineLuaRegisterStringGet(local, "GetInitialSaveGameName", (void *)GetInitialSaveGameName);
+    EngineLuaRegisterStringGet(local, "GetInitialClientSaveGameName", (void *)GetInitialClientSaveGameName);
+    EngineLuaRegisterStringGet(local, "GetGameflowScriptEnum", (void *)GetGameflowScriptEnum);
+    EngineLuaRegisterStringGet(local, "GetGameflowScriptState", (void *)GetGameflowScriptState);
+    EngineLuaRegisterStringGet(local, "GetGUIWorldName", (void *)GetGUIWorldName);
+    EngineLuaRegisterStringGet(local, "GetGUILevelName", (void *)GetGUILevelName);
+    EngineLuaRegisterStringGet(local, "GetGUIScenarioName", (void *)GetGUIScenarioName);
+    EngineLuaRegisterStringGet(local, "GetGUIStartPointName", (void *)GetGUIStartPointName);
+    EngineLuaRegisterStringGet(local, "GetPVPWorldName", (void *)GetPVPWorldName);
+    EngineLuaRegisterStringGet(local, "GetPVPLevelName", (void *)GetPVPLevelName);
+    EngineLuaRegisterStringGet(local, "GetPVPScenarioName", (void *)GetPVPScenarioName);
+    EngineLuaRegisterStringGet(local, "GetPVPStartPointName", (void *)GetPVPStartPointName);
+    EngineLuaRegisterStringGet(local, "GetFrontEndWorldName", (void *)GetFrontEndWorldName);
+    EngineLuaRegisterStringGet(local, "GetFrontEndLevelName", (void *)GetFrontEndLevelName);
+    EngineLuaRegisterStringGet(local, "GetFrontEndScenarioName", (void *)GetFrontEndScenarioName);
+    EngineLuaRegisterStringGet(local, "GetFrontEndStartPointName", (void *)GetFrontEndStartPointName);
+    EngineLuaRegisterStringGet(local, "GetControlSystemRecordName", (void *)GetControlSystemRecordName);
+    EngineLuaRegisterStringGet(local, "GetInitialHeroEntityName", (void *)GetInitialHeroEntityName);
+    EngineLuaRegisterStringGet(local, "GetInitialHenchmanEntityName", (void *)GetInitialHenchmanEntityName);
+    EngineLuaRegisterStringGet(local, "GetInitialHeroMeleeWeapon", (void *)GetInitialHeroMeleeWeapon);
+    EngineLuaRegisterStringGet(local, "GetInitialHeroRangedWeapon", (void *)GetInitialHeroRangedWeapon);
+    EngineLuaRegisterStringGet(local, "GetInitialHenchmanMeleeWeapon", (void *)GetInitialHenchmanMeleeWeapon);
+    EngineLuaRegisterStringGet(local, "GetInitialHenchmanRangedWeapon", (void *)GetInitialHenchmanRangedWeapon);
+    EngineLuaRegisterStringGet(local, "GetInitialHeroScriptTypeIdentifier", (void *)GetInitialHeroScriptTypeIdentifier);
+    EngineLuaRegisterStringGet(local, "GetOverriddenDogCharacterRecordName", (void *)GetOverriddenDogCharacterRecordName);
+    EngineLuaRegisterStringGet(local, "GetOverriddenClientDogCharacterRecordName", (void *)GetOverriddenClientDogCharacterRecordName);
+    EngineLuaRegisterIntGet(local, "GetMillisecondsToWaitForLuaDebugger", (void *)GetMillisecondsToWaitForLuaDebugger);
+    EngineLuaRegisterBoolGet(local, "IsReleaseBuild", (void *)IsReleaseBuild);
+    EngineLuaRegisterBoolGet(local, "GetUseRetailFrontEnd", (void *)GetUseRetailFrontEnd);
+    EngineLuaRegisterString(local, "AddOptionalStartupScript", (void *)AddOptionalStartupScript);
+    EngineLuaRegisterFlagSet(local, "SetRunFromDVD", (void *)SetRunFromDVD);
+    EngineLuaRegisterFlagSet(local, "SetIgnoreCheckLocalDLCVersionFile", (void *)SetIgnoreCheckLocalDLCVersionFile);
+    EngineLuaRegisterFlagSet(local, "SetDoFinalMarketplaceOfferCheck", (void *)SetDoFinalMarketplaceOfferCheck);
+    EngineLuaRegisterFlagSet(local, "SetUseRetailFrontEnd", (void *)EngineLuaNoop_616380);   // nullsub_6
+    EngineLuaRegisterFlagSet(local, "SetAllowAllSkipStates", (void *)SetAllowAllSkipStates);
+    EngineLuaRegisterFlagSet(local, "SetToCreateNewSaveFilePerSave", (void *)EngineLuaNoop_615F30);   // nullsub_5
+    EngineLuaRegisterNoopSet(local, "SetFrontEndDemoMode", (void *)EngineLuaNoop_615DA0);    // nullsub_4
+    EngineLuaRegisterFlagSet(local, "SetStartMusicAndAtmosOnLevelLoad", (void *)SetStartMusicAndAtmosOnLevelLoad);
+    EngineLuaRegisterFlagSet(local, "SetVSync", (void *)SetVSync);
+    EngineLuaRegisterIntSet(local, "SetVSyncThreshold", (void *)SetVSyncThreshold);
+    EngineLuaRegisterIntSet(local, "SetMSToShowLegalScreen", (void *)SetMSToShowLegalScreen);
+    EngineLuaRegisterIntSet(local, "SetPresentationInterval", (void *)SetPresentationInterval);
+    EngineLuaRegisterMultiSet(local, "AddAudioBank", (void *)AddAudioBank);
+    EngineLuaRegisterFlagSet(local, "SetDevFrontendSignin", (void *)SetDevFrontendSignin);
+    EngineLuaRegisterFlagSet(local, "SetAllowMultiplayerJoining", (void *)SetAllowMultiplayerJoining);
+    EngineLuaRegisterFlagSet(local, "SetDisableLiveFunctionality", (void *)SetDisableLiveFunctionality);
+    EngineLuaRegisterBoolGet(local, "IsLiveFunctionalityDisabled", (void *)IsLiveFunctionalityDisabled);
+    EngineLuaRegisterBoolGet(local, "GetDifficultySetToHard", (void *)GetDifficultySetToHard);
+    EngineLuaRegisterBoolGet(local, "SpotCheckSuccessful_1", (void *)SpotCheckSuccessful_1);
+    EngineLuaRegisterBoolGet(local, "SpotCheckSuccessful_2", (void *)SpotCheckSuccessful_2);
+    EngineLuaRegisterBoolGet(local, "SpotCheckSuccessful_3", (void *)SpotCheckSuccessful_3);
+    EngineLuaRegisterBoolGet(local, "SpotCheckSuccessful_4", (void *)SpotCheckSuccessful_4);
+    EngineLuaRegisterBoolGet(local, "SpotCheckSuccessful_5", (void *)SpotCheckSuccessful_5);
+    EngineLuaRegisterBoolGet(local, "SpotCheckSuccessful_6", (void *)SpotCheckSuccessful_6);
+
+    // Release the GlobalTable accessor's refcounted control block (local[1]).
+    volatile LONG *ref = (volatile LONG *)local[1];
+    if (ref != 0 && InterlockedDecrement(ref) == 0)
+    {
+        void (*cb)(int) = *(void (**)(int))(size_t)ref[1];   // the release callback
+        cb((int)(size_t)ref[2]);                              // its context argument
+        LHFree((void *)(size_t)ref);
+    }
+}
+
+// sub_55F120 (0x55F120 - 0x55F192) -- ClearOptionalStartupScriptList: the
+// thiscall list-clear RunLuaStartupScripts runs over the
+// optional-startup-script container (the original `this` = &dword_1DBD104;
+// the container's +20 / +24 words are the tail-node global 0x1DBD118 and
+// the size global 0x1DBD11C).  It relinks the tail node to itself (P[0] =
+// P[4] = P), zeroes the size, then walks the node chain (P[0] -> node[0] ->
+// ... -> P) releasing each 12-byte node: its +8 shared slot (the
+// InterlockedDecrement of the block's +12 refcount, SharedBufferFree on
+// zero, the g_Addend drop per slot) and the node itself (LHFree, the heap
+// table's +16 slot).  Returns the tail node.
+// [NOT byte-identical] placement-dependent (the relative calls to
+// SharedBufferFree / LHFree / the InterlockedDecrement IAT slots) and it
+// refs the high-VA list globals.
+static int ClearOptionalStartupScriptList(void)
+{
+    int *P     = (int *)(size_t)g_list_1DBD118;   // the tail node
+    int *first = (int *)(size_t)P[0];             // P[0]: the first node
+    P[0] = (int)(size_t)P;                        // P[0] = P (self-link)
+    P[1] = (int)(size_t)P;                        // P[4] = P
+    g_list_1DBD11C = 0;                           // the list size
+    if (first != P)
+    {
+        int *prev = 0;
+        do
+        {
+            prev = (int *)(size_t)first[0];       // the previous link
+            if (first[2] != 0)
+            {
+                F3SharedBuffer *block = (F3SharedBuffer *)(size_t)first[2];
+                if (InterlockedDecrement(&block->refcount) <= 0 && first[2] != 0)
+                    SharedBufferFree(block);
+                first[2] = 0;
+            }
+            InterlockedDecrement(&g_Addend);      // the live-slot count
+            first[2] = 0;
+            LHFree(first);                        // the 12-byte node
+            first = prev;
+        }
+        while (prev != P);
+    }
+    return (int)(size_t)P;
+}
+
+// sub_616710 (0x616710 - 0x616894) -- RunLuaStartupScripts: report the
+// broken-Lua-script marker files after the engine Lua environment rebuild.
+// Build the 16-byte LHSFS::CLegacyFile (the sub_17FE870 ctor + the
+// sub_17FE0A0 open-setup, a documented stub) over the caller's
+// startup-script path slot (the "Data\Scripts\Startup\" + "startup.lua"
+// slot ReinitEngineLua concats) and, when that marker file opens
+// (sub_17FDC30: the +8 file slot set), log "Lua startup script has an
+// error in it" over the Lua module (SetSharedSlot + LogScriptError,
+// sub_629660, + ReleaseSharedSlot), then walk the
+// optional-startup-script list (the 0x1DBD104 / 0x1DBD118 container;
+// each 12-byte node's +8 shared slot holds the script name): build
+// "Data\Scripts\Startup\<name>" (SharedSlotConcat), open it, and -- when
+// it opens too -- log
+// "Optional startup script \"<name>\" has an error in it"
+// (SharedSlotConcatLiteral + MakeSettingsFilePath + LogScriptError),
+// finally clearing the list (sub_55F120).  Returns the main file
+// object's dtor result (sub_17FD970 -> ReleaseSharedSlot's new g_Addend
+// count).  cdecl (the Lua module as arg 0, the path-slot address as
+// arg 1); the sole caller is ReinitEngineLua (0x61A54E), which discards
+// the result.
+// [NOT byte-identical] placement-dependent (the relative calls to the
+// shared-slot / file / logging helpers + the __security_check_cookie IAT
+// slot) and it refs the high-VA list + path-prefix globals.  The
+// file-open setup (sub_17FE0A0) and the log emitter (LogScriptError,
+// sub_629660) are the documented stubs, so the marker files never open
+// and the error branch is not taken in this build; the original's
+// __invalid_parameter_noinfo list-iterator guards are unreachable for the
+// same reason.
+//
+//  long RunLuaStartupScripts(int luaModule, F3SharedBuffer **scriptSlot)
+static long RunLuaStartupScripts(int luaModule, F3SharedBuffer **scriptSlot)
+{
+    DWORD file[4];   // v14: the main startup-script marker file (CLegacyFile)
+
+    LegacyFileCtor(file, scriptSlot, 1, 2);            // sub_17FE870
+    if (LegacyFileHasData(file) != 0)                  // sub_17FDC30
+    {
+        F3SharedBuffer *msg  = 0;   // v12: the error message slot (reused per node)
+        F3SharedBuffer *lit  = 0;   // v10: "Optional startup script \"<name>"
+        F3SharedBuffer *full = 0;   // v11: the full error message
+        SetSharedSlot(&msg, "Lua startup script has an error in it", -1);
+        LogScriptError(luaModule, scriptSlot, &msg);   // sub_629660
+        ReleaseSharedSlot(&msg);
+
+        int *tail = (int *)(size_t)g_list_1DBD118;     // the tail node (P)
+        int *head = (int *)(size_t)g_list_1DBD104;     // the head block (H)
+        int *node = (int *)(size_t)tail[0];            // P[0]: the first node
+        for (;;)
+        {
+            if (node == (int *)(size_t)g_list_1DBD118)   // it != end()
+                break;
+            // original: the MSVC list-iterator checks here (the head
+            // liveness vs 0x1DBD104, the node != end() deref guard and
+            // the increment guard, each via __invalid_parameter_noinfo);
+            // the list is consistent in this build and the loop is
+            // unreachable while the file-open stubs stay.
+            (void)head;
+
+            SharedSlotConcat(&msg, &g_unk_1DBE2B4, (F3SharedBuffer **)(node + 2));
+            DWORD optFile[4];   // v13: the optional-script marker file
+            LegacyFileCtor(optFile, &msg, 1, 2);       // sub_17FE870
+            if (LegacyFileHasData(optFile) != 0)       // sub_17FDC30
+            {
+                SharedSlotConcatLiteral(&lit, "Optional startup script \"", &msg);
+                MakeSettingsFilePath(&full, &lit, "\" has an error in it");
+                LogScriptError(luaModule, &msg, &full);   // sub_629660
+                ReleaseSharedSlot(&full);
+                ReleaseSharedSlot(&lit);
+            }
+            LegacyFileDtor(optFile);                   // sub_17FD970
+            ReleaseSharedSlot(&msg);
+            node = (int *)(size_t)node[0];             // ++it
+        }
+        ClearOptionalStartupScriptList();              // sub_55F120
+    }
+    return LegacyFileDtor(file);                       // sub_17FD970
+}
+
+// sub_6ECE40 / sub_6ECEC0 (0x6ECE40-0x6ECEB4 / 0x6ECEC0-0x6ECF34) -- the
+// "empty handle-map" owner-wrapper ctor: thiscall (this in ECX) + `retn 8`
+// (two unused stack args).  The two are identical except the element size
+// (0x50 = 80 bytes for sub_6ECE40, 0x1C = 28 bytes for sub_6ECEC0).  It
+// allocates a 4-byte head node (node[0] = this) into this[0], then the
+// element; the element is zeroed at +0/+4/+8, self-linked so it is an empty
+// list head (elem[0] = elem[1] = elem[2] = elem), and its last two bytes are
+// set to 1 (elem[size-4] = 1, elem[size-3] = 1).  The element is stored at
+// this+0x18 (this[6]) with this+0x1C (this[7]) = 0.
+// [NOT byte-identical] placement-dependent (relative call to LHAlloc).
+static void *HandleMapEmptyInit(void *obj, unsigned int elemSize)
+{
+    DWORD *d    = (DWORD *)obj;
+    DWORD *node = (DWORD *)LHAlloc(4);
+    d[0] = (DWORD)node;
+    if (node)
+        node[0] = (DWORD)obj;                 // *node = this
+    DWORD *elem = (DWORD *)LHAlloc(elemSize);
+    if (elem)
+    { elem[0] = 0; elem[1] = 0; elem[2] = 0; }
+    BYTE *e = (BYTE *)elem;
+    e[elemSize - 3] = 0;
+    e[elemSize - 4] = 1;
+    d[6] = (DWORD)elem;
+    e[elemSize - 3] = 1;
+    if (elem)
+    { elem[1] = (DWORD)elem; elem[0] = (DWORD)elem; elem[2] = (DWORD)elem; }
+    d[7] = 0;
+    return obj;
+}
+
+// sub_5DEC20 (0x5DEC20 - 0x5DEC4D) -- KorePushEmptyTable: allocate a fresh
+// (empty) hash table (KoreAllocHashTable(a1, 0, 0)) and append the {table, 5}
+// 8-byte record to the module value array at the a1[7] cursor, advancing the
+// cursor by 8.  cdecl.  VM-internal -- out of scope.  Stub: no-op (0).
+static void *KorePushEmptyTable(int mod, int a2, int a3)
+{ (void)mod; (void)a2; (void)a3; return 0; }
+
+// sub_5FC530 (0x5FC530 - 0x5FC54A) -- KoreValueArraySet: a thin wrapper over
+// sub_5F9E40, the tag-dispatching "write a value into the module value array
+// at an offset" op.  cdecl.  VM-internal -- out of scope.  Stub: no-op.
+static void KoreValueArraySet(int mod, int a2, int a3)
+{ (void)mod; (void)a2; (void)a3; }
+
+// sub_5E18A0 (0x5E18A0 - 0x5E1957) -- KoreLookupSlotByIndex: resolve / create
+// a value-array slot addressed by a (negative) index over a module using
+// sub_407970 / sub_5D93D0 / sub_55DFE0 / sub_407A90, and return its index
+// (-1 when the top slot is a non-tagged empty hole).  cdecl.  VM-internal --
+// out of scope.  Stub: returns -1 (no slot).
+static int KoreLookupSlotByIndex(int mod, int a2)
+{ (void)mod; (void)a2; return -1; }
+
+// sub_6E9620 (0x6E9620 - 0x6E96DF) -- CEntityScriptHandleManagerCtor: the
+// 80-byte CEntityScriptHandleManager (0x50 bytes).  thiscall + `retn 4` (the
+// Lua module is the single stack arg).  Builds: the CEntityScriptHandleManager
+// vtable at +0, the two empty handle-map owner-wrappers (sub_6ECE40 at +4 with
+// an 80-byte element, sub_6ECEC0 at +0x28 with a 28-byte element), +0x24 = 0,
+// +0x48 = -2 and +0x4C = the Lua module, then a short run of VM-side
+// registrations over that module: two empty-table pushes (KorePushEmptyTable,
+// sub_5DEC20), the "v" intern (KoreAppendString, sub_407070), the "__mode"
+// builtin name (KoreRegisterBuiltinName, sub_4076D0), a value-array trim
+// (KoreValueArraySet, sub_5FC530) when the module's +0x1C used-counter is at
+// or past its +0x20 capacity, and finally +0x48 = KoreLookupSlotByIndex
+// (module, -10000) (sub_5E18A0).  Sole caller: ReinitEngineLua (0x61A5A7),
+// which builds it into the engine's +0xC4.  [NOT byte-identical]
+// placement-dependent (relative calls) and refs the high-VA
+// CEntityScriptHandleManager::`vftable' plus the "v" / "__mode" rdata strings.
+//
+//  void *CEntityScriptHandleManagerCtor(void *obj, int luaModule)
+static void *CEntityScriptHandleManagerCtor(void *obj, int luaModule)
+{
+    CBaseClassNonCopyableCtor(obj);
+    *(void **)obj = g_CEntityScriptHandleManagerVtable;   // `vftable'
+    HandleMapEmptyInit((char *)obj + 4,   0x50);          // sub_6ECE40
+    *(DWORD *)((char *)obj + 0x24) = 0;
+    HandleMapEmptyInit((char *)obj + 0x28, 0x1C);         // sub_6ECEC0
+    *(DWORD *)((char *)obj + 0x48) = 0xFFFFFFFE;          // -2
+    *(DWORD *)((char *)obj + 0x4C) = (DWORD)luaModule;
+    int     mod    = luaModule;                           // = *(obj + 0x4C)
+    DWORD *  modB  = (DWORD *)mod;                        // the module's words
+    KorePushEmptyTable(mod, 0, 0);                         // sub_5DEC20(module, 0, 0)
+    KorePushEmptyTable(mod, 0, 0);                         // sub_5DEC20(*(this+0x4C), 0, 0)
+    KoreAppendString(mod, "v", 1);                         // sub_407070
+    KoreRegisterBuiltinName(mod, -2, "__mode");            // sub_4076D0
+    DWORD v4 = modB[0x1C / 4];                             // *(module + 0x1C)
+    if ((v4 - 16) >= modB[0x20 / 4])                       // unsigned, cf. `jb'
+    {
+        KoreValueArraySet(mod, (int)(v4 - 16), (int)(v4 - 8));  // sub_5FC530
+        modB[0x1C / 4] -= 8;                              // *(module + 0x1C) -= 8
+    }
+    *(DWORD *)((char *)obj + 0x48) = (DWORD)KoreLookupSlotByIndex(mod, 0xFFFFD8F0); // sub_5E18A0
+    return obj;
+}
 
 // nullsub_27 (0x6EFF60 - 0x6EFF61) -- one-byte `retn` no-op thunk.
 static void nullsub_27(void) { }
 
-// nullsub_28 / sub_70DDB0 -- the "EngineTest" module registration pair
-// (module-private stub copies; gamemain.cpp keeps its own for the
-// EngineTest registration outside this module).
-static void  nullsub_28(int a) { (void)a; }
-static void  sub_70DDB0(int a) { (void)a; }
+// ============================================================================
+//  ResetEngineTest  (nullsub_28, 0x70DBB0 - 0x70DBB1) and
+//  RegisterEngineTest  (sub_70DDB0, 0x70DDB0 - 0x70DEBA) -- the
+//  "Debug.EngineTest" Lua module registration pair
+//
+//  RegisterEngineTest(luaModule) is called on the fresh Lua module from
+//  ReinitEngineLua (0x61A57B, when `flag` is set) and from RunFrontEnd
+//  (0x61D602), always immediately after the ResetEngineTest no-op.  It
+//  builds the two table-handle pairs {value, ctrl} on the stack: the
+//  "Debug" global table (EngineLuaDebugTable, sub_633E70 -- the table name
+//  is the g_slot_1DBDC78 shared slot, "Debug" by default) and the
+//  "EngineTest" subtable (EngineLuaEnsureTable, sub_67C2B0).  It then
+//  registers the five EngineTest methods on that table -- AddMistInstance,
+//  UpdateMaterialParameterFloat, UpdateMaterialParameterVec4,
+//  GetSelectedPrimitiveResourceID, SetSelectedPrimitive -- each via the
+//  124-byte registration helper (EngineLuaRegisterNamedClosure; five
+//  address-identical variants, sub_640870 / sub_70E320 / sub_70E3A0 /
+//  sub_70E420 / sub_70E530): the C wrapper pointer is stored in the
+//  table's VM value array and a builtin closure is installed whose
+//  upvalue-marshalling function (the 80-byte sub_70E0xx family / sub_63E1F0)
+//  pulls the first Lua value off the VM stack and dispatches to the wrapper
+//  with the converted arguments.  The epilogue drops the pair's refcounted
+//  control blocks (InterlockedDecrement; at zero, dispatch the release
+//  callback + LHFree) and zeroes the EngineTest pair.
+//  [NOT byte-identical] placement-dependent (relative calls) and it
+//  references the high-VA .rdata method-name strings.
+// ============================================================================
+
+// 0x1DBDC78: the Debug-class name slot ("Debug" by default; set by the
+// sub_1A5C980 static initializer, released by the atexit handler sub_1AC2320).
+static F3SharedBuffer *g_slot_1DBDC78 = 0;   // 0x1DBDC78: "Debug" class-name slot
+
+// ----------------------------------------------------------------
+//  VM-internal stubs the EngineTest registration reaches (Kore VM value-
+//  stack / arg-marshalling machinery; out of scope; documented no-ops).
+// ----------------------------------------------------------------
+// sub_5DF650 (0x5DF650) -- reserve 8 bytes on a VM value stack: grow the
+// backing buffer when the cursor (a1[7]) runs past capacity (a2 = the
+// buffer base a1[0] + 0xCC).  2908 callers; VM-internal.  Stub: no-op.
+static void KoreValueStackReserve(void *table, void *tableBase, int ctrl, int cursor)
+{ (void)table; (void)tableBase; (void)ctrl; (void)cursor; }
+// sub_5DC450 (0x5DC450) -- return a pointer to a freshly reserved 4-byte
+// value-array slot.  2777 callers; VM-internal.  Stub: 0 (no slot).
+static void *KoreValueArraySlot(void *table, int size)
+{ (void)table; (void)size; return 0; }
+// sub_67C180 (0x67C180) -- intern/look up a builtin name on a module: push
+// the name string on the module value stack, run the builtin string op, and
+// write the {value, ctrl} pair to out ({0, 0} when the name is unregistered
+// or the module context is empty).  thiscall (the {value, ctrl} pair in
+// ECX); VM-internal.  Stub: {0, 0}.
+static void KoreLookupBuiltinValue(DWORD *thisPair, DWORD *out, const char *name)
+{ (void)thisPair; out[0] = 0; out[1] = 0; (void)name; }
+// sub_6179D0 (0x6179D0) -- release a KoreLookupBuiltinValue {value, ctrl}
+// temp: InterlockedDecrement the ctrl block (dispatch its release callback +
+// LHFree at zero) and zero the pair.  thiscall; VM-internal.  Stub: no-op.
+static void KoreReleaseLookupPair(DWORD *pair)
+{ (void)pair; }
+// sub_67C540 (0x67C540) -- hash a name and store it in the module's global
+// table over a reserved value-array slot.  thiscall (the {value, ctrl} pair
+// in ECX); 2643 callers; VM-internal.  Stub: no-op.
+static void EngineLuaStoreGlobalName(DWORD *pair, void *table, const char *name)
+{ (void)pair; (void)table; (void)name; }
+// sub_408200 (0x408200) -- pull the Nth Lua number argument off a VM stack.
+// 1236 callers; VM-internal.  Stub: 0.0f.
+static float KoreGetNumberArg(int vm, int idx)
+{ (void)vm; (void)idx; return 0.0f; }
+// sub_4072D0 (0x4072D0) -- pull the Nth Lua argument (a value-slot pointer)
+// off a VM stack.  3323 callers; VM-internal.  Stub: 0 (no slot).
+static void *KoreGetArgSlot(int vm, int idx)
+{ (void)vm; (void)idx; return 0; }
+// sub_407370 (0x407370) -- pull the Nth Lua string argument (raw byte
+// pointer) off a VM stack.  591 callers; VM-internal.  Stub: 0.
+static const char *KoreGetArgStringBytes(int vm, int idx)
+{ (void)vm; (void)idx; return 0; }
+// sub_62AF90 (0x62AF90) -- 3-byte value-slot getter (mov eax,[ecx]; retn);
+// converts a VM value slot to its scalar value.  229 callers; VM-internal.
+// Stub: 0.
+static int KoreSlotToValue(int slot)
+{ (void)slot; return 0; }
+// sub_62AFF0 (0x62AFF0) -- 3-byte int-slot getter (mov eax,[ecx]; retn);
+// converts a VM value slot to its int value.  3 callers; VM-internal.
+// Stub: 0.
+static int KoreSlotToInt(int slot)
+{ (void)slot; return 0; }
+// sub_18982A0 (0x18982A0) -- push a C string onto a VM value stack (the
+// 24-byte thiscall with a scratch slot in ECX).  254 callers; VM-internal.
+// Stub: no-op.
+static void KorePushString(void *local, const char *s)
+{ (void)local; (void)s; }
+// sub_19E23D0 (0x19E23D0) -- the VM material-parameter-FLOAT update op
+// ((scratch, slot2, slot3, value, scratch, 1)).  2 callers; VM-internal.
+// Stub: 0.
+static int KoreMaterialUpdateFloat(void *scratch, int slot2, int slot3, float value, void *scratch2, int flag)
+{ (void)scratch; (void)slot2; (void)slot3; (void)value; (void)scratch2; (void)flag; return 0; }
+// sub_19E2370 (0x19E2370) -- the VM material-parameter-VEC4 update op
+// ((scratch, slot2, slot3, slot4, scratch, 1)).  1 caller; VM-internal.
+// Stub: 0.
+static int KoreMaterialUpdateVec4(void *scratch, int slot2, int slot3, int slot4, void *scratch2, int flag)
+{ (void)scratch; (void)slot2; (void)slot3; (void)slot4; (void)scratch2; (void)flag; return 0; }
+// sub_19DE1E0 (0x19DE1E0) -- read the selected primitive's resource id into
+// a 4-byte local (14 bytes; the caller reads the value back from the local).
+// 1 caller; VM-internal.  Stub: writes 0.
+static void KoreReadSelectedPrimitiveID(int *local)
+{ *local = 0; }
+// sub_19DE1B0 (0x19DE1B0) -- store the selected primitive resource id (the
+// 34-byte VM op the SetSelectedPrimitive thunk jmps to).  1 caller;
+// VM-internal.  Stub: 0.
+static int KoreStoreSelectedPrimitive(int id)
+{ (void)id; return 0; }
+// sub_4171A0 (0x4171A0) -- the 16-byte vector-4 init thiscall (215 bytes,
+// 4 callers; a small engine vector ctor).  Stub: no-op.
+static void F3Vector4Init(void *vec)
+{ (void)vec; }
+// sub_19DD510 (0x19DD510) -- begin the mist-instance VM record over a
+// 156-byte engine buffer (thiscall: buffer in ECX, 0, &direction vec4).
+// 2 callers; VM-internal.  Stub: no-op.
+static void KoreBeginMistInstance(void *buffer, int a2, void *direction)
+{ (void)buffer; (void)a2; (void)direction; }
+// sub_673C50 (0x673C50) -- 6-byte getter of the Kore VM core object
+// (g_dword_1DBDD4C; 0 = no live VM).  5963 callers.  Stub: the global.
+static int KoreGetVMCore(void)
+{ return g_dword_1DBDD4C; }
+// sub_7E2470 (0x7E2470) -- 6-byte engine-state query (mov eax,[?]; retn).
+// 83 callers.  Stub: 0.
+static int KoreEngineStateQuery(int a)
+{ (void)a; return 0; }
+// sub_19E2610 (0x19E2610) -- finish the mist-instance VM record over the
+// 156-byte engine buffer (thiscall: buffer in ECX + the query result).
+// 111 callers; VM-internal.  Stub: no-op.
+static void KoreFinishMistInstance(void *buffer, int a2)
+{ (void)buffer; (void)a2; }
+// sub_19E19B0 (0x19E19B0) -- 7-byte thiscall commit of a VM record buffer
+// (returns eax).  130 callers; VM-internal.  Stub: 0.
+static int KoreCommitRecordBuffer(void *buffer)
+{ (void)buffer; return 0; }
+// sub_5D93D0 (0x5D93D0) -- pop/convert a Lua number off a VM stack into a
+// double (76 bytes, 206 callers).  VM-internal.  Stub: 0.0.
+static double KorePopNumberValue(int vm, int sp)
+{ (void)vm; (void)sp; return 0.0; }
+
+// ----------------------------------------------------------------
+//  SharedSlotFormat (0x1A01670) -- module-private copy of the gamemain.cpp
+//  static (vsprintf into a shared slot); the EngineTest
+//  GetSelectedPrimitiveResourceID wrapper needs it in this translation unit.
+// ----------------------------------------------------------------
+static F3SharedBuffer **SharedSlotFormat(F3SharedBuffer **out, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+
+    int flen = (int)strlen(fmt);
+    unsigned char *raw = (unsigned char *)malloc((unsigned)(flen + 1032));
+    if (raw != 0)
+    {
+        *(DWORD *)raw = 56797;
+        char *buf = (char *)(raw + 2);
+        int written = vsprintf_s(buf, (unsigned)(flen + 1024), fmt, ap);
+        if (written <= flen + 1024)
+        {
+            F3SharedBuffer *nb = 0;
+            if (buf != 0 && *buf != 0)
+            {
+                nb = (F3SharedBuffer *)LHAlloc(16);
+                if (nb != 0)
+                {
+                    nb->data = 0;
+                    nb->length = 0;
+                    nb->capacity = 0;
+                    unsigned int len = 0;
+                    while (buf[len] != 0)
+                        len++;
+                    SharedBufferAssign(nb, buf, len);
+                    nb->refcount = 1;
+                }
+            }
+            if (*out != 0)
+            {
+                if (InterlockedDecrement(&(*out)->refcount) <= 0)
+                    SharedBufferFree(*out);
+                *out = 0;
+            }
+            if (nb != 0)
+                *out = nb;
+        }
+        if (*(DWORD *)raw == 56797)
+            free(raw);
+    }
+    va_end(ap);
+    return out;
+}
+
+//  ReleaseLookupCtrl -- the {value, ctrl} pair epilogue shared by
+//  EngineLuaDebugTable / RegisterEngineTest: drop one reference to the
+//  refcounted control block; at zero, dispatch its release callback
+//  (block+4 with the block+8 context) and LHFree the block.
+static void ReleaseLookupCtrl(DWORD ctrl)
+{
+    if (ctrl != 0 && InterlockedDecrement((volatile LONG *)ctrl) == 0)
+    {
+        DWORD *b = (DWORD *)ctrl;
+        ((void (*)(DWORD))b[1])(b[2]);
+        LHFree((void *)b);
+    }
+}
+
+// ----------------------------------------------------------------
+//  The five EngineTest C wrappers (the function pointers the registration
+//  stores in the "EngineTest" table value array; only referenced by address).
+// ----------------------------------------------------------------
+
+// sub_70DCE0 (0x70DCE0 - 0x70DDAE) -- AddMistInstance: build the 156-byte
+// mist-instance record (direction = a2 - a1 at +0x50, the third vector at
+// +0x58, the scalar at +0x30), run it through the VM record ops, and commit.
+static int EngineTestAddMistInstance(const void *a1, const void *a2, const void *a3, float a4)
+{
+    char buf[0x9C];                                // the 156-byte record buffer
+    float  f   = *(float *)(buf + 0x30);
+    float *vec = (float *)(buf + 0x50);            // direction = a2 - a1
+    float *a3v = (float *)(buf + 0x58);            // the third vector
+    int   i;
+
+    F3Vector4Init(vec);                            // sub_4171A0
+    for (i = 0; i < 4; i++)
+        vec[i] = ((const float *)a2)[i] - ((const float *)a1)[i];
+    for (i = 0; i < 4; i++)
+        a3v[i] = ((const float *)a3)[i];
+    f = a4;
+    KoreBeginMistInstance(buf, 0, vec);            // sub_19DD510
+    int core = KoreGetVMCore();                    // sub_673C50
+    void **vt = (void **)(*(void **)(core));
+    int x = ((int (__thiscall *)(int, int))vt[5])(core, 1);   // vtable +0x14, arg 1 (thiscall, this = core)
+    int y = KoreEngineStateQuery(x);               // sub_7E2470
+    KoreFinishMistInstance(buf, y);                // sub_19E2610
+    return KoreCommitRecordBuffer(buf);            // sub_19E19B0
+}
+
+// sub_70DBD0 (0x70DBD0 - 0x70DD28) -- UpdateMaterialParameterFloat: push the
+// first slot's string onto the VM stack and run the material FLOAT update.
+static F3SharedBuffer **EngineTestUpdateMaterialParameterFloat(F3SharedBuffer **slot1, F3SharedBuffer **slot2, F3SharedBuffer **slot3, float value)
+{
+    F3SharedBuffer *scratch;
+    const char *s = GetSlotString(slot1);
+    KorePushString(&scratch, s);                   // sub_18982A0
+    return (F3SharedBuffer **)KoreMaterialUpdateFloat(&scratch, (int)slot2, (int)slot3, value, &scratch, 1);   // sub_19E23D0
+}
+
+// sub_70DC30 (0x70DC30 - 0x70DC87) -- UpdateMaterialParameterVec4: push the
+// first slot's string onto the VM stack and run the material VEC4 update.
+static F3SharedBuffer **EngineTestUpdateMaterialParameterVec4(F3SharedBuffer **slot1, F3SharedBuffer **slot2, F3SharedBuffer **slot3, F3SharedBuffer **slot4)
+{
+    F3SharedBuffer *scratch;
+    const char *s = GetSlotString(slot1);
+    KorePushString(&scratch, s);                   // sub_18982A0
+    return (F3SharedBuffer **)KoreMaterialUpdateVec4(&scratch, (int)slot2, (int)slot3, (int)slot4, &scratch, 1);   // sub_19E2370
+}
+
+// sub_70DC90 (0x70DC90 - 0x70DCDD) -- GetSelectedPrimitiveResourceID: read
+// the selected primitive's resource id and format it "%u" into the out slot.
+static F3SharedBuffer **EngineTestGetSelectedPrimitiveResourceID(F3SharedBuffer **out)
+{
+    int v;
+    KoreReadSelectedPrimitiveID(&v);               // sub_19DE1E0 (value re-read from the local)
+    InitSharedSlot(out);
+    SharedSlotFormat(out, "%u", v);
+    return out;
+}
+
+// sub_70DB80 (0x70DB80 - 0x70DB84) -- SetSelectedPrimitive: the 5-byte jmp
+// thunk to the VM store op.  [NOT byte-identical] placement-dependent
+// (the relative `jmp` displacement depends on where the thunk lands).
+static int EngineTestSetSelectedPrimitive(int id)
+{ return KoreStoreSelectedPrimitive(id); }         // sub_19DE1B0
+
+// ----------------------------------------------------------------
+//  The five upvalue-marshalling functions (the builtin-closure C functions
+//  handed to KoreRegisterBuiltinClosure: they pull the first Lua value off
+//  the VM stack -- tag 7 = table (data+16), tag 2 = string (data+0), else
+//  0 -- and dispatch to the wrapper with the converted arguments).
+// ----------------------------------------------------------------
+
+// sub_70DEC0 (0x70DEC0 - 0x70DE4F) -- the AddMistInstance dispatcher: pull
+// the three remaining Lua arguments (converting each to a VM value) and call
+// the wrapper with the first.
+static int EngineTestDispatchSlotString(int fn, int vm, int base)
+{
+    KoreGetNumberArg(vm, base + 3);                // sub_408200 (discarded)
+    void *s3 = KoreGetArgSlot(vm, base + 2);       // sub_4072D0
+    KoreSlotToValue(*(int *)s3);                   // sub_62AF90
+    void *s2 = KoreGetArgSlot(vm, base + 1);       // sub_4072D0
+    KoreSlotToValue(*(int *)s2);                   // sub_62AF90
+    void *s1 = KoreGetArgSlot(vm, base);           // sub_4072D0
+    int v = KoreSlotToValue(*(int *)s1);           // sub_62AF90
+    ((void (*)(int))fn)(v);
+    return 0;
+}
+
+// sub_70E0D0 (0x70E0D0 - 0x70E11F) -- AddMistInstance upvalue (80 bytes):
+// pull the first Lua value and dispatch to EngineTestDispatchSlotString.
+static int EngineTestAddMistInstanceUpvalue(int vm)
+{
+    int  sp   = *(int *)((char *)vm + 32);
+    int  slot = *(int *)(sp - 8);
+    int  tag  = *(int *)(slot + 16);
+    int *data = (int *)(slot + 12);
+    if (tag == 7)
+        return EngineTestDispatchSlotString(data[4], vm, 1);
+    if (tag == 2)
+        return EngineTestDispatchSlotString(data[0], vm, 1);
+    return EngineTestDispatchSlotString(0, vm, 1);
+}
+
+// sub_70DF40 (0x70DF40 - 0x70DFF0) -- the UpdateMaterialParameterFloat
+// dispatcher: pull the number arg 4 + the three string args 1-3 (into fresh
+// shared slots), call the wrapper, release the slots.
+static int EngineTestDispatchFloatStrings(int fn, int vm, int base)
+{
+    float f = KoreGetNumberArg(vm, base + 3);              // sub_408200
+    F3SharedBuffer *s3 = 0, *s2 = 0, *s1 = 0;
+    SetSharedSlot(&s3, KoreGetArgStringBytes(vm, base + 2), -1);  // sub_407370
+    SetSharedSlot(&s2, KoreGetArgStringBytes(vm, base + 1), -1);
+    SetSharedSlot(&s1, KoreGetArgStringBytes(vm, base), -1);
+    ((void (*)(F3SharedBuffer **, F3SharedBuffer **, F3SharedBuffer **, float))fn)(&s1, &s2, &s3, f);
+    ReleaseSharedSlot(&s1);
+    ReleaseSharedSlot(&s2);
+    ReleaseSharedSlot(&s3);
+    return 0;
+}
+
+// sub_70E120 (0x70E120 - 0x70E16F) -- UpdateMaterialParameterFloat upvalue.
+static int EngineTestUpdateMaterialParameterFloatUpvalue(int vm)
+{
+    int  sp   = *(int *)((char *)vm + 32);
+    int  slot = *(int *)(sp - 8);
+    int  tag  = *(int *)(slot + 16);
+    int *data = (int *)(slot + 12);
+    if (tag == 7)
+        return EngineTestDispatchFloatStrings(data[4], vm, 1);
+    if (tag == 2)
+        return EngineTestDispatchFloatStrings(data[0], vm, 1);
+    return EngineTestDispatchFloatStrings(0, vm, 1);
+}
+
+// sub_70DFF0 (0x70DFF0 - 0x70E0CF) -- the UpdateMaterialParameterVec4
+// dispatcher: pull the int arg 4 + the three string args 1-3 (into fresh
+// shared slots), call the wrapper, release the slots.
+static int EngineTestDispatchIntStrings(int fn, int vm, int base)
+{
+    void *n = KoreGetArgSlot(vm, base + 3);                // sub_4072D0
+    int i = KoreSlotToInt(*(int *)n);                      // sub_62AFF0
+    F3SharedBuffer *s3 = 0, *s2 = 0, *s1 = 0;
+    SetSharedSlot(&s3, KoreGetArgStringBytes(vm, base + 2), -1);  // sub_407370
+    SetSharedSlot(&s2, KoreGetArgStringBytes(vm, base + 1), -1);
+    SetSharedSlot(&s1, KoreGetArgStringBytes(vm, base), -1);
+    ((void (*)(F3SharedBuffer **, F3SharedBuffer **, F3SharedBuffer **, int))fn)(&s1, &s2, &s3, i);
+    ReleaseSharedSlot(&s1);
+    ReleaseSharedSlot(&s2);
+    ReleaseSharedSlot(&s3);
+    return 0;
+}
+
+// sub_70E170 (0x70E170 - 0x70E1BF) -- UpdateMaterialParameterVec4 upvalue.
+static int EngineTestUpdateMaterialParameterVec4Upvalue(int vm)
+{
+    int  sp   = *(int *)((char *)vm + 32);
+    int  slot = *(int *)(sp - 8);
+    int  tag  = *(int *)(slot + 16);
+    int *data = (int *)(slot + 12);
+    if (tag == 7)
+        return EngineTestDispatchIntStrings(data[4], vm, 1);
+    if (tag == 2)
+        return EngineTestDispatchIntStrings(data[0], vm, 1);
+    return EngineTestDispatchIntStrings(0, vm, 1);
+}
+
+// sub_70E1C0 (0x70E1C0 - 0x70E251) -- the GetSelectedPrimitiveResourceID
+// dispatcher: call the wrapper into a temp slot, ref/release it, and append
+// the block's C string to the VM value stack (KoreAppendString, sub_407070);
+// an empty slot instead appends an 8-byte empty value-array record.
+static int EngineTestDispatchReturnString(int fn, int vm)
+{
+    F3SharedBuffer *slot = 0;
+    F3SharedBuffer *block = 0;
+    ((void (*)(F3SharedBuffer **))fn)(&slot);
+    RefSharedSlot(&block, &slot);               // thiscall (sub_1A012C0)
+    ReleaseSharedSlot(&slot);
+    if (block != 0)
+    {
+        const char *data = block->data;
+        if (data != 0)
+        {
+            KoreAppendString(vm, data, (int)strlen(data));   // sub_407070
+            ReleaseSharedSlot(&block);
+            return 1;
+        }
+        int cursor = *(int *)((char *)vm + 0x1C);
+        *(int *)(cursor + 4) = 0;
+        *(int *)((char *)vm + 0x1C) = cursor + 8;
+    }
+    else
+    {
+        KoreAppendString(vm, "", 0);            // sub_407070 (the empty string)
+    }
+    ReleaseSharedSlot(&block);
+    return 1;
+}
+
+// sub_70E4A0 (0x70E4A0 - 0x70E4EF) -- GetSelectedPrimitiveResourceID upvalue.
+static int EngineTestGetSelectedPrimitiveResourceIDUpvalue(int vm)
+{
+    int  sp   = *(int *)((char *)vm + 32);
+    int  slot = *(int *)(sp - 8);
+    int  tag  = *(int *)(slot + 16);
+    int *data = (int *)(slot + 12);
+    if (tag == 7)
+        return EngineTestDispatchReturnString(data[4], vm);
+    if (tag == 2)
+        return EngineTestDispatchReturnString(data[0], vm);
+    return EngineTestDispatchReturnString(0, vm);
+}
+
+// sub_63E1F0 (0x63E1F0 - 0x63E26A) -- SetSelectedPrimitive upvalue (122
+// bytes): pull the first Lua value (the stored C function pointer), pop the
+// optional number argument (0.0 when the stack is empty), and call the
+// function with it.
+static int EngineTestSetSelectedPrimitiveUpvalue(int vm)
+{
+    int  sp   = *(int *)((char *)vm + 32);
+    int  slot = *(int *)(sp - 8);
+    int *data = (int *)(slot + 12);
+    int  tag  = *(int *)(slot + 16);
+    void *p;
+    if (tag == 7)
+        p = (void *)data[4];
+    else if (tag == 2)
+        p = (void *)data[0];
+    else
+        p = 0;
+    void *fn = *(void **)p;
+    double d = (sp < *(int *)((char *)vm + 28))
+        ? KorePopNumberValue(vm, sp)             // sub_5D93D0
+        : 0.0;
+    ((void (*)(double))fn)(d);
+    return 0;
+}
+
+// ----------------------------------------------------------------
+//  EngineLuaDebugTable / EngineLuaEnsureTable / EngineLuaRegisterNamedClosure
+//  -- the table-ensuring and method-registration ops.
+// ----------------------------------------------------------------
+
+// sub_67C2B0 (0x67C2B0 - 0x67C381) -- EngineLuaEnsureTable: intern/look up
+// NAME on the module context (KoreLookupBuiltinValue, sub_67C180); when found
+// (or the context is empty) copy the {value, ctrl} pair to OUT with a
+// transient increment/decrement of its ctrl block; otherwise create the table
+// for the name on the module value stack (reserve 8, KorePushEmptyTable,
+// KoreRegisterBuiltinName(-2), roll back), re-look-up into OUT and release
+// the first temp.  thiscall + `retn 8` (the {value, ctrl} context pair in
+// ECX, OUT and NAME on the stack).  VM-internal.
+static DWORD *EngineLuaEnsureTable(DWORD *thisPair, DWORD *out, const char *name)
+{
+    DWORD pair[2];
+    KoreLookupBuiltinValue(thisPair, pair, name);           // sub_67C180
+    if (pair[0] != 0 || thisPair[0] == 0)
+    {
+        out[0] = pair[0];
+        out[1] = pair[1];
+        if (pair[1] != 0)
+        {
+            InterlockedIncrement((volatile LONG *)pair[1]);
+            ReleaseLookupCtrl(pair[1]);   // decrement; dispatch + LHFree at 0
+        }
+    }
+    else
+    {
+        DWORD *table = *(DWORD **)thisPair;
+        DWORD  cursor = *(DWORD *)(table + 0x1C);
+        KoreValueStackReserve(table, *(void **)table, thisPair[1], cursor);  // sub_5DF650
+        *(DWORD *)(table + 0x1C) = cursor + 8;
+        KorePushEmptyTable((int)table, 0, 0);                // sub_5DEC20
+        KoreRegisterBuiltinName((int)table, -2, name);       // sub_4076D0
+        *(DWORD *)(table + 0x1C) = cursor;                   // roll back
+        KoreLookupBuiltinValue(thisPair, out, name);         // sub_67C180 (re-look-up)
+        KoreReleaseLookupPair(pair);                         // sub_6179D0
+    }
+    return out;
+}
+
+// sub_633E70 (0x633E70 - 0x633EE8) -- EngineLuaDebugTable: build the global-
+// table context on the module (EngineLuaGlobalTable, sub_67C390), ensure the
+// table named by the g_slot_1DBDC78 slot ("Debug") into OUT, drop the pair's
+// ctrl block, and return OUT.  10+ callers (the module-registration family).
+static DWORD *EngineLuaDebugTable(DWORD *out, int luaModule)
+{
+    EngineLuaGlobalTable((int *)out, luaModule);   // sub_67C390
+    const char *name = GetSlotString(&g_slot_1DBDC78);
+    EngineLuaEnsureTable(out, out, name);          // sub_67C2B0 (this = out = OUT)
+    ReleaseLookupCtrl(out[1]);                     // the epilogue release
+    return out;
+}
+
+// sub_640870 / sub_70E320 / sub_70E3A0 / sub_70E420 / sub_70E530 -- the five
+// 124-byte registration helpers (identical except for the upvalue-marshalling
+// function embedded in each body): when the {value, ctrl} context pair's
+// value is set, reserve 8 bytes on the module value stack, store the C
+// wrapper pointer in the reserved slot, install the builtin closure (the
+// upvalue fn, 1 upvalue), store the name in the global table (sub_67C540),
+// register the builtin name (KoreRegisterBuiltinName, -2), and roll the stack
+// back.  thiscall + `retn 8` (the context pair in ECX, NAME and WRAPPER on
+// the stack).  VM-internal.  (sub_640870 / sub_70E530 are shared with other
+// module registrations; sub_70E320 / sub_70E3A0 / sub_70E420 are EngineTest-
+// specific.)  One shared implementation here takes the upvalue as a parameter.
+static DWORD EngineLuaRegisterNamedClosure(DWORD *pair, const char *name, int wrapper, int upvalue)
+{
+    DWORD value = pair[0];
+    if (value != 0)
+    {
+        DWORD *table = *(DWORD **)value;
+        DWORD  cursor = *(DWORD *)(table + 0x1C);
+        KoreValueStackReserve(table, *(void **)table, pair[1], cursor);   // sub_5DF650
+        *(DWORD *)(table + 0x1C) = cursor + 8;
+        DWORD *slot = (DWORD *)KoreValueArraySlot(table, 4);              // sub_5DC450
+        *slot = (DWORD)wrapper;
+        KoreRegisterBuiltinClosure((int)table, upvalue, 1);
+        EngineLuaStoreGlobalName(pair, table, name);                      // sub_67C540
+        KoreRegisterBuiltinName((int)table, -2, name);                    // sub_4076D0
+        *(DWORD *)(table + 0x1C) = cursor;                                // roll back
+    }
+    return value;
+}
+
+// ResetEngineTest  (nullsub_28, 0x70DBB0 - 0x70DBB1) -- the one-byte `retn`
+// no-op called immediately before RegisterEngineTest by ReinitEngineLua
+// (0x61A56F, with the Lua module pushed) and RunFrontEnd (0x61D5F6, no
+// argument).  Byte-identical: the single `retn`.
+__declspec(naked)
+void ResetEngineTest(int luaModule)
+{
+    (void)luaModule;
+    __asm { retn }
+}
+
+// RegisterEngineTest  (sub_70DDB0, 0x70DDB0 - 0x70DEBA) -- register the
+// "Debug.EngineTest" Lua module (see the section header above).  [NOT
+// byte-identical] placement-dependent (relative calls) and it references
+// the high-VA .rdata method-name strings.
+void RegisterEngineTest(int luaModule)
+{
+    DWORD classPair[2];   // the "Debug" table pair {value, ctrl}
+    DWORD testPair[2];    // the "EngineTest" table pair {value, ctrl}
+
+    EngineLuaDebugTable(classPair, luaModule);                       // sub_633E70
+    EngineLuaEnsureTable(classPair, testPair, "EngineTest");         // sub_67C2B0
+    EngineLuaRegisterNamedClosure(testPair, "AddMistInstance",                 (int)EngineTestAddMistInstance,                  (int)EngineTestAddMistInstanceUpvalue);                  // sub_70E320
+    EngineLuaRegisterNamedClosure(testPair, "UpdateMaterialParameterFloat",    (int)EngineTestUpdateMaterialParameterFloat,     (int)EngineTestUpdateMaterialParameterFloatUpvalue);   // sub_70E3A0
+    EngineLuaRegisterNamedClosure(testPair, "UpdateMaterialParameterVec4",     (int)EngineTestUpdateMaterialParameterVec4,      (int)EngineTestUpdateMaterialParameterVec4Upvalue);    // sub_70E420
+    EngineLuaRegisterNamedClosure(testPair, "GetSelectedPrimitiveResourceID",  (int)EngineTestGetSelectedPrimitiveResourceID,   (int)EngineTestGetSelectedPrimitiveResourceIDUpvalue); // sub_70E530
+    EngineLuaRegisterNamedClosure(testPair, "SetSelectedPrimitive",            (int)EngineTestSetSelectedPrimitive,             (int)EngineTestSetSelectedPrimitiveUpvalue);       // sub_640870
+
+    ReleaseLookupCtrl(testPair[1]);                                  // epilogue: release the EngineTest pair's ctrl
+    testPair[0] = 0;
+    testPair[1] = 0;
+    ReleaseLookupCtrl(classPair[1]);                                 // release the Debug pair's ctrl
+}
 
 int ReinitEngineLua(void *obj, int flag)
 {
@@ -8346,15 +10201,15 @@ int ReinitEngineLua(void *obj, int flag)
     {
         int startup = 0;
         SharedSlotConcat((F3SharedBuffer **)&startup, &g_unk_1DBE2B4, &g_unk_1DBDA6C);
-        RunLuaStartupScripts((int)dw[0xBC / 4], startup);
+        RunLuaStartupScripts((int)dw[0xBC / 4], (F3SharedBuffer **)&startup);
         ReleaseSharedSlot((F3SharedBuffer **)&startup);
     }
 
     // 6. Optional "EngineTest" module.
     if (flag != 0)
     {
-        nullsub_28((int)dw[0xBC / 4]);
-        sub_70DDB0((int)dw[0xBC / 4]);
+        ResetEngineTest((int)dw[0xBC / 4]);
+        RegisterEngineTest((int)dw[0xBC / 4]);
     }
 
     // 7. (The original calls the nullsub_27 no-op when +0xC0 is set.)
@@ -8365,7 +10220,7 @@ int ReinitEngineLua(void *obj, int flag)
     int  esm    = 0;
     void *esmMem = LHAlloc(0x50);
     if (esmMem != 0)
-        esm = (int)CEntityScriptHandleManagerCtor(esmMem, (void *)dw[0xBC / 4]);
+        esm = (int)CEntityScriptHandleManagerCtor(esmMem, dw[0xBC / 4]);
     if (dw[0xC4 / 4] != 0)
     {
         void *old0C4 = (void *)dw[0xC4 / 4];

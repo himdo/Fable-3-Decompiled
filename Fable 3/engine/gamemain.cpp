@@ -6577,8 +6577,9 @@ static F3SharedBuffer **SharedSlotAppendSlot(F3SharedBuffer **dst, F3SharedBuffe
 //
 //  cdecl. SetSharedSlot(dst, lit, -1) followed by SharedSlotAppendSlot(dst,
 //  src); returns dst. (The version-table summary loop uses it to build the
-//  ",id" segments.)
-static F3SharedBuffer **SharedSlotConcatLiteral(F3SharedBuffer **dst, const char *lit, F3SharedBuffer **src)
+//  ",id" segments.)  Exposed (non-static) for the CLuaManager serialise-script
+//  path (engine/luavm.cpp); declared in gamemain.h.
+F3SharedBuffer **SharedSlotConcatLiteral(F3SharedBuffer **dst, const char *lit, F3SharedBuffer **src)
 {
     SetSharedSlot(dst, lit, -1);
     SharedSlotAppendSlot(dst, src);
@@ -6596,7 +6597,8 @@ static F3SharedBuffer **SharedSlotConcatLiteral(F3SharedBuffer **dst, const char
 //  MakeSettingsFilePath (0x1A02230, slot + literal).  [NOT byte-identical]
 //  (placement-dependent relative calls to CopySharedSlot /
 //  SharedSlotAppendSlot, the Interlocked IAT slot, and the high-VA global
-//  g_Addend, 0x02075C48).
+//  g_Addend, 0x02075C48).  Exposed (non-static) for the CLuaManager
+//  serialise-script path (engine/luavm.cpp); declared in gamemain.h.
 F3SharedBuffer **SharedSlotConcat(F3SharedBuffer **dst, F3SharedBuffer **src1, F3SharedBuffer **src2)
 {
     *dst = 0;
@@ -8017,8 +8019,6 @@ static void *sub_72FB30(void *obj)
 { *(void **)obj = g_CGameRendererVtable; *(void **)((char *)obj + 4) = 0; return obj; }
 static void  sub_72FB10(void *obj, void *argList, void *a, void *b)
 { (void)obj; (void)argList; (void)a; (void)b; }
-static void  nullsub_28(int a) { (void)a; }
-static void  sub_70DDB0(int a) { (void)a; }
 static void  sub_18F0180(void) {}
 static void  sub_72FAE0(void *obj) { (void)obj; }
 static void  sub_61BFE0(void *obj, int a) { (void)obj; (void)a; }
@@ -8039,26 +8039,8 @@ static void  sub_18FB930(void) {}
 // can be indexed. (OBJ is a class instance pointer.)
 #define F3_VT(OBJ) ((void **)(*(void **)(OBJ)))
 
-// ============================================================
-//  F3WString -- the 36-byte front-end wide path string (the MSVC
-//  basic_string<wchar_t, 2> layout + two extra zeroed dwords) that the
-//  front-end path-string methods operate on (sub_435C10 = F3WStringAssign
-//  assign, sub_4358A0 = F3WStringFromAnsi, sub_4357C0 =
-//  F3WStringNormalizeSeparators, sub_436BA0 = F3WStringNormalize, sub_5AF180):
-//    +0    d0 (low word zeroed by the reset idiom)
-//    +4    SSO buffer (8 wchars) / heap pointer
-//    +20   wchar length
-//    +24   capacity ( < 8 => SSO )
-//    +28 / +32  extra zeroed words
-// ============================================================
-typedef struct F3WString
-{
-    DWORD   d0;
-    union { wchar_t buf[8]; DWORD ptr; } u;
-    DWORD   len;
-    DWORD   cap;
-    DWORD   e1, e2;
-} F3WString;
+// The 36-byte F3WString wide-path struct now lives in gamemain.h (it is
+// shared with the CLuaManager serialise-script path in engine/luavm.cpp).
 
 static wchar_t *F3WStringData(F3WString *s)
 {
@@ -8155,7 +8137,9 @@ static void F3WStringNormalizeSeparators(F3WString *s)
 //  [NOT byte-identical] placement-dependent: E8 calls to the _mbstowcs_s /
 //  __alloca_probe / __security_check_cookie CRT slots and to sub_435C10 /
 //  sub_4357C0, plus the original 0x1010-byte stack frame and cookie.
-static F3WString *F3WStringFromAnsi(F3WString *obj, const char *src)
+//  Exposed (non-static) for the CLuaManager serialise-script path
+//  (engine/luavm.cpp); declared in gamemain.h.
+F3WString *F3WStringFromAnsi(F3WString *obj, const char *src)
 {
     F3WStringAssignAnsi(obj, src);
     F3WStringNormalizeSeparators(obj);
@@ -9130,7 +9114,7 @@ static void *GetVfsArchiveCollection(void)
 // sub_180D220 (0x180D220 - 0x180D3E1) -- the file subsystem's per-entry VFS
 // reload (thiscall + `retn 0Ch`; the archive collection in ECX, the out entry
 // slot, the entry, and the .vfsconfig path F3WString on the stack).  Hashes the
-// path (sub_56DFD0), looks the entry up in the archive collection (sub_180F0E0
+// path (GetWideStringHash / sub_56DFD0), looks the entry up in the archive collection (sub_180F0E0
 // tree search), and dispatches the matched provider's reload (the entry
 // vtable[4] with the path / provider index).  Unimplemented in this build: the
 // provider-name lookup + the tree search are remaining no-op stubs because the
@@ -9451,11 +9435,11 @@ static void FileSubsysRegisterDir(void *obj, void *a2, void *a3)
         ((void (*)(void *))F3_VT(node)[2])(node);           // vtable slot 2 (Release)
 }
 
-// sub_17FE870: the LHSFS::CLegacyFile ctor over a 16-byte block (vtable +
-// shared slot + two zeroed words). 'slot' (a2) is the caller's temporary
-// path-string shared slot, handed to the sub_17FE0A0 setup (a remaining
-// stub here).
-static void LegacyFileCtor(void *obj, F3SharedBuffer *slot, int a3, int a4)
+// sub_17FE870 (0x17FE870 - 0x17FE8A5): the LHSFS::CLegacyFile ctor over a
+// 16-byte block (vtable + shared slot + two zeroed words). 'slot' (a2) is
+// the caller's path-string shared slot (the address of the F3SharedBuffer
+// * field), handed to the sub_17FE0A0 open-setup (a remaining stub here).
+void LegacyFileCtor(void *obj, F3SharedBuffer **slot, int a3, int a4)
 {
     DWORD *b = (DWORD *)obj;
     b[0] = (DWORD)g_CLegacyFileVtable;
@@ -9465,8 +9449,9 @@ static void LegacyFileCtor(void *obj, F3SharedBuffer *slot, int a3, int a4)
     (void)slot; (void)a3; (void)a4;
 }
 
-// sub_17FDC30: does the legacy file have data (the +8 slot set)?
-static int LegacyFileHasData(const void *obj)
+// sub_17FDC30 (0x17FDC30 - 0x17FDC39): does the legacy file have data (the
+// +8 file slot set, i.e. did the open succeed)?
+int LegacyFileHasData(const void *obj)
 {
     return *(const DWORD *)((const char *)obj + 8) != 0;
 }
@@ -9490,9 +9475,10 @@ static long ResolveDataPathSlot(F3SharedBuffer **slot) { (void)slot; return 0; }
 // globals (dword_1E2D7BC).
 static void LegacyFileSetDataPath(void *obj) { (void)obj; }
 
-// sub_17FD970: the LHSFS::CLegacyFile dtor (release +12 / +8, release the
-// shared slot, reset the vtable to LHFile::CAFile).
-static long LegacyFileDtor(void *obj)
+// sub_17FD970 (0x17FD970 - 0x17FD9A7): the LHSFS::CLegacyFile dtor (release
+// +12 / +8, release the shared slot, reset the vtable to LHFile::CAFile).
+// Returns the slot release's new g_Addend count.
+long LegacyFileDtor(void *obj)
 {
     DWORD *b = (DWORD *)obj;
     if (b[3] != 0 && F3_VT((void *)b[3]) != 0)
@@ -9731,7 +9717,7 @@ dataSubsys:
     // CLegacyFile (fileBlock) is constructed separately, and the slot is
     // released afterwards.
     SetSharedSlot(&fileSlot, "build_version.txt", -1);
-    LegacyFileCtor(fileBlock, fileSlot, 1, 2);            // sub_17FE870
+    LegacyFileCtor(fileBlock, &fileSlot, 1, 2);           // sub_17FE870
     ReleaseSharedSlot(&fileSlot);
     if (LegacyFileHasData(fileObj) != 0)                  // sub_17FDC30(v45)
         CopyFileToSharedSlot(fileObj, &g_unk_1DBDA78);    // sub_61D800(&unk_1DBDA78)
@@ -10188,8 +10174,8 @@ signedIn:
         dw[0x9C / 4] = (DWORD)v58;
         sub_72FB10((void *)v58, obj, v108, str103);
 
-        nullsub_28((int)dw[0xBC / 4]);
-        sub_70DDB0((int)dw[0xBC / 4]);
+        ResetEngineTest((int)dw[0xBC / 4]);
+        RegisterEngineTest((int)dw[0xBC / 4]);
         sub_18F0180();
         sub_72FAE0((void *)dw[0x9C / 4]);
 

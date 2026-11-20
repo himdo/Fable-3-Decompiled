@@ -16,4 +16,18 @@ void DestroyLuaModule(int luaModule);
 // CLuaManager, the +0xC4 CEntityScriptHandleManager).  obj = the CGameEngine.
 int ReinitEngineLua(void *obj, int flag);
 
+// void ResetEngineTest(int luaModule)   (nullsub_28, 0x70DBB0)
+// -- the one-byte `retn` no-op paired with RegisterEngineTest (the argument
+// is unused; ReinitEngineLua pushes the Lua module, RunFrontEnd does not).
+void ResetEngineTest(int luaModule);
+
+// void RegisterEngineTest(int luaModule)   (sub_70DDB0, 0x70DDB0 - 0x70DEBA)
+// -- register the "Debug.EngineTest" Lua module: ensure the "Debug" table
+// (sub_633E70) + the "EngineTest" subtable (sub_67C2B0) and register the
+// five methods (AddMistInstance, UpdateMaterialParameterFloat,
+// UpdateMaterialParameterVec4, GetSelectedPrimitiveResourceID,
+// SetSelectedPrimitive).  Called from ReinitEngineLua (flag set) and
+// RunFrontEnd, always right after ResetEngineTest.
+void RegisterEngineTest(int luaModule);
+
 #endif // F3_LUAVM_H
