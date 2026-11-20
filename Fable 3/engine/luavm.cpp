@@ -21,6 +21,8 @@
 #include <float.h>                // _controlfp (the FPU round-toward-zero in KoreHeapInitGrow)
 #include <intrin.h>               // __rdtsc (the QPC span accounting in KoreHeapInitGrow)
 #include <string.h>               // memset
+#include <stdlib.h>               // strtod / strtoul (the VM string-to-float)
+#include <ctype.h>                // isspace (the VM string-to-float trailing check)
 #include <malloc.h>               // _aligned_malloc / _aligned_free (the VM aligned allocator)
 #include <stdio.h>                // _vsnprintf_s (the float / source formatting)
 #include <stdarg.h>               // va_list (the vsnprintf wrapper)
@@ -914,6 +916,7 @@ static int    KoreCreateUpvalueTable(int obj, int vmcore, int closure, int dst, 
 static int    KoreNormalizeValue(int table, int v, int top);             // sub_5DDED0
 static int    KorePushCFrame(int obj, int vmcore, int retPos, int v, int newTop, int valIdx); // sub_612D50
 static int    KorePushClosureFrame(int obj, int vmcore, int retPos, int v, int top, int valIdx); // sub_612BB0
+static int    KoreReturnFromClosure(int obj, int vmcore, int v, int rpos);          // sub_5E8FA0
 static int    KorePopCFrame(int obj, int table, int rv);                 // sub_60BBD0
 static int    KoreRunCode(int table, int code, int arg2);                // sub_5E9AA0 (interpreter)
 static int    KoreInvokeValue(int table, int argCount, int retPos, int valIdx); // sub_5EC770
@@ -4181,7 +4184,7 @@ static int KoreVmSprintf(int vmcore, const char *format, void *arglist)
     *top = (int)entry;
     top[1] = 4;
     vm[7] = (int)(top + 2);
-    return (int)(entry + 2);
+    return (int)(entry + 8);   // the interned payload bytes (the original returns entry + 8)
 }
 
 // ---- sub_5DBFE0: variadic wrapper that forwards to the VM vsprintf.
@@ -6131,11 +6134,14 @@ static int        g_word_1DBD02A      = 0xFFFF;                          // 0x1D
 static int        g_word_1DBD02C      = 0xFFFF;                          // 0x1DBD02C
 static int        g_proto_1DBD890[4]  = { -1, -1, -1, -1 };              // 0x1DBD890
 static int        g_proto_1DBD8A0[4]  = { -1, -1, -1, -1 };              // 0x1DBD8A0
-// off_1C830B8: type-name table (index = type tag).
+// off_1C830B8: type-name table (index = type tag): 0 nil, 1 boolean,
+// 2 userdata, 3 number, 4 string, 5 table, 6 function, 7 userdata,
+// 8 thread, 9/10 function (closure kinds), 11 ui64, 12 struct, 13 (null),
+// 14 "no value", 15 nil.
 static const char *g_KoreTypeNames[16] = {
-    "nil", "number", "string", "boolean", "table", "closure",
-    "thread", "lightuserdata", "userdata", "function", "coroutine",
-    "unary", "struct", "prototype", "upvalue", "unknown"
+    "nil", "boolean", "userdata", "number", "string", "table",
+    "function", "userdata", "thread", "function", "function",
+    "ui64", "struct", 0, "no value", "nil"
 };
 // off_1C83014: metamethod / operator-name table (index = op id).
 static const char *g_KoreOpNames[16] = {
@@ -6248,17 +6254,33 @@ static int KoreStringCompare(int a, int b)
     return pa - pb;
 }
 
-// ---- sub_5D6DE0: string-to-float conversion (strtod of the payload bytes).
-static int KoreFloatFromString(int s, int len, int out)
+// ---- sub_5D6DE0 (0x5D6DE0 - 0x5D6E7B): string-to-float conversion (the VM's
+// strtod).  s is a string value cell (the interned record in the cell's value
+// word; payload bytes at record + 8, len the payload length); out receives
+// the float.  strtod first; when it stops at 'x' / 'X' the whole payload is
+// re-parsed as a base-16 integer (strtoul radix 16, +2^32 added back over the
+// top bit) so hex literals parse.  Trailing whitespace is skipped; returns 1
+// only when the whole payload is consumed, 0 otherwise (the failure the
+// number-arg checkers branch on).  [NOT byte-identical] reimplemented with
+// the CRT strtod / strtoul / isspace.
+static int KoreFloatFromString(int cell, int len, int out)
 {
-    char buf[0x100];
-    int n = (len > 0 && len < 0x100) ? len : 0x100;
-    const char *p = (const char *)*(int *)s + 12;
-    int i;
-    for (i = 0; i < n && p[i]; ++i) buf[i] = p[i];
-    buf[i] = 0;
-    *(float *)out = (float)strtod(buf, 0);
-    return 1;
+    const char *p = (const char *)*(int *)cell + 8;
+    char *end = 0;
+    *(float *)out = (float)strtod(p, &end);
+    if (end == p)
+        return 0;
+    if (*end == 'x' || *end == 'X')
+    {
+        unsigned int v = strtoul(p, &end, 16);
+        double d = (double)v;
+        if ((int)v < 0)
+            d += 4294967296.0;
+        *(float *)out = (float)d;
+    }
+    while (*end != 0 && isspace((unsigned char)*end))
+        ++end;
+    return end == p + len;
 }
 
 // ---- sub_610BA0: struct field get by {value, type} key. (0x610BA0 - 0x610C56)
@@ -6437,7 +6459,9 @@ static int KoreMakeStructInstance(int vmcore, int proto, int rows, int buckets)
     return (int)inst;
 }
 
-// ---- sub_5E8FA0: build a table with arraySize / hashSize from the encodings.
+// ---- build a table with arraySize / hashSize from the encodings.
+// (Dead stub; its former sub_5E8FA0 label was wrong -- 0x5E8FA0 is
+// KoreReturnFromClosure. Not wired to any in-tree caller.)
 static int KoreMakeInstance(int vmcore, int proto, int rows, int buckets)
 {
     int obj = KoreAllocHashTable(vmcore, rows, buckets);
@@ -6733,22 +6757,107 @@ static void KoreTypeCheckFail2(int vmcore, int obj, int slot, const char *fmt, .
     KoreTablePanic(vmcore, "%s", fmt);
 }
 
-// ---- resolve the operator name string for a binary op (small stub; this is
-// a distinct operator-name lookup, NOT sub_5E30C0 -- that is the recursive
-// __index gettable resolver, now KoreGettableResolve).
-static int KoreLookupOperatorName(int vmcore, int slot, int op, int opchar)
+// ---- sub_5E3010 (0x5E3010 - 0x5E305D): resolve the metamethod for an
+// operator on the value at `slot`, or panic when none is installed.  It calls
+// KoreLookupMetamethod(vmcore, slot, slot, op) -- the operand is passed for
+// both value slots, i.e. a unary lookup -- and returns the {payload, type}
+// pair that yields.  When the pair's type word is 0 (no metamethod, i.e. the
+// nil pair) it raises "operator <op> is not supported for <op> <type>" via
+// KoreTablePanic, where <type> is g_KoreTypeNames[*(int*)(slot + 4)] (the
+// operand's type name) and <op> is the caller's operator-name string, then
+// still returns the (nil) pair.  [NOT byte-identical] placement-dependent
+// (relative calls to the high-VA KoreLookupMetamethod / KoreTablePanic
+// helpers).  This is a distinct operator-metamethod lookup, NOT sub_5E30C0
+// (the recursive __index gettable resolver, KoreGettableResolve).
+static __int64 KoreLookupOperatorName(int vmcore, int slot, int op, const char *opname)
 {
-    (void)vmcore; (void)slot; (void)op; (void)opchar;
-    return 0;
+    __int64 pair = KoreLookupMetamethod(vmcore, slot, slot, op);
+    if ((int)(pair >> 32) == 0)
+        KoreTablePanic(vmcore, "operator %s is not supported for %s %s",
+                       opname, opname, g_KoreTypeNames[*(int *)(slot + 4)]);
+    return pair;
 }
 
-// ---- sub_5E3CD0: concatenate a run of value-stack slots.
-static int KoreConcatSlots(int vmcore, int base, int code, int lb, int b, int lb2)
+// ---- sub_5E3CD0 (0x5E3CD0 - 0x5E3E4F): the ".." concat opcode helper
+// (opcode 0x36 in KoreRunCode).  Concatenates the run of value-stack slots
+// [startIdx .. endIdx] into a single value left at slot startIdx, then
+// copies it into the destination slot.  Each step folds the two slots at
+// indices i-1 and i into one: when both are numbers (type 3) or strings
+// (type 4) the pair is copied to the stack top and folded by
+// KoreConcatValues (sub_5DC2B0); otherwise the ".." metamethod (operator id
+// 9) is looked up via KoreLookupMetamethod -- preferring the non-plain-
+// string side as the receiver when one side is a plain string (type 4) and
+// the other is not -- and invoked with the two slots as its two arguments.
+// A nil metamethod pair panics with "operator %s is not supported for %s %s
+// %s" (the two type names from g_KoreTypeNames).  The folded result is
+// popped back down to slot i-1 each step.  Grows the value stack first if
+// top + 24 would exceed capacity, and returns the (possibly relocated)
+// value-stack base.  [NOT byte-identical] placement-dependent: relative
+// calls to the high-VA KoreReallocValueStack / KoreConcatValues /
+// KoreLookupMetamethod / KoreTablePanic / KoreInvokeValue helpers and the
+// g_KoreTypeNames table, plus the variadic panic call.
+static int KoreConcatSlots(int vmcore, int base, int code, int dest, int startIdx, int endIdx)
 {
-    (void)base; (void)code; (void)lb; (void)b; (void)lb2;
-    *(int *)vmcore = g_dword_1DBCFE0;
-    *(int *)(vmcore + 4) = g_dword_1DBCFE4;
-    return vmcore;
+    int *vm = (int *)vmcore;
+    if (vm[7] + 24 > (unsigned)vm[9])
+        KoreReallocValueStack(vmcore + 4, vmcore, 3);
+    base = vm[8];
+    if (startIdx < endIdx)
+    {
+        int i = endIdx;
+        do
+        {
+            int *slotHi = (int *)(base + 8 * i);
+            int *slotLo = slotHi - 2;
+            int loType = slotLo[1];
+            int hiType = slotHi[1];
+            if ((loType == 4 || loType == 3) && (hiType == 4 || hiType == 3))
+            {
+                int *top = (int *)vm[7];
+                top[0] = slotLo[0];
+                top[1] = loType;
+                top[2] = slotHi[0];
+                top[3] = hiType;
+                vm[7] = (int)(top + 4);
+                KoreConcatValues(vmcore, 2);
+            }
+            else
+            {
+                int *primary = slotLo;
+                int *other = slotHi;
+                if (loType == 4 && hiType != 4)
+                {
+                    primary = slotHi;
+                    other = slotLo;
+                }
+                __int64 meta = KoreLookupMetamethod(vmcore, (int)primary, (int)other, 9);
+                if ((int)(meta >> 32) == 0)
+                    KoreTablePanic(vmcore, "operator %s is not supported for %s %s %s",
+                                   "..", g_KoreTypeNames[*(int *)(primary + 4)], "..",
+                                   g_KoreTypeNames[*(int *)(other + 4)]);
+                int *top = (int *)vm[7];
+                top[0] = (int)meta;
+                top[1] = (int)(meta >> 32);
+                top[2] = slotLo[0];
+                top[3] = slotLo[1];
+                top[4] = slotHi[0];
+                top[5] = slotHi[1];
+                vm[7] = (int)(top + 6);
+                KoreInvokeValue(vmcore, 2, 1, code);
+            }
+            int *top = (int *)vm[7];
+            int val = *(int *)(top - 8);
+            int type = *(int *)(top - 4);
+            base = vm[8];
+            vm[7] = (int)(top - 2);
+            *(int *)(base + 8 * (i - 1)) = val;
+            *(int *)(base + 8 * (i - 1) + 4) = type;
+            --i;
+        } while (i > startIdx);
+    }
+    *(int *)(base + 8 * dest) = *(int *)(base + 8 * startIdx);
+    *(int *)(base + 8 * dest + 4) = *(int *)(base + 8 * startIdx + 4);
+    return base;
 }
 
 // ---- sub_611360 family: the arithmetic binary operator with metatable fallback.
@@ -6770,11 +6879,102 @@ static __int64 KoreArithOp(int vmcore, int a, int typeA, int b, int typeB, int c
     return ((unsigned __int64)3 << 32) | (unsigned int)r;
 }
 
-// ---- sub_5E8FA0: return from a closure frame.
-static int KoreReturnFromClosure(int vmcore, int frame, int retPos)
+// ---- sub_5E8FA0 (0x5E8FA0 - 0x5E9142) -- KoreReturnFromClosure: the
+// RETURN-from-Lua-closure opcode handler; the mirror of
+// KorePushClosureFrame.  Reads the frame's saved local-slot count
+// (frame+10 word), increments its use counter (frame+8 word) and clears
+// the slot count, then shrinks the value-stack base by 8*nslots and copies
+// the return-value run [v, rpos) down to the slot just below the new base
+// (8 bytes under it).  Grows the stack if the prospective top (last
+// returned value + 8*argcount + 8) would pass end.  When the closure's
+// flag byte (+10) has bit 0x02 set, the run of non-upvalue values between
+// the upvalue slots and the new base is moved to the top of the locals
+// (three KoreReverseValuePairs passes) and the count is recorded in
+// frame+10; with bit 0x04 set the upvalues are materialized into a hash
+// table via KoreCreateUpvalueTable, otherwise the upvalue-slot type word
+// is zeroed.  Finishes by zeroing the type words of any unfilled local
+// slots above the returned values, setting base = dst + 8 and
+// top = base + 8*argcount.  Returns top (or argcount on the zero-fill
+// path, which the sole caller never uses).  [NOT byte-identical]
+// placement-dependent: relative calls to the high-VA
+// KoreReallocValueStack / KoreReverseValuePairs / KoreCreateUpvalueTable.
+static int KoreReturnFromClosure(int obj, int vmcore, int v, int rpos)
 {
-    (void)vmcore; (void)frame; (void)retPos;
-    return 0;
+    int *t = (int *)obj;                    // continuation object (vmcore+4)
+    int *tv = (int *)vmcore;                // value-stack table
+    int frame = t[2];                       // current frame record (byte addr)
+    int *s = (int *)v;
+    int closure = *s;                       // closure being returned from
+    int pop8 = 8 * *(unsigned short *)(frame + 10);   // 8 * saved local count
+    int base = tv[8];
+    ++*(unsigned short *)(frame + 8);       // frame use counter
+    int newbase = base - pop8;
+    *(unsigned short *)(frame + 10) = 0;
+    int dst = newbase - 8;                  // return values land here
+    int *d = (int *)dst;
+    int *e = (int *)rpos;
+    if (s != e)
+    {
+        do
+        {
+            *d = *s;
+            d[1] = s[1];
+            s += 2;
+            d += 2;
+        } while (s != e);
+    }
+    tv[8] = newbase;
+    int argcount = *(unsigned char *)(closure + 9);
+    int upcount = *(unsigned char *)(closure + 11);
+    int topEnd = (int)d + 8 * argcount + 8; // prospective top
+    int nret = ((int)d - dst) >> 3;         // number of returned pairs
+    int v31 = (int)d;
+    if ((unsigned int)topEnd > (unsigned int)tv[9])
+    {
+        int start = tv[10];
+        int dstSlots = (dst - start) >> 3;
+        int dSlots = ((int)d - start) >> 3;
+        KoreReallocValueStack(obj, vmcore, (topEnd - tv[7]) >> 3);
+        int nstart = tv[10];
+        dst = nstart + 8 * dstSlots;
+        v31 = nstart + 8 * dSlots;
+    }
+    int p = dst + 8;
+    if ((*(unsigned char *)(closure + 10) & 2) != 0)
+    {
+        int m = (v31 - 8 * upcount - p) >> 3;
+        if (m <= 0) m = 0;
+        if (m != 0)
+        {
+            *(unsigned short *)(frame + 10) = (unsigned short)m;
+            int v29 = nret - m;
+            KoreReverseValuePairs(dst, nret - m);
+            KoreReverseValuePairs(dst + 8 * v29, m);
+            KoreReverseValuePairs(dst, nret);
+            p += 8 * m;
+        }
+        int up8 = 8 * upcount;
+        if ((*(unsigned char *)(closure + 10) & 4) != 0)
+            KoreCreateUpvalueTable(obj, vmcore, closure, p + up8, dst);
+        else
+            *(int *)(p + up8 + 4) = 0;
+    }
+    int localsEnd = p + 8 * upcount;
+    tv[8] = p;
+    if ((unsigned int)v31 >= (unsigned int)localsEnd)
+    {
+        int result = p + 8 * argcount;
+        tv[7] = result;
+        return result;
+    }
+    int *z = (int *)v31;
+    do
+    {
+        z[1] = 0;                       // zero the type word of each slot
+        z += 2;
+    } while ((unsigned int)z < (unsigned int)localsEnd);
+    tv[7] = p + 8 * argcount;
+    return argcount;                    // unused by the sole caller
 }
 
 // ---- sub_60AE60: return from a C function frame.
@@ -6821,10 +7021,244 @@ static int KoreStructSetField(int vmcore, int value, int key)
     return obj;
 }
 
-// ---- sub_5E4CB0: the built-in C closure "iterate globals".
-static void KoreIterGlobals(int vmcore)
+// ---- sub_5D93D0 (0x5D93D0 - 0x5D941C): read a VM value cell as a number.
+// Type 3 (number): the stored float.  Type 4 (string): the payload parsed in
+// place by KoreFloatFromString (the converted float overwrites the cell's
+// value word).  Anything else: 0.0.  206 callers; the shared number-arg
+// primitive of the builtin argument checkers.
+static double KorePopNumberValue(int vmcore, int cell)
 {
     (void)vmcore;
+    float out = 0.0f;
+    int *c = (int *)cell;
+    if (c[1] == 3)
+        out = *(float *)c;
+    else if (c[1] == 4)
+    {
+        if (KoreFloatFromString(cell, *(int *)c[0] & 0x3FFFFFFF, cell) != 0)
+            out = *(float *)c;
+    }
+    return out;
+}
+
+// ---- sub_5D9420 (0x5D9420 - 0x5D946B): is the cell a number?  Type 3 -> 1;
+// type 4 -> 1 when KoreFloatFromString can parse the payload (the parse
+// writes the converted float into the cell's value word); else 0.
+static int KoreValueIsNumber(int vmcore, int cell)
+{
+    (void)vmcore;
+    int *c = (int *)cell;
+    if (c[1] == 3)
+        return 1;
+    if (c[1] == 4)
+        return KoreFloatFromString(cell, *(int *)c[0] & 0x3FFFFFFF, cell) != 0;
+    return 0;
+}
+
+// ---- sub_4082C0 (0x4082C0 - 0x408385): the Nth Lua argument as a number
+// (0.0 when the slot is absent).  Positive idx counts from the frame base
+// (arg 1 at the vmcore + 32 cell); negative idx from the top; the -10000 /
+// -10001 / -10002 specials address the VM buffer's +0xCC cell, the callee
+// function slot's type word aliased as a string cell at vmcore + 56, and
+// the vmcore + 48 cell respectively; other -1000x values index the callee
+// function object's payload (fn - 8*idx - 80012).
+static double KoreArgNumberValue(int vmcore, int idx)
+{
+    int *vm = (int *)vmcore;
+    if (idx <= -10000)
+    {
+        if (idx == -10000) return KorePopNumberValue(vmcore, vm[0] + 204);
+        if (idx == -10002) return KorePopNumberValue(vmcore, vmcore + 48);
+        int base = vm[8];
+        if (idx == -10001)
+        {
+            vm[14] = *(int *)(base - 4);
+            vm[15] = 5;
+            return KorePopNumberValue(vmcore, vmcore + 56);
+        }
+        return KorePopNumberValue(vmcore, *(int *)(base - 8) - 8 * idx - 80012);
+    }
+    if (idx < 0)
+    {
+        int cell = vm[7] + 8 * idx;
+        return cell >= vm[8] ? KorePopNumberValue(vmcore, cell) : 0.0;
+    }
+    if (idx > 0)
+    {
+        int cell = vm[8] + 8 * idx - 8;
+        return cell < vm[7] ? KorePopNumberValue(vmcore, cell) : 0.0;
+    }
+    return 0.0;
+}
+
+// ---- sub_408140 (0x408140 - 0x4081FB): is the Nth Lua argument a number?
+// 1/0 (0 when the slot is absent).  Same index rules as KoreArgNumberValue;
+// in-range slots go through KoreValueIsNumber (which converts a parseable
+// string cell in place).
+static int KoreArgIsNumber(int vmcore, int idx)
+{
+    int *vm = (int *)vmcore;
+    if (idx <= -10000)
+    {
+        if (idx == -10000) return KoreValueIsNumber(vmcore, vm[0] + 204);
+        if (idx == -10002) return KoreValueIsNumber(vmcore, vmcore + 48);
+        int base = vm[8];
+        if (idx == -10001)
+        {
+            vm[14] = *(int *)(base - 4);
+            vm[15] = 5;
+            return KoreValueIsNumber(vmcore, vmcore + 56);
+        }
+        return KoreValueIsNumber(vmcore, *(int *)(base - 8) - 8 * idx - 80012);
+    }
+    if (idx < 0)
+    {
+        int cell = vm[7] + 8 * idx;
+        return cell >= vm[8] ? KoreValueIsNumber(vmcore, cell) : 0;
+    }
+    if (idx > 0)
+    {
+        int cell = vm[8] + 8 * idx - 8;
+        return cell < vm[7] ? KoreValueIsNumber(vmcore, cell) : 0;
+    }
+    return 0;
+}
+
+// ---- sub_408C50 (0x408C50 - 0x408CEC): the type tag of the Nth Lua
+// argument (-1 when the slot is absent), with the two closure tags (9/10)
+// folded to 6 ("function") for messages.  Same index rules as
+// KoreArgNumberValue.
+static int KoreArgTypeTag(int vmcore, int idx)
+{
+    int *vm = (int *)vmcore;
+    int cell;
+    if (idx <= -10000)
+    {
+        if (idx == -10000) cell = vm[0] + 204;
+        else if (idx == -10002) cell = vmcore + 48;
+        else
+        {
+            int base = vm[8];
+            if (idx == -10001)
+            {
+                vm[14] = *(int *)(base - 4);
+                vm[15] = 5;
+                cell = vmcore + 56;
+            }
+            else cell = *(int *)(base - 8) - 8 * idx - 80012;
+        }
+    }
+    else if (idx > 0)
+    {
+        cell = vm[8] + 8 * idx - 8;
+        if (cell >= vm[7]) return -1;
+    }
+    else if (idx < 0)
+    {
+        cell = vm[7] + 8 * idx;
+        if (cell < vm[8]) return -1;
+    }
+    else
+        return -1;
+    int t = *(int *)(cell + 4);
+    return (t == 9 || t == 10) ? 6 : t;
+}
+
+// ---- sub_5E39E0 (0x5E39E0 - 0x5E3AD4): the builtin bad-argument panic.
+// Resolves the current (top) frame; when the frame index cannot be resolved
+// it panics "bad argument #%d (%s)", otherwise it resolves the function name
+// ('n'), decrements the argument number for "method" frames, and panics
+// "bad argument #%d to '%s' (%s)".  Never returns (longjmp).
+static int KoreBadArgumentPanic(int vmcore, int idx, const char *msg)
+{
+    int fr[143] = { 0 };   // the 568-byte frame record
+    if (KoreResolveFrameIndex(vmcore, 0, fr) == 0)
+        return KoreTablePanic(vmcore, "bad argument #%d (%s)", idx, msg);
+    (void)KoreResolveFrameInfo(vmcore, "n", fr);
+    const char *name = *(const char **)(fr + 4);
+    if (name == 0)
+        name = "?";
+    if (strcmp(name, "method") == 0)
+        --idx;
+    return KoreTablePanic(vmcore, "bad argument #%d to '%s' (%s)", idx, name, msg);
+}
+
+// ---- sub_5E4970 (0x5E4970 - 0x5E49CB): the builtin integer-argument
+// checker (51 callers).  The Nth argument as an integer
+// (KoreArgNumberValue); a zero value from a number slot (including an absent
+// argument) yields 0; a zero from a non-number slot panics "integer
+// expected, got <type>" through KoreBadArgumentPanic (the type name from
+// g_KoreTypeNames, tag -1 = "no value").  The panic path pushes the
+// formatted message as a string cell (KoreVmVprintf) before raising.
+static int KoreGetIntegerArg(int vmcore, int idx)
+{
+    int result = (int)KoreArgNumberValue(vmcore, idx);
+    if (result == 0)
+    {
+        if (KoreArgIsNumber(vmcore, idx) == 0)
+        {
+            int t = KoreArgTypeTag(vmcore, idx);
+            const char *tname = (t == -1) ? "no value" : g_KoreTypeNames[t & 0xF];
+            int msg = KoreVmVprintf(vmcore, "%s expected, got %s", "integer", tname);
+            KoreBadArgumentPanic(vmcore, idx, (const char *)msg);
+        }
+        return 0;
+    }
+    return result;
+}
+
+// ---- 0x5DF650 (0x5DF650 - 0x5DF6A4): fetch a global by integer index from
+// a {value, type} pair.  Type 5 (table) indexes the pair's table object
+// directly via KoreGlobalGetByInt; any other type dispatches through
+// KoreGlobalGetByIntIndirect (the object's +0x0C row base, the nil pair when
+// it is zero).  The {value, type} result is stored through out.  Shared by
+// the 0xE iterate-globals opcode family, the builtin argument accessors, and
+// the module-registration helpers (2908 callers).  (Misidentified as the
+// value-stack "reserve" helper in earlier passes; the reserve is the
+// sub_5DC450 slot push.)
+static void KoreGlobalGetByIntPair(int vmcore, int pair, int idx, int *out)
+{
+    if (*(int *)(pair + 4) == 5)
+    {
+        *(unsigned __int64 *)out = KoreGlobalGetByInt(vmcore, *(int *)pair, idx);
+    }
+    else
+    {
+        int tmp[2] = { 0, 0 };
+        KoreGlobalGetByIntIndirect(*(int *)pair, tmp, vmcore, idx);
+        out[0] = tmp[0];
+        out[1] = tmp[1];
+    }
+}
+
+// ---- sub_5E4CB0 (0x5E4CB0 - 0x5E4D1E): the built-in C closure
+// "iterate globals" -- next() over the globals table: argument 1 is the table object
+// (or an object with a +0x0C row base), argument 2 the current integer
+// index.  Fetches entry (index + 1) into a fresh top-of-stack cell
+// (KoreGlobalGetByIntPair); a nil entry ends the iteration with one result
+// (the nil cell), otherwise the float (index + 1) is staged in the next
+// cell and copied over the index argument's slot, returning two results:
+// (next index, fetched value).  The VM's 0xE opcode special-cases this
+// closure by pointer (see the interpreter), so this body is the explicit
+// Lua call path of the closure.
+// [NOT byte-identical] placement-dependent (relative E8 calls to
+// KoreGetIntegerArg and KoreGlobalGetByIntPair).
+static int KoreIterGlobals(int vmcore)
+{
+    int i = KoreGetIntegerArg(vmcore, 2);
+    int top = *(int *)(vmcore + 28);
+    int next = i + 1;
+    KoreGlobalGetByIntPair(vmcore, *(int *)(vmcore + 32), next, (int *)top);
+    *(int *)(vmcore + 28) = top + 8;
+    if (top >= *(int *)(vmcore + 32) && *(int *)(top + 4) == 0)
+        return 1;
+    *(int *)(top + 12) = 3;
+    *(float *)(top + 8) = (float)next;
+    *(int *)(vmcore + 28) = top + 16;
+    *(int *)(top - 8) = *(int *)(top + 8);
+    *(int *)(top - 4) = *(int *)(top + 12);
+    *(int *)(vmcore + 28) = top + 8;
+    return 2;
 }
 
 // ---- sub_5DE0D0: metatable operator lookup for comparison / assignment ops.
@@ -7612,11 +8046,11 @@ lbl_131:
                 if (Size[7] + 24 > (unsigned)Size[9])
                     KoreReallocValueStack((int)(Size + 1), table, 3);
                 int *slot = (int *)(off + Size[8]);
-                int name = KoreLookupOperatorName(table, (int)slot, 10, '#');
+                __int64 pair = KoreLookupOperatorName(table, (int)slot, 10, "#");
                 int *t = (int *)Size[7];
                 int v0 = *(int *)slot, v1 = *(int *)(slot + 4);
-                t[1] = 1;
-                t[0] = name;
+                t[1] = (int)(pair >> 32);
+                t[0] = (int)pair;
                 t[2] = v0;
                 t[3] = v1;
                 Size[7] = (int)(t + 4);
@@ -8095,10 +8529,10 @@ lbl_518:
                     KoreReleaseAllocRecords(table, v4);
                 int *cl = (int *)*(int *)v7;
                 v421 = *(int *)v7;
-                int base = KoreReturnFromClosure(table, v7, rpos);
+                KoreReturnFromClosure((int)(Size + 1), table, v7, rpos);
                 a2 = (int)*(char **)(cl + 16);
                 v387 = *(int *)(cl + 12);
-                v4 = base;
+                v4 = Size[8];
                 v374 = (char *)a2;
                 continue;
             }
@@ -8923,8 +9357,10 @@ static int           g_dword_1C86C58 = 0;   // 0x1C86C58: screen height
 //  The 11 builtin registration helpers (all 0x618290 + n*0x80, 124 bytes
 //  each).  Shared body (thiscall on the 2-dword GlobalTable accessor,
 //  ("LuaName", wrapper-fn) on the stack): when the accessor's +0 is set,
-//  reserve 8 bytes on the VM value stack (sub_5DF650 + sub_5DC450), memcpy
-//  the wrapper pointer in, KoreRegisterBuiltinClosure(vm, <upvalue fn>, 1)
+//  run the sub_5DF650 pair fetch over the buffer's +0xCC cell, take the
+//  fresh value-array slot from sub_5DC450 (pushing the {slot, 7} cell --
+//  the 8-byte reserve), memcpy the wrapper pointer in, and
+//  KoreRegisterBuiltinClosure(vm, <upvalue fn>, 1)
 //  (the upvalue fn sub_617AD0..sub_618790 marshals the Lua args -- a string
 //  to a shared slot, a bool, a float, ... -- per the builtin's signature),
 //  sub_67C540 (hash the name + store it in the global table),
@@ -9629,11 +10065,10 @@ static F3SharedBuffer *g_slot_1DBDC78 = 0;   // 0x1DBDC78: "Debug" class-name sl
 //  VM-internal stubs the EngineTest registration reaches (Kore VM value-
 //  stack / arg-marshalling machinery; out of scope; documented no-ops).
 // ----------------------------------------------------------------
-// sub_5DF650 (0x5DF650) -- reserve 8 bytes on a VM value stack: grow the
-// backing buffer when the cursor (a1[7]) runs past capacity (a2 = the
-// buffer base a1[0] + 0xCC).  2908 callers; VM-internal.  Stub: no-op.
-static void KoreValueStackReserve(void *table, void *tableBase, int ctrl, int cursor)
-{ (void)table; (void)tableBase; (void)ctrl; (void)cursor; }
+// sub_5DF650 (0x5DF650) -- the get-by-int pair fetch.  Implemented above
+// as KoreGlobalGetByIntPair (the earlier "reserve 8 bytes" reading was
+// wrong: the 8-byte reserve in the registration helpers is the sub_5DC450
+// slot push).
 // sub_5DC450 (0x5DC450) -- return a pointer to a freshly reserved 4-byte
 // value-array slot.  2777 callers; VM-internal.  Stub: 0 (no slot).
 static void *KoreValueArraySlot(void *table, int size)
@@ -9728,10 +10163,8 @@ static void KoreFinishMistInstance(void *buffer, int a2)
 // (returns eax).  130 callers; VM-internal.  Stub: 0.
 static int KoreCommitRecordBuffer(void *buffer)
 { (void)buffer; return 0; }
-// sub_5D93D0 (0x5D93D0) -- pop/convert a Lua number off a VM stack into a
-// double (76 bytes, 206 callers).  VM-internal.  Stub: 0.0.
-static double KorePopNumberValue(int vm, int sp)
-{ (void)vm; (void)sp; return 0.0; }
+// sub_5D93D0 (0x5D93D0) -- the number-cell reader.  Implemented above as
+// KorePopNumberValue (the earlier 0.0 stub replaced).
 
 // ----------------------------------------------------------------
 //  SharedSlotFormat (0x1A01670) -- module-private copy of the gamemain.cpp
@@ -10047,7 +10480,8 @@ static int EngineTestSetSelectedPrimitiveUpvalue(int vm)
 // NAME on the module context (KoreLookupBuiltinValue, sub_67C180); when found
 // (or the context is empty) copy the {value, ctrl} pair to OUT with a
 // transient increment/decrement of its ctrl block; otherwise create the table
-// for the name on the module value stack (reserve 8, KorePushEmptyTable,
+// for the name on the module value stack (the sub_5DF650 pair fetch over the
+// buffer's +0xCC cell, the sub_5DC450 8-byte reserve, KorePushEmptyTable,
 // KoreRegisterBuiltinName(-2), roll back), re-look-up into OUT and release
 // the first temp.  thiscall + `retn 8` (the {value, ctrl} context pair in
 // ECX, OUT and NAME on the stack).  VM-internal.
@@ -10067,15 +10501,17 @@ static DWORD *EngineLuaEnsureTable(DWORD *thisPair, DWORD *out, const char *name
     }
     else
     {
-        DWORD *table = *(DWORD **)thisPair;
-        DWORD  cursor = *(DWORD *)(table + 0x1C);
-        KoreValueStackReserve(table, *(void **)table, thisPair[1], cursor);  // sub_5DF650
-        *(DWORD *)(table + 0x1C) = cursor + 8;
-        KorePushEmptyTable((int)table, 0, 0);                // sub_5DEC20
-        KoreRegisterBuiltinName((int)table, -2, name);       // sub_4076D0
-        *(DWORD *)(table + 0x1C) = cursor;                   // roll back
-        KoreLookupBuiltinValue(thisPair, out, name);         // sub_67C180 (re-look-up)
-        KoreReleaseLookupPair(pair);                         // sub_6179D0
+        DWORD *table = *(DWORD **)thisPair;   // the table object (thisPair[0])
+        DWORD *buffer = *(DWORD **)table;     // its value-stack buffer object
+        DWORD  cursor = *(DWORD *)(buffer + 0x1C);
+        KoreGlobalGetByIntPair((int)buffer, (int)*(DWORD **)buffer + 204,
+                               (int)*(DWORD *)(table + 4), (int *)cursor);   // sub_5DF650
+        *(DWORD *)(buffer + 0x1C) = cursor + 8;
+        KorePushEmptyTable((int)buffer, 0, 0);                // sub_5DEC20
+        KoreRegisterBuiltinName((int)buffer, -2, name);       // sub_4076D0
+        *(DWORD *)(buffer + 0x1C) = cursor;                   // roll back
+        KoreLookupBuiltinValue(thisPair, out, name);          // sub_67C180 (re-look-up)
+        KoreReleaseLookupPair(pair);                          // sub_6179D0
     }
     return out;
 }
@@ -10096,9 +10532,11 @@ static DWORD *EngineLuaDebugTable(DWORD *out, int luaModule)
 // sub_640870 / sub_70E320 / sub_70E3A0 / sub_70E420 / sub_70E530 -- the five
 // 124-byte registration helpers (identical except for the upvalue-marshalling
 // function embedded in each body): when the {value, ctrl} context pair's
-// value is set, reserve 8 bytes on the module value stack, store the C
-// wrapper pointer in the reserved slot, install the builtin closure (the
-// upvalue fn, 1 upvalue), store the name in the global table (sub_67C540),
+// value is set, run the sub_5DF650 pair fetch over the buffer's +0xCC cell
+// (storing its result in the current top value cell), take the fresh value
+// array slot from sub_5DC450 (the 8-byte reserve), store the C wrapper
+// pointer in the slot, install the builtin closure (the upvalue fn, 1
+// upvalue), store the name in the global table (sub_67C540),
 // register the builtin name (KoreRegisterBuiltinName, -2), and roll the stack
 // back.  thiscall + `retn 8` (the context pair in ECX, NAME and WRAPPER on
 // the stack).  VM-internal.  (sub_640870 / sub_70E530 are shared with other
@@ -10109,9 +10547,10 @@ static DWORD EngineLuaRegisterNamedClosure(DWORD *pair, const char *name, int wr
     DWORD value = pair[0];
     if (value != 0)
     {
-        DWORD *table = *(DWORD **)value;
+        DWORD *table = *(DWORD **)value;   // the value-stack buffer object
         DWORD  cursor = *(DWORD *)(table + 0x1C);
-        KoreValueStackReserve(table, *(void **)table, pair[1], cursor);   // sub_5DF650
+        KoreGlobalGetByIntPair((int)table, (int)*(DWORD **)table + 204,
+                               (int)*(DWORD *)(value + 4), (int *)cursor);   // sub_5DF650
         *(DWORD *)(table + 0x1C) = cursor + 8;
         DWORD *slot = (DWORD *)KoreValueArraySlot(table, 4);              // sub_5DC450
         *slot = (DWORD)wrapper;
