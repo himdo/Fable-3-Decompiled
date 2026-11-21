@@ -44,8 +44,9 @@ static BYTE g_byte_1C86BD9 = 0;  // 0x1C86BD9: set 0 when -loadsavegame is given
 // ============================================================
 //  WaitForDebuggerOrTimeout  -- debug-build-only convenience (NOT part of the
 //  original). Compiled only when FABLE3_WAIT_FOR_DEBUGGER is defined: the debug
-//  build (build_vs2008_debug.bat) sets it, the release build does not, so this
-//  pause is present in debug builds and entirely absent from release builds.
+//  build (build_vs2008_debug.bat, output Debug/Win32) defines it, the release
+//  build (build_vs2008.bat, output Release/Win32) does not, so this pause is
+//  present in debug builds and entirely absent from release builds.
 //
 //  The reconstructed Fable3.exe is a small GUI exe that, when launched
 //  through the FableLauncher -> F3Secu -> Fable3 chain, starts running (and

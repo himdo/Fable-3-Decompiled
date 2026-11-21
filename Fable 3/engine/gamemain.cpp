@@ -65,9 +65,10 @@ static BYTE  g_byte_2075F4E = 1;   // 0x2075F4E: path-normalize enable flag
 // Function-pointer slots published by the frontend (0x1D8C850 / 0x1D8C854).
 static void *g_off_1D8C850 = 0;    // 0x1D8C850
 static void *g_off_1D8C854 = 0;    // 0x1D8C854
-// Global "this" objects the frontend dispatches through (0x1DBD048 / 0x1DBD9E8).
-// The callees (stubs) never dereference them, so a zeroed block stands in.
-static int   g_unk_1DBD048[8] = { 0 };   // 0x1DBD048
+// 0x1DBD048 (the ApplicationName slot) is the engine-wide shared global
+// g_slot_1DBD048 (common/common.cpp), read below to build the worker window
+// title.  0x1DBD9E8 (the frontend object) still needs a zeroed placeholder:
+// the callees (stubs) never dereference it, so a block stands in.
 // 0x1DBD9E8: the frontend object.  The original constructor (EventObjCtor,
 // 0x18C46E0, thiscall + retn 8, invoked at registration by sub_1A5C6A0) stores a
 // CreateEventA handle at +0x80; WaitForEvent / SetFrontendEvent / the
@@ -9857,7 +9858,7 @@ char RunFrontEnd(void *obj, int arg)
     {
         void *mgr  = GetManager();
         void **vt  = (void **)*(void ***)mgr;
-        int   v13  = (int)(DWORD)SharedSlotToWide((F3SharedBuffer **)&g_unk_1DBD048, &v76);
+        int   v13  = (int)(DWORD)SharedSlotToWide(&g_slot_1DBD048, &v76);
         int   r    =
             ((int (*)(void *, int, int, int, int, int, int, int, int))vt[1])(
                 mgr, (int)v107, (int)str103[1], (int)str103[2], (int)str103[0], arg,

@@ -9300,7 +9300,9 @@ static int CLuaManagerRunSerialiseScript(void *obj)
 // and front-end contexts, the hero / henchman setup, the script names and
 // the gameflow state (shared with the frontend: gamemain.cpp keeps its own
 // module-local copy of the 0x1DBD048 object).
-static F3SharedBuffer *g_slot_1DBD048 = 0;   // 0x1DBD048: ApplicationName
+// 0x1DBD048: ApplicationName -- the engine-wide shared slot (g_slot_1DBD048,
+// defined in common/common.cpp). Shared with gamemain.cpp's window-title path
+// so a name set here by SetApplicationName is visible to the worker window.
 static F3SharedBuffer *g_slot_1DBD04C = 0;   // 0x1DBD04C: AIScriptName
 static F3SharedBuffer *g_slot_1DBD050 = 0;   // 0x1DBD050: CameraScriptName
 static F3SharedBuffer *g_slot_1DBD054 = 0;   // 0x1DBD054: QuestScriptName
@@ -10653,7 +10655,7 @@ int ReinitEngineLua(void *obj, int flag)
         luaMgr = (int)CLuaManagerCtor(newMgr, (void *)dw[0xBC / 4], (void *)dw[0x98 / 4]);
     dw[0xC0 / 4] = (DWORD)luaMgr;
 
-     CLuaManagerRunSerialiseScript((void *)luaMgr);
+    CLuaManagerRunSerialiseScript((void *)luaMgr);
     RegisterEngineLuaFunctions((int)dw[0xBC / 4]);
 
     // 5. First-time init: build the startup-script path and run the

@@ -23,7 +23,13 @@ set "RC=%SDK%\Bin\RC.Exe"
 set "ORIG=D:\projects\hacking\Windows\Fable 3\Fable3.exe"
 
 rem ---- configuration ----
-set "CFG=Release"
+rem  DEBUG build: outputs to Debug\Win32 (separate from the release build in
+rem  Release\Win32, so a debug build never overwrites the non-pausing release
+rem  exe). It defines FABLE3_WAIT_FOR_DEBUGGER=1, so WinMain pauses for up to
+rem  60 s waiting for a debugger to attach (see WaitForDebuggerOrTimeout in
+rem  main.cpp). The release build (build_vs2008.bat) omits that define and has
+rem  no such pause.
+set "CFG=Debug"
 set "ARCH=Win32"
 
 rem ---- VS2008 environment (x86 host/compiler + SDK 7.1) ----
@@ -90,7 +96,7 @@ pushd "%OUTREL%" || exit /b 1
 
 :: Application sources: the entry point plus one file per module folder.
 :: Add a new module by listing its .cpp in SRCS (paths are relative to the
-:: project root; each .obj is produced in the Release/Win32 output dir and
+:: project root; each .obj is produced in the Debug/Win32 output dir and
 :: then linked below by name).
 set "SRCS=..\..\main.cpp ..\..\framework\framework.cpp ..\..\common\common.cpp ..\..\engine\engine.cpp ..\..\engine\worker.cpp ..\..\engine\manager.cpp ..\..\engine\object_registry.cpp ..\..\engine\xlo_device.cpp ..\..\engine\gameengine.cpp ..\..\engine\gamethread.cpp ..\..\engine\gamemain.cpp ..\..\engine\luavm.cpp ..\..\engine\XLip.cpp ..\..\engine\netinit.cpp ..\..\engine\thread.cpp ..\..\save\save.cpp"
 

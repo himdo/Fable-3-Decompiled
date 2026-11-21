@@ -82,6 +82,14 @@ extern void *g_dword_1E2EEF4;
 // the device-build path (worker.cpp), read by the XLO callbacks.
 extern DWORD g_dword_1E2ED80[14];
 
+// 0x1DBD048 - the engine "ApplicationName" shared slot (F3SharedBuffer*).
+// Written by the Lua builtins (SetApplicationName, luavm.cpp) and read by the
+// frontend window-title path (gamemain.cpp) to build the worker window class
+// name, so it must be a single engine-wide global. (Was a duplicated per-TU
+// static, so a name set by Lua never reached the window-title code and the
+// class name was empty.)
+extern F3SharedBuffer *g_slot_1DBD048;
+
 // InitSharedSlot (0x1A00C30) - construct a (null) shared slot and register it
 // in the live-slot count. __thiscall in the original: the slot pointer is in
 // ECX and is returned in EAX (no stack args). Declared here as a plain free

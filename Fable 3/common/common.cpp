@@ -59,6 +59,15 @@ void *g_dword_1E2EEF4 = 0;
 // PARAMETERS) handed to XLiveOnCreateDevice / XLiveOnResetDevice.
 DWORD g_dword_1E2ED80[14];
 
+// 0x1DBD048: the engine "ApplicationName" shared slot (F3SharedBuffer*).
+// Single engine-wide global shared by luavm.cpp (SetApplicationName /
+// GetApplicationName, the Lua builtins that write it) and gamemain.cpp (the
+// frontend window-title path that reads it to build the worker window class
+// name). (Was a duplicated per-TU static in luavm.cpp plus a zeroed int[8]
+// placeholder in gamemain.cpp, so a name set by Lua never reached the
+// window-title code and the worker window class name came out empty.)
+F3SharedBuffer *g_slot_1DBD048 = 0;
+
 // ============================================================
 //  OutOfMemory  (0x01A034F0 - 0x01A0356C)  -- report an out-of-memory condition
 //  [NOT byte-identical] placement-dependent (relative calls to swprintf_s, OutputDebugStringW, DebugBreak).

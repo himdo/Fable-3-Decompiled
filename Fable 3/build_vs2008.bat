@@ -23,6 +23,10 @@ set "RC=%SDK%\Bin\RC.Exe"
 set "ORIG=D:\projects\hacking\Windows\Fable 3\Fable3.exe"
 
 rem ---- configuration ----
+rem  RELEASE build: outputs to Release\Win32. Does NOT define
+rem  FABLE3_WAIT_FOR_DEBUGGER, so WinMain runs immediately (no debugger-attach
+rem  pause). The debug build (build_vs2008_debug.bat) defines that flag, pauses
+rem  up to 60 s for a debugger, and outputs to Debug\Win32.
 set "CFG=Release"
 set "ARCH=Win32"
 
