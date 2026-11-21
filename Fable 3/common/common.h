@@ -69,6 +69,19 @@ extern DWORD g_Addend;
 // ReleaseSharedSlotWide (0x19FFA70).
 extern DWORD g_WideSlotCount;
 
+// 0x1E2EEF4 - the current XLO device object (a vtable-backed pointer). The
+// worker's device-creation path stores a real D3D9/XLO device here, and the
+// per-frame render loop (gamemain.cpp) plus the XLO callbacks (xlo_device.cpp)
+// all read it, so it must be a single engine-wide global. (Was a duplicated
+// per-TU static in worker.cpp / gamemain.cpp / xlo_device.cpp, which meant a
+// device written in one file was invisible to the others.)
+extern void *g_dword_1E2EEF4;
+
+// 0x1E2ED80 - the 56-byte (14 DWORD) XLO device-caps block (the D3DPRESENT_
+// PARAMETERS handed to XLiveOnCreateDevice / XLiveOnResetDevice). Written by
+// the device-build path (worker.cpp), read by the XLO callbacks.
+extern DWORD g_dword_1E2ED80[14];
+
 // InitSharedSlot (0x1A00C30) - construct a (null) shared slot and register it
 // in the live-slot count. __thiscall in the original: the slot pointer is in
 // ECX and is returned in EAX (no stack args). Declared here as a plain free
@@ -145,6 +158,23 @@ const WCHAR *GetLocalizedString(const WCHAR ***obj);
 // See locale_static_ctor_callpath.md.
 extern DWORD g_dword_1DBD010;   // 0x1DBD010: GUI_WRONG_EXECUTABLE_NAME
 extern DWORD g_dword_1DBD014;   // 0x1DBD014: GUI_WRONG_EXECUTABLE_DESC
+
+// Graphics globals shared between the video-options module (engine/gamemain.cpp,
+// which owns the definitions) and the device module (engine/worker.cpp, the
+// XLO device build path).  They sit at their original image VAs in the
+// device/vtable cluster (0x01DB11F4 / 0x01DB12xx / 0x020FCAxx / 0x020FCBxx)
+// and are referenced by both the surface-clear paths and the device
+// create/teardown paths, so they live in one translation unit each but are
+// visible to both.
+extern DWORD g_dword_1D9AF60[0x200 * 28]; // 0x1D9AF60: texture source-descriptor table (0x70-byte rows, 110 valid)
+extern DWORD g_qword_20FC928[2];   // 0x20FC928: the current display resolution (w, h)
+extern BYTE  g_byte_2075F05;       // 0x2075F05: surface-creation flag (CreateXloDeviceFromAdapter Ex vs. classic)
+extern int   g_dword_1E2ED7C;      // 0x1E2ED7C: frame-nesting counter (0x1E2ED7C)
+
+// Refresh a CSurface wrapper's 5-word format block from a surface's description
+// (engine/gamemain.cpp, sub_5A2EF0).  Shared so the device-build path can call
+// it on the backbuffer surface.
+DWORD QueryCsurfaceFormat(int *fmt, void *surface);
 
 // GetSharedSlotWide (0x19FF560) - the wide-string getter for the WIDE (WCHAR)
 // shared-slot family (the accessor counterpart to the wide null-ctor

@@ -2473,7 +2473,7 @@ static int IsFullScreen(void)
 // display-mode record. Read by GetCurrentResolution (0x18F1100), the
 // aspect-ratio getters (sub_18F0AA0 / sub_18F1120) and the 5%/95% split
 // helper (sub_18F0AE0).
-static DWORD g_qword_20FC928[2] = { 0, 0 };
+DWORD g_qword_20FC928[2] = { 0, 0 };
 
 // ============================================================
 //  GetCurrentResolution  (0x18F1100 - 0x18F1115)  -- the current display
@@ -2534,10 +2534,10 @@ static DWORD *GetCurrentResolution(DWORD *out)
 // ============================================================
 
 // 0x1E2EEF4: the current XLO device object (a vtable-backed pointer).
-// Defined separately (static) in worker.cpp / xlo_device.cpp.
-static void *g_dword_1E2EEF4  = 0;
+// Defined once in common/common.cpp and declared in common/common.h
+// (included above), so worker.cpp / gamemain.cpp / xlo_device.cpp share it.
 // 0x2075F05: surface-creation flag (nonzero -> 0x200 create flag + format 0).
-static BYTE  g_byte_2075F05   = 0;
+BYTE   g_byte_2075F05   = 0;
 // 0x1D9B040: surface param passed to device vtable[25].
 static DWORD g_dword_1D9B040  = 0;
 // 0x1DB12F8 / 0x1DB1314: global 32-byte CSurface records {vtable, surface,
@@ -2900,7 +2900,7 @@ static int ReRegisterGraphicsState(void)
 //   +0x3C..+0x43 left shift per component c0..c3
 //   +0x6C clear flags (bit 2 = element-conversion clear mode: 58 = 4x u16,
 //         63 = 4x float, handled by ClearCsurface)
-static DWORD g_dword_1D9AF60[0x200 * 28] = {
+DWORD g_dword_1D9AF60[0x200 * 28] = {
    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,  // row 0
    0x00000014, 0x00000001, 0x00000018, 0x00000008, 0x00000008, 0x00000008, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000010, 0x00000008, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,  // row 1
    0x00000015, 0x00000001, 0x00000020, 0x00000008, 0x00000008, 0x00000008, 0x00000008, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000010, 0x00000008, 0x00000000, 0x00000018, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,  // row 2
@@ -3133,7 +3133,7 @@ static void *g_CSurfaceVtable[13] = {
 //  3. Write the format block: fmt[1]=desc[5], fmt[2]=desc[6], fmt[3]=desc[3],
 //     fmt[4]=desc[1]; return desc[5].
 // ============================================================
-static DWORD QueryCsurfaceFormat(int *fmt, void *surface)
+DWORD QueryCsurfaceFormat(int *fmt, void *surface)
 {
     int desc[8] = { 0 };
     if (surface != 0)   // null-guard; the original would fault pre-device
@@ -3956,7 +3956,7 @@ static void ResetGraphicsSurfaces(void)
 //  trailing zeroed 8-byte float slot).
 // ============================================================
 static DWORD g_unk_1DB12B4   = 0xFF000000;  // 0x1DB12B4  device-slot state (worker.cpp keeps its own copy)
-static int   g_dword_1E2ED7C = 0;           // 0x1E2ED7C  frame-nesting counter
+int   g_dword_1E2ED7C = 0;           // 0x1E2ED7C  frame-nesting counter
 static CRITICAL_SECTION g_stru_20FC948;     // 0x20FC948  device critical section
 static int   g_stru_20FC948Init = 0;
 static double g_dbl_20FC960  = 0.0;         // 0x20FC960  last frame time (under the device CS)

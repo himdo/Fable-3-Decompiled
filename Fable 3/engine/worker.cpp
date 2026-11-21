@@ -309,8 +309,14 @@ static DWORD g_unk_1DB12B4   = 0xFF000000;  // 0x1DB12B4  device-slot state
 // (0x18F1220); the companion DWORDs (1DB1248 / 1DB1268) are cleared
 // alongside their objects. Zero in the image.
 static DWORD g_dword_1DB1228 = 0;
-static DWORD g_dword_1DB1244 = 0;
-static DWORD g_dword_1DB1248 = 0;
+// 0x1DB1240 .. 0x1DB125C: the device surface-record block (8 DWORDs / 32 bytes).
+//   [0] (0x1DB1240)               record header
+//   [1] (0x1DB1244)               device backbuffer surface object
+//   [2] (0x1DB1248)               backbuffer present flag
+//   [3..7] (0x1DB124C..0x1DB125C) 5-word format record (QueryCsurfaceFormat out)
+// Modeled as one contiguous array so CopySlotRecord (sub_18D1B70) can copy the
+// 28-byte payload ([1..7]) from the record base, matching the image layout.
+static DWORD g_dword_1DB1240[8] = { 0 };
 static DWORD g_dword_1DB1264 = 0;
 static DWORD g_dword_1DB1268 = 0;
 
@@ -380,14 +386,10 @@ static BYTE  g_byte_1D9E19C  = 0;
 // WM_SIZE path).
 static int ResizeWorkerWindow(CWorkerWin32 *obj);
 
-// 0x1E2EEF4: the current XLO device object (a vtable-backed pointer; defined
-// here ahead of IsDisplayReady, grouped conceptually with the device-global
-// block further down).
-static void *g_dword_1E2EEF4 = 0;
-
-// 0x1E2ED80: the 56-byte (14 DWORD) XLO device-caps block (xlo_device.cpp
-// carries an independent mirror of this global for the XLO import paths).
-static DWORD g_dword_1E2ED80[14];
+// 0x1E2EEF4 (the current XLO device object) and 0x1E2ED80 (the 56-byte
+// 14-DWORD XLO device-caps block) are engine-wide shared globals now defined
+// once in common/common.cpp and declared in common/common.h (included above),
+// so worker.cpp / gamemain.cpp / xlo_device.cpp all see the same device.
 
 // 0x1E2EDCC: device capability byte gating the render-mode-class selection
 // (GetDisplayModeClass, sub_18EFF00). Bit 2 selects class 2 vs 1; bit 4
@@ -436,10 +438,11 @@ static void F3EnterDisplayCs(void)
 //  device through its vtable[16] (offset 0x40) with the new caps, record the
 //  caps into dword_1E2ED80 and the mode class into dword_1E2ED74 (selected
 //  from the last caps dword: bit 0x80000001/low bit -> 1, bit 2 -> 2, bit 4
-//  -> 3, bit 8 -> 4), run sub_18F1310, re-notify the 0x20FCA0C list (vtable[2])
-//  and the 0x20FC9EC list, clear byte_2075F04, and return 1. The full
-//  device-rebuild subsystem (object-list management, sub_18E65F0,
-//  sub_18F1310, sub_56xxxx helpers) is out of scope. Returns 0 (reset failed)
+//  -> 3, bit 8 -> 4), run InitXloDeviceState (sub_18F1310), re-notify the
+//  0x20FCA0C list (vtable[2]) and the 0x20FC9EC list, clear byte_2075F04, and
+//  return 1. The full device-rebuild subsystem (object-list management,
+//  sub_18E65F0, InitXloDeviceState (sub_18F1310), sub_56xxxx helpers) is out
+//  of scope. Returns 0 (reset failed)
 //  so IsDisplayReady stays conservative.
 // ============================================================
 static int ResetXloDevice(const DWORD *caps56)
@@ -1150,7 +1153,8 @@ static F3DisplayMode *InitDisplayMode(F3DisplayMode *dm)
 //  Original semantics (under the device critical section stru_20FC948): 0 =
 //  the requested mode is / became current, 1 = the mode was changed, 2 = the
 //  restore-to-current failed. Deep display-mode subsystem (sub_18F1510 /
-//  ResetXloDevice (0x18F2310) / sub_18EFF00 / sub_18F21A0 / sub_18F05D0 / sub_18F1B30); out
+//  ResetXloDevice (0x18F2310) / sub_18EFF00 / sub_18F21A0 /
+//  PickBestDisplayMode (sub_18F05D0) / BuildXloDeviceFromRequest (sub_18F1B30)); out
 //  of scope here. Returns 0 (mode already current) so callers take the
 //  success path.
 // ============================================================
@@ -1339,25 +1343,55 @@ static bool CreateD3D9DisplayObject(int adapterIndex, DWORD *outBehavior, int fl
 }
 
 // ============================================================
-//  [STUB]  BuildXloDeviceFromRequest  (sub_18F1B30 + its query/pick helpers,
-//  0x18F1B30-0x18F1E60)  -- build the XLO device from the display-mode request
+//  F3XloCaps  -- the 56-byte (14-DWORD) XLO device caps / present-params
+//  block built by the display-mode setters (SetDisplayMode / TrySetDisplayMode)
+//  and consumed by BuildXloDeviceFromRequest (CreateXloDevice, sub_18F1B30).
+//  The live copy the device vtable reads lives at g_dword_1E2ED80 / xmmword
+//  1E2ED80 (copied in by CreateXloDevice).
 //
-//  int BuildXloDeviceFromRequest(const F3DisplayMode *dm)   -- 1 = success
-//
-//  Original (only reached once CreateD3D9DisplayObject has produced a live
-//  D3D9 object in dword_1E2EEF8): query the adapter's display-mode descriptor
-//  (device vtable slot 8, offset 0x20) into a 16-byte out block, walk the
-//  texture-source-descriptor table (dword_1D9AF60, 0x70-byte rows) for the row
-//  whose key matches the descriptor, pick the closest matching mode
-//  (sub_18F05D0), assemble the 56-byte display-mode request, and build the
-//  device (sub_18F1B30) -- returning its build status. The D3D9 / XLO
-//  device-rebuild subsystem is out of scope. Returns 1 (build succeeded).
+//  Byte layout (as the setters build it):
+//    +0   field[0]  texture source-descriptor table row index (format key row)
+//    +4   field[1]  the picked display-mode index (0 = none -> no device)
+//    +8   field[2]  width
+//    +12  field[3]  height
+//    +16  field[4]  present flag (1)
+//    +20  field[5]  flags (0)
+//    +24  field[6]  byte 24 gates caps[6]/caps[8]; byte 25 gates caps[13]
+//    +28  field[7]  refresh rate (100)
+//    +32  field[8]  render-mode-class tier (GetDisplayModeClass arg)
+//    +36  field[9]  (0)
+//    +40  field[10] behavior flags: bit0 sleep-retry, bit1 -> behavior 2,
+//                   bit2 second-chance (behavior 2), bit4 Ex create path
+//    +44  field[11] (unwritten)
+//    +48  field[12] (unwritten)
+//    +52  field[13] (unwritten)
 // ============================================================
-static int BuildXloDeviceFromRequest(const F3DisplayMode *dm)
+struct F3XloCaps
 {
-    (void)dm;
-    return 1;
-}
+    DWORD field[14];
+};
+
+// 0x1D9DF80: the end of the texture source-descriptor table (g_dword_1D9AF60).
+// Distance from the table base in DWORDs: (0x1D9DF80 - 0x1D9AF60) / 4 = 3080
+// (= 110 rows of 28 DWORDs).
+#define F3_FORMAT_TABLE_END 3080
+
+// Forward declarations for the XLO device-build path (definitions below, after
+// DestroyDevice, so all the device globals they read are already in scope).
+static int      DestroyDevice(void);
+static int      F3FindFormatRow(DWORD key);
+static DWORD   *PickBestDisplayMode(DWORD *out, DWORD *fmtIdx, int w, int h);
+static int      CreateXloDeviceFromAdapter(DWORD adapter, const DWORD *caps,
+                                           const F3XloCaps *req, DWORD deviceType);
+static int      SetDeviceViewport(const DWORD *rect);
+static DWORD   *CopySlotRecord(DWORD *src, DWORD *dst);
+static int      RegisterDeviceSlotRecords(const DWORD *tmpl);
+static char     CheckDeviceTextCaps(void);
+static int      NvApiLoadInit(void);
+static int      NvApiRegisterDevice(int a, int b);
+static int      NvApiConfigure(int a);
+static DWORD    InitXloDeviceState(void);
+static int      BuildXloDeviceFromRequest(const F3XloCaps *req);
 
 // ============================================================
 //  SetDisplayMode  (0x18F2B30 - 0x18F2D66)  -- set the display mode
@@ -1410,12 +1444,47 @@ static int SetDisplayMode(const F3DisplayMode *dm)
     else
     {
         // No device yet: create the D3D9 object and, on success, build the
-        // device from the request. Without a live D3D9 object this reports the
-        // "no device" status (1).
+        // 56-byte XLO device request and build the device from it. Without a
+        // live D3D9 object this reports the "no device" status (1).
         int v5 = 1;
         DWORD behavior = 1;   // the original seeds the out behavior to 1
         if (CreateD3D9DisplayObject(dm->f00, &behavior, dm->f28) != 0)
-            v5 = (BuildXloDeviceFromRequest(dm) == 0);
+        {
+            // Query the adapter's display-mode descriptor (d3d9 vtable[8],
+            // 16-byte out block = {width, height, refresh, pixelFormat}).
+            DWORD mode[4] = { 0, 0, 0, 0 };
+            void **vt = *(void ***)g_dword_1E2EEF8;
+            typedef void (__stdcall *F3AdapterModeFn)(DWORD, DWORD, DWORD *);
+            ((F3AdapterModeFn)vt[8])(g_dword_1E2EEF8, g_dword_1E2EDB8[1], mode);
+            DWORD pixelFormat = mode[3];
+
+            // Assemble the 56-byte XLO device request (F3XloCaps).
+            F3XloCaps req;
+            memset(req.field, 0, sizeof(req.field));
+            req.field[0]  = (DWORD)F3FindFormatRow(pixelFormat);  // byte 0
+            req.field[2]  = (DWORD)dm->width;                     // byte 8
+            req.field[3]  = (DWORD)dm->height;                    // byte 12
+            req.field[4]  = 1;                                    // byte 16
+            req.field[5]  = 0;                                    // byte 20
+            req.field[6]  = ((DWORD)(dm->f20 & 0xFF)) << 8;       // byte 24=0, 25=low byte of f20
+            req.field[7]  = 100;                                  // byte 28
+            req.field[8]  = 0;                                    // byte 32
+            req.field[9]  = 0;                                    // byte 36
+            req.field[10] = (DWORD)dm->f28;                       // byte 40
+            if (behavior == 2)
+                req.field[10] |= 2;
+
+            // Pick the best matching display mode and build the device from it.
+            DWORD fmtIdx = (DWORD)F3FindFormatRow(pixelFormat);
+            DWORD picked = 0;
+            PickBestDisplayMode(&picked, &fmtIdx, dm->f12, dm->f16);
+            req.field[1] = picked;                                // byte 4
+            if (picked != 0)
+            {
+                g_dword_1E2ED7C = 0;
+                v5 = (BuildXloDeviceFromRequest(&req) == 0);
+            }
+        }
         LeaveCriticalSection(&g_stru_20FC948);
         return v5;
     }
@@ -1663,7 +1732,7 @@ static void PumpWorkerMessages(CWorkerWin32 *obj)
 
 // ============================================================
 //  nvapi.dll interface subsystem state (0x1E2C / 0x1D94)  -- the init
-//  (sub_17D1D10) loads nvapi.dll, takes nvapi_QueryInterface, and resolves the
+//  (NvApiLoadInit, sub_17D1D10) loads nvapi.dll, takes nvapi_QueryInterface, and resolves the
 //  before/after hooks; the unload (NvApiTeardownUnload) clears the table and
 //  frees the library. The original keeps these at the VAs noted; here they
 //  live as static globals in this module.
@@ -1674,7 +1743,7 @@ static int (__cdecl *g_dword_1E2C70C)(DWORD, int *) = 0;        // 0x1E2C70C  be
 static int (__cdecl *g_dword_1E2C710)(DWORD, int, int, int) = 0; // 0x1E2C710  after-call hook
 
 //  178-entry resolved-interface table (0x1D941F4 - 0x1D94A08), 12 bytes per
-//  slot: resolved entry pointer at +0, resolved flag byte at +4. Slot 112 is
+//  slot: resolved entry pointer at +0, resolved flag byte at +4. Slot 92 is
 //  dword_1D94644 / byte_1D94648 (NVAPI interface 0x2EC50C2B).
 struct F3NvApiSlot
 {
@@ -1707,7 +1776,7 @@ static int NvApiTeardownFlush(void)
 {
     int pre = 0;
     int result;
-    F3NvApiSlot *slot = &g_dword_1D941F4[112];   // 0x1D94644 / 0x1D94648, interface 0x2EC50C2B
+    F3NvApiSlot *slot = (F3NvApiSlot *)((char *)g_dword_1D941F4 + (0x1D94644 - 0x1D941F4));   // 0x1D94644 / 0x1D94648, interface 0x2EC50C2B
 
     if (g_dword_1E2C708 != 0 && slot->entry == 0 && slot->resolved == 0)
     {
@@ -1840,7 +1909,7 @@ static DWORD g_dword_20FCB08[44 * 64];
 //  [STUB]  sub_18F0850  (0x18F0850 - 0x18F08C7)  -- device teardown (per-slot)
 //
 //  Releases the base per-slot device object for the current slot
-//  (dword_2075F10) from the 0x20FCA68 record table and calls sub_18F07B0().
+//  (dword_2075F10) from the 0x20FCA68 record table and calls SetDeviceViewport (sub_18F07B0).
 //  Out of scope here; reached as the fall-through of TeardownDeviceSlot.
 // ============================================================
 static int sub_18F0850(void) { return 0; }
@@ -2152,13 +2221,13 @@ static int ReleaseDeviceObjects(void)
         g_dword_1DB1264 = 0;
         g_dword_1DB1268 = 0;
     }
-    if (g_dword_1DB1244 != 0)
+    if (g_dword_1DB1240[1] != 0)
     {
-        void **ovt = *(void ***)g_dword_1DB1244;
+        void **ovt = *(void ***)g_dword_1DB1240[1];
         void (__stdcall *release)(void *) = (void (__stdcall *)(void *))ovt[2];
-        release((void *)g_dword_1DB1244);
-        g_dword_1DB1244 = 0;
-        g_dword_1DB1248 = 0;
+        release((void *)g_dword_1DB1240[1]);
+        g_dword_1DB1240[1] = 0;
+        g_dword_1DB1240[2] = 0;
     }
 
     DWORD slot = g_dword_2075F10;
@@ -2227,6 +2296,612 @@ static int DestroyDevice(void)
         return result;
     }
     return 0;
+}
+
+// ============================================================
+//  XLO device-build state globals (sub_18F1B30 / CreateXloDevice and its
+//  helpers).  All zero in the image; here they live as static globals in this
+//  module.
+// ============================================================
+static DWORD  g_dword_1DB11F4[11];   // 0x1DB11F4  the last 44-byte display-mode request
+static DWORD  g_dword_20FC984 = 0;   // 0x20FC984  format-table index (request field[0])
+static DWORD  g_dword_1E2ED74 = 0;   // 0x1E2ED74  device render-mode class
+static float  g_flt_1E2ED78 = 0.0f;  // 0x1E2ED78  device refresh rate
+static float  g_flt_20FC968 = 0.0f;  // 0x20FC968  device refresh rate (mirror)
+static DWORD  g_dword_2074540 = 0;   // 0x2074540  the built device (mirror of 1E2EEF4)
+static DWORD  g_dword_1E2EEF0 = 0;   // 0x1E2EEF0  NVAPI device-registration scratch
+static DWORD  g_dword_1E2EE7C = 0;   // 0x1E2EE7C  text-caps threshold (low byte + 10*byte1)
+// 0x1BD3030: the rdata display-mode flags table (4 valid values + 0 sentinel).
+static const DWORD g_dword_1BD3030[5] = { 0x47, 0x4B, 0x4D, 0x50, 0 };
+
+// ============================================================
+//  F3FindFormatRow  -- walk the texture source-descriptor table
+//  (g_dword_1D9AF60, 0x70-byte rows) for the row whose first word (the
+//  pixel-format lookup key) equals `key`; returns the row index, or 0 when no
+//  row matches (the original resets to row 0 at the table end).
+// ============================================================
+static int F3FindFormatRow(DWORD key)
+{
+    int idx = 0;
+    const DWORD *row = g_dword_1D9AF60;
+    while (row[0] != key)
+    {
+        row += 28;
+        ++idx;
+        if ((const void *)row >= (const void *)&g_dword_1D9AF60[F3_FORMAT_TABLE_END])
+        {
+            idx = 0;
+            break;
+        }
+    }
+    return idx;
+}
+
+// ============================================================
+//  PickBestDisplayMode  (sub_18F05D0)  -- pick the closest matching display
+//  mode
+//
+//  DWORD *PickBestDisplayMode(DWORD *out, DWORD *fmtIdx, int targetW, int targetH)
+//      -- stores the best table row index in *out and returns out
+//
+//  Walks the rdata flags table g_dword_1BD3030 (4 valid + 0 sentinel). For each
+//  flags value, checks the D3D9 object's caps query (vtable[10], offset 40) and
+//  mode check (vtable[12], offset 48) with the format row key
+//  (g_dword_1D9AF60[28 * *fmtIdx]); when both succeed, finds the table row whose
+//  key equals the flags value and computes the squared distance from that row's
+//  width/height (row[13]/row[14]) to the target, keeping the minimum. Stops
+//  early on distance 0 or at the sentinel. Returns the best row index (0 = none).
+// ============================================================
+static DWORD *PickBestDisplayMode(DWORD *out, DWORD *fmtIdx, int targetW, int targetH)
+{
+    int best = 0;
+    int bestDist = 0x7FFFFFFF;
+    int i = 0;
+    const DWORD *flags = g_dword_1BD3030;
+    void **vt = *(void ***)g_dword_1E2EEF8;
+    typedef int (__stdcall *F3CapsFn)(DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
+    typedef int (__stdcall *F3ModeFn)(DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
+    F3CapsFn caps = (F3CapsFn)vt[10];   // offset 40
+    F3ModeFn check = (F3ModeFn)vt[12];  // offset 48
+    for (;;)
+    {
+        DWORD fmtKey = g_dword_1D9AF60[28 * (*fmtIdx)];
+        if (caps(g_dword_1E2EEF8, g_dword_1E2EDB8[1], g_dword_1E2EDB8[0], fmtKey, 2, 1, flags[i]) >= 0 &&
+            check(g_dword_1E2EEF8, g_dword_1E2EDB8[1], g_dword_1E2EDB8[0], fmtKey, fmtKey, flags[i]) >= 0)
+        {
+            int idx = F3FindFormatRow(flags[i]);
+            int dw = (int)g_dword_1D9AF60[28 * idx + 13] - targetW;
+            int dh = (int)g_dword_1D9AF60[28 * idx + 14] - targetH;
+            int dist = dw * dw + dh * dh;
+            if (dist < bestDist)
+            {
+                best = idx;
+                bestDist = dist;
+            }
+            if (dist == 0)
+                break;
+        }
+        if (g_dword_1BD3030[i + 1] == 0)
+            break;
+        ++i;
+    }
+    *out = (DWORD)best;
+    return out;
+}
+
+// ============================================================
+//  CreateXloDeviceFromAdapter  (sub_18F04B0)  -- create the XLO device on the
+//  D3D9 object
+//
+//  int CreateXloDeviceFromAdapter(DWORD adapter, const DWORD *caps,   // 56-byte caps block
+//                                 const F3XloCaps *req, DWORD deviceType)
+//
+//  If (req field[10] & 0x10) and d3d9.dll exports Direct3DCreate9Ex: call the
+//  D3D9 object's CreateDeviceEx (vtable[20], offset 80) with
+//  (d3d9, adapter, deviceType, hWndParent, 68, caps, 0, &local) and store the
+//  result in the device (dword_1E2EEF4), setting byte_2075F05 = 1 (Ex path).
+//  Otherwise call CreateDevice (vtable[16], offset 64) with
+//  (d3d9, adapter, deviceType, hWndParent, 68, caps, &dword_1E2EEF4), setting
+//  byte_2075F05 = 0 (classic path). Returns the HRESULT.
+// ============================================================
+static int CreateXloDeviceFromAdapter(DWORD adapter, const DWORD *caps,
+                                      const F3XloCaps *req, DWORD deviceType)
+{
+    int hr;
+    HMODULE h = GetModuleHandleA("d3d9.dll");
+    if (((req->field[10] & 0x10) != 0) && (h != 0)
+        && (GetProcAddress(h, "Direct3DCreate9Ex") != 0))
+    {
+        void **vt = *(void ***)g_dword_1E2EEF8;
+        typedef int (__stdcall *F3CreateDeviceExFn)(DWORD, DWORD, DWORD, HWND, DWORD, const DWORD *, DWORD, DWORD *);
+        F3CreateDeviceExFn fn = (F3CreateDeviceExFn)vt[20];   // offset 80
+        DWORD local = 0;
+        hr = fn(g_dword_1E2EEF8, adapter, deviceType, g_hWndParent, 68, caps, 0, &local);
+        g_dword_1E2EEF4 = (void *)local;
+        g_byte_2075F05 = 1;
+    }
+    else
+    {
+        void **vt = *(void ***)g_dword_1E2EEF8;
+        typedef int (__stdcall *F3CreateDeviceFn)(DWORD, DWORD, DWORD, HWND, DWORD, const DWORD *, DWORD *);
+        F3CreateDeviceFn fn = (F3CreateDeviceFn)vt[16];   // offset 64
+        hr = fn(g_dword_1E2EEF8, adapter, deviceType, g_hWndParent, 68, caps, (DWORD *)&g_dword_1E2EEF4);
+        g_byte_2075F05 = 0;
+    }
+    return hr;
+}
+
+// ============================================================
+//  SetDeviceViewport  (sub_18F07B0)  -- set the device viewport to a rect
+//
+//  int SetDeviceViewport(const DWORD *rect)   -- rect = {x, y, right, bottom}
+//
+//  Copies the 4-DWORD rect into the current slot's row in the per-slot
+//  client-rect table (g_dword_20FCB08), then builds a D3DVIEWPORT9
+//  {x, y, width=right-x, height=bottom-y, minz=0, maxz=1.0f} and calls the
+//  device's SetViewport (vtable[47], offset 188). Returns the result.
+// ============================================================
+static int SetDeviceViewport(const DWORD *rect)
+{
+    DWORD slot = g_dword_2075F10;
+    DWORD *row = &g_dword_20FCB08[slot * 44];
+    row[0] = rect[0];
+    row[1] = rect[1];
+    row[2] = rect[2];
+    row[3] = rect[3];
+
+    DWORD vp[6];
+    vp[0] = rect[0];
+    vp[1] = rect[1];
+    vp[2] = rect[2] - rect[0];
+    vp[3] = rect[3] - rect[1];
+    vp[4] = 0;
+    vp[5] = 0x3F800000;   // 1.0f (ds:dword_1BD2A1C)
+
+    void **vt = *(void ***)g_dword_1E2EEF4;
+    typedef int (__stdcall *F3ViewportFn)(DWORD, DWORD *);
+    F3ViewportFn fn = (F3ViewportFn)vt[47];   // offset 188
+    return fn((DWORD)g_dword_1E2EEF4, vp);
+}
+
+// ============================================================
+//  CopySlotRecord  (sub_18D1B70)  -- copy a 32-byte record, releasing the
+//  destination's wrapped object first
+//
+//  DWORD *CopySlotRecord(DWORD *src, DWORD *dst)   -- usercall (src in EDI, dst in ESI)
+//
+//  When src != dst: release dst[1] (the destination's wrapped vtable object,
+//  offset +4) via vtable[2] (offset 8) and clear dst[1..2]; then copy
+//  src[1..7] (28 bytes) into dst[1..7]; then, if the new dst[1] is non-zero,
+//  call its vtable[1] (offset 4, a no-arg method taking the object). Returns
+//  dst.
+// ============================================================
+static DWORD *CopySlotRecord(DWORD *src, DWORD *dst)
+{
+    if (src != dst)
+    {
+        if (dst[1] != 0)
+        {
+            void **ovt = *(void ***)dst[1];
+            void (__stdcall *release)(void *) = (void (__stdcall *)(void *))ovt[2];
+            release((void *)dst[1]);
+            dst[1] = 0;
+            dst[2] = 0;
+        }
+        dst[1] = src[1];
+        dst[2] = src[2];
+        dst[3] = src[3];
+        dst[4] = src[4];
+        dst[5] = src[5];
+        dst[6] = src[6];
+        dst[7] = src[7];
+        if (dst[1] != 0)
+        {
+            void **ovt = *(void ***)dst[1];
+            void (__stdcall *init)(void *) = (void (__stdcall *)(void *))ovt[1];
+            init((void *)dst[1]);
+        }
+    }
+    return dst;
+}
+
+// ============================================================
+//  RegisterDeviceSlotRecords  (sub_18F0CB0)  -- register the device's slot
+//  records (usercall; the surface-record base in EAX)
+//
+//  int RegisterDeviceSlotRecords(const DWORD *surfRec)
+//
+//  Copies the surface record (surfRec, the 0x1DB1240 block) into the current
+//  slot's row in the per-slot record table (CopySlotRecord), then calls the
+//  device's register method (vtable[37], offset 0x94) with (device, 0,
+//  surfRec[1]). Then, for v = 1..3: call the register method with (device, v, 0)
+//  and release + clear the slot row's sub-record at byte offset v*32 (row
+//  DWORDs i/4+1 and i/4+2 for i = 32, 64, 96). Returns the sub_18F0850 result
+//  (the per-slot teardown tail, a stub returning 0).
+// ============================================================
+static int RegisterDeviceSlotRecords(const DWORD *surfRec)
+{
+    DWORD slot = g_dword_2075F10;
+    CopySlotRecord((DWORD *)surfRec, (DWORD *)&g_dword_20FCA68[slot * 44]);
+    void **vt = *(void ***)g_dword_1E2EEF4;
+    typedef void (__stdcall *F3RegFn)(DWORD, DWORD, DWORD);
+    F3RegFn reg = (F3RegFn)vt[37];   // offset 0x94
+    reg((DWORD)g_dword_1E2EEF4, 0, surfRec[1]);
+    DWORD v = 1;
+    for (int i = 32; i < 128; i += 32)
+    {
+        reg((DWORD)g_dword_1E2EEF4, v, 0);
+        DWORD *row = &g_dword_20FCA68[slot * 44] + i / 4;
+        if (row[1] != 0)
+        {
+            void **ovt = *(void ***)row[1];
+            void (__stdcall *release)(void *) = (void (__stdcall *)(void *))ovt[2];
+            release((void *)row[1]);
+            row[1] = 0;
+            row[2] = 0;
+        }
+        ++v;
+    }
+    return sub_18F0850();
+}
+
+// ============================================================
+//  CheckDeviceTextCaps  (sub_18F08D0)  -- check the device's text caps
+//
+//  char CheckDeviceTextCaps(void)
+//
+//  If 100 * (low byte of dword_1E2EE7C + 10 * byte1 of dword_1E2EE7C) >= 0xBB8,
+//  return 1. Otherwise, call the D3D9 object's caps query (vtable[10], offset
+//  40) with (d3d9, adapter, 1, 22, 0, 1, 0x54657874); on success, call the
+//  device's set method (vtable[57], offset 228) with (device, 154, 0x54657874)
+//  and return 1. Returns 0 otherwise.
+// ============================================================
+static char CheckDeviceTextCaps(void)
+{
+    DWORD v = g_dword_1E2EE7C;
+    if (100 * ((unsigned __int8)v + 10 * (unsigned int)((v >> 8) & 0xFF)) >= 0xBB8)
+        return 1;
+    void **vt = *(void ***)g_dword_1E2EEF8;
+    typedef int (__stdcall *F3CapsFn)(DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
+    F3CapsFn caps = (F3CapsFn)vt[10];   // offset 40
+    if (caps(g_dword_1E2EEF8, g_dword_1E2EDB8[1], 1, 22, 0, 1, 0x54657874) >= 0)
+    {
+        void **dvt = *(void ***)g_dword_1E2EEF4;
+        typedef void (__stdcall *F3SetFn)(DWORD, DWORD, DWORD);
+        F3SetFn set = (F3SetFn)dvt[57];   // offset 228
+        set((DWORD)g_dword_1E2EEF4, 154, 0x54657874);
+        return 1;
+    }
+    return 0;
+}
+
+// ============================================================
+//  NvApiLoadInit  (sub_17D1D10)  -- load nvapi.dll and resolve the interface
+//  hooks
+//
+//  int NvApiLoadInit(void)
+//
+//  Lazily LoadLibraryA("nvapi.dll") (returns -2 on failure). Resolve
+//  nvapi_QueryInterface into dword_1E2C708; if absent, FreeLibrary and return
+//  -1. Call the resolver with 0x150E828 to obtain the base interface (v1); if
+//  v1 is NULL or v1(v1) != 0, clear the resolver, FreeLibrary and return -1.
+//  Otherwise resolve the before/after hooks (dword_1E2C70C / dword_1E2C710)
+//  via the resolver with 0x33C7358C / 0x593E8644; if one is set and the other
+//  is not, clear both. Returns 0 on success.
+// ============================================================
+static int NvApiLoadInit(void)
+{
+    int (__cdecl *v1)(void);
+
+    if (g_hLibModule == 0)
+    {
+        g_hLibModule = LoadLibraryA("nvapi.dll");
+        if (g_hLibModule == 0)
+            return -2;
+    }
+    g_dword_1E2C708 = (int (__cdecl *)(DWORD))GetProcAddress(g_hLibModule, "nvapi_QueryInterface");
+    if (g_dword_1E2C708 == 0)
+    {
+        FreeLibrary(g_hLibModule);
+        g_hLibModule = 0;
+        return -1;
+    }
+    v1 = (int (__cdecl *)(void))g_dword_1E2C708(0x150E828);
+    if (v1 == 0 || v1() != 0)
+    {
+        g_dword_1E2C708 = 0;
+        FreeLibrary(g_hLibModule);
+        g_hLibModule = 0;
+        return -1;
+    }
+    g_dword_1E2C70C = (int (__cdecl *)(DWORD, int *))g_dword_1E2C708(0x33C7358C);
+    g_dword_1E2C710 = (int (__cdecl *)(DWORD, int, int, int))g_dword_1E2C708(0x593E8644);
+    if ((g_dword_1E2C70C != 0) != (g_dword_1E2C710 != 0))
+    {
+        g_dword_1E2C70C = 0;
+        g_dword_1E2C710 = 0;
+    }
+    return 0;
+}
+
+// ============================================================
+//  NvApiRegisterDevice  (sub_17D6680)  -- register the device with an NVAPI
+//  interface (interface id 0xAC7E37F4)
+//
+//  int NvApiRegisterDevice(int a, int b)   -- two args (cdecl)
+//
+//  Lazily resolves the interface entry (interface id 0xAC7E37F4) into the
+//  interface-table slot at 0x1D9465C (flag at 0x1D94660). Returns -3 if no
+//  entry is available. Otherwise runs the resolved entry with (a, b),
+//  bracketed by the before-hook dword_1E2C70C(id, &pre) and the after-hook
+//  dword_1E2C710(id, pre, 0, result). Returns the entry's result.
+// ============================================================
+static int NvApiRegisterDevice(int a, int b)
+{
+    F3NvApiSlot *slot = (F3NvApiSlot *)((char *)g_dword_1D941F4 + (0x1D9465C - 0x1D941F4));
+    int pre = 0;
+    int result;
+
+    if (g_dword_1E2C708 != 0 && slot->entry == 0 && slot->resolved == 0)
+    {
+        slot->entry = (int (__cdecl *)(void))g_dword_1E2C708(0xAC7E37F4);
+        slot->resolved = 1;
+    }
+    if (slot->entry == 0)
+        return -3;
+    if (g_dword_1E2C70C != 0)
+        g_dword_1E2C70C(0xAC7E37F4, &pre);
+    result = ((int (__cdecl *)(int, int))slot->entry)(a, b);
+    if (g_dword_1E2C710 != 0)
+        g_dword_1E2C710(0xAC7E37F4, pre, 0, result);
+    return result;
+}
+
+// ============================================================
+//  NvApiConfigure  (sub_17D6160)  -- configure the device's NVAPI flush state
+//  (interface id 0xBE7692EC)
+//
+//  int NvApiConfigure(int a)   -- one arg (cdecl)
+//
+//  Lazily resolves the interface entry (interface id 0xBE7692EC) into the
+//  interface-table slot at 0x1D94608 (flag at 0x1D9460C). Returns -3 if no
+//  entry is available. Otherwise runs the resolved entry with (a), bracketed
+//  by the before-hook dword_1E2C70C(id, &pre) and the after-hook
+//  dword_1E2C710(id, pre, 0, result). Returns the entry's result.
+// ============================================================
+static int NvApiConfigure(int a)
+{
+    F3NvApiSlot *slot = (F3NvApiSlot *)((char *)g_dword_1D941F4 + (0x1D94608 - 0x1D941F4));
+    int pre = 0;
+    int result;
+
+    if (g_dword_1E2C708 != 0 && slot->entry == 0 && slot->resolved == 0)
+    {
+        slot->entry = (int (__cdecl *)(void))g_dword_1E2C708(0xBE7692EC);
+        slot->resolved = 1;
+    }
+    if (slot->entry == 0)
+        return -3;
+    if (g_dword_1E2C70C != 0)
+        g_dword_1E2C70C(0xBE7692EC, &pre);
+    result = ((int (__cdecl *)(int))slot->entry)(a);
+    if (g_dword_1E2C710 != 0)
+        g_dword_1E2C710(0xBE7692EC, pre, 0, result);
+    return result;
+}
+
+// ============================================================
+//  InitXloDeviceState  (sub_18F1310)  -- initialize the XLO device state
+//
+//  DWORD InitXloDeviceState(void)
+//
+//  1. Acquire the device's backbuffer surface (vtable[18], offset 72) with
+//     (dev, 0, 0, 0, &backbuffer).
+//  2. Release the previous backbuffer object (g_dword_1DB1240[1], vtable[2])
+//     if non-zero; store the new backbuffer in g_dword_1DB1240[1] and set the
+//     present flag g_dword_1DB1240[2] = (backbuffer != 0).
+//  3. Refresh the 5-word format record (g_dword_1DB1240[3..7]) from the
+//     backbuffer (QueryCsurfaceFormat).
+//  4. Register the device's slot records (RegisterDeviceSlotRecords, the
+//     0x1DB1240 surface record).
+//  5. Check the device's text caps (CheckDeviceTextCaps).
+//  6. Set the current resolution (g_qword_20FC928) from the caps block
+//     (g_dword_1E2ED80[0..1] = width/height).
+//  7. Call the device's acquire method (vtable[118], offset 0x1D8) with
+//     (dev, 8, &g_dword_2075F14).
+//  8. Store the device in the container's f00 (g_stru_20FC988.f00).
+//  Returns the device pointer (g_dword_1E2EEF4).
+// ============================================================
+static DWORD InitXloDeviceState(void)
+{
+    DWORD dev = (DWORD)g_dword_1E2EEF4;
+    void **vt = *(void ***)dev;
+
+    DWORD backbuffer = 0;
+    typedef void (__stdcall *F3BackBufFn)(DWORD, DWORD, DWORD, DWORD, DWORD *);
+    ((F3BackBufFn)vt[18])(dev, 0, 0, 0, &backbuffer);   // offset 72
+
+    if (g_dword_1DB1240[1] != 0)
+    {
+        void **ovt = *(void ***)g_dword_1DB1240[1];
+        void (__stdcall *release)(void *) = (void (__stdcall *)(void *))ovt[2];
+        release((void *)g_dword_1DB1240[1]);
+    }
+    g_dword_1DB1240[1] = backbuffer;
+    g_dword_1DB1240[2] = (backbuffer != 0);
+    QueryCsurfaceFormat((int *)&g_dword_1DB1240[3], (void *)backbuffer);
+
+    RegisterDeviceSlotRecords(&g_dword_1DB1240[0]);
+    CheckDeviceTextCaps();
+
+    g_qword_20FC928[0] = g_dword_1E2ED80[0];
+    g_qword_20FC928[1] = g_dword_1E2ED80[1];
+
+    typedef void (__stdcall *F3AcqFn)(DWORD, DWORD, DWORD *);
+    ((F3AcqFn)vt[118])(dev, 8, (DWORD *)&g_dword_2075F14);   // offset 0x1D8
+
+    g_stru_20FC988.f00 = (DWORD)dev;
+    return (DWORD)dev;
+}
+
+// ============================================================
+//  BuildXloDeviceFromRequest  (CreateXloDevice, sub_18F1B30 - 0x18F1E60)  --
+//  build the XLO device from the 56-byte display-mode request
+//
+//  int BuildXloDeviceFromRequest(const F3XloCaps *req)   -- 1 = success, 0 = fail
+//
+//  Only reached once CreateD3D9DisplayObject has produced a live D3D9 object in
+//  dword_1E2EEF8.  Destroys any previous device, saves the 44-byte request to
+//  0x1DB11F4, builds the 56-byte caps block, allocates the flush-request
+//  object, creates the device on the D3D9 object (with the
+//  0x8876086A/0x88760868/0x8876086C retry logic), captures the device's
+//  refresh rate, copies the caps block to the live global (dword_1E2ED80),
+//  sets the render-mode class (dword_1E2ED74) and current resolution
+//  (qword_20FC928), sets the full-size viewport (SetDeviceViewport, sub_18F07B0),
+//  initializes the device state (InitXloDeviceState, sub_18F1310), loads +
+//  registers NVAPI (NvApiLoadInit sub_17D1D10 / NvApiRegisterDevice sub_17D6680),
+//  and registers the flush-request resource (NvApiRegisterDevice, sub_17D6680).
+//  Returns 1 on
+//  success, 0 when the device cannot be created.
+//
+//  [NOT byte-identical] placement-dependent (relative calls to the D3D9 / XLO
+//  device-rebuild subsystem + the __security_check_cookie IAT slot) and refs
+//  the high-VA device globals at their original addresses.
+// ============================================================
+static int BuildXloDeviceFromRequest(const F3XloCaps *req)
+{
+    DWORD caps[14];
+    DWORD out[4];
+    int behavior;
+
+    DestroyDevice();
+
+    // Save the 44-byte request (11 DWORDs) at 0x1DB11F4..0x1DB121C.
+    memcpy(g_dword_1DB11F4, req->field, 44);
+
+    // Build the 56-byte caps block (the live copy the device vtable reads).
+    {
+        BYTE b24 = (BYTE)(req->field[6] & 0xFF);
+        BYTE b25 = (BYTE)((req->field[6] >> 8) & 0xFF);
+        memset(caps, 0, sizeof(caps));
+        caps[0]  = req->field[2];                                // width
+        caps[1]  = req->field[3];                                // height
+        caps[2]  = g_dword_1D9AF60[28 * req->field[0]];          // format key
+        caps[3]  = req->field[4];
+        caps[6]  = (b24 == 0) ? 3 : 2;
+        caps[7]  = (DWORD)g_hWndParent;
+        caps[8]  = (b24 == 0) ? 1 : 0;
+        caps[12] = req->field[5];
+        caps[13] = (b25 == 0) ? 0x80000000 : (DWORD)GetDisplayModeClass(req->field[8]);
+    }
+    g_dword_20FC984 = req->field[0];
+
+    behavior = ((req->field[10] & 2) != 0) + 1;
+
+    // Allocate + initialize the flush-request object if absent.
+    if (g_dword_2075F00 == 0)
+    {
+        void *flush = LHAlloc(20);
+        if (flush != 0)
+        {
+            memset(flush, 0, 20);
+            ((BYTE *)flush)[18] = 1;
+            NvApiConfigure(1);
+            g_dword_2075F00 = flush;
+        }
+        else
+        {
+            g_dword_2075F00 = 0;
+        }
+    }
+
+    // Create the device on the D3D9 object (with the retry logic).
+    int st = CreateXloDeviceFromAdapter(g_dword_1E2EDB8[1], caps, req, (DWORD)behavior);
+    if (st != 0)
+    {
+        for (;;)
+        {
+            if (st != 0x8876086A && st != 0x88760868 && st != 0x8876086C)
+                return 0;
+            if ((req->field[10] & 1) == 0)
+                break;
+            Sleep(0x64u);
+            st = CreateXloDeviceFromAdapter(g_dword_1E2EDB8[1], caps, req, (DWORD)behavior);
+            if (st == 0)
+                goto created;
+        }
+        if ((req->field[10] & 4) == 0 ||
+            CreateXloDeviceFromAdapter(g_dword_1E2EDB8[1], caps, req, 2) != 0)
+            return 0;
+    }
+created:
+    // Query the device's display mode (vtable[8], offset 0x20) and capture the
+    // refresh rate (the int64 at out+8; add 2^31 when the low word is negative).
+    {
+        void **vt = *(void ***)g_dword_1E2EEF4;
+        typedef void (__stdcall *F3ModeFn)(DWORD, DWORD, DWORD *);
+        F3ModeFn fn = (F3ModeFn)vt[8];
+        memset(out, 0, sizeof(out));
+        fn((DWORD)g_dword_1E2EEF4, 0, out);
+        long long refresh64 = *(long long *)(out + 2);
+        if ((int)out[2] < 0)
+            refresh64 += 2147483648LL;
+        g_flt_1E2ED78 = (float)refresh64;
+        g_flt_20FC968 = (float)refresh64;
+    }
+
+    // Copy the caps block to the live global (g_dword_1E2ED80 / xmmword 1E2ED80).
+    memcpy(g_dword_1E2ED80, caps, sizeof(caps));
+
+    // Set the device render-mode class (dword_1E2ED74) from caps[13].
+    {
+        DWORD mc = caps[13];
+        if ((mc & 0x80000001) != 0)
+            g_dword_1E2ED74 = 1;
+        else if ((mc & 0x2) != 0)
+            g_dword_1E2ED74 = 2;
+        else if ((mc & 0x4) != 0)
+            g_dword_1E2ED74 = 3;
+        else
+            g_dword_1E2ED74 = ((mc & 0x8) != 0) ? 4 : 1;
+    }
+
+    // Set the current resolution (qword_20FC928) from the caps block.
+    g_qword_20FC928[0] = caps[0];
+    g_qword_20FC928[1] = caps[1];
+
+    // Set the device viewport to the full width/height.
+    {
+        DWORD rect[4];
+        rect[0] = 0;
+        rect[1] = 0;
+        rect[2] = caps[0];
+        rect[3] = caps[1];
+        SetDeviceViewport(rect);
+    }
+
+    // Initialize the device state (backbuffer, format record, slot records,
+    // text caps, resolution, acquire method, container f00).
+    InitXloDeviceState();
+
+    g_dword_2074540 = (DWORD)g_dword_1E2EEF4;
+
+    // Load + init NVAPI, then register the device.
+    if (NvApiLoadInit() == 0)
+    {
+        if (NvApiRegisterDevice((int)g_dword_1E2EEF4, (int)&g_dword_1E2EEF0) != 0)
+            NvApiTeardownUnload();
+        else
+            g_byte_2075DDB = 1;
+    }
+
+    // Register the device's flush-request resource with NVAPI.
+    {
+        void *flush = g_dword_2075F00;
+        NvApiRegisterDevice((int)g_dword_1E2EEF4, (int)((char *)flush + 12));
+        ((BYTE *)flush)[16] = 1;
+    }
+    return 1;
 }
 
 // ============================================================

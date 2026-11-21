@@ -3,16 +3,14 @@
 
 #include "xlo_device.h"
 #include "xlive.h"                // the xlive.dll (XLiveAPI) import declarations
+#include "common/common.h"        // g_dword_1E2EEF4 / g_dword_1E2ED80 (shared device globals)
 #include <windows.h>
 #include <string.h>
 
-// 0x1E2EEF4: the current XLO device object (a vtable-backed pointer; the
-// on-create-device callback passes its value straight to XLiveOnCreateDevice).
-static DWORD g_dword_1E2EEF4 = 0;
-
-// 0x1E2ED80: the 56-byte (14 DWORD) XLO device-caps block. The callbacks copy
-// this into a local buffer before handing it to the XDK.
-static DWORD g_dword_1E2ED80[14];
+// 0x1E2EEF4 (the current XLO device object) and 0x1E2ED80 (the 56-byte
+// 14-DWORD XLO device-caps block) are engine-wide shared globals now defined
+// once in common/common.cpp and declared in common/common.h, so these
+// callbacks read the same device the worker / gamemain render loop uses.
 
 typedef struct F3XloDeviceCaps { DWORD field[14]; } F3XloDeviceCaps;
 typedef char F3XloDeviceCapsSizeCheck[(sizeof(F3XloDeviceCaps) == 56) ? 1 : -1];
@@ -46,7 +44,7 @@ int OnCreateDevice(void)
 {
     F3XloDeviceCaps caps;
     memcpy(&caps, g_dword_1E2ED80, sizeof(caps));   // == sub_18F01A0()
-    return (int)XLiveOnCreateDevice(g_dword_1E2EEF4, &caps);
+    return (int)XLiveOnCreateDevice((DWORD)g_dword_1E2EEF4, &caps);
 }
 
 // ============================================================

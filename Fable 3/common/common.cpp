@@ -49,6 +49,16 @@ DWORD g_Addend = 0;
 // (sub_19FF580) / wide setters, dropped by ReleaseSharedSlotWide (0x19FFA70).
 DWORD g_WideSlotCount = 0;
 
+// 0x1E2EEF4: the current XLO device object (a vtable-backed pointer). Single
+// engine-wide global shared by worker.cpp (device create/destroy),
+// gamemain.cpp (the per-frame render loop) and xlo_device.cpp (the XLO
+// on-create / on-reset callbacks).
+void *g_dword_1E2EEF4 = 0;
+
+// 0x1E2ED80: the 56-byte (14 DWORD) XLO device-caps block (the D3DPRESENT_
+// PARAMETERS) handed to XLiveOnCreateDevice / XLiveOnResetDevice.
+DWORD g_dword_1E2ED80[14];
+
 // ============================================================
 //  OutOfMemory  (0x01A034F0 - 0x01A0356C)  -- report an out-of-memory condition
 //  [NOT byte-identical] placement-dependent (relative calls to swprintf_s, OutputDebugStringW, DebugBreak).

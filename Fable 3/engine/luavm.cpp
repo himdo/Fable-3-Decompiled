@@ -158,10 +158,31 @@ static void *KoreVmAllocFreeAligned(int a1, void *src, size_t size, int aligned)
 // +0x94 handler slot; always returns 1).
 static int KoreReturnsOne(void) { return 1; }
 
-// sub_5DBFC0 (0x5DBFC0 - 0x5DBFD7) -- no-op config handler (the a1[3] word,
-// stored into the module host's +0x294).  Remaining stub: an unreachable
-// error-report leaf in this build.
-static int KoreNoopStub0(int a1) { (void)a1; return 0; }
+// sub_5DBFC0 (0x5DBFC0 - 0x5DBFD7) -- KoreMinExpandSize: the config a1[3]
+// expand-gate handler (stored into the module host's +0x294).  It is called
+// first thing by KoreVmAllocExpand (sub_5F6420) as gate(vmcore, size) -- if
+// the returned size is < the request the last-resort expand aborts into the
+// panic path.  This default gate returns max(size, *( *(vmcore) + 4) >> 3):
+// the requested size, or at least one eighth of the module host block size
+// (the 1032-byte host -> 129), so it always authorises the expand.  Unreached
+// in this build (the VM heap never OOM-expands).  Byte-identical: call-free
+// with no data refs, the original 23 bytes are emitted exactly.
+__declspec(naked) unsigned int KoreMinExpandSize(unsigned int vmcore, unsigned int size)
+{
+    __asm
+    {
+        mov eax, [esp+4]
+        mov ecx, [eax]
+        mov eax, [ecx+4]
+        mov ecx, [esp+8]
+        shr eax, 3
+        cmp ecx, eax
+        jbe short done
+        mov eax, ecx
+    done:
+        ret
+    }
+}
 // nullsub_3 -- no-op config handler (the a1[7] word, the module host's +0x2B4
 // slot before CreateLuaModule rewrites it to the sub_628100 panic handler).
 static int KoreNoopRet0(void) { return 0; }
@@ -189,7 +210,8 @@ static void KoreEnsureLuaHeapObject(void)
 // config record with the "Main State" defaults -- the two registry pointers
 // (dword_1C841D4 / dword_1C841D8, the a1[12] / a1[13] words), the a1[4]
 // aligned allocator (KoreVmAllocFreeAligned, sub_5D7970), the a1[6] panic
-// traceback, the a1[7] nullsub_3, the a1[3] no-op handler, the "Main State"
+// traceback, the a1[7] nullsub_3, the a1[3] expand-gate handler
+// (KoreMinExpandSize, sub_5DBFC0), the "Main State"
 // name, and the 100 / 10 / 0x200000 / 8 / 8 / 128 / -1 words.  CreateLuaModule
 // then overwrites the engine-specific fields on top of these.  thiscall in the
 // original (the record in ECX); a plain free function here.
@@ -202,7 +224,7 @@ static int *KoreInitModuleConfig(int *cfg)
     cfg[1]  = 10;
     cfg[6]  = (int)KorePanicTraceback;
     cfg[7]  = (int)KoreNoopRet0;
-    cfg[3]  = (int)KoreNoopStub0;
+    cfg[3]  = (int)KoreMinExpandSize;
     cfg[8]  = (int)"Main State";
     cfg[9]  = 8;
     cfg[10] = 8;
@@ -10631,7 +10653,7 @@ int ReinitEngineLua(void *obj, int flag)
         luaMgr = (int)CLuaManagerCtor(newMgr, (void *)dw[0xBC / 4], (void *)dw[0x98 / 4]);
     dw[0xC0 / 4] = (DWORD)luaMgr;
 
-    CLuaManagerRunSerialiseScript((void *)luaMgr);
+     CLuaManagerRunSerialiseScript((void *)luaMgr);
     RegisterEngineLuaFunctions((int)dw[0xBC / 4]);
 
     // 5. First-time init: build the startup-script path and run the
