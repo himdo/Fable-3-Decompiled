@@ -151,7 +151,7 @@ static int SteamAPI_Init(void)
 
 // Forward declarations (defined later in this file).
 static void DetachSharedSlot(F3SharedBuffer **slot);
-static void AppendSharedSlot(F3SharedBuffer **slot, const char *src);
+void AppendSharedSlot(F3SharedBuffer **slot, const char *src);   // sub_1A01880
 static F3SharedBuffer **ResolvePathSlot(F3SharedBuffer **a1, F3SharedBuffer **a2);
 static int SplitPathIntoSlots(F3SharedBuffer **path, F3SharedBuffer **driveOut,
                               F3SharedBuffer **dirOut, F3SharedBuffer **fileOut,
@@ -519,6 +519,9 @@ static char FindXmlSection(F3XmlStream *obj, const char *name);
 static char XmlCheckRootSection(F3XmlStream *obj, const char *name);
 static int  XmlAdvance(F3XmlStream *obj);
 static char XmlReadBoolAttr(F3XmlStream *obj, void *name, BYTE *out);
+// sub_17DBE60 (defined below): the real vtable[8] slot (read the current
+// element's value as an int64/hex word into *out)
+static void XmlReadAttrValue64(F3XmlStream *obj, DWORD *out);
 
 // ============================================================
 //  LHXML report handler (off_1D94CA0)
@@ -611,6 +614,8 @@ static void CXMLReadStreamCtor(F3XmlStream *obj)
         g_CXMLReadStreamVtable[2] = (void *)XmlCheckRootSection;   // vt[2]
     if (g_CXMLReadStreamVtable[3] == 0)
         g_CXMLReadStreamVtable[3] = (void *)XmlAdvance;           // vt[3]
+    if (g_CXMLReadStreamVtable[8] == 0)
+        g_CXMLReadStreamVtable[8] = (void *)XmlReadAttrValue64;   // vt[8]
     if (g_CXMLReadStreamVtable[10] == 0)
         g_CXMLReadStreamVtable[10] = (void *)XmlReadBoolAttr;     // vt[10]
 }
@@ -720,6 +725,17 @@ static char XmlReadBoolAttr(F3XmlStream *obj, void *name, BYTE *out)
 {
     (void)obj; (void)name; (void)out;
     return 0;
+}
+
+// sub_17DBE60 (0x17DBE60 - 0x17DBEB0): read the current element's value as an
+// int64 word (vtable[8]). The original resolves the current node's value
+// string, converts it (decimal, or 0x-prefixed hex via sub_17DBA90) and
+// stores the result in *out. [remaining stub] no element is ever current in
+// this build (the LHXML parse is a remaining stub), so the reader never runs
+// and *out is left as is.
+static void XmlReadAttrValue64(F3XmlStream *obj, DWORD *out)
+{
+    (void)obj; (void)out;
 }
 
 // sub_17DC2B0 + sub_17DAA20 (0x17DC2B0 - 0x17DC2DA): the CXMLReadStream dtor
@@ -866,9 +882,10 @@ F3SharedBuffer **EngRefSharedSlot(F3SharedBuffer **dst, F3SharedBuffer **src)   
 //  is "dword_1DBE2F0"): .bss (starts null), populated by the settings
 //  subsystem before the paths below are built. It is also the base slot used
 //  by sub_67C910 / MakeAbnormalShutdownPath / the AccessibilitySettings.xml
-//  builders.
+//  builders. Exposed to the worker module (SaveSettingsBeforeExit,
+//  gamemain.h) which rebuilds the AccessibilitySettings.xml path.
 // ============================================================
-static F3SharedBuffer *g_dword_1DBE2F0 = 0;   // 0x1DBE2F0: settings-directory path slot
+F3SharedBuffer *g_dword_1DBE2F0 = 0;   // 0x1DBE2F0: settings-directory path slot
 
 // sub_4040C0 (0x4040C0 - 0x40413B): index of the highest set bit (floor log2).
 static int TopBitIndex(unsigned int x)
@@ -1004,7 +1021,7 @@ static void DetachSharedSlot(F3SharedBuffer **slot)
 //  (SharedBufferCreate, 0x1A01360) and any old block the slot holds is
 //  released. The live-slot count (g_Addend) is the caller's responsibility
 //  (InitSharedSlot / EngRefSharedSlot own it).
-static void AppendSharedSlot(F3SharedBuffer **slot, const char *src)
+void AppendSharedSlot(F3SharedBuffer **slot, const char *src)
 {
     if (*slot != 0)
     {
@@ -1929,9 +1946,9 @@ static F3SharedBuffer **ResolvePathSlot(F3SharedBuffer **a1, F3SharedBuffer **a2
 //  InterlockedDecrement(slot+12) hits the caller's stack frame, a large value
 //  that never triggers a free; not reproduced.) Callers: RunFrontEnd (the
 //  "Data/ThisIsSteam" Steam probe and the abnormal_shutdown check), sub_67E030,
-//  sub_1329EE0, SaveSettingsBeforeExit, sub_18F72B0.
+//  sub_1329EE0, SaveSettingsBeforeExit, InitAccessibilitySettings.
 // ============================================================
-static int SharedFileExists(F3SharedBuffer **obj)
+int SharedFileExists(F3SharedBuffer **obj)
 {
     F3SharedBuffer *local = 0;
 
@@ -1952,6 +1969,199 @@ static int SharedFileExists(F3SharedBuffer **obj)
     }
     ReleaseSharedSlot(&local);
     return 1;
+}
+
+// ============================================================
+//  DeleteSharedFile  (0x18B0420 - 0x18B0494)
+//  [NOT byte-identical] placement-dependent (relative calls to the resolver,
+//  SharedBufferFree and the DeleteFileA / InterlockedDecrement IAT slots)
+//  plus the high-VA globals Str1 (the empty string at 0x01BD44D7) and
+//  g_Addend (0x02075C48).
+//
+//  int DeleteSharedFile(F3SharedBuffer **slot)
+//
+//  "Delete the (resolved) path of this shared slot." The slot is resolved
+//  through the path resolver (sub_18AFB90), which stores a fresh block
+//  holding the process CWD (ANSI text, a trailing backslash appended) in
+//  the local slot -- the source slot is effectively ignored (the resolver
+//  clears it before re-deriving the path), exactly as in SharedFileExists.
+//  DeleteFileA is called on the resolved text (the empty string when the
+//  local block is null), then, on both branches, the local block's
+//  reference is dropped (InterlockedDecrement; free at zero) and g_Addend
+//  is decremented. Because the resolver returns the CWD -- a directory --
+//  DeleteFileA always fails and 0 is returned. Callers: SaveSettingsBeforeExit
+//  (worker.cpp, the AccessibilitySettings.xml delete) and the worker
+//  WM_CLOSE path (worker.cpp, the abnormal_shutdown.tmp marker). Exposed in
+//  gamemain.h for the worker module.
+// ============================================================
+int DeleteSharedFile(F3SharedBuffer **slot)
+{
+    F3SharedBuffer *local = 0;
+
+    ResolvePathSlot(&local, slot);
+
+    const char *path = (local != 0) ? local->data : "";   // "" = Str1, 0x1BD44D7
+    int result = (int)DeleteFileA(path);
+    if (local != 0)
+    {
+        if (InterlockedDecrement(&local->refcount) <= 0)
+            SharedBufferFree(local);
+    }
+    InterlockedDecrement(&g_Addend);
+    return result;
+}
+
+// ============================================================
+//  Accessibility settings (the SystemParametersInfo save/restore values and
+//  the AccessibilitySettings.xml reader). The game snapshots the three system
+//  parameters it may override (SPI_GETHIDCONFIRM 0x3A, SPI_GETKEYBOARDSPEED
+//  0x34, SPI_GETKEYBOARDDelay 0x32) at start-up, applies the saved overrides
+//  from AccessibilitySettings.xml, and restores the snapshot on exit (the
+//  matching SPI_SET* calls live in SaveSettingsBeforeExit, worker.cpp).
+// ============================================================
+
+// 0x1D9E18C / 0x1D9E194: the SPI_GETHIDCONFIRM / SPI_GETKEYBOARDSPEED
+// snapshot (the .data initial values stand until start-up overwrites them
+// with the live system values). Non-static: SaveSettingsBeforeExit
+// (worker.cpp) restores from them (see gamemain.h).
+DWORD g_dword_1D9E18C = 8;
+DWORD g_dword_1D9E194 = 8;
+// 0x1D9E19C: the SPI_GETKEYBOARDDelay snapshot (the 4-byte value block
+// passed to SystemParametersInfoA; the .data initial value is 24).
+BYTE  g_byte_1D9E19C[4] = { 0x18, 0, 0, 0 };
+
+// 0x1D9E190 / 0x1D9E198 / 0x1D9E1A0 (byte_1D9E19C+4): the shared slots
+// (F3SharedBuffer*) of the three accessibility-setting values loaded by
+// InitAccessibilitySettings (.bss, start null).
+static F3SharedBuffer *g_dword_1D9E190 = 0;
+static F3SharedBuffer *g_dword_1D9E198 = 0;
+static F3SharedBuffer *g_dword_1D9E1A0 = 0;
+
+// 0x20FC8D8: the accessibility-settings section name slot (F3SharedBuffer*);
+// .bss, so empty = the "" (root) section. 0x20FC8DC / 0x20FC8E0 / 0x20FC8E4:
+// the name slots of the three accessibility-setting elements (.bss, empty =
+// the "" default).
+static F3SharedBuffer *g_dword_20FC8D8 = 0;
+static F3SharedBuffer *g_dword_20FC8DC = 0;
+static F3SharedBuffer *g_dword_20FC8E0 = 0;
+static F3SharedBuffer *g_dword_20FC8E4 = 0;
+
+// ============================================================
+//  ReadXmlNamedValue  (0x18F6600 - 0x18F6641)  -- sub_18F6600
+//  [NOT byte-identical] refs the high-VA empty-string global Str1
+//  (0x01BD44D7); the virtual dispatch itself is preserved through the
+//  stream's vtable pointer.
+//
+//  DWORD ReadXmlNamedValue(F3SharedBuffer **nameSlot, F3XmlStream *stream,
+//                          DWORD *out)
+//
+//  Enter the named section of the stream and read its value: the name is the
+//  C string held by nameSlot (the empty string when the slot is null). When
+//  the stream enters it (vtable[1] = FindXmlSection), the current element's
+//  value is read into *out (vtable[8] = sub_17DBE60) and the result is the
+//  advance to the next sibling (vtable[3] = XmlAdvance); 0 when the named
+//  section is not found. The settings readers/writers (InitAccessibilitySettings
+//  / ApplyDisplaySettings and the save-file loaders) use this to pull one
+//  int64 value out of the current XML element.
+// ============================================================
+static DWORD ReadXmlNamedValue(F3SharedBuffer **nameSlot, F3XmlStream *stream,
+                               DWORD *out)
+{
+    const char *name = (nameSlot != 0 && *nameSlot != 0) ? (*nameSlot)->data : "";
+    void **vt = (void **)stream->vtable;
+    if (((char (*)(F3XmlStream *, const char *))vt[1])(stream, name) != 0)
+    {
+        ((void (*)(F3XmlStream *, DWORD *))vt[8])(stream, out);
+        return (DWORD)((DWORD (*)(F3XmlStream *))vt[3])(stream);
+    }
+    return 0;
+}
+
+// ============================================================
+//  InitAccessibilitySettings  (0x18F72B0 - 0x18F7455)
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  RefSharedSlot / AppendSharedSlot / SharedFileExists / SharedBufferFree /
+//  CXMLReadStreamCtor / OpenXmlFile / FindXmlSection / ReadXmlNamedValue /
+//  XmlAdvance / SaveSettingsBeforeExit / CXMLReadStreamDtor and the
+//  SystemParametersInfoA / InterlockedDecrement IAT slots) plus the high-VA
+//  globals below, the settings-directory slot g_dword_1DBE2F0, g_Addend and
+//  the "AccessibilitySettings.xml" literal.
+//
+//  LONG InitAccessibilitySettings(void)
+//
+//  The accessibility-settings start-up load. First the current values of the
+//  three system parameters are snapshotted (SPI_GETHIDCONFIRM 0x3A and
+//  SPI_GETKEYBOARDSPEED 0x34 into g_dword_1D9E18C / g_dword_1D9E194,
+//  SPI_GETKEYBOARDDelay 0x32 into g_byte_1D9E19C) for the later restore in
+//  SaveSettingsBeforeExit. Then, when "AccessibilitySettings.xml" exists in
+//  the settings directory (a ref of the g_dword_1DBE2F0 slot + the filename,
+//  checked with SharedFileExists), a CXMLReadStream is opened on it and, when
+//  the section named by g_dword_20FC8D8 (empty by default = the root) is
+//  found, each of the three named values (g_dword_20FC8DC / g_dword_20FC8E0 /
+//  g_dword_20FC8E4, empty by default) is loaded (ReadXmlNamedValue) into the
+//  g_dword_1D9E190 / g_dword_1D9E198 / g_dword_1D9E1A0 slots and the stream
+//  advances past it. SaveSettingsBeforeExit then runs, the stream is
+//  destroyed, and 0 is returned. When the file does not exist the
+//  InterlockedDecrement counter value is returned as-is (the defaults stand).
+//  Caller: CWorkerWin32_RunGame (worker.cpp).
+// ============================================================
+LONG InitAccessibilitySettings(void)
+{
+    SystemParametersInfoA(0x3A, 8, (PVOID)&g_dword_1D9E18C, 0);   // SPI_GETHIDCONFIRM
+    SystemParametersInfoA(0x34, 8, (PVOID)&g_dword_1D9E194, 0);   // SPI_GETKEYBOARDSPEED
+    SystemParametersInfoA(0x32, 0x18, (PVOID)g_byte_1D9E19C, 0);  // SPI_GETKEYBOARDDelay
+
+    F3SharedBuffer *path = 0;
+    RefSharedSlot(&path, &g_dword_1DBE2F0);
+    AppendSharedSlot(&path, "AccessibilitySettings.xml");
+    char exists = SharedFileExists(&path);
+    if (path != 0)
+    {
+        if (InterlockedDecrement(&path->refcount) <= 0)
+            SharedBufferFree(path);
+        path = 0;
+    }
+    long result = InterlockedDecrement(&g_Addend);
+
+    if (exists != 0)
+    {
+        F3XmlStream stream;
+        CXMLReadStreamCtor(&stream);
+
+        F3SharedBuffer *path2 = 0;
+        RefSharedSlot(&path2, &g_dword_1DBE2F0);
+        AppendSharedSlot(&path2, "AccessibilitySettings.xml");
+        const char *fileName = (path2 != 0) ? path2->data : "";
+        char opened = OpenXmlFile(&stream, fileName);
+        if (path2 != 0)
+        {
+            if (InterlockedDecrement(&path2->refcount) <= 0)
+                SharedBufferFree(path2);
+            path2 = 0;
+        }
+        InterlockedDecrement(&g_Addend);
+
+        if (opened != 0)
+        {
+            const char *rootName = (g_dword_20FC8D8 != 0) ? g_dword_20FC8D8->data : "";
+            if (FindXmlSection(&stream, rootName) != 0)
+            {
+                F3SharedBuffer *value = 0;
+                ReadXmlNamedValue(&g_dword_20FC8DC, &stream, (DWORD *)&value);
+                g_dword_1D9E190 = value;
+                ReadXmlNamedValue(&g_dword_20FC8E0, &stream, (DWORD *)&value);
+                g_dword_1D9E198 = value;
+                ReadXmlNamedValue(&g_dword_20FC8E4, &stream, (DWORD *)&value);
+                g_dword_1D9E1A0 = value;
+                XmlAdvance(&stream);
+            }
+        }
+
+        SaveSettingsBeforeExit();
+        CXMLReadStreamDtor(&stream);
+        return 0;
+    }
+    return (LONG)result;
 }
 
 // ============================================================

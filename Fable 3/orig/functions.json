@@ -268,11 +268,5 @@
 "rva": 3340240,
 "size": 5,
 "source": "gamethread"
-},
-{
-"name": "?sub_18F0850@@YAHXZ",
-"rva": 21956688,
-"size": 119,
-"source": "worker"
 }
 ]

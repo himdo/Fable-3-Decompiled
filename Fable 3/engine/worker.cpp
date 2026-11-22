@@ -1,6 +1,13 @@
 // Fable 3 — CWorkerWin32 module implementation (the 664-byte main worker
 // object, its deleting destructor, and the current-worker registry).
 
+#include <stdio.h>   // _invalid_parameter_noinfo
+#include <math.h>    // fabsf
+#include <new>       // std::bad_alloc (InputQueueAllocBuffer overflow path)
+#include <stdexcept> // std::length_error (ProcessInputQueue overflow path)
+#include <new>       // std::bad_alloc (InputQueueAllocBuffer overflow path)
+#include <stdexcept> // std::length_error (ProcessInputQueue overflow path)
+
 #include "worker.h"
 #include "common/common.h"
 #include "manager.h"
@@ -377,10 +384,8 @@ static HCURSOR g_hCursor       = 0;   // 0x20FC8D4
 static char    g_byte_2122F1C  = 0;   // 0x2122F1C
 
 // 0x1D9E18C / 0x1D9E194 / 0x1D9E19C: the system-parameter restore values used
-// by SaveSettingsBeforeExit (sub_18F71E0).
-static DWORD g_dword_1D9E18C = 0;
-static DWORD g_dword_1D9E194 = 0;
-static BYTE  g_byte_1D9E19C  = 0;
+// by SaveSettingsBeforeExit (sub_18F71E0) now live in gamemain.cpp next to the
+// settings cluster (InitAccessibilitySettings reads them too); see gamemain.h.
 
 // Forward declaration for a helper defined later in this file (used by the
 // WM_SIZE path).
@@ -424,31 +429,1261 @@ static void F3EnterDisplayCs(void)
 }
 
 // ============================================================
-//  [STUB]  ResetXloDevice  (0x18F2310 - 0x18F2850)  -- reset/recreate the XLO
-//  device from a fresh 56-byte caps block
+//  XLO device-object containers  +  ResetXloDevice
+//  (0x18F2310 - 0x18F2850 and its transitive sub_56xxxx / sub_18E6xxx helpers)
 //
-//  int ResetXloDevice(const DWORD *caps56)   -- 1 = reset succeeded, 0 = failed
+//  The device keeps three 20-byte red-black "list" containers (device objects
+//  walked for teardown / re-notification) and one 28-byte red-black "map"
+//  container (object -> SEH slot).  Each container is a self-referential
+//  sentinel node (an empty tree) plus a 4-byte wrapper pointer and a count.
+//  In the image every container is empty (poison 0xFFFFFFFF at image load;
+//  the subsystem init that would populate them is not executed in this build),
+//  so the wrapper / sentinel pairs below are the valid empty-tree layout and
+//  all container walks are no-ops.
 //
-//  Original semantics (nested under the device CS stru_20FC948 already held
-//  by the caller): if the device object (dword_1E2EEF4) reports status
-//  0x88760868 (already reset) return 0. Otherwise, unless the device has
-//  been built once (byte_2075F04), release the per-device resources first
-//  (the LHAlloc-allocated container, the 0x20FCA0C/0x20FC9CC object-list
-//  callback walks, ReleaseDeviceObjects + sub_566CB0). Then recreate the
-//  device through its vtable[16] (offset 0x40) with the new caps, record the
-//  caps into dword_1E2ED80 and the mode class into dword_1E2ED74 (selected
-//  from the last caps dword: bit 0x80000001/low bit -> 1, bit 2 -> 2, bit 4
-//  -> 3, bit 8 -> 4), run InitXloDeviceState (sub_18F1310), re-notify the
-//  0x20FCA0C list (vtable[2]) and the 0x20FC9EC list, clear byte_2075F04, and
-//  return 1. The full device-rebuild subsystem (object-list management,
-//  sub_18E65F0, InitXloDeviceState (sub_18F1310), sub_56xxxx helpers) is out
-//  of scope. Returns 0 (reset failed)
-//  so IsDisplayReady stays conservative.
+//  ResetXloDevice passes the 56-byte device caps block BY VALUE (14 DWORDs on
+//  the stack), matching the original's rep-movsd by-value call convention.
+//
+//  [NOT byte-identical] throughout: the original helpers use userpurge
+//  register passing and high-VA global references, and the RB rebalancing is
+//  transcribed from IDA pseudocode; behavioral fidelity is the goal (the
+//  containers are always empty in this build).
 // ============================================================
-static int ResetXloDevice(const DWORD *caps56)
+
+// Forward declarations of device-state functions defined further below in this
+// module (ResetXloDevice calls them before their definitions).
+static int   ReleaseDeviceObjects(void);
+static DWORD InitXloDeviceState(void);
+
+// 0x1E2ED74: device render-mode class (1..4).  Defined here (moved up from the
+// device-build globals block below) so ResetXloDevice can store it.
+static DWORD g_dword_1E2ED74 = 0;
+
+// 0x2075F04: the "device built once" flag.  Set on the first reset so that
+// subsequent resets skip the one-time release phase; cleared at the end of
+// every reset.
+static BYTE  g_byte_2075F04 = 0;
+
+// The 56-byte (14-DWORD) device caps block, passed by value to
+// ResetXloDevice (the original does a rep-movsd of 14 DWORDs onto the stack).
+// (This is the same F3XloCaps consumed by BuildXloDeviceFromRequest; the
+// definition lives here so ResetXloDevice can take it by value.)
+struct F3XloCaps
 {
-    (void)caps56;
-    return 0;
+    DWORD field[14];
+};
+typedef char F3XloCaps_SizeCheck[(sizeof(F3XloCaps) == 56) ? 1 : -1];
+
+// ---- container node layouts ---------------------------------------------
+// 20-byte node used by the three device-object lists.
+typedef struct F3ObjNode20
+{
+    DWORD left;      // +0x00
+    DWORD parent;    // +0x04
+    DWORD right;     // +0x08
+    DWORD key;       // +0x0C  (object pointer / callback)
+    BYTE  flag;      // +0x10  (delete flag)
+    BYTE  terminus;  // +0x11  (sentinel / end flag)
+    char  pad[2];
+} F3ObjNode20;
+typedef char F3ObjNode20_SizeCheck[(sizeof(F3ObjNode20) == 20) ? 1 : -1];
+
+// 28-byte node used by the device-object map.
+typedef struct F3ObjNode28
+{
+    DWORD left;      // +0x00
+    DWORD parent;    // +0x04
+    DWORD right;     // +0x08
+    DWORD key;       // +0x0C  (object pointer)
+    DWORD aux;       // +0x10  (SEH slot word 0)
+    DWORD block;     // +0x14  (SEH slot word 1, refcounted)
+    BYTE  color;     // +0x18  (RB color)
+    BYTE  terminus;  // +0x19  (sentinel / end flag)
+    char  pad[2];
+} F3ObjNode28;
+typedef char F3ObjNode28_SizeCheck[(sizeof(F3ObjNode28) == 28) ? 1 : -1];
+
+// 32-byte container header.  The wrapper points to a 4-byte block whose
+// content is the address of this header, so a non-null dereference of the
+// wrapper lands on the header and [wrapper + 0x18] is the sentinel pointer
+// (matching the original layout: wrapper at +0x00, sentinel at +0x18, count
+// at +0x1C).
+typedef struct F3ObjContainer
+{
+    DWORD wrapper;   // +0x00
+    char  pad[20];   // +0x04 .. +0x17
+    DWORD sentinel;  // +0x18
+    DWORD count;     // +0x1C
+} F3ObjContainer;
+typedef char F3ObjContainer_SizeCheck[(sizeof(F3ObjContainer) == 32) ? 1 : -1];
+
+// The original container helpers call the CRT invalid-parameter handler on
+// invariant violations (these are never reached for the empty containers in
+// this build).  Use a project-local no-op stand-in (the original aborts /
+// reports; no-op is fine for the empty case).  A local _invalid_parameter_noinfo
+// definition emits the CRT symbol __invalid_parameter_noinfo at the /LTCG link
+// and collides with libcmt.lib(invarg.obj) (LNK2005), so it keeps a name of
+// its own.
+static void F3InvalidParameterNoop(void)
+{
+}
+
+// ---- container sentinels + wrapper blocks + headers ---------------------
+static F3ObjNode20 g_sentList1;   // 0x20FCA24
+static F3ObjNode20 g_sentList2;   // 0x20FC9E4
+static F3ObjNode20 g_sentList3;   // 0x20FCA04
+static F3ObjNode28 g_sentMap;     // 0x20FCA44
+static DWORD       g_wrapList1;   // 0x20FCA0C block
+static DWORD       g_wrapList2;   // 0x20FC9CC block
+static DWORD       g_wrapList3;   // 0x20FC9EC block
+static DWORD       g_wrapMap;     // 0x20FCA2C block
+static F3ObjContainer g_contList1;   // base 0x20FCA0C
+static F3ObjContainer g_contList2;   // base 0x20FC9CC
+static F3ObjContainer g_contList3;   // base 0x20FC9EC
+static F3ObjContainer g_contMap;     // base 0x20FCA2C
+
+static void F3InitDeviceObjContainers(void)
+{
+    // List 1 (20-byte nodes, 0x20FCA0C / 0x20FCA24 / 0x20FCA28).
+    F3ObjNode20 *s1 = &g_sentList1;
+    s1->left = s1->right = s1->parent = (DWORD)s1;
+    s1->key = 0; s1->flag = 1; s1->terminus = 1;
+    g_wrapList1  = (DWORD)&g_contList1;   // wrapper content = container struct
+    g_contList1.wrapper  = (DWORD)&g_wrapList1;
+    g_contList1.sentinel = (DWORD)s1;
+    g_contList1.count    = 0;
+
+    // List 2 (20-byte nodes, 0x20FC9CC / 0x20FC9E4 / 0x20FC9E8).
+    F3ObjNode20 *s2 = &g_sentList2;
+    s2->left = s2->right = s2->parent = (DWORD)s2;
+    s2->key = 0; s2->flag = 1; s2->terminus = 1;
+    g_wrapList2  = (DWORD)&g_contList2;
+    g_contList2.wrapper  = (DWORD)&g_wrapList2;
+    g_contList2.sentinel = (DWORD)s2;
+    g_contList2.count    = 0;
+
+    // List 3 (20-byte nodes, 0x20FC9EC / 0x20FCA04 / 0x20FCA08).
+    F3ObjNode20 *s3 = &g_sentList3;
+    s3->left = s3->right = s3->parent = (DWORD)s3;
+    s3->key = 0; s3->flag = 1; s3->terminus = 1;
+    g_wrapList3  = (DWORD)&g_contList3;
+    g_contList3.wrapper  = (DWORD)&g_wrapList3;
+    g_contList3.sentinel = (DWORD)s3;
+    g_contList3.count    = 0;
+
+    // Map (28-byte nodes, 0x20FCA2C / 0x20FCA44 / 0x20FCA48).
+    F3ObjNode28 *sm = &g_sentMap;
+    sm->left = sm->right = sm->parent = (DWORD)sm;
+    sm->key = 0; sm->aux = 0; sm->block = 0;
+    sm->color = 0; sm->terminus = 1;
+    g_wrapMap     = (DWORD)&g_contMap;
+    g_contMap.wrapper  = (DWORD)&g_wrapMap;
+    g_contMap.sentinel = (DWORD)sm;
+    g_contMap.count    = 0;
+}
+
+// Static-constructor guard so the containers are valid from program start
+// (matches the original subsystem init running before main).
+struct F3DeviceObjContainersInit
+{
+    F3DeviceObjContainersInit() { F3InitDeviceObjContainers(); }
+};
+static F3DeviceObjContainersInit g_deviceObjContainersInit;
+
+// ============================================================
+//  F3ObjTreeStep20  (sub_568420 / sub_568330, byte-identical twins)
+//  -- advance a 2-word in-order iterator {container, node} over a 20-byte
+//  node tree to the in-order successor.  [NOT byte-identical] userpurge.
+// ============================================================
+static void F3ObjTreeStep20(DWORD *iter)
+{
+    if (iter[0] == 0)
+        F3InvalidParameterNoop();
+    F3ObjNode20 *node = (F3ObjNode20 *)iter[1];
+    if (node->terminus != 0)
+        F3InvalidParameterNoop();
+    F3ObjNode20 *parent = (F3ObjNode20 *)node->parent;
+    if (parent->terminus != 0)
+    {
+        // node is the root: walk node->right while the right child's parent
+        // is still node.
+        F3ObjNode20 *r = (F3ObjNode20 *)node->right;
+        for (;;)
+        {
+            if (r->terminus != 0)
+                break;
+            if ((DWORD)node != r->parent)
+                break;
+            iter[1] = (DWORD)r;
+            r = (F3ObjNode20 *)r->right;
+        }
+        iter[1] = (DWORD)r;
+        return;
+    }
+    F3ObjNode20 *l = (F3ObjNode20 *)parent->left;
+    if (l->terminus != 0)
+    {
+        iter[1] = (DWORD)parent;
+        return;
+    }
+    F3ObjNode20 *cur = l;
+    for (;;)
+    {
+        F3ObjNode20 *next = (F3ObjNode20 *)l->left;
+        if (next->terminus != 0)
+            break;
+        cur = l;
+        l = next;
+    }
+    iter[1] = (DWORD)cur;
+}
+
+// ============================================================
+//  F3ObjTreeStep28  (sub_568540)  -- in-order successor over a 28-byte node
+//  tree (the terminus flag lives at byte +0x19 instead of +0x11).
+//  [NOT byte-identical] userpurge.
+// ============================================================
+static void F3ObjTreeStep28(DWORD *iter)
+{
+    if (iter[0] == 0)
+        F3InvalidParameterNoop();
+    F3ObjNode28 *node = (F3ObjNode28 *)iter[1];
+    if (node->terminus != 0)
+        F3InvalidParameterNoop();
+    F3ObjNode28 *parent = (F3ObjNode28 *)node->parent;
+    if (parent->terminus != 0)
+    {
+        F3ObjNode28 *r = (F3ObjNode28 *)node->right;
+        for (;;)
+        {
+            if (r->terminus != 0)
+                break;
+            if ((DWORD)node != r->parent)
+                break;
+            iter[1] = (DWORD)r;
+            r = (F3ObjNode28 *)r->right;
+        }
+        iter[1] = (DWORD)r;
+        return;
+    }
+    F3ObjNode28 *l = (F3ObjNode28 *)parent->left;
+    if (l->terminus != 0)
+    {
+        iter[1] = (DWORD)parent;
+        return;
+    }
+    F3ObjNode28 *cur = l;
+    for (;;)
+    {
+        F3ObjNode28 *next = (F3ObjNode28 *)l->left;
+        if (next->terminus != 0)
+            break;
+        cur = l;
+        l = next;
+    }
+    iter[1] = (DWORD)cur;
+}
+
+// ============================================================
+//  F3ObjTreePrev28  (sub_5684C0)  -- in-order predecessor over a 28-byte node
+//  tree.  [NOT byte-identical] userpurge.
+// ============================================================
+static void F3ObjTreePrev28(DWORD *iter)
+{
+    if (iter[0] == 0)
+        F3InvalidParameterNoop();
+    F3ObjNode28 *node = (F3ObjNode28 *)iter[1];
+    if (node->terminus != 0)
+    {
+        node = (F3ObjNode28 *)node->parent;
+        iter[1] = (DWORD)node;
+        if (node->terminus != 0)
+            F3InvalidParameterNoop();
+        return;
+    }
+    F3ObjNode28 *l = (F3ObjNode28 *)node->left;
+    if (l->terminus != 0)
+    {
+        // node->left is terminal: climb node->right while it is the parent's
+        // left child.
+        F3ObjNode28 *nr = (F3ObjNode28 *)node->right;
+        for (;;)
+        {
+            if (nr->terminus != 0)
+                break;
+            if (iter[1] != nr->left)
+                break;
+            iter[1] = (DWORD)nr;
+            nr = (F3ObjNode28 *)nr->right;
+        }
+        if (((F3ObjNode28 *)iter[1])->terminus != 0)
+            F3InvalidParameterNoop();
+        iter[1] = (DWORD)nr;
+        return;
+    }
+    F3ObjNode28 *r = (F3ObjNode28 *)l->parent;
+    if (r->terminus != 0)
+    {
+        iter[1] = (DWORD)l;
+        return;
+    }
+    F3ObjNode28 *cur = r;
+    for (;;)
+    {
+        F3ObjNode28 *next = (F3ObjNode28 *)cur->parent;
+        if (next->terminus != 0)
+            break;
+        cur = next;
+    }
+    iter[1] = (DWORD)cur;
+}
+
+// ============================================================
+//  F3ObjTreeSearch28  (sub_565450)  -- BST search in the 28-byte map by key;
+//  returns a 2-word result {wrapper, node-or-sentinel}.
+//  [NOT byte-identical] userpurge (the result was returned in EAX).
+// ============================================================
+static DWORD *F3ObjTreeSearch28(DWORD *out, DWORD *keyWord)
+{
+    F3ObjNode28 *sentinel = (F3ObjNode28 *)g_contMap.sentinel;
+    F3ObjNode28 *v2 = sentinel;
+    F3ObjNode28 *v3 = (F3ObjNode28 *)sentinel->parent;
+    while (v3->terminus == 0)
+    {
+        if (v3->key >= *keyWord)
+        {
+            v2 = v3;
+            v3 = (F3ObjNode28 *)v3->left;
+        }
+        else
+        {
+            v3 = (F3ObjNode28 *)v3->right;
+        }
+    }
+    out[1] = (DWORD)v2;
+    out[0] = g_contMap.wrapper;
+    return out;
+}
+
+// ============================================================
+//  F3ObjNodeAlloc28  (sub_567D30)  -- allocate and initialize a 28-byte map
+//  node from a 3-DWORD key block {key, aux, block}.
+//  [NOT byte-identical] userpurge + LHAlloc.
+// ============================================================
+static DWORD *F3ObjNodeAlloc28(DWORD left, DWORD right, DWORD parent,
+                               const DWORD *key3)
+{
+    DWORD *n = (DWORD *)LHAlloc(28);
+    if (n == 0)
+        return 0;
+    n[0] = left;
+    n[1] = right;
+    n[2] = parent;
+    n[3] = key3[0];
+    n[4] = key3[1];
+    n[5] = key3[2];
+    if (n[5] != 0)
+        InterlockedIncrement((volatile LONG *)n[5]);
+    ((BYTE *)n)[0x18] = 0;
+    ((BYTE *)n)[0x19] = 0;
+    return n;
+}
+
+// ============================================================
+//  F3ObjTreeRotateLeft28 / F3ObjTreeRotateRight28
+//  (sub_567C50 / sub_567CA0)  -- RB rotations; `headerAddr` is the address of
+//  the container header so [headerAddr + 0x18] is the sentinel node.
+//  [NOT byte-identical] userpurge + high-VA header reference.
+// ============================================================
+static void F3ObjTreeRotateLeft28(DWORD x, DWORD headerAddr)
+{
+    DWORD y  = *(DWORD *)(x + 8);
+    DWORD yl = *(DWORD *)y;
+    *(DWORD *)(x + 8) = yl;
+    if (*(BYTE *)(yl + 0x19) == 0)
+        *(DWORD *)(yl + 4) = x;
+    DWORD xparent = *(DWORD *)(x + 4);
+    *(DWORD *)(y + 4) = xparent;
+    DWORD header = *(DWORD *)(headerAddr + 0x18);
+    if (x == *(DWORD *)(header + 4))
+    {
+        *(DWORD *)(header + 4) = y;
+        *(DWORD *)y  = x;
+        *(DWORD *)(x + 4) = y;
+    }
+    else
+    {
+        xparent = *(DWORD *)(x + 4);
+        if (x == *(DWORD *)xparent)
+        {
+            *(DWORD *)xparent = y;
+            *(DWORD *)y  = x;
+            *(DWORD *)(x + 4) = y;
+        }
+        else
+        {
+            *(DWORD *)(xparent + 8) = y;
+            *(DWORD *)y  = x;
+            *(DWORD *)(x + 4) = y;
+        }
+    }
+}
+
+static void F3ObjTreeRotateRight28(DWORD x, DWORD headerAddr)
+{
+    DWORD y  = *(DWORD *)(x + 8);
+    DWORD yl = *(DWORD *)y;
+    *(DWORD *)(x + 8) = yl;
+    if (*(BYTE *)(yl + 0x19) == 0)
+        *(DWORD *)(yl + 4) = x;
+    DWORD xparent = *(DWORD *)(x + 4);
+    *(DWORD *)(y + 4) = xparent;
+    DWORD header = *(DWORD *)(headerAddr + 0x18);
+    if (x == *(DWORD *)(header + 4))
+    {
+        *(DWORD *)(header + 4) = y;
+        *(DWORD *)(y + 8) = x;
+        *(DWORD *)(x + 4) = y;
+    }
+    else
+    {
+        xparent = *(DWORD *)(x + 4);
+        if (x == *(DWORD *)(xparent + 8))
+            *(DWORD *)(xparent + 8) = y;
+        else
+            *(DWORD *)xparent = y;
+        *(DWORD *)(y + 8) = x;
+        *(DWORD *)(x + 4) = y;
+    }
+}
+
+// ============================================================
+//  F3ObjTreeInsert28  (sub_566DF0)  -- insert a 28-byte node below `pos`
+//  (flag 0 = right child, flag 1 = left child) and rebalance; returns a
+//  2-word iterator {wrapper, node}.
+//  [NOT byte-identical] transcribed from IDA pseudocode.
+// ============================================================
+static DWORD *F3ObjTreeInsert28(DWORD pos, DWORD *out2, int flag,
+                                const DWORD *key3)
+{
+    if (g_contMap.count >= 0x15555554)
+        return 0;   // "map/set<T> too long" (the original throws)
+    DWORD sentinel = g_contMap.sentinel;
+    DWORD node = (DWORD)F3ObjNodeAlloc28(sentinel, sentinel, pos, key3);
+    ++g_contMap.count;
+    if (pos == sentinel)
+    {
+        *(DWORD *)(sentinel + 4) = node;
+        *(DWORD *)sentinel       = node;
+        *(DWORD *)(sentinel + 8) = node;
+    }
+    else if (flag == 0)
+    {
+        *(DWORD *)(pos + 8) = node;
+        if (pos == *(DWORD *)(sentinel + 8))
+            *(DWORD *)(sentinel + 8) = node;
+    }
+    else
+    {
+        *(DWORD *)pos = node;
+        if (pos == *(DWORD *)sentinel)
+            *(DWORD *)sentinel = node;
+    }
+    // RB fixup: walk the parent chain, recoloring / rotating as needed.
+    DWORD i = node;
+    for (;;)
+    {
+        DWORD p = *(DWORD *)(i + 4);          // parent
+        if (*(BYTE *)(p + 0x18) != 0)         // parent is black
+            break;
+        DWORD g = *(DWORD *)(p + 4);          // grandparent
+        DWORD uncle = (p == *(DWORD *)g) ? *(DWORD *)(g + 8) : *(DWORD *)g;
+        if (*(BYTE *)(uncle + 0x18) != 0)     // uncle is black -> rotate
+        {
+            if (p == *(DWORD *)g)             // p is the left child
+            {
+                if (i == *(DWORD *)(p + 8))   // i is the right child
+                {
+                    i = p;
+                    F3ObjTreeRotateLeft28(i, (DWORD)&g_contMap);
+                }
+                *(BYTE *)(*(DWORD *)(i + 4) + 0x18) = 1;
+                *(BYTE *)(*(DWORD *)(*(DWORD *)(i + 4) + 4) + 0x18) = 0;
+                F3ObjTreeRotateRight28(i, (DWORD)&g_contMap);
+                continue;
+            }
+            else                              // p is the right child
+            {
+                if (i == *(DWORD *)p)         // i is the left child
+                {
+                    i = p;
+                    F3ObjTreeRotateRight28(i, (DWORD)&g_contMap);
+                }
+                *(BYTE *)(*(DWORD *)(i + 4) + 0x18) = 1;
+                *(BYTE *)(*(DWORD *)(*(DWORD *)(i + 4) + 4) + 0x18) = 0;
+                F3ObjTreeRotateLeft28(i, (DWORD)&g_contMap);
+                continue;
+            }
+        }
+        // uncle is red: recolor parent / uncle black, grandparent red, climb.
+        *(BYTE *)(p + 0x18) = 1;
+        *(BYTE *)(uncle + 0x18) = 1;
+        *(BYTE *)(g + 0x18) = 0;
+        i = g;
+    }
+    *(BYTE *)(*(DWORD *)(sentinel + 4) + 0x18) = 1;   // root is black
+    out2[1] = node;
+    out2[0] = g_contMap.wrapper;
+    return out2;
+}
+
+// ============================================================
+//  F3ObjTreeFindOrInsertMin28  (sub_566BE0)  -- BST search for the key; if
+//  absent, insert it as the left child of the found node.  Returns a 3-word
+//  result {wrapper, node, inserted}.
+//  [NOT byte-identical] transcribed from IDA pseudocode.
+// ============================================================
+static DWORD *F3ObjTreeFindOrInsertMin28(DWORD *out3, const DWORD *key3)
+{
+    DWORD sentinel = g_contMap.sentinel;
+    DWORD v2 = *(DWORD *)(sentinel + 4);
+    BOOL inserted = TRUE;
+    DWORD v4 = sentinel;
+    if (*(BYTE *)(v2 + 0x19) == 0)
+    {
+        DWORD key = key3[0];
+        for (;;)
+        {
+            v4 = v2;
+            inserted = (key < *(DWORD *)(v2 + 0xC));
+            if (key >= *(DWORD *)(v2 + 0xC))
+                v2 = *(DWORD *)(v2 + 8);
+            else
+                v2 = *(DWORD *)v2;
+            if (*(BYTE *)(v2 + 0x19) != 0)
+                break;
+        }
+    }
+    DWORD v6 = g_contMap.wrapper;
+    DWORD v7 = v4;
+    DWORD v12 = g_contMap.wrapper;
+    if (inserted)
+    {
+        DWORD *node;
+        if (v4 == *(DWORD *)sentinel)
+            node = (DWORD *)F3ObjTreeInsert28(v4, &v12, 1, key3);
+        else
+        {
+            F3ObjTreePrev28(&v12);
+            node = (DWORD *)F3ObjTreeInsert28(v4, &v12, inserted, key3);
+        }
+        out3[0] = node ? node[0] : 0;
+        v7 = node ? node[1] : 0;
+        out3[2] = 1;
+    }
+    else
+    {
+        if (*(DWORD *)(v7 + 0xC) >= key3[0])
+        {
+            out3[0] = v6;
+            out3[2] = 0;
+            v7 = v4;
+        }
+    }
+    out3[1] = v7;
+    return out3;
+}
+
+// ============================================================
+//  F3ObjTreeFindOrInsertCached28  (sub_5652C0)  -- cached BST find-or-insert
+//  in the 28-byte map (uses the hint node to speed up the search).
+//  [NOT byte-identical] transcribed from IDA pseudocode.
+// ============================================================
+static DWORD *F3ObjTreeFindOrInsertCached28(DWORD *out3, const DWORD *key3,
+                                            int wrapper, int hint)
+{
+    if (g_contMap.count == 0)
+    {
+        F3ObjTreeInsert28(g_contMap.sentinel, out3, 1, key3);
+        return out3;
+    }
+    DWORD leftmost = *(DWORD *)g_contMap.sentinel;
+    if (wrapper == 0 || wrapper != g_contMap.wrapper)
+        F3InvalidParameterNoop();
+    if (hint == leftmost)
+    {
+        if (key3[0] < *(DWORD *)(hint + 0xC))
+        {
+            F3ObjTreeInsert28(hint, out3, 1, key3);
+            return out3;
+        }
+        DWORD *r = F3ObjTreeFindOrInsertMin28(out3, key3);
+        out3[0] = r[0];
+        out3[1] = r[1];
+        return out3;
+    }
+    if (wrapper == 0 || wrapper != g_contMap.wrapper)
+        F3InvalidParameterNoop();
+    if (hint == g_contMap.sentinel)
+    {
+        if (*(DWORD *)(*(DWORD *)(g_contMap.sentinel + 8) + 0xC) >= key3[0])
+        {
+            DWORD *r = F3ObjTreeFindOrInsertMin28(out3, key3);
+            out3[0] = r[0];
+            out3[1] = r[1];
+            return out3;
+        }
+        F3ObjTreeInsert28(hint, out3, 1, key3);
+        return out3;
+    }
+    // General case: compare against the hint and its predecessor/successor.
+    int less = (*(DWORD *)(hint + 0xC) < key3[0]);
+    if (*(DWORD *)(hint + 0xC) > key3[0])
+    {
+        DWORD v12 = hint;
+        F3ObjTreePrev28(&v12);
+        if (*(DWORD *)(v12 + 0xC) < key3[0])
+        {
+            if (*(BYTE *)(*(DWORD *)(v12 + 8) + 0x19) == 0)
+            {
+                F3ObjTreeInsert28(v12, out3, 1, key3);
+                return out3;
+            }
+            F3ObjTreeInsert28(v12, out3, 0, key3);
+            return out3;
+        }
+    }
+    if (!less)
+    {
+        DWORD *r = F3ObjTreeFindOrInsertMin28(out3, key3);
+        out3[0] = r[0];
+        out3[1] = r[1];
+        return out3;
+    }
+    F3ObjTreeInsert28(hint, out3, 1, key3);
+    return out3;
+}
+
+// ============================================================
+//  F3ObjMapInsert28  (sub_5640A0)  -- search-or-insert the object key in the
+//  28-byte map; returns a pointer to the resulting node's {aux, block} pair
+//  (node + 0x10).
+//  [NOT byte-identical] thiscall + userpurge + high-VA globals.
+// ============================================================
+static DWORD *F3ObjMapInsert28(DWORD *objSlot)
+{
+    DWORD out3[2];
+    F3ObjTreeSearch28(out3, objSlot);
+    if (out3[0] == 0 || out3[0] != g_contMap.wrapper)
+        F3InvalidParameterNoop();
+    DWORD v4 = out3[1];
+    if (v4 == g_contMap.sentinel || *objSlot < *(DWORD *)(v4 + 0xC))
+    {
+        DWORD v8[2];
+        v8[0] = *objSlot;
+        v8[1] = 0;
+        DWORD *r = F3ObjTreeFindOrInsertCached28(out3, v8, (int)out3[0],
+                                                 (int)out3[1]);
+        v4 = r[1];
+    }
+    DWORD head = (out3[0] != 0) ? *(DWORD *)out3[0] : 0;
+    if (out3[0] == 0)
+        F3InvalidParameterNoop();
+    if (v4 == *(DWORD *)(head + 0x18))
+        F3InvalidParameterNoop();
+    return (DWORD *)(v4 + 16);
+}
+
+// ============================================================
+//  F3ObjIterInit28  (sub_564200)  -- initialize a 2-word iterator {wrapper,
+//  node} for the object key: the found node if present, else the sentinel.
+//  [NOT byte-identical] userpurge (both args were in EDI / ESI).
+// ============================================================
+static DWORD *F3ObjIterInit28(DWORD *out, DWORD *objSlot)
+{
+    DWORD out3[2];
+    F3ObjTreeSearch28(out3, objSlot);
+    if (out3[0] == 0 || out3[0] != g_contMap.wrapper)
+        F3InvalidParameterNoop();
+    if (out3[1] == g_contMap.sentinel ||
+        *objSlot < *(DWORD *)(out3[1] + 0xC))
+    {
+        out[0] = g_contMap.wrapper;
+        out[1] = g_contMap.sentinel;
+    }
+    else
+    {
+        out[0] = out3[0];
+        out[1] = out3[1];
+    }
+    return out;
+}
+
+// ============================================================
+//  F3ObjNodeFree28  (sub_565490)  -- free a 28-byte map subtree: walk the
+//  left chain, recursing on the parent field, releasing the refcounted SEH
+//  block and freeing each node.  A no-op on an empty (sentinel) tree.
+//  [NOT byte-identical] stdcall + high-VA heap-table reference.
+// ============================================================
+static void F3ObjNodeFree28(DWORD *root)
+{
+    DWORD *v1 = root;
+    for (DWORD *i = root; ((BYTE *)i)[0x19] == 0; v1 = i)
+    {
+        F3ObjNodeFree28((DWORD *)i[2]);
+        i = (DWORD *)*i;
+        if (v1[5] != 0 && InterlockedDecrement((volatile LONG *)v1[5]) == 0)
+        {
+            DWORD *blk = (DWORD *)v1[5];
+            ((void (*)(DWORD))blk[1])(blk[2]);
+            LHFree(blk);
+        }
+        v1[4] = 0;
+        v1[5] = 0;
+        LHFree(v1);
+    }
+}
+
+// Forward declarations (defined below): F3ObjRangeClear28 erases from the
+// map, and F3ObjTreeErase28 climbs to the rightmost descendant.
+static DWORD *F3ObjTreeErase28(DWORD a1, DWORD *a2, char a3, int a4);
+static DWORD  F3ObjTreeRoot28(DWORD node);
+
+// ============================================================
+//  F3ObjRangeClear28  (sub_566CB0)  -- clear a range of the 28-byte map
+//  (or, for an empty container, re-establish the sentinel self-links and
+//  return {wrapper, sentinel}).
+//  [NOT byte-identical] fastcall + high-VA references.
+// ============================================================
+static DWORD *F3ObjRangeClear28(DWORD a1, DWORD *a2, int a3, int a4,
+                                int a5, int a6)
+{
+    int v6 = a3;
+    int v8 = **(DWORD **)(a1 + 24);
+    DWORD *v9 = a2;
+    if (a3 == 0 || a3 != *(DWORD *)a1)
+    {
+        F3InvalidParameterNoop();
+        v6 = a3;
+    }
+    if (a4 != v8)
+        goto LABEL_13;
+    int v10 = *(DWORD *)(a1 + 24);
+    if (a5 == 0 || a5 != *(DWORD *)a1)
+    {
+        F3InvalidParameterNoop();
+        v6 = a3;
+    }
+    if (a6 == v10)
+    {
+        F3ObjNodeFree28((DWORD *)*(DWORD *)(v10 + 4));
+        *(DWORD **)(v10 + 4) = (DWORD *)v10;
+        *(DWORD *)(a1 + 28) = 0;
+        *(DWORD *)v10 = v10;
+        *(DWORD **)(v10 + 8) = (DWORD *)v10;
+        DWORD v12 = *(DWORD *)v10;
+        v9[0] = 0;
+        v9[1] = v12;
+        v9[0] = *(DWORD *)a1;
+        return v9;
+    }
+LABEL_13:
+    for (;;)
+    {
+        if (v6 == 0 || v6 != a5)
+        {
+            F3InvalidParameterNoop();
+            v6 = a3;
+        }
+        if (a4 == a6)
+            break;
+        F3ObjTreeStep28(v9);
+        F3ObjTreeErase28(a1, v9, (char)v6, a4);
+        v6 = a3;
+        v9 = a2;
+    }
+    v9[0] = *(DWORD *)a1;
+    v9[1] = a4;
+    return v9;
+}
+
+// ============================================================
+//  F3ObjTreeErase28  (sub_5678C0)  -- erase a node from the 28-byte map with
+//  RB rebalancing, release its SEH block, free the node, and decrement the
+//  container count; returns a 2-word iterator {wrapper, node}.
+//  [NOT byte-identical] transcribed from IDA pseudocode; only reachable for a
+//  non-empty map (never in this build).
+// ============================================================
+static DWORD *F3ObjTreeErase28(DWORD a1, DWORD *a2, char a3, int a4)
+{
+    (void)a3;
+    int *node = (int *)a4;
+    if (*(BYTE *)(node + 0x19) != 0)
+        return a2;   // "invalid map/set<T> iterator" (the original throws)
+    F3ObjTreeStep28(a2);
+    // Splice the node out of the tree: replace it with its non-terminal
+    // child and fix up the sentinel's leftmost / rightmost pointers. (RB
+    // delete rebalancing omitted: the map is always empty in this build, so
+    // this path is never reached.)
+    int *v4;
+    if (*(BYTE *)(*(int **)node + 0x19) != 0)
+        v4 = (int *)node[2];
+    else if (*(BYTE *)(node[2] + 0x19) != 0)
+        v4 = (int *)*node;
+    else
+        v4 = (int *)node[2];
+    int *v5 = (int *)node[1];
+    if (*(BYTE *)v4 == 0)
+        v4[1] = (int)v5;
+    int sentinel = *(DWORD *)(a1 + 24);
+    if (*(int **)(sentinel + 4) == node)
+        *(int **)(sentinel + 4) = v4;
+    else if (*(int **)v5 == node)
+        *v5 = (int)v4;
+    else
+        v5[2] = (int)v4;
+    if ((int)*(int *)sentinel == (int)node)
+    {
+        if (*(BYTE *)v4 != 0)
+            *(int *)sentinel = (int)v5;
+        else
+        {
+            int *i = v4;
+            int *r = (int *)v4[0];
+            for (; *(BYTE *)r == 0; r = (int *)r[0])
+                i = r;
+            *(int *)sentinel = (int)i;
+        }
+    }
+    if ((int)*(int *)(sentinel + 8) == (int)node)
+        *(int *)(sentinel + 8) = (int)((*(BYTE *)v4 != 0)
+                                          ? (DWORD)v5
+                                          : F3ObjTreeRoot28((DWORD)v4));
+    // Release the SEH block and free the node.
+    if (node[5] != 0 && InterlockedDecrement((volatile LONG *)node[5]) == 0)
+    {
+        DWORD *blk = (DWORD *)node[5];
+        ((void (*)(DWORD))blk[1])(blk[2]);
+        LHFree(blk);
+    }
+    node[4] = 0;
+    node[5] = 0;
+    LHFree(node);
+    if (*(DWORD *)(a1 + 28) != 0)
+        *(DWORD *)(a1 + 28) = *(DWORD *)(a1 + 28) - 1;
+    a2[1] = (DWORD)node;
+    a2[0] = *(DWORD *)a1;
+    return a2;
+}
+
+// ============================================================
+//  F3ObjTreeRoot28  (sub_568710)  -- climb the parent chain from a node to
+//  its rightmost / deepest descendant (returns the input node when it has no
+//  non-terminal parent).
+//  [NOT byte-identical] userpurge (the node was passed in EAX).
+// ============================================================
+static DWORD F3ObjTreeRoot28(DWORD node)
+{
+    for (DWORD i = *(DWORD *)(node + 8); *(BYTE *)(i + 0x19) == 0;
+         i = *(DWORD *)(i + 8))
+        node = i;
+    return node;
+}
+
+// ============================================================
+//  F3SehSlotRelease  (sub_414850)  -- release-and-clear a 2-word {aux, block}
+//  SEH slot: decrement the block refcount and, when it reaches zero, call the
+//  handler (block + 4) with the arg (block + 8) and free the block.
+//  [NOT byte-identical] userpurge + high-VA heap-table reference.
+// ============================================================
+static void F3SehSlotRelease(DWORD *slot)
+{
+    if (slot[1] != 0)
+    {
+        if (InterlockedDecrement((volatile LONG *)slot[1]) == 0)
+        {
+            DWORD *blk = (DWORD *)slot[1];
+            ((void (*)(DWORD))blk[1])(blk[2]);
+            LHFree(blk);
+        }
+    }
+    slot[0] = 0;
+    slot[1] = 0;
+}
+
+// ---- device slot tables (worker.cpp-local copies; the device slot init is
+//      never run in this build because no device is created) -------------
+// 0x1E2EF10: per-slot device state (16 entries); zeroed on reset.
+static DWORD  g_dword_1E2EF10[16] = {0};
+// 0x1DB12FC: the default device object assigned to missing slots.
+static DWORD  g_dword_1DB12FC = 0;
+// 0x1E2EAF8: per-slot "has object" flag (indexed by slot).
+static DWORD  g_dword_1E2EAF8[0x105] = {0};
+// 0x1E2EB4C: slot objects for slots >= 16 (indexed by raw slot).
+static DWORD  g_dword_1E2EB4C[0x105] = {0};
+// 0x1E2EF60: slot objects for slots < 16 (indexed by slot).
+static DWORD  g_dword_1E2EF60[16] = {0};
+// 0x1DB4AF8: per-slot registration (indexed by slot; >= 0x101 wraps by -241).
+static DWORD  g_dword_1DB4AF8[0x105] = {0};
+
+// ============================================================
+//  AssignXloDeviceSlot  (sub_18E6250)  -- store a device object in slot
+//  <16 -> g_dword_1E2EF60[slot] else g_dword_1E2EB4C[slot]; if the
+//  registration changed, record it and call device vtable[65] (device, slot,
+//  object).
+//  [NOT byte-identical] userpurge + high-VA globals / vtable dispatch.
+// ============================================================
+static int AssignXloDeviceSlot(int slot, int obj)
+{
+    if (slot >= 16)
+        g_dword_1E2EB4C[slot] = obj;
+    else
+        g_dword_1E2EF60[slot] = obj;
+    if (g_dword_1DB4AF8[slot] != obj)
+    {
+        int v2 = slot;
+        if ((unsigned)slot >= 0x101)
+            v2 = slot - 241;
+        g_dword_1DB4AF8[v2] = obj;
+        void *dev = g_dword_1E2EEF4;
+        int (*fn)(void *, int, int) =
+            (int (*)(void *, int, int))(*(DWORD *)dev + 260);
+        return fn(dev, slot, obj);
+    }
+    return slot;
+}
+
+// ============================================================
+//  InitXloDeviceSlots  (sub_18E65F0)  -- fill in the missing device slots
+//  with the default object (g_dword_1DB12FC) and register the per-slot
+//  records for slots 257..0x104.
+//  [NOT byte-identical] high-VA globals / vtable dispatch.
+// ============================================================
+static int InitXloDeviceSlots(void)
+{
+    for (unsigned i = 0; i < 0x10; ++i)
+    {
+        if (g_dword_1E2EF10[i] == 0)
+            AssignXloDeviceSlot((int)i, (int)g_dword_1DB12FC);
+    }
+    int v1 = (int)g_dword_1DB12FC;
+    int result = 0;
+    for (unsigned j = 257; j < 0x105; ++j)
+    {
+        result = 4 * (int)j;
+        if (g_dword_1E2EAF8[j] == 0)
+        {
+            if (j >= 16)
+                g_dword_1E2EB4C[j] = (DWORD)v1;
+            else
+                g_dword_1E2EF60[j] = (DWORD)v1;
+            if (g_dword_1DB4AF8[j] != (DWORD)v1)
+            {
+                if (j >= 0x101)
+                    result -= 964;
+                *(int *)((char *)g_dword_1DB4AF8 + result) = v1;
+                void *dev = g_dword_1E2EEF4;
+                int (*fn)(void *, int, int) =
+                    (int (*)(void *, int, int))(*(DWORD *)dev + 260);
+                result = fn(dev, (int)j, v1);
+                v1 = (int)g_dword_1DB12FC;
+            }
+        }
+    }
+    return result;
+}
+
+// ============================================================
+//  ResetXloDevice  (0x18F2310 - 0x18F2850)  -- reset / recreate the XLO device
+//  from a fresh 56-byte caps block (passed by value).
+//
+//  int ResetXloDevice(F3XloCaps caps)   -- 1 = reset succeeded, 0 = failed
+//
+//  Original semantics: enter the device CS stru_20FC948.  If the device object
+//  (dword_1E2EEF4) reports status 0x88760868 (already reset) leave and return
+//  0.  Otherwise, unless the device has been built once (byte_2075F04), run the
+//  one-time release phase: InitXloDeviceSlots, set byte_2075F04, allocate a
+//  4-byte wrapper (v50) and a 28-byte self-linked sentinel node (v51), walk the
+//  0x20FCA0C list (object vtable[1] teardown + SEH insert into the map) and the
+//  0x20FC9CC list (raw callbacks), call ReleaseDeviceObjects, clear the local
+//  container (sub_566CB0) and free v51 / v50.  Then recreate the device through
+//  its vtable[16] (offset 0x40) with the new caps (a failed reset leaves the CS
+//  and returns 0), record the caps into dword_1E2ED80 and the mode class into
+//  dword_1E2ED74, run InitXloDeviceState (sub_18F1310), re-notify the 0x20FCA0C
+//  list (object vtable[2]) and the 0x20FC9EC list (raw callbacks), free the map
+//  tree and reset its sentinel, clear byte_2075F04, leave the CS and return 1.
+//
+//  [NOT byte-identical] placement-dependent (relative calls, the by-value
+//  56-byte stack argument) and refs the high-VA device / container globals;
+//  the RB-tree helpers are transcribed from IDA pseudocode.  In this build the
+//  device is never created (no window), so this path is never exercised; the
+//  goal is a faithful, compilable transcription that does not crash.
+// ============================================================
+static int ResetXloDevice(F3XloCaps caps)
+{
+    F3EnterDisplayCs();
+
+    void *dev = g_dword_1E2EEF4;
+    void **vt = *(void ***)dev;
+    int status = ((int (*)(void *))vt[3])(dev);
+    if (status == 0x88760868)
+    {
+        LeaveCriticalSection(&g_stru_20FC948);
+        return 0;
+    }
+
+    if (g_byte_2075F04 == 0)
+    {
+        // ---- one-time release phase ----
+        InitXloDeviceSlots();
+        g_byte_2075F04 = 1;
+
+        DWORD local_v50 = 0;
+        DWORD *w50 = (DWORD *)LHAlloc(4);
+        if (w50 != 0)
+        {
+            *w50 = (DWORD)&local_v50;   // wrapper content = address of the local
+            local_v50 = (DWORD)w50;
+        }
+
+        // The local 28-byte self-referential empty-tree sentinel (v51).
+        DWORD *v51 = (DWORD *)LHAlloc(0x1C);
+        DWORD local_v51 = (DWORD)v51;
+        if (v51 != 0)
+        {
+            ((BYTE *)v51)[0x18] = 1;    // color = 1
+            ((BYTE *)v51)[0x19] = 1;    // terminus = 1
+            v51[0] = local_v51;         // left   = self
+            v51[1] = local_v51;         // parent = self
+            v51[2] = local_v51;         // right  = self
+        }
+
+        // ---- walk 1 (list 1): object vtable[1] teardown + SEH insert ----
+        {
+            DWORD iter[2];
+            iter[0] = g_contList1.wrapper;
+            iter[1] = *(DWORD *)g_contList1.sentinel;
+            DWORD sent1 = g_contList1.sentinel;
+            while (1)
+            {
+                if (iter[0] == 0 || iter[0] != g_contList1.wrapper)
+                    F3InvalidParameterNoop();
+                if (iter[1] == sent1)
+                    break;
+                DWORD v48 = 0, lpAddend = 0;
+                DWORD head = iter[0];
+                if (head != 0)
+                    head = *(DWORD *)head;
+                else
+                    F3InvalidParameterNoop();
+                if (iter[1] == *(DWORD *)(head + 0x18))
+                    F3InvalidParameterNoop();
+                DWORD obj = *(DWORD *)(iter[1] + 0xC);
+                void **ovt = *(void ***)obj;
+                ((void (__thiscall *)(void *, DWORD *))ovt[1])((void *)obj, &v48);
+                if (v48 != 0)
+                {
+                    DWORD head2 = iter[0];
+                    if (head2 != 0)
+                        head2 = *(DWORD *)head2;
+                    else
+                        F3InvalidParameterNoop();
+                    if (iter[1] == *(DWORD *)(head2 + 0x18))
+                        F3InvalidParameterNoop();
+                    DWORD *r = F3ObjMapInsert28((DWORD *)(iter[1] + 0xC));
+                    if (r[1] != lpAddend)
+                        F3SehSlotRelease(r);
+                    r[0] = v48;
+                    r[1] = lpAddend;
+                    if (lpAddend != 0)
+                        InterlockedIncrement((volatile LONG *)lpAddend);
+                }
+                if (lpAddend != 0 &&
+                    InterlockedDecrement((volatile LONG *)lpAddend) == 0)
+                {
+                    DWORD *blk = (DWORD *)lpAddend;
+                    ((void (*)(DWORD))blk[1])(blk[2]);
+                    LHFree(blk);
+                }
+                F3ObjTreeStep20(iter);
+            }
+        }
+
+        // ---- walk 2 (list 2): raw callbacks ----
+        {
+            DWORD iter[2];
+            iter[0] = g_contList2.wrapper;
+            iter[1] = *(DWORD *)g_contList2.sentinel;
+            DWORD sent2 = g_contList2.sentinel;
+            while (1)
+            {
+                if (iter[0] == 0 || iter[0] != g_contList2.wrapper)
+                    F3InvalidParameterNoop();
+                if (iter[1] == sent2)
+                    break;
+                DWORD head = iter[0];
+                if (head != 0)
+                    head = *(DWORD *)head;
+                else
+                    F3InvalidParameterNoop();
+                if (iter[1] == *(DWORD *)(head + 0x18))
+                    F3InvalidParameterNoop();
+                ((void (*)(void))(*(DWORD *)(iter[1] + 0xC)))();
+                F3ObjTreeStep20(iter);
+            }
+        }
+
+        // ---- release the device objects + clear the local container ----
+        ReleaseDeviceObjects();
+        {
+            // A 32-byte local container: wrapper at +0x00, sentinel (v51) at
+            // +0x18, count at +0x1C (sub_566CB0 reads [container + 0x18]).
+            struct F3LocalContainer
+            {
+                DWORD wrapper;   // +0x00 (v50)
+                char  pad[20];
+                DWORD sentinel;  // +0x18 (v51)
+                DWORD count;     // +0x1C
+            } lc;
+            lc.wrapper  = local_v50;
+            lc.sentinel = local_v51;
+            lc.count    = 0;
+            DWORD out2[2];
+            F3ObjRangeClear28((DWORD)&lc, out2, (int)local_v50,
+                              (int)*(DWORD *)local_v51, (int)local_v50,
+                              (int)local_v51);
+        }
+        LHFree((void *)local_v51);
+        local_v51 = 0;
+        LHFree((void *)local_v50);
+    }
+
+    // ---- recreate the device through vtable[16] with the new caps ----
+    {
+        int (*reset)(void *, const DWORD *) =
+            (int (*)(void *, const DWORD *))vt[16];
+        int r = reset(dev, caps.field);
+        if (r != 0)
+        {
+            LeaveCriticalSection(&g_stru_20FC948);
+            return 0;
+        }
+    }
+
+    // ---- record the caps + derive the mode class ----
+    {
+        DWORD mc = caps.field[13];
+        if (mc & 0x80000001)
+            g_dword_1E2ED74 = 1;
+        else if (mc & 2)
+            g_dword_1E2ED74 = 2;
+        else if (mc & 4)
+            g_dword_1E2ED74 = 3;
+        else
+            g_dword_1E2ED74 = (mc & 8) ? 4 : 1;
+    }
+    memcpy(g_dword_1E2ED80, caps.field, sizeof(caps.field));
+
+    // ---- re-initialize the device state ----
+    InitXloDeviceState();
+
+    // ---- walk 4 (list 1): object vtable[2] re-notification ----
+    {
+        DWORD iter[2];
+        iter[0] = g_contList1.wrapper;
+        iter[1] = *(DWORD *)g_contList1.sentinel;
+        DWORD sent1 = g_contList1.sentinel;
+        while (1)
+        {
+            if (iter[0] == 0 || iter[0] != g_contList1.wrapper)
+                F3InvalidParameterNoop();
+            if (iter[1] == sent1)
+                break;
+            DWORD head = iter[0];
+            if (head != 0)
+                head = *(DWORD *)head;
+            else
+                F3InvalidParameterNoop();
+            if (iter[1] == *(DWORD *)(head + 0x18))
+                F3InvalidParameterNoop();
+            DWORD *objSlot = (DWORD *)(iter[1] + 0xC);
+            DWORD out_pair[2];
+            F3ObjIterInit28(out_pair, objSlot);
+            if (out_pair[0] == 0 || out_pair[0] != g_contMap.wrapper)
+                F3InvalidParameterNoop();
+            DWORD node = out_pair[1];
+            DWORD block = 0, aux = 0;
+            if (node != g_contMap.sentinel)
+            {
+                DWORD head2 = out_pair[0];
+                if (head2 != 0)
+                    head2 = *(DWORD *)head2;
+                else
+                    F3InvalidParameterNoop();
+                if (node == *(DWORD *)(head2 + 0x18))
+                    F3InvalidParameterNoop();
+                block = *(DWORD *)(node + 0x14);
+                aux   = *(DWORD *)(node + 0x10);
+                if (block != 0)
+                    InterlockedIncrement((volatile LONG *)block);
+            }
+            DWORD head3 = iter[0];
+            if (head3 != 0)
+                head3 = *(DWORD *)head3;
+            else
+                F3InvalidParameterNoop();
+            if (iter[1] == *(DWORD *)(head3 + 0x18))
+                F3InvalidParameterNoop();
+            DWORD obj = *objSlot;
+            if (block != 0)
+                InterlockedIncrement((volatile LONG *)block);
+            void **ovt2 = *(void ***)obj;
+            ((void (__thiscall *)(void *, DWORD, DWORD))ovt2[2])((void *)obj, aux, block);
+            if (block != 0 &&
+                InterlockedDecrement((volatile LONG *)block) == 0)
+            {
+                DWORD *blk = (DWORD *)block;
+                ((void (*)(DWORD))blk[1])(blk[2]);
+                LHFree(blk);
+            }
+            F3ObjTreeStep20(iter);
+        }
+    }
+
+    // ---- free the map tree + reset its sentinel (no-op when empty) ----
+    F3ObjNodeFree28((DWORD *)*(DWORD *)(g_contMap.sentinel + 4));
+    *(DWORD **)(g_contMap.sentinel + 4) = (DWORD *)g_contMap.sentinel;
+    g_contMap.count = 0;
+    *(DWORD *)g_contMap.sentinel = g_contMap.sentinel;
+    *(DWORD **)(g_contMap.sentinel + 8) = (DWORD *)g_contMap.sentinel;
+
+    // ---- walk 3 (list 3): raw callbacks ----
+    {
+        DWORD iter[2];
+        iter[0] = g_contList3.wrapper;
+        iter[1] = *(DWORD *)g_contList3.sentinel;
+        DWORD sent3 = g_contList3.sentinel;
+        while (1)
+        {
+            if (iter[0] == 0 || iter[0] != g_contList3.wrapper)
+                F3InvalidParameterNoop();
+            if (iter[1] == sent3)
+                break;
+            DWORD head = iter[0];
+            if (head != 0)
+                head = *(DWORD *)head;
+            else
+                F3InvalidParameterNoop();
+            if (iter[1] == *(DWORD *)(head + 0x18))
+                F3InvalidParameterNoop();
+            ((void (*)(void))(*(DWORD *)(iter[1] + 0xC)))();
+            F3ObjTreeStep20(iter);
+        }
+    }
+
+    g_byte_2075F04 = 0;
+    LeaveCriticalSection(&g_stru_20FC948);
+    return 1;
 }
 
 //  IsDisplayReady  (0x18F2850 - 0x18F28B5)  -- is the XLO display ready to
@@ -479,7 +1714,9 @@ static char IsDisplayReady(void)
     int status   = (*(int (**)(void *, void *))(vt[3]))(devObj, devObj);
     if (status == 0x88760869)
     {
-        if (ResetXloDevice(g_dword_1E2ED80) == 0)
+        F3XloCaps resetCaps;
+        memcpy(resetCaps.field, g_dword_1E2ED80, sizeof(resetCaps.field));
+        if (ResetXloDevice(resetCaps) == 0)
         {
             LeaveCriticalSection(&g_stru_20FC948);
             return 0;
@@ -547,24 +1784,6 @@ void *FindActiveInputDevice(void *obj)
 }
 
 // ============================================================
-//  InitAccessibilitySettings  (0x18F72B0 - 0x18F7455)  -- [remaining stub]
-//
-//  The accessibility-settings start-up load: applies the SystemParametersInfoA
-//  overrides (SPI_GETHIDCONFIRM 0x3A / GETKEYBOARDSPEED 0x34 / GETKEYBOARDPREECHO
-//  0x32 into dword_1D9E18C / dword_1D9E194 / byte_1D9E19C), and when
-//  "AccessibilitySettings.xml" exists in the settings directory (the
-//  0x1DBE2F0 slot + "AccessibilitySettings.xml", SharedFileExists), opens it
-//  through CXMLReadStream + FindXmlSection and loads the three accessibility
-//  values into dword_20FC8DC / dword_20FC8E0 / dword_20FC8E4 / byte_1D9E19C,
-//  then runs SaveSettingsBeforeExit. The LHXML engine and the settings-value
-//  consumers are out of scope here, so this remains a no-op stub (the
-//  original's behavior with no settings file: the defaults stand).
-// ============================================================
-static void InitAccessibilitySettings(void)
-{
-}
-
-// ============================================================
 //  CWorkerWin32_RunGame  (0x18F7C50 - 0x18F7D21)  -- the worker's "run the
 //  game" step (the manager's run dispatch delegates to this with the worker
 //  in ECX/EDI)
@@ -588,7 +1807,7 @@ static void InitAccessibilitySettings(void)
 //  CopySharedSlot, 0x1A01270), then releases the temporary local slot
 //  (SharedBufferFree at zero buffer refcount + the g_Addend decrement). It
 //  sets the pump state to 1 (window create), leaves the CS, runs the
-//  accessibility-settings load (sub_18F72B0, stubbed), blocks on event1
+//  accessibility-settings load (InitAccessibilitySettings, 0x18F72B0), blocks on event1
 //  (+0x9C, INFINITE), and returns (hwnd != 0) -- nonzero only once the
 //  main thread's pump (PumpWorker state 1) has created the worker window
 //  and signalled event1. Null-guarded (the original assumes the worker
@@ -623,21 +1842,336 @@ char CWorkerWin32_RunGame(void *worker, int a2, int a3, int a4, int a5, int a6,
     w->workerState = 1;      // +0x22C: request the window create
     LeaveCriticalSection(&w->cs);
 
-    InitAccessibilitySettings();   // sub_18F72B0 (stub)
+    InitAccessibilitySettings();   // 0x18F72B0
 
     WaitForSingleObjectEx(w->event1, INFINITE, FALSE);   // +0x9C
     return (w->hwnd != 0);
 }
 
-// 0x188D710 -- handle a raw-input report (obj, HRAWINPUT). The original calls
-// GetRawInputData and feeds the gamepad axis/button state into the input
-// subsystem (sub_412AB0 / sub_412B00 / sub_417C50 / sub_5CCC90 / ...), which
-// is out of scope here. [remaining stub]
+// Input event record (32 bytes) pushed onto the device's input event queue.
+// The original never writes +0x04 / +0x1C (stack residue is copied too).
+typedef struct
+{
+    float time;    // +0x00  GetTickCount()/1000.0 (stored as float)
+    int   pad0;    // +0x04  (never written by the producer)
+    int   type;    // +0x08  1 = press, 2 = release, 6 = wheel
+    int   button;  // +0x0C  button number (1-based), 0 for axis / wheel
+    float value;   // +0x10  wheel delta
+    int   pad1a;   // +0x14  0
+    int   pad1b;   // +0x18  0
+    int   pad1;    // +0x1C  (never written by the producer)
+} F3InputEvent;
+
+// Raw-input report (0x28 bytes) filled by GetRawInputData (RID_INPUT, the
+// 0x10-byte RAWINPUTHEADER size). Type 0 = mouse / input device.
+typedef struct
+{
+    DWORD type;        // +0x00  0 = mouse / input device
+    DWORD dwSize;      // +0x04
+    DWORD unk08;       // +0x08
+    DWORD unk0C;       // +0x0C
+    BYTE  flags;       // +0x10  bit0: 1 = no relative axis motion this report
+    BYTE  pad11[3];
+    WORD  buttons;     // +0x14  bit 2k / 2k+1 = press / release of button k+1
+                       //        (ten buttons); bit 10 (0x400) = wheel active
+    WORD  wheelDelta;  // +0x16  signed 16-bit wheel delta
+    DWORD unk18;       // +0x18
+    LONG  xDelta;      // +0x1C  relative X motion
+    LONG  yDelta;      // +0x20  relative Y motion
+    BYTE  pad24[4];
+} F3RawInputReport;
+
+// 0x5CD210 -- the myvector overflow guard: __debugbreak, then throw
+// std::length_error("myvector<T> too long") (invoking the non-NULL callback
+// at 0x01DDCFC8 first). No return.
+// [NOT byte-identical] refs the std::length_error / exception machinery and
+// the high-VA exception-hook global (0x01DDCFC8).
+static void (*g_dword_1DDCFC8)(const void *) = 0;   // 0x01DDCFC8: exception hook (0 here)
+static void InputQueueOverflowThrow(void)
+{
+    __debugbreak();
+    std::length_error err("myvector<T> too long");
+    if (g_dword_1DDCFC8 != 0)
+        g_dword_1DDCFC8(&err);
+    throw err;
+}
+
+// 0x5CD460 -- allocate the input-queue record buffer: LHAlloc(0) when slots
+// is 0, else LHAlloc(32 * slots); throws std::bad_alloc (stdext::bad_alloc in
+// 2008, through the 0x01DDCFC8 callback) when 32 * slots overflows
+// (0xFFFFFFFF / slots < 0x20).
+// [NOT byte-identical] relative call to LHAlloc + the bad_alloc machinery.
+static void *InputQueueAllocBuffer(unsigned int slots)
+{
+    if (slots == 0)
+        return LHAlloc(0);
+    if (0xFFFFFFFFu / slots < 0x20u)
+    {
+        std::bad_alloc err;
+        if (g_dword_1DDCFC8 != 0)
+            g_dword_1DDCFC8(&err);
+        throw err;
+    }
+    return LHAlloc(32 * slots);
+}
+
+// 0x5CD830 -- copy the 32-byte input records in [src, srcEnd) to dst, one
+// record at a time (skipping the copy when dst is null). Returns the advanced
+// dst (dst + 32 * n).
+static void *CopyInputRecords(void *dst, const void *src, const void *srcEnd)
+{
+    char *d = (char *)dst;
+    const char *s = (const char *)src;
+    while (s != (const char *)srcEnd)
+    {
+        if (d != 0)
+            memcpy(d, s, 32);
+        s += 32;
+        d += 32;
+    }
+    return (void *)d;
+}
+
+// 0x5CD5D0 -- fill [dst, dstEnd) with copies of the 32-byte record at src.
+// Returns the advanced dst (dstEnd).
+static void *FillInputRecords(void *dst, void *dstEnd, const void *src)
+{
+    char *d = (char *)dst;
+    while (d != (char *)dstEnd)
+    {
+        memcpy(d, src, 32);
+        d += 32;
+    }
+    return (void *)d;
+}
+
+// 0x5CD560 -- copy `count` 32-byte records from src to dst (skipping the
+// copies when dst is null). Returns dst + 32 * count.
+static void *CopyInputRecordsN(void *dst, const void *src, int count)
+{
+    char *d = (char *)dst;
+    unsigned int n = (unsigned int)count;
+    while (n-- > 0)
+    {
+        if (d != 0)
+            memcpy(d, src, 32);
+        d += 32;
+    }
+    return (void *)d;
+}
+
+// 0x5CD410 + 0x5CD7E0 -- move the 32-byte records of [marker, srcEnd) up one
+// slot: the new value at P is the old value at P - 32 for P in
+// [marker + 32, dstEnd), copied one record at a time, backward.
+static void ShiftInputRecordsUp(void *marker, void *srcEnd, void *dstEnd)
+{
+    char *s = (char *)srcEnd;
+    char *d = (char *)dstEnd;
+    while (s != (char *)marker)
+    {
+        memcpy(d, s - 32, 32);
+        s -= 32;
+        d -= 32;
+    }
+}
+
+// 0x5CCF70 -- insert a 32-byte input event record into the device's input
+// queue (head +8, tail +0xC, limit +0x10; 32-byte slots). The record
+// is copied to the stack at entry, then placed at `marker` within
+// [head, tail): [marker, tail) shifts up one
+// slot and the tail extends by 32; when the capacity cannot hold the pending
+// records + 1, the buffer is grown to max(3/2 * capacity, pending + 1)
+// (InputQueueAllocBuffer), the records of [head, marker), the new record and
+// the records of [marker, tail) are copied into the new buffer, and the old
+// one is freed through the heap table (dword_2075B24 + 16; skipped when head
+// is 0). Throws std::length_error("myvector<T> too long") when the pending
+// count is 0x7FFFFFF. Returns marker + 32 (or the heap-free EAX / 0 after a
+// grow); the sole caller discards it. stdcall (retn 10h); arg 3 is unused.
+// [NOT byte-identical] placement-dependent (relative calls to the copy / grow
+// helpers and __security_check_cookie) plus the high-VA heap-table free slot
+// (dword_2075B24 + 16, LHFree here) and exception-hook global (0x01DDCFC8).
+static int ProcessInputQueue(void *queue, const void *event, int unused, void *marker)
+{
+    (void)unused;
+    DWORD *q = (DWORD *)queue;
+    DWORD ev[8];   // the 32-byte record, copied at entry (the original's var_2C)
+    memcpy(ev, event, 32);
+
+    DWORD head = q[2];
+    DWORD tail = q[3];
+    DWORD cap = (head != 0) ? (DWORD)((q[4] - head) >> 5) : 0;
+    DWORD pending = (DWORD)((tail - head) >> 5);
+    if (0x7FFFFFFu - pending < 1u)
+        InputQueueOverflowThrow();   // 0x5CD210 (no return)
+    DWORD need = pending + 1;
+
+    if (cap >= need)
+    {
+        if (((tail - (DWORD)marker) >> 5) != 0)
+        {
+            // marker is below the tail: duplicate the last pending record into
+            // the new slot, shift [marker, tail) up one slot, put the record
+            // at marker.
+            q[3] = (DWORD)(DWORD_PTR)CopyInputRecords((void *)tail, (void *)(tail - 32), (void *)tail);   // InputQueueCopyRangeThunk -> CopyInputRecords
+            ShiftInputRecordsUp(marker, (void *)(tail - 32), (void *)tail);                                // ShiftInputRecordsUp
+        }
+        else
+        {
+            // marker == tail (the append case, as used by FlushInputQueue):
+            // re-copy the record at the tail, write the new record there and
+            // advance the tail.
+            CopyInputRecords((void *)tail, marker, (void *)((DWORD)marker + 32));                          // InputQueueCopyRangeThunk -> CopyInputRecords
+            CopyInputRecordsN((void *)tail, ev, 1 - (int)((tail - (DWORD)marker) >> 5));                   // InputQueueCopyAtThunk -> CopyInputRecordsN
+            q[3] += 32;
+        }
+        return (int)(DWORD_PTR)FillInputRecords(marker, (void *)((DWORD)marker + 32), ev);                 // FillInputRecords
+    }
+
+    // Grow: 1.5x the capacity (0 on overflow), clamped up to `need`.
+    DWORD half = cap >> 1;
+    DWORD newcap = (0x7FFFFFFu - half >= cap) ? cap + half : 0;
+    if (newcap < need)
+        newcap = need;
+    DWORD newbuf = (DWORD)(DWORD_PTR)InputQueueAllocBuffer(newcap);    // InputQueueAllocBuffer
+    DWORD p1 = (DWORD)(DWORD_PTR)CopyInputRecords((void *)newbuf, (void *)head, marker);                   // CopyInputRecords
+    CopyInputRecordsN((void *)p1, ev, 1);                                                                      // CopyInputRecordsN
+    CopyInputRecords((void *)(p1 + 32), marker, (void *)tail);                                                 // CopyInputRecords
+    DWORD count = (DWORD)((tail - head) >> 5) + 1;
+    int result = 0;   // the heap-free thunk's EAX (0 when head is 0); the caller discards it
+    if (head != 0)
+        LHFree((void *)head);                                          // dword_2075B24 + 16
+    q[4] = newbuf + 32 * newcap;
+    q[3] = newbuf + 32 * count;
+    q[2] = newbuf;
+    return result;
+}
+
+// 0x5CCDE0 -- full-queue flush: guarantee room for one more input event by
+// inserting it through ProcessInputQueue (append at the tail, growing the
+// buffer if needed), report {0, head + 32*count} (head re-read after the
+// insert) into the 8-byte out slot, and return the slot (a stack address, as
+// in the original).
+#pragma warning(push)
+#pragma warning(disable : 4172)   // intentionally returns the stack slot address
+static void *FlushInputQueue(void *queue, void *event, DWORD tail)
+{
+    DWORD *q = (DWORD *)queue;
+    DWORD head = q[2];
+    DWORD count = (((q[3] - head) & 0xFFFFFFE0u) != 0) ? (tail - head) >> 5 : 0;
+    ProcessInputQueue(queue, event, 0, (void *)tail);
+    DWORD slot[2] = { 0, 0 };
+    slot[1] = q[2] + 32 * count;   // head re-read after the insert
+    return slot;
+}
+#pragma warning(pop)
+
+// 0x5CCC90 -- push a 32-byte input event record onto the queue. When the
+// queue is full (or uninitialized, head == 0) it flushes through
+// FlushInputQueue (which guarantees room and inserts the event at the tail
+// via ProcessInputQueue). Returns the new tail (or the flush slot on a full
+// queue).
+static void *PushInputEvent(void *queue, const void *event)
+{
+    DWORD *q = (DWORD *)queue;
+    DWORD head = q[2];
+    DWORD cap = (head != 0) ? (q[4] - head) >> 5 : 0;
+    DWORD tail = q[3];
+    if ((tail - head) >> 5 >= cap)
+        return FlushInputQueue(queue, (void *)event, tail);
+    if (tail != 0)
+        memcpy((void *)tail, event, 32);
+    q[3] = tail + 32;
+    return (void *)(tail + 32);
+}
+
+// ============================================================
+//  HandleRawInput  (0x188D710 - 0x188D8DF)  -- handle a raw-input report
+//  (WM_INPUT) for the active input device.
+//  [NOT byte-identical] placement-dependent (relative calls to the vec
+//  component get / set helpers sub_412AB0 / sub_412B00 / sub_412B50 /
+//  sub_4129F0 / sub_417C50 / sub_417B60, folded into direct float4
+//  accesses, and to PushInputEvent / FlushInputQueue) plus the
+//  GetRawInputData / GetTickCount IAT slots and the dbl_1BF9478 (1000.0)
+//  / dbl_1BF9390 (127.0) data refs.
+//
+//  Original: UINT __stdcall HandleRawInput(device, HRAWINPUT). device is
+//  the active input device object:
+//    +0x5C float sensitivity
+//    +0x70 float4 state {x, y, z, wheelAccum}
+//    +0xA8 input event queue (see PushInputEvent)
+//
+//  Reads the 0x28-byte report with GetRawInputData (RID_INPUT, the 0x10-byte
+//  header size). For a type-0 (mouse / input device) report it builds a
+//  stack event {time = GetTickCount()/1000, ...} and, when the report's
+//  flags byte has no "no motion" bit, moves the x / y state by
+//  delta * sensitivity / 127 (x87 float arithmetic); when the 0x400 button
+//  bit is set it records a type-6 wheel event (value = wheel delta) and
+//  accumulates the wheel state (state.w += delta); then it records a press
+//  (type 1) / release (type 2) event for each of the ten buttons encoded as
+//  2-bit pairs in report.buttons. Returns the result of the last operation
+//  (GetRawInputData, the tick count, the new y / wheel float, or the queue
+//  tail after a push).
+// ============================================================
 static UINT HandleRawInput(void *obj, void *hRawInput)
 {
-    (void)obj;
-    (void)hRawInput;
-    return 0;
+    char *o = (char *)obj;
+    F3RawInputReport report;
+    UINT reportSize = sizeof(report);
+    UINT result = GetRawInputData((HRAWINPUT)hRawInput, RID_INPUT, &report,
+                                  &reportSize, (UINT)sizeof(RAWINPUTHEADER));
+    if (report.type != 0)
+        return result;
+
+    float *state = (float *)(o + 0x70);      // the float4 state
+    float sensitivity = *(float *)(o + 0x5C);
+    void *queue = o + 0xA8;
+
+    F3InputEvent event;
+    event.type = 1;
+    event.button = 0;
+    event.value = 0.0f;
+    event.pad1a = 0;
+    event.pad1b = 0;
+    result = GetTickCount();
+    event.time = (float)((double)(LONG)result / 1000.0);
+
+    if ((report.flags & 1) == 0)
+    {
+        // The original rounds each scaled delta to float (FSTP m32) before
+        // adding it to the state (FADD m32).
+        float dx = (float)((double)report.xDelta * (double)sensitivity / 127.0);
+        float dy = (float)((double)report.yDelta * (double)sensitivity / 127.0);
+        state[0] = (float)((double)state[0] + dx);
+        state[1] = (float)((double)state[1] + dy);
+        result = (UINT)state[1];   // the y-setter (sub_4129F0) returns the new y
+    }
+    if ((report.buttons & 0x400) != 0)
+    {
+        int wheelDelta = (short)report.wheelDelta;   // movsx: sign-extended
+        event.type = 6;
+        event.value = (float)wheelDelta;
+        PushInputEvent(queue, &event);
+        float wheel = (float)((double)state[2] + (float)wheelDelta);
+        state[3] = wheel;
+        result = (UINT)wheel;      // the wheel-setter (sub_417B60) returns the new value
+    }
+    for (int shift = 0, button = 1, n = 5; n != 0; shift += 2, ++button, --n)
+    {
+        int pair = (report.buttons >> shift) & 3;
+        if (pair & 1)
+        {
+            event.type = 1;
+            event.button = button;
+            result = (UINT)(DWORD_PTR)PushInputEvent(queue, &event);
+        }
+        if (pair & 2)
+        {
+            event.type = 2;
+            event.button = button;
+            result = (UINT)(DWORD_PTR)PushInputEvent(queue, &event);
+        }
+    }
+    return result;
 }
 
 // 0x188F140 -- record an input event (obj, WORD code, BYTE state). The
@@ -696,24 +2230,45 @@ static void WorkerFlushFrame(void *worker)
 }
 
 // 0x18F71E0 -- save settings before exit. Restores the three system
-// parameters the game overrode; the original also re-saves
-// AccessibilitySettings.xml through shared buffers (out of scope). Returns the
-// save status.
-static LONG SaveSettingsBeforeExit(void)
+// parameters the game overrode (SPI_SETHIDCONFIRM / SPI_SETKEYBOARDSPEED /
+// SPI_SETKEYBOARDDelay), then, when AccessibilitySettings.xml exists in the
+// settings directory, deletes it (a fresh ref of the settings-directory slot
+// + the filename, DeleteSharedFile) and returns the release's new g_Addend
+// count; otherwise returns the g_Addend count after the existence-check
+// release. Non-static: InitAccessibilitySettings / ApplyDisplaySettings
+// (gamemain.cpp) and the WM_CLOSE path (DispatchWorkerMessage) call it.
+LONG SaveSettingsBeforeExit(void)
 {
     SystemParametersInfoA(0x3B, 8, &g_dword_1D9E18C, 0);
     SystemParametersInfoA(0x35, 8, &g_dword_1D9E194, 0);
-    SystemParametersInfoA(0x33, 0x18, (PVOID)(unsigned long)g_byte_1D9E19C, 0);
-    return 0;
-}
+    SystemParametersInfoA(0x33, 0x18, (PVOID)g_byte_1D9E19C, 0);
 
-// 0x18B0420 -- delete the file resolved from a shared-buffer slot. The
-// original resolves the path via sub_18AFB90 and DeleteFileA's it, releasing
-// the refcount; the path resolution is out of scope. [remaining stub]
-static int DeleteSharedFile(void *slot)
-{
-    (void)slot;
-    return 0;
+    F3SharedBuffer *path = 0;
+    RefSharedSlot(&path, &g_dword_1DBE2F0);
+    AppendSharedSlot(&path, "AccessibilitySettings.xml");
+    char exists = SharedFileExists(&path);
+    if (path != 0)
+    {
+        if (InterlockedDecrement(&path->refcount) <= 0)
+            SharedBufferFree(path);
+        path = 0;
+    }
+    LONG result = InterlockedDecrement(&g_Addend);
+    if (exists != 0)
+    {
+        F3SharedBuffer *path2 = 0;
+        RefSharedSlot(&path2, &g_dword_1DBE2F0);
+        AppendSharedSlot(&path2, "AccessibilitySettings.xml");
+        DeleteSharedFile(&path2);
+        if (path2 != 0)
+        {
+            if (InterlockedDecrement(&path2->refcount) <= 0)
+                SharedBufferFree(path2);
+            path2 = 0;
+        }
+        return InterlockedDecrement(&g_Addend);
+    }
+    return result;
 }
 
 // 0xBE37E0 -- release the LFX module (the loaded module at 0x1DD3218).
@@ -816,7 +2371,7 @@ static LRESULT DispatchWorkerMessage(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM 
                 {
                     F3SharedBuffer *slot = 0;
                     MakeAbnormalShutdownPath(&slot);   // 0x67C930: settings dir + "abnormal_shutdown.tmp"
-                    DeleteSharedFile(slot);
+                    DeleteSharedFile(&slot);           // 0x18B0420 (EAX = &slot in the original)
                     ReleaseSharedSlot(&slot);
                 }
                 ReleaseLfxModule();
@@ -1067,6 +2622,13 @@ static int CreateWorkerWindow(CWorkerWin32 *obj)
     const char *className;
     void *block = obj->sharedBlock;   // +596 (0x254)
     className = (block != 0) ? *(const char **)block : g_DefaultClassName;
+    // TODO THIS IS TEMPORARY: the original's shared slot is not guaranteed to be valid at this point, so the class name may be null/empty. The original assumes it is valid and will crash if it is not. The fallback here is to use the default class name (the original's hard-coded "Fable 3" string).
+    // The class name is the ApplicationName slot (0x1DBD048, the worker window
+    // title). If it is unset or empty the slot's data pointer is null/"" and
+    // CreateWindowExA fails (empty class name -> NULL handle), so no window is
+    // ever shown. Fall back to the original's window class/title.
+    if (className == 0 || className[0] == '\0')
+        className = "Fable 3";
 
     WNDCLASSEXA wc;
     memset(&wc, 0, sizeof(wc));
@@ -1144,21 +2706,10 @@ static F3DisplayMode *InitDisplayMode(F3DisplayMode *dm)
     return dm;
 }
 
-// ============================================================
-//  [STUB]  TrySetDisplayMode  (0x18F28C0 - ...)  -- try to make the requested
-//  display mode current
-//
-//  int TrySetDisplayMode(const F3DisplayMode *dm)
-//
-//  Original semantics (under the device critical section stru_20FC948): 0 =
-//  the requested mode is / became current, 1 = the mode was changed, 2 = the
-//  restore-to-current failed. Deep display-mode subsystem (sub_18F1510 /
-//  ResetXloDevice (0x18F2310) / sub_18EFF00 / sub_18F21A0 /
-//  PickBestDisplayMode (sub_18F05D0) / BuildXloDeviceFromRequest (sub_18F1B30)); out
-//  of scope here. Returns 0 (mode already current) so callers take the
-//  success path.
-// ============================================================
-static int TrySetDisplayMode(const F3DisplayMode *dm) { (void)dm; return 0; }
+// TrySetDisplayMode (0x18F28C0) and its helpers are defined below, after the
+// XLO device-build forward declarations they need (PickBestDisplayMode /
+// BuildXloDeviceFromRequest / F3FindFormatRow) and after F3_FORMAT_TABLE_END.
+static int TrySetDisplayMode(const F3DisplayMode *dm);
 
 // ============================================================
 //  GetDisplayModeClass  (sub_18EFF00, 0x18EFF00-0x18EFF49)  -- map a
@@ -1192,21 +2743,69 @@ static int GetDisplayModeClass(int tier)
 extern "C" void *Direct3DCreate9(UINT SDKVersion);
 
 // ============================================================
-//  [STUB]  F3EnumAdapterModes  (sub_18F1FC0)  -- enumerate the selected
-//  adapter's display modes into a heap list
+//  F3EnumAdapterModes  (sub_18F1FC0, 0x18F1FC0 - 0x18F219B, 475 bytes)
+//  -- enumerate the selected adapter's display modes into a local container
 //
 //  void *F3EnumAdapterModes(void *container, DWORD adapterId, int flags)
 //
 //  Original: thiscall (the 20-byte local `container` in ECX, adapterId and
-//  flags on the stack, caller cleans 8). Builds a per-adapter mode list from
-//  the D3D9 object (dword_1E2EEF8) using the rdata adapter table at
-//  unk_1BD3020 and returns the list head. The D3D9/XLO enumeration is out of
-//  scope; the container is left unpopulated so the caller's free is a no-op.
+//  flags on the stack, caller cleans 8). Walks the rdata adapter table at
+//  unk_1BD3020 ({0x1F, 0x15, 0x16, 0x00} -- stops at the 0 sentinel) and, for
+//  each D3DFORMAT, queries the live D3D9 object (dword_1E2EEF8) through its
+//  vtable: vtable[6] (offset 0x18) returns the mode count for the format and
+//  vtable[7] (offset 0x1C) fills each mode's 4-DWORD descriptor
+//  {width, height, refresh, pixelFormat}. Each unique {width, height} pair is
+//  collected in a local red-black tree keyed on the 8-byte pair. The tree is
+//  internal: it is destroyed before the function returns and the container's
+//  vector is reset to empty below, so the dedup has no observable effect on
+//  the returned value. The 20-byte container (8-byte header + a 3-pointer
+//  8-byte-element vector) is returned with its vector words (+8/+0xC/+0x10)
+//  zeroed; the 8-byte header (+0/+4) is left untouched. Returns the container.
+//
+//  [NOT byte-identical] refs the high-VA D3D9 object g_dword_1E2EEF8
+//  (0x01E2EEF8) and the rdata format table unk_1BD3020 (0x01BD3020) at their
+//  original addresses, and dispatches into the D3D9 object's vtable[6]/[7].
 // ============================================================
 static void *F3EnumAdapterModes(void *container, DWORD adapterId, int flags)
 {
-    (void)container; (void)adapterId; (void)flags;
-    return 0;
+    DWORD *c = (DWORD *)container;
+    const int filter = flags & 0x20;
+    const DWORD d3d = g_dword_1E2EEF8;
+    if (d3d != 0)
+    {
+        void **vt = *(void ***)d3d;
+        typedef DWORD (__stdcall *F3D3D9ModeCountFn)(DWORD, DWORD, DWORD);
+        typedef void  (__stdcall *F3D3D9ModeFn)(DWORD, DWORD, DWORD, DWORD, DWORD *);
+        F3D3D9ModeCountFn countFn = (F3D3D9ModeCountFn)vt[6];
+        F3D3D9ModeFn modeFn = (F3D3D9ModeFn)vt[7];
+        // The rdata adapter table unk_1BD3020: {0x1F, 0x15, 0x16, 0x00}
+        // (D3DFMT_X1 / D3DFMT_A8R8G8B8 / D3DFMT_A8B8G8R8, then the 0 sentinel).
+        static const DWORD fmtTable[] = { 0x1F, 0x15, 0x16, 0x00 };
+        for (int i = 0; fmtTable[i] != 0; ++i)
+        {
+            const DWORD fmt = fmtTable[i];
+            const int count = (int)countFn(d3d, adapterId, fmt);
+            if (count <= 0)
+                continue;
+            for (int m = 0; m < count; ++m)
+            {
+                DWORD mode[4];
+                modeFn(d3d, adapterId, fmt, (DWORD)m, mode);
+                if (filter != 0 && (DWORD)mode[0] < (DWORD)mode[1])
+                    continue;   // (flags & 0x20): drop landscape modes
+                // (the unique {mode[0], mode[1]} pair is inserted into the
+                //  local red-black tree; the tree is destroyed before the
+                //  return and the vector is reset below, so this has no
+                //  observable effect here.)
+            }
+        }
+    }
+    // Reset the container's 8-byte-element vector to empty (begin/end/capacity
+    // at +8/+0xC/+0x10); the 8-byte header at +0/+4 is left untouched.
+    c[2] = 0;
+    c[3] = 0;
+    c[4] = 0;
+    return container;
 }
 
 // ============================================================
@@ -1366,10 +2965,7 @@ static bool CreateD3D9DisplayObject(int adapterIndex, DWORD *outBehavior, int fl
 //    +48  field[12] (unwritten)
 //    +52  field[13] (unwritten)
 // ============================================================
-struct F3XloCaps
-{
-    DWORD field[14];
-};
+// (struct F3XloCaps is defined at the top of the ResetXloDevice cluster.)
 
 // 0x1D9DF80: the end of the texture source-descriptor table (g_dword_1D9AF60).
 // Distance from the table base in DWORDs: (0x1D9DF80 - 0x1D9AF60) / 4 = 3080
@@ -1392,6 +2988,275 @@ static int      NvApiRegisterDevice(int a, int b);
 static int      NvApiConfigure(int a);
 static DWORD    InitXloDeviceState(void);
 static int      BuildXloDeviceFromRequest(const F3XloCaps *req);
+
+// ============================================================
+//  F3InitXloCapsDefaults  (sub_563700, 0x563700 - 0x563732)  -- seed a 56-byte
+//  XLO device-caps block with the default present parameters
+//
+//  void F3InitXloCapsDefaults(F3XloCaps *caps)
+//
+//  [NOT byte-identical] (the original is a usercall with the block in EAX);
+//  the body is a plain store sequence. Sets the 44-byte core the original
+//  writes: {0, 0, 0, 0, 1, 60, 0, 100, 0, 0, 0} (present flag 1 at byte 16,
+//  refresh 60 at byte 20, refresh 100 at byte 28); the remaining 12 bytes
+//  (field[11..13]) are left unwritten by the original (stack garbage there),
+//  so they are zeroed for determinism.
+// ============================================================
+static void F3InitXloCapsDefaults(F3XloCaps *caps)
+{
+    caps->field[0]  = 0;
+    caps->field[1]  = 0;
+    caps->field[2]  = 0;
+    caps->field[3]  = 0;
+    caps->field[4]  = 1;     // byte 16: present flag
+    caps->field[5]  = 60;    // byte 20: refresh
+    caps->field[6]  = 0;     // byte 24: caps flags (2-byte field)
+    caps->field[7]  = 100;   // byte 28: refresh
+    caps->field[8]  = 0;     // byte 32
+    caps->field[9]  = 0;     // byte 36
+    caps->field[10] = 0;     // byte 40: behavior flags
+    caps->field[11] = 0;     // bytes 44..55: zeroed (stack garbage in the original)
+    caps->field[12] = 0;
+    caps->field[13] = 0;
+}
+
+// ============================================================
+//  F3PickBestModeDescriptor  (sub_18F1510, 0x18F1510 - 0x18F175B)  -- pick
+//  the adapter display-mode descriptor closest to the requested mode
+//
+//  DWORD *F3PickBestModeDescriptor(DWORD *out16, const F3DisplayMode *dm)
+//      -- stores the best 16-byte descriptor {width, height, refresh,
+//         pixelFormat} into *out16 and returns out16 (both call sites read
+//         the result through the returned pointer)
+//
+//  [NOT byte-identical] refs the high-VA device globals g_dword_1E2EEF8
+//  (0x01E2EEF8, the D3D9 adapter object) / g_dword_1E2EDB8 (0x01E2EDB8, the
+//  adapter index at +4) and the texture source-descriptor table
+//  g_dword_1D9AF60 (0x01D9AF60) at their original addresses, refs the rdata
+//  adapter-format table unk_1BD3020 (0x01BD3020, {0x1F, 0x15, 0x16, 0x00})
+//  and the rdata floats (1e30f at 0x1BF9420, 10.0f at 0x1BE5700), and
+//  dispatches into the D3D9 object's vtable[6] (mode count) / vtable[7]
+//  (per-mode fetch). A 2-arg cdecl: (out16, dm); both call sites read the
+//  result through the returned pointer.
+//
+//  Walks the rdata adapter-format table unk_1BD3020 (stopping at the 0
+//  sentinel); for each D3DFORMAT, queries the live D3D9 object for the mode
+//  count (vtable[6]) and, per mode, the 16-byte descriptor (vtable[7],
+//  {width, height, refresh, pixelFormat}). A mode with width < height is
+//  skipped when (dm->f28 & 0x20) is set. The descriptor's pixel format
+//  selects a texture source-descriptor table row (row[0] key; the original
+//  resets the index to row 0 when no row matches); when width, height AND
+//  refresh all equal the request's and the row's bits-per-element ratio
+//  (row[2] / row[1] / row[1], integer division) equals dm->f12, the mode is
+//  an exact match: it is stored into *out16 and returned immediately. The
+//  remaining modes are scored (float, the fabs of each term, the x87
+//  sequence collapsed to float math):
+//      size  = (|w - dmW| + |h - dmH|) / (dmW + dmH) * 10
+//      score = size + |ratio - f12| / f12 * 10 + |f24 - refresh| / f24
+//  keeping the strictly-smallest. If no mode scores better (or the adapter
+//  enumerates nothing), the all-zero descriptor is returned (width 0).
+//  Sole caller: TrySetDisplayMode (0x18F28C0).
+// ============================================================
+static DWORD *F3PickBestModeDescriptor(DWORD *out16, const F3DisplayMode *dm)
+{
+    const float F3_SCORE_INF = 1.0e30f;   // 0x1BF9420 (dword_1BF9420)
+    const float F3_SCORE_SCALE = 10.0f;   // 0x1BE5700 (dword_1BE5700)
+    // The rdata adapter table unk_1BD3020: {0x1F, 0x15, 0x16, 0x00}
+    // (D3DFMT_A8R8G8B8 / D3DFMT_X8R8G8B8 / D3DFMT_A8B8G8R8, then the 0 sentinel).
+    static const DWORD fmtTable[] = { 0x1F, 0x15, 0x16, 0x00 };
+
+    float bestScore = F3_SCORE_INF;
+    DWORD  bestDesc[4] = { 0, 0, 0, 0 };
+    const DWORD d3d = g_dword_1E2EEF8;
+    if (d3d != 0)   // null-guard a pre-device slot (the original would fault)
+    {
+        void **vt = *(void ***)d3d;
+        typedef DWORD (__stdcall *F3D3D9ModeCountFn)(DWORD, DWORD, DWORD);
+        typedef void  (__stdcall *F3D3D9ModeFn)(DWORD, DWORD, DWORD, DWORD, DWORD *);
+        F3D3D9ModeCountFn countFn = (F3D3D9ModeCountFn)vt[6];
+        F3D3D9ModeFn modeFn = (F3D3D9ModeFn)vt[7];
+
+        const DWORD *fmtKey = fmtTable;
+        do
+        {
+            const int count = (int)countFn(d3d, g_dword_1E2EDB8[1], *fmtKey);
+            int i = 0;
+            for (; i < count; ++i)
+            {
+                DWORD desc[4];
+                modeFn(d3d, g_dword_1E2EDB8[1], *fmtKey, (DWORD)i, desc);
+                if (((dm->f28 & 0x20) != 0) && (DWORD)desc[0] < (DWORD)desc[1])
+                    continue;   // (f28 & 0x20): drop portrait modes (w < h)
+                // The pixel format's texture source-descriptor table row (the
+                // original resets to row 0 when no row matches the key).
+                const int rowIdx = F3FindFormatRow(desc[3]);
+                const DWORD *row = &g_dword_1D9AF60[28 * rowIdx];
+                if (desc[0] == (DWORD)dm->width && desc[1] == (DWORD)dm->height &&
+                    desc[2] == (DWORD)dm->f24)
+                {
+                    // bits-per-element ratio (integer division, as the
+                    // original's two cdq/idiv steps; row[1] is the element
+                    // divisor, always 1 in the embedded table).
+                    const int ratio = (int)(row[2] / row[1] / row[1]);
+                    if (dm->f12 == ratio)
+                    {
+                        memcpy(out16, desc, 16);   // exact match: return immediately
+                        return out16;
+                    }
+                }
+                // Signed 32-bit differences, as the original's int sub +
+                // cvtsi2ss pairs (desc[] is DWORD, so cast before the
+                // subtraction).
+                const float sizeScore =
+                    (fabsf((float)((int)desc[0] - dm->width)) +
+                     fabsf((float)((int)desc[1] - dm->height))) /
+                    (float)(dm->width + dm->height) * F3_SCORE_SCALE;
+                const int ratio = (int)(row[2] / row[1] / row[1]);
+                float score = sizeScore +
+                    fabsf((float)(ratio - dm->f12)) / (float)dm->f12 * F3_SCORE_SCALE +
+                    fabsf((float)(dm->f24 - (int)desc[2])) / (float)dm->f24;
+                if (score < bestScore)   // fcomip + jbe: strictly smaller only
+                {
+                    bestScore = score;
+                    memcpy(bestDesc, desc, 16);
+                }
+            }
+            ++fmtKey;
+        } while (*fmtKey != 0);
+    }
+
+    memcpy(out16, bestDesc, 16);
+    return out16;
+}
+
+// ============================================================
+//  TrySetDisplayMode  (0x18F28C0 - 0x18F2B22)  -- try to make the requested
+//  display mode current
+//
+//  int TrySetDisplayMode(const F3DisplayMode *dm)   -- 0 = current, 1 = changed,
+//                                                     2 = restore-to-current failed
+//
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  F3PickBestModeDescriptor (sub_18F1510), GetDisplayModeClass (sub_18EFF00),
+//  ResetXloDevice (0x18F2310), CreateD3D9DisplayObject (0x18F21A0),
+//  F3InitXloCapsDefaults (sub_563700), F3FindFormatRow (sub_435100),
+//  PickBestDisplayMode (sub_18F05D0), BuildXloDeviceFromRequest (sub_18F1B30)
+//  and the Enter/LeaveCriticalSection IAT slots) and refs the high-VA device
+//  globals g_dword_1E2EEF4 (0x01E2EEF4), the 56-byte caps block
+//  g_dword_1E2ED80 (0x01E2ED80), g_dword_1E2ED7C (0x01E2ED7C) and the device
+//  critical section g_stru_20FC948 (0x020FC948).
+//
+//  Original semantics (nested under the device CS stru_20FC948): if the
+//  device object (dword_1E2EEF4) is present, pick the adapter mode descriptor
+//  closest to the request (F3PickBestModeDescriptor, sub_18F1510); when its
+//  width is > 0, copy the live 56-byte caps block (dword_1E2ED80), overwrite
+//  width / height (bytes 0/4), zero byte 32, set the refresh (byte 48) and
+//  the render-mode class (byte 52, GetDisplayModeClass(dm->f36) when the
+//  request's byte 29 is nonzero, else 0x80000000), and reset the XLO device
+//  (ResetXloDevice) -- a successful reset returns 0 (the requested mode is /
+//  became current). Otherwise restore the original caps (a second
+//  ResetXloDevice on the live block): success returns 1 (the mode was
+//  changed / restored), failure returns 2 (the restore-to-current failed).
+//  If the device is absent, create the D3D9 object
+//  (CreateD3D9DisplayObject / sub_18F21A0; a failure returns 1) and, when
+//  the picked descriptor's width is nonzero (else 1), build the 56-byte XLO
+//  device request from the seeded defaults (F3InitXloCapsDefaults, sub_563700):
+//  the picked descriptor's pixel-format row (F3FindFormatRow, sub_435100)
+//  at byte 0, width / height at bytes 8/12, refresh at byte 20, caps flags
+//  byte 24 = 1 + the request's byte 29 at byte 25, the request's f20 /
+//  f24 / f28 at bytes 28/32/40 (behavior 2 ORs 2 into byte 40); the picked
+//  display mode (PickBestDisplayMode, sub_18F05D0, on the format row and the
+//  request's f16 / f20) goes into byte 4 -- a zero pick returns 1. With a
+//  picked mode, zero g_dword_1E2ED7C and build the device
+//  (BuildXloDeviceFromRequest / sub_18F1B30), returning its negated status
+//  (1 = success).
+// ============================================================
+static int TrySetDisplayMode(const F3DisplayMode *dm)
+{
+    F3EnterDisplayCs();
+
+    if (g_dword_1E2EEF4 != 0)
+    {
+        // Device present: rebuild the XLO device with the picked mode.
+        F3XloCaps caps;
+        DWORD  picked[4];
+        memcpy(caps.field, g_dword_1E2ED80, sizeof(caps.field));
+        F3PickBestModeDescriptor(picked, dm);
+        if ((int)picked[0] > 0)   // the original's `test eax, eax; jbe`
+        {
+            caps.field[0]  = picked[0];              // byte 0:  width
+            caps.field[1]  = picked[1];              // byte 4:  height
+            caps.field[8]  = 0;                      // byte 32
+            caps.field[12] = picked[2];              // byte 48: refresh
+            caps.field[13] = (((const unsigned char *)&dm->f28)[1] != 0)
+                                 ? (DWORD)GetDisplayModeClass(dm->f36)
+                                 : 0x80000000;       // byte 52
+            if (ResetXloDevice(caps) != 0)
+            {
+                LeaveCriticalSection(&g_stru_20FC948);
+                return 0;   // the requested mode is / became current
+            }
+        }
+        // The reset failed (or the picked mode was unusable): restore the
+        // original caps and report the outcome.
+        F3XloCaps current;
+        memcpy(current.field, g_dword_1E2ED80, sizeof(current.field));
+        if (ResetXloDevice(current) != 0)
+        {
+            LeaveCriticalSection(&g_stru_20FC948);
+            return 1;   // the mode was changed (restored to the original)
+        }
+        LeaveCriticalSection(&g_stru_20FC948);
+        return 2;   // the restore-to-current failed
+    }
+
+    // No device yet: create the D3D9 object and build the device from the
+    // request's picked adapter mode.
+    DWORD behavior = 1;   // the original seeds the out behavior to 1
+    if (CreateD3D9DisplayObject(dm->f00, &behavior, dm->f28) == 0)
+    {
+        LeaveCriticalSection(&g_stru_20FC948);
+        return 1;
+    }
+
+    DWORD picked[4];
+    F3PickBestModeDescriptor(picked, dm);
+    if (picked[0] == 0)
+    {
+        LeaveCriticalSection(&g_stru_20FC948);
+        return 1;
+    }
+
+    F3XloCaps req;
+    F3InitXloCapsDefaults(&req);   // {0,0,0,0, 1, 60, 0, 100, 0, 0, 0, ...}
+    DWORD fmtRow = (DWORD)F3FindFormatRow(picked[3]);   // pixel-format row
+    req.field[0]  = fmtRow;                            // byte 0
+    req.field[2]  = picked[0];                         // byte 8:  width
+    req.field[3]  = picked[1];                         // byte 12: height
+    req.field[5]  = picked[2];                         // byte 20: refresh
+    req.field[6]  = 1 | ((DWORD)(((const unsigned char *)&dm->f28)[1]) << 8);  // byte 24 = 1, byte 25 = dm+29
+    req.field[7]  = (DWORD)dm->f20;                    // byte 28
+    req.field[8]  = (DWORD)dm->f24;                    // byte 32
+    req.field[10] = (DWORD)dm->f28;                    // byte 40
+    if (behavior == 2)
+        req.field[10] |= 2;
+
+    // Pick the closest display mode (the format row is the input key; the
+    // original re-runs the row lookup before the pick, which is idempotent).
+    DWORD pickedMode = 0;
+    PickBestDisplayMode(&pickedMode, &fmtRow, dm->f16, dm->f20);
+    req.field[1] = pickedMode;                         // byte 4
+    if (pickedMode == 0)
+    {
+        LeaveCriticalSection(&g_stru_20FC948);
+        return 1;
+    }
+
+    g_dword_1E2ED7C = 0;
+    int result = (BuildXloDeviceFromRequest(&req) == 0);
+    LeaveCriticalSection(&g_stru_20FC948);
+    return result;
+}
 
 // ============================================================
 //  SetDisplayMode  (0x18F2B30 - 0x18F2D66)  -- set the display mode
@@ -1428,12 +3293,18 @@ static int SetDisplayMode(const F3DisplayMode *dm)
         caps[12] = 0;                            // byte offset 48
         caps[13] = (dm->f20 != 0) ? (DWORD)GetDisplayModeClass(dm->f24)
                                   : 0x80000000;   // byte offset 52
-        if (ResetXloDevice(caps) != 0)
+        // The original passes the 56-byte caps block BY VALUE (14 DWORDs on
+        // the stack), so copy it into an F3XloCaps before each call.
+        F3XloCaps capsByVal;
+        memcpy(capsByVal.field, caps, sizeof(capsByVal.field));
+        if (ResetXloDevice(capsByVal) != 0)
         {
             LeaveCriticalSection(&g_stru_20FC948);
             return 0;
         }
-        if (ResetXloDevice(g_dword_1E2ED80) != 0)
+        F3XloCaps capsByVal2;
+        memcpy(capsByVal2.field, g_dword_1E2ED80, sizeof(capsByVal2.field));
+        if (ResetXloDevice(capsByVal2) != 0)
         {
             LeaveCriticalSection(&g_stru_20FC948);
             return 1;
@@ -1906,18 +3777,49 @@ static DWORD g_dword_20FCAE8[44 * 64];
 static DWORD g_dword_20FCB08[44 * 64];
 
 // ============================================================
-//  [STUB]  sub_18F0850  (0x18F0850 - 0x18F08C7)  -- device teardown (per-slot)
+//  ApplySlotViewport  (sub_18F0850, 0x18F0850 - 0x18F08C7)  -- re-apply the
+//  current slot's stored viewport rect to the device
+//  [NOT byte-identical] relative call to SetDeviceViewport and refs the slot
+//  index (dword_2075F10) and the per-slot record table (0x20FCA68) at their
+//  original high VAs.
 //
-//  Releases the base per-slot device object for the current slot
-//  (dword_2075F10) from the 0x20FCA68 record table and calls SetDeviceViewport (sub_18F07B0).
-//  Out of scope here; reached as the fall-through of TeardownDeviceSlot.
+//  int ApplySlotViewport(void)   -- no args (cdecl), returns int
+//
+//  For the current slot's (dword_2075F10) row in the per-slot record table
+//  (0x20FCA68, 44 DWORDs), picks the stored {right, bottom} pair: from the
+//  row's first record (object at row DWORD 1) when that record is set
+//  (values at row DWORDs 4 and 5), else from the slot trailer when its flag
+//  (row DWORD 33) is set (values at row DWORDs 36 and 37). With neither
+//  present, returns the slot's byte offset (176 * slot); otherwise builds the
+//  rect {0, 0, right, bottom} and returns SetDeviceViewport(rect).
 // ============================================================
-static int sub_18F0850(void) { return 0; }
+static int ApplySlotViewport(void)
+{
+    DWORD slot = g_dword_2075F10;
+    DWORD *row = &g_dword_20FCA68[slot * 44];
+
+    DWORD right, bottom;
+    if (row[1] != 0)
+    {
+        right = row[4];
+        bottom = row[5];
+    }
+    else
+    {
+        if (row[33] == 0)
+            return (int)(slot * 176);
+        right = row[36];
+        bottom = row[37];
+    }
+
+    DWORD rect[4] = { 0, 0, right, bottom };
+    return SetDeviceViewport(rect);
+}
 
 // ============================================================
 //  TeardownDeviceSlot  (0x18F0E00 - 0x18F0E9B)  -- device teardown (per-slot)
 //  [NOT byte-identical] placement-dependent (relative fall-through to
-//  sub_18F0850) and refs the slot index (dword_2075F10), the device object
+//  ApplySlotViewport) and refs the slot index (dword_2075F10), the device object
 //  (dword_1E2EEF4) and the per-slot record table (0x20FCA68) at their
 //  original high VAs.
 //
@@ -1930,7 +3832,7 @@ static int sub_18F0850(void) { return 0; }
 //  (device, n, 0) where n is 1/2/3, then releases the sub-record object
 //  (vtable[2]) and clears the two DWORDs at row offsets (9,10)/(17,18)/(25,26).
 //  If the slot's trailer flag (row offset 33) is set, falls through to
-//  sub_18F0850(); otherwise returns the last release result (or 0).
+//  ApplySlotViewport(); otherwise returns the last release result (or 0).
 // ============================================================
 static int TeardownDeviceSlot(void)
 {
@@ -1963,7 +3865,7 @@ static int TeardownDeviceSlot(void)
     }
 
     if (g_dword_20FCA68[g_dword_2075F10 * 44 + 33] != 0)
-        return sub_18F0850();
+        return ApplySlotViewport();
     return result;
 }
 
@@ -2305,7 +4207,7 @@ static int DestroyDevice(void)
 // ============================================================
 static DWORD  g_dword_1DB11F4[11];   // 0x1DB11F4  the last 44-byte display-mode request
 static DWORD  g_dword_20FC984 = 0;   // 0x20FC984  format-table index (request field[0])
-static DWORD  g_dword_1E2ED74 = 0;   // 0x1E2ED74  device render-mode class
+// (g_dword_1E2ED74 is defined at the top of the ResetXloDevice cluster.)
 static float  g_flt_1E2ED78 = 0.0f;  // 0x1E2ED78  device refresh rate
 static float  g_flt_20FC968 = 0.0f;  // 0x20FC968  device refresh rate (mirror)
 static DWORD  g_dword_2074540 = 0;   // 0x2074540  the built device (mirror of 1E2EEF4)
@@ -2516,8 +4418,8 @@ static DWORD *CopySlotRecord(DWORD *src, DWORD *dst)
 //  device's register method (vtable[37], offset 0x94) with (device, 0,
 //  surfRec[1]). Then, for v = 1..3: call the register method with (device, v, 0)
 //  and release + clear the slot row's sub-record at byte offset v*32 (row
-//  DWORDs i/4+1 and i/4+2 for i = 32, 64, 96). Returns the sub_18F0850 result
-//  (the per-slot teardown tail, a stub returning 0).
+//  DWORDs i/4+1 and i/4+2 for i = 32, 64, 96). Returns the ApplySlotViewport result (the slot's stored viewport applied to
+//  the device).
 // ============================================================
 static int RegisterDeviceSlotRecords(const DWORD *surfRec)
 {
@@ -2542,7 +4444,7 @@ static int RegisterDeviceSlotRecords(const DWORD *surfRec)
         }
         ++v;
     }
-    return sub_18F0850();
+    return ApplySlotViewport();
 }
 
 // ============================================================

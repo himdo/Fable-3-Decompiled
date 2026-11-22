@@ -121,4 +121,56 @@ int LegacyFileHasData(const void *obj);
 // LHFile::CAFile).  Returns the slot release's new g_Addend count.
 long LegacyFileDtor(void *obj);
 
+// ============================================================
+//  Accessibility settings (defined in gamemain.cpp next to the
+//  CXMLReadStream / shared-slot helpers it is built from).
+// ============================================================
+
+// 0x1DBE2F0 - the settings-directory shared slot (F3SharedBuffer*): .bss
+// (starts null), the base slot of every settings-file path builder (defined
+// in gamemain.cpp). Exposed for SaveSettingsBeforeExit (worker.cpp), which
+// rebuilds the AccessibilitySettings.xml path against it.
+extern F3SharedBuffer *g_dword_1DBE2F0;
+
+// sub_1A01880 (0x1A01880 - 0x1A01934) -- append (or create) a string on a
+// shared slot (defined in gamemain.cpp). Exposed for SaveSettingsBeforeExit
+// (worker.cpp).
+void AppendSharedSlot(F3SharedBuffer **slot, const char *src);
+
+// SharedFileExists (0x18B0F30 - 0x18B0F98) -- "is the (resolved) path of
+// this shared slot an existing, non-directory file?" (defined in
+// gamemain.cpp). Exposed for SaveSettingsBeforeExit (worker.cpp).
+int SharedFileExists(F3SharedBuffer **obj);
+
+// DeleteSharedFile (0x18B0420 - 0x18B0494) -- "delete the (resolved) path of
+// this shared slot": resolve through the path resolver (sub_18AFB90),
+// DeleteFileA the resolved text (the CWD -- a directory, so the delete always
+// fails), release the local block and g_Addend on both branches, and return
+// DeleteFileA's 1/0 result (defined in gamemain.cpp).
+int DeleteSharedFile(F3SharedBuffer **slot);
+
+// InitAccessibilitySettings (0x18F72B0 - 0x18F7455) -- the
+// accessibility-settings start-up load (snapshot the three system parameters
+// it may override, apply the saved overrides from AccessibilitySettings.xml
+// when present, run SaveSettingsBeforeExit). Called from
+// CWorkerWin32_RunGame (worker.cpp). Returns 0 when the file was processed,
+// else the live-slot counter value of the existence-check release.
+LONG InitAccessibilitySettings(void);
+
+// SaveSettingsBeforeExit (0x18F71E0 - 0x18F72AC) -- restore the three system
+// parameters snapshotted at start-up, then delete AccessibilitySettings.xml
+// from the settings directory when present (DeleteSharedFile) -- defined in
+// worker.cpp, the CWorkerWin32 module; also called by InitAccessibilitySettings
+// here.
+LONG SaveSettingsBeforeExit(void);
+
+// 0x1D9E18C / 0x1D9E194 / 0x1D9E19C: the system-parameter snapshot globals
+// (defined in gamemain.cpp). g_dword_1D9E18C / g_dword_1D9E194 are the
+// SPI_GETHIDCONFIRM / SPI_GETKEYBOARDSPEED snapshot values; g_byte_1D9E19C is
+// the 4-byte SPI_GETKEYBOARDDelay value block. SaveSettingsBeforeExit
+// (worker.cpp) restores from them.
+extern DWORD g_dword_1D9E18C;
+extern DWORD g_dword_1D9E194;
+extern BYTE  g_byte_1D9E19C[4];
+
 #endif  // F3_GAMEMAIN_H
