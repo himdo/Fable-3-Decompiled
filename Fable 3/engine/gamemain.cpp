@@ -13,6 +13,7 @@
 #include "xlip.h"                 // F3AString + the XLip module (engine/xlip.h)
 #include "banktree.h"             // BankTreeEraseRange (the bank-tree range erase)
 #include "namemap.h"              // NameMapEraseRange (the +0x94 name-map range erase)
+#include "subnode.h"              // SubNodeEraseRange (the +0x74 SubNode range erase)
 #include "common/common.h"        // LHAlloc / LHFree / InitSharedSlot / ReleaseSharedSlot
 #include "engine/engine.h"        // SetThreadName (the thread-name announce)
 #include "gameengine.h"           // GetGameEngine (sub_619A90)
@@ -28,6 +29,7 @@
 #include <wchar.h>                // _wgetcwd
 #include <stdarg.h>               // va_list / va_start / vswprintf_s (XLipDebugMessage)
 #include <string.h>
+#include <ctype.h>                // tolower (the shared-slot lowercase pass)
 #include <setjmp.h>               // longjmp / jmp_buf (the VM-heap OOM expand)
 #include <wctype.h>               // iswspace (the XLipCultures line trim)
 #include <mbstring.h>             // _mbscmp / _mbsicmp
@@ -84,6 +86,10 @@ static int   g_unk_1DBD9E8[33] = { 0 };  // 0x1DBD9E8 (0x84 bytes)
 static void *g_CDiskFileWin32Vtable[4] = { 0 };
 static void *g_CAFileVtable[4]         = { 0 };
 static void *g_CLegacyFileVtable[4]    = { 0 };
+
+// F3_VT(OBJ): read OBJ's vtable (the first word) as a void ** so its slots
+// can be indexed. (OBJ is a class instance pointer.)
+#define F3_VT(OBJ) ((void **)(*(void **)(OBJ)))
 
 // ============================================================
 //  xlive.dll / steam_api imports
@@ -4800,27 +4806,109 @@ static void *SlotPairSet(void *slot, void **pair)
     return slot;
 }
 
-// sub_626770 (0x626770) -- reset the +0x74 bank word-collection (the
-// BankTreeEraseRange analogue for the +0x74 collection type).  Out of scope.
-// Stub: no-op.  [remaining stub]
-static void sub_626770(char *coll, void *tmp, char *heapWord, int val0, int val1, int val2)
-{ (void)coll; (void)tmp; (void)heapWord; (void)val0; (void)val1; (void)val2; }
+// F3InvalidParam (defined lower, in the sorted-map cluster) is the no-op
+// stand-in for the original's CRT __invalid_parameter_noinfo() debug-iterator
+// checks; forward-declare it so the bank string-collection destructor below
+// can use it.
+void F3InvalidParam(void);
 
-// sub_624B10 (0x624B10) -- clear the +0x1C string collection: free every
-// non-null node in the node list, then the node list itself and the +0x04
-// buffer word, zeroing the head / capacity / count.  Deep node-teardown
-// chain -- out of scope.  Stub: no-op.  [remaining stub]
-static void sub_624B10(char *str) { (void)str; }
+//  BankStringsDtor  (0x624B10 - 0x624BEC)  -- the bank container's +0x1C
+//  string-collection destructor (the sub_72C220 init counterpart).  Frees
+//  every non-null element of the element array (each element's +0x0C data
+//  buffer first, then the element itself), then the element array, the +0x1C
+//  self-tag block, the +0x10 block, and the +0x04 self-tag block, zeroing the
+//  array / block fields.  thiscall (obj in ECX).
+//  [NOT byte-identical] placement-dependent (the relative E8 calls to LHFree
+//  and the __invalid_parameter_noinfo IAT slot).
+//
+//  void BankStringsDtor(void *obj)
+//
+//  obj (the +0x1C member, 0x3C bytes) is the MSVC debug-mode dynamic array:
+//  +0x04 a self-referencing 4-byte tag block (freed unconditionally), +0x10..
+//  +0x18 a block (freed when non-null, then zeroed), +0x1C a self-referencing
+//  4-byte tag block (freed unconditionally, the array-manager deref in the
+//  per-element bounds checks), +0x28 / +0x2C the element-array start / end,
+//  +0x30 zeroed.  Each element (a DWORD in the array) is a pointer to a heap
+//  object whose +0x0C holds a separately-allocated data buffer.
+static void BankStringsDtor(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+
+    // The element-array bounds (a debug-iterator invariant; the original
+    // __invalid_parameter_noinfo's and continues on a violation).
+    if (o[0x28 / 4] > o[0x2C / 4])
+        F3InvalidParam();
+
+    DWORD arrStart = o[0x28 / 4];
+    DWORD arrEnd   = o[0x2C / 4];
+    DWORD tag      = o[0x1C / 4];       // the self-tag block, captured at entry
+
+    for (DWORD i = arrStart; ; i += 4)
+    {
+        if (o[0x28 / 4] > o[0x2C / 4])
+            F3InvalidParam();
+        if (tag == 0 || tag != o[0x1C / 4])
+            F3InvalidParam();
+        if (i == arrEnd)
+            break;
+
+        // The tag-block deref (the null branch is the error path).
+        DWORD m;
+        if (tag != 0)
+            m = *(DWORD *)tag;
+        else
+        {
+            F3InvalidParam();
+            m = 0;
+        }
+        if (i >= *(DWORD *)(m + 0x10))
+            F3InvalidParam();
+
+        DWORD el = *(DWORD *)i;
+        if (el != 0)
+        {
+            LHFree((void *)(*(DWORD *)(el + 0x0C)));   // the element's data buffer
+            LHFree((void *)el);
+        }
+
+        DWORD m2;
+        if (tag != 0)
+            m2 = *(DWORD *)tag;
+        else
+        {
+            F3InvalidParam();
+            m2 = 0;
+        }
+        if (i >= *(DWORD *)(m2 + 0x10))
+            F3InvalidParam();
+    }
+
+    if (arrStart != 0)
+        LHFree((void *)arrStart);
+    o[0x28 / 4] = 0;
+    o[0x2C / 4] = 0;
+    o[0x30 / 4] = 0;
+    LHFree((void *)o[0x1C / 4]);       // the self-tag block (unconditional)
+
+    DWORD block = o[0x10 / 4];
+    if (block != 0)
+        LHFree((void *)block);
+    o[0x10 / 4] = 0;
+    o[0x14 / 4] = 0;
+    o[0x18 / 4] = 0;
+
+    LHFree((void *)o[0x04 / 4]);       // the +0x04 self-tag block (unconditional)
+}
 
 //  DestroyBankContainer  (0x626EF0 - 0x62700C)  -- the 240-byte bank
 //  container's destructor (the InitBankContainer counterpart): reset the
 //  three word-collections (+0xCC via BankTreeEraseRange, +0x94 via
-//  NameMapEraseRange, +0x74 via sub_626770), each followed by the LHFree of
+//  NameMapEraseRange, +0x74 via SubNodeEraseRange), each followed by the LHFree of
 //  the +0x18 sentinel node + the +0x0 head node and the +0x18 / +0x1C zero; DeleteCritical
 //  Section the +0xB4 section; free the +0x68 word (when non-null) and zero
 //  +0x68 / +0x6C / +0x70; free the +0x5C back-reference node; clear the
-//  +0x1C string (sub_624B10); free the +0x04 string buffer when +0x18 >=
-//  0x10, and reset +0x14 = 0 / +0x18 = 0x0F / the +0x04 flag = 0.
+//  +0x1C string collection (BankStringsDtor); free the +0x04 string buffer
+//  when +0x18 >= 0x10, and reset +0x14 = 0 / +0x18 = 0x0F / the +0x04 flag = 0.
 //  thiscall (obj in ECX).  [NOT byte-identical] placement-dependent (the
 //  E8 calls) and refs the LHFree / DeleteCriticalSection high-VA slots.
 static void DestroyBankContainer(void *obj)
@@ -4854,10 +4942,12 @@ static void DestroyBankContainer(void *obj)
         w[0xB0 / 4] = 0;
     }
 
-    // +0x74 word-collection.
+    // +0x74 word-collection (the SubNode range erase, cleared to empty).
     {
         DWORD tmp[2];
-        sub_626770(o + 0x74, &tmp, o + 0x8C, w[0x74 / 4], w[0x8C / 4], w[0x74 / 4]);
+        void *head = *(void **)(o + 0x74);          // the tree's head node
+        void *sent = *(void **)(o + 0x8C);          // the tree's sentinel node
+        SubNodeEraseRange(o + 0x74, tmp, head, *(void **)(sent), head, sent);
         LHFree((void *)w[0x8C / 4]);
         LHFree((void *)w[0x74 / 4]);
         w[0x8C / 4] = 0;
@@ -4871,7 +4961,7 @@ static void DestroyBankContainer(void *obj)
     w[0x70 / 4] = 0;
     LHFree((void *)w[0x5C / 4]);
 
-    sub_624B10(o + 0x1C);
+    BankStringsDtor(o + 0x1C);
     if (w[0x18 / 4] >= 0x10u)
         LHFree((void *)w[4 / 4]);
     w[0x14 / 4] = 0;
@@ -4892,19 +4982,1200 @@ static void ReleaseBankObject(void *obj)
     }
 }
 
-// sub_17FE8B0 (0x17FE8B0 - 0x17FE8E4) -- CLegacyMemoryFile ctor over the
-// 16-byte object: store the vtable, the wide shared-string ctor at +4
-// (sub_19FF580), the +8 count zero, then open the shared-slot file
-// (sub_17FE290 with the slot, 1, 2 flags).  Deep file-subsystem chain --
-// out of scope.  Stub: returns 0 (the video never opens).  [remaining stub]
-static long sub_17FE8B0(void *obj, int slotId, int a3, int a4)
-{ (void)obj; (void)slotId; (void)a3; (void)a4; return 0; }
+// ============================================================
+//  LHSFS::CLegacyMemoryFile (16 bytes: { vtable, wide-path slot, open-file
+//  handle, +0xC word }) -- the ctor (sub_17FE8B0), the open-setup
+//  (sub_17FE290, vtable slot 1), the deleting dtor (sub_18004B0, vtable
+//  slot 0), and the LHVFS file-system singletons / object classes they
+//  reach.  The deep IFile resolve/read chain (the CFileSystem singletons,
+//  sub_18A9440, the wrapper's vt[4] path resolve) is out of scope and
+//  stubbed below -- the resolve stub hands back a null source, so the file
+//  handle stays unset (the video never opens, as before).
+// ============================================================
 
-// sub_625E20 (0x625E20 - 0x625E99) -- append a { value, refcount } node to
-// the +0x30 sub-object's node list (capacity check against +0x3C / +0x40,
-// the sub_625600 grow path, the InterlockedIncrement of the appended
-// reference).  Out of scope.  Stub: no-op.  [remaining stub]
-static void sub_625E20(void *list, void **value) { (void)list; (void)value; }
+// 0x1E2D7B0: the global file-system object's init flag (bit 0 = first use).
+static BYTE  g_FileSystemFlags = 0;
+// 0x1E2D7AC: the global LHVFS::CWin32FileSystem wrapper object (created
+// lazily on first use, released at exit).
+static DWORD g_FileSystemObject = 0;
+// 0x1E2D7BC: the shape-spawn directory prefix slot (one word; the image
+// initial -1 is overwritten to null by the startup init sub_1AA6490, which
+// runs InitSharedSlot on it, and the atexit sub_1AD38C0 releases it).
+static F3SharedBuffer *g_ShapeSpawnPrefixSlot = 0;
+// 0x1BD44D7: the default prefix string the open-setup compares against
+// (the image holds the wide "UseShapeSpawnDir"; read as an ANSI string it
+// is empty, so an empty slot makes the prefix check a no-op).
+static const char g_ShapeSpawnDefaultStr[1] = { 0 };
+
+// sub_1A01BE0 (0x1A01BE0 - 0x1A01C38) -- copy `src`'s block into `out`
+// (RefSharedSlot: out is nulled, g_Addend bumped, the block shared with a
+// refcount bump), DetachSharedSlot it (a private copy), lowercase the
+// payload in place, and return `out`.  `src` is left holding its original
+// block untouched.  [NOT byte-identical] placement-dependent (the
+// RefSharedSlot / DetachSharedSlot / tolower calls).
+static F3SharedBuffer **DetachToLowerSharedSlot(F3SharedBuffer **src,
+                                                F3SharedBuffer **out)
+{
+    RefSharedSlot(out, src);
+    DetachSharedSlot(out);
+    F3SharedBuffer *b = *out;
+    if (b != 0)
+    {
+        unsigned int i = 0;
+        for (i = 0; i < b->length; i++)
+            b->data[i] = (char)tolower((int)(unsigned char)b->data[i]);
+    }
+    return out;
+}
+
+// sub_1A01C40 (0x1A01C40 - 0x1A01CBE) -- substring: build a fresh counted
+// buffer over [start, end) of the string in the block held at *blockLoc
+// (defaulting to the empty default string for an empty location) and swap
+// it into the out slot (releasing the slot's old block first).  [NOT
+// byte-identical] placement-dependent (the SharedBufferCreate /
+// SharedBufferFree calls) plus the Interlocked IAT slots.
+static F3SharedBuffer **SubstringSharedSlot(F3SharedBuffer **blockLoc,
+                                            F3SharedBuffer **out,
+                                            int start, int end)
+{
+    *out = 0;
+    InterlockedIncrement(&g_Addend);
+    const char *str = (*blockLoc != 0) ? (*blockLoc)->data : g_ShapeSpawnDefaultStr;
+    const char *seg = str + start;
+    F3SharedBuffer *created = 0;
+    if (seg != 0 && *seg != 0)
+        created = SharedBufferCreate(seg, end - start);
+    if (*out != 0)
+    {
+        if (InterlockedDecrement(&(*out)->refcount) <= 0 && *out != 0)
+            SharedBufferFree(*out);
+        *out = 0;
+    }
+    if (created != 0)
+        *out = created;
+    return out;
+}
+
+// sub_19FF9E0 (0x19FF9E0 - 0x19FFA14) -- the WIDE shared-slot copy-assign
+// (CopySharedSlotWide's sibling minus the up-front null + counter bump):
+// when src is a different non-empty slot, drop dst's block (the wide
+// release sub_19FF9B0 -- refcount down, free via SharedBufferFree on zero)
+// and share src's (copy the block, refcount up).  [NOT byte-identical]
+// placement-dependent plus the Interlocked IAT slots.
+static F3SharedBuffer **AssignSharedSlotWide(F3SharedBuffer **dst,
+                                             F3SharedBuffer **src)
+{
+    if (src != dst && *src != *dst)
+    {
+        if (*dst != 0)
+        {
+            if (InterlockedDecrement(&(*dst)->refcount) <= 0 && *dst != 0)
+                SharedBufferFree(*dst);
+            *dst = 0;
+        }
+        if (*src != 0)
+        {
+            *dst = *src;
+            InterlockedIncrement(&(*dst)->refcount);
+        }
+    }
+    return dst;
+}
+
+// sub_42D0D0 / sub_6C9520 (0x42D0D0 - 0x42D0FF, 0x6C9520 - 0x6C954F) --
+// the byte-identical refcounted pointer swap: ref the source object
+// (vtable slot 1), release the old destination object (vtable slot 2),
+// store the source, return dst.  One static stands in for both.  [NOT
+// byte-identical] placement-dependent.
+static void *SharedRefAssign(void **dst, void **src)
+{
+    void *s = *src;
+    if (s != 0)
+        ((void (WINAPI *)(void *))F3_VT(s)[1])(s);
+    void *d = *dst;
+    if (d != 0)
+        ((void (WINAPI *)(void *))F3_VT(d)[2])(d);
+    *dst = s;
+    return dst;
+}
+
+// ---- LHVFS::CMemoryFile (76 bytes) -- the in-memory IFile the open-setup
+//  builds over an opened file:
+//    +0x00 vtable  +0x04 refcount  +0x08 / +0x09 flag bytes
+//    +0x0C / +0x14 buffer start/end  +0x1C / +0x20 position words
+//    +0x24 IFile / stream member     +0x28 critical section (24 bytes)
+//    +0x40 / +0x44 / +0x48 tail words
+
+// [remaining stub] the original CMemoryFile dtor: release the +0x24 member,
+// LHFree the buffer, drop the critical section.
+static void WINAPI MemoryFileDtor(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    if (o[9] != 0)
+    {
+        ((void (WINAPI *)(void *))F3_VT((void *)o[9])[2])((void *)o[9]);
+        o[9] = 0;
+    }
+    if (o[5] != 0)
+    {
+        LHFree((void *)o[5]);
+        o[5] = 0;
+        o[3] = 0;
+    }
+    DeleteCriticalSection((CRITICAL_SECTION *)(o + 10));
+}
+
+static void WINAPI MemoryFileAddRef(void *obj)
+{
+    InterlockedIncrement((volatile LONG *)((char *)obj + 4));
+}
+
+static void WINAPI MemoryFileRelease(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    if (InterlockedDecrement((volatile LONG *)(o + 1)) == 0)
+    {
+        MemoryFileDtor(obj);
+        LHFree(obj);
+    }
+}
+
+// the CMemoryFile vtable (original 0x19A9xxx `??_7CMemoryFile@LHVFS@@6B@`):
+// dtor / AddRef (vt+4) / Release (vt+8); the IFile read/seek method slots
+// are remaining stubs.
+static void *g_MemoryFileVtable[8] =
+{
+    (void *)MemoryFileDtor,      // [0]
+    (void *)MemoryFileAddRef,    // [1]
+    (void *)MemoryFileRelease,   // [2]
+    0, 0, 0, 0, 0                // [remaining stub]
+};
+
+// sub_18A92A0 (0x18A92A0 - 0x18A932A) -- the CMemoryFile ctor (the size
+// variant): store the CMemoryFile vtable, zero the object, set the flag
+// bytes (+0x08 = 1, +0x09 = 0), the position words to the size, initialize
+// the critical section at +0x28, store the caller flag at +0x44, and
+// LHAlloc(size) the buffer at +0x0C / +0x14.  (The ALLOC-log tail is
+// skipped -- the verbose flag dword_20B5FA8 is off.)  [NOT byte-identical]
+// placement-dependent (the LHAlloc / InitializeCriticalSection IAT calls).
+static void *MemoryFileCtor(void *obj, DWORD size, int flag)
+{
+    DWORD *o = (DWORD *)obj;
+    BYTE  *b = (BYTE *)obj;
+    o[0]  = (DWORD)g_MemoryFileVtable;
+    o[1]  = 0;
+    b[8]  = 1;
+    b[9]  = 0;
+    o[3]  = 0; o[4] = 0; o[5] = 0; o[6] = 0;
+    o[7]  = size; o[8] = size;
+    o[9]  = 0;
+    InitializeCriticalSection((CRITICAL_SECTION *)(o + 10));
+    o[16] = 0; o[17] = (DWORD)flag; o[18] = 0;
+    void *buf = LHAlloc(size);
+    o[3] = (DWORD)buf;
+    o[5] = (DWORD)buf;
+    return obj;
+}
+
+// sub_18A9330 (0x18A9330 - 0x18A9366) -- create an EMPTY CMemoryFile:
+// LHAlloc(76), MemoryFileCtor (size 0, flag 0), store the object in the
+// out slot and take a reference on it.  [NOT byte-identical]
+// placement-dependent (the LHAlloc / sub_18A92A0 relative calls).
+static void *CreateEmptyMemoryFile(void **out)
+{
+    void *mem = LHAlloc(76);
+    void *r = (mem != 0) ? MemoryFileCtor(mem, 0, 0) : 0;
+    *out = r;
+    if (r != 0)
+        MemoryFileAddRef(r);
+    return out;
+}
+
+// sub_18A9440 (0x18A9440 - 0x18A96E7) -- read the source IFile into the
+// CMemoryFile buffer (the deep IFile read / offset / stream chain).
+// [remaining stub]
+static void *MemoryFileReadFromSource(void *mem, void *src, int flag)
+{ (void)mem; (void)src; (void)flag; return 0; }
+
+// sub_18A9770 (0x18A9770 - 0x18A97BB) -- open a CMemoryFile over a source
+// file: when src is null, null the out slot; otherwise LHAlloc(76), build
+// the CMemoryFile from the source (sub_18A9440, remaining stub), store the
+// object in the out slot and take a reference.  [NOT byte-identical]
+// placement-dependent (the LHAlloc / sub_18A9440 relative calls).
+static void *OpenMemoryFile(void **out, void *src, int flag)
+{
+    if (src == 0)
+    {
+        *out = 0;
+        return out;
+    }
+    void *mem = LHAlloc(76);
+    void *r = 0;
+    if (mem != 0)
+        r = MemoryFileReadFromSource(mem, src, flag);
+    *out = r;
+    if (r != 0)
+        MemoryFileAddRef(r);
+    return out;
+}
+
+// ---- LHVFS::CWin32FileSystem wrapper (48 bytes) -- the global
+//  "file-system facade" object the open-setup resolves paths through
+//  (created by CreateFileSystemWrapper, stored at g_FileSystemObject).
+
+// Win32FileSystemDtor  (0x18AAC30 - 0x18AAC9A)  -- the LHVFS::
+// CWin32FileSystem complete-object dtor body.  It runs from the deleting
+// dtor (sub_5AF660, the wrapper vtable's vt[10]) when the refcount drops
+// to zero: it releases the three ref-counted members -- the +0x24
+// path-description, the +0x28 file-system sub-object, and the +0x2C 32-byte
+// CFileManifest -- through each member's own vt[2] (Release), highest
+// offset first (the original unwind order); then drops the embedded SSO
+// wide-path string's heap buffer (cap at +0x20, data pointer at +0x0C) and
+// resets the string fields.  [NOT byte-identical] the member Release
+// dispatches and the SSO-buffer free are relative calls, and the free goes
+// through the high-VA heap table (dword_2075B24 + 16), so this is a C++
+// reimplementation.  The original also swaps the vtable to the base
+// CAddRelQueryImp<IFileSystem,...> vtable on exit; the stub frees the object
+// right after, so it is never re-dispatched through the old vtable.
+static void WINAPI Win32FileSystemDtor(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    int i;
+    // release the +0x24 / +0x28 / +0x2C members via each member's vt[2]
+    for (i = 11; i >= 9; i--)
+    {
+        if (o[i] != 0)
+        {
+            ((void (WINAPI *)(void *))F3_VT((void *)o[i])[2])((void *)o[i]);
+            o[i] = 0;
+        }
+    }
+    // drop the embedded SSO wide-path string's heap buffer, then reset it
+    if (o[8] >= 8)
+        LHFree((void *)o[3]);
+    o[8] = 7;                        // +0x20
+    o[7] = 0;                        // +0x1C
+    *(WORD *)((char *)obj + 0x0C) = 0;  // +0x0C (low word of the data ptr)
+}
+
+static void WINAPI Win32FileSystemAddRef(void *obj)
+{
+    InterlockedIncrement((volatile LONG *)((char *)obj + 4));
+}
+
+static void WINAPI Win32FileSystemRelease(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    if (InterlockedDecrement((volatile LONG *)(o + 1)) == 0)
+    {
+        Win32FileSystemDtor(obj);
+        LHFree(obj);
+    }
+}
+
+// forward decls for the 36-byte wide-string helpers (defined further
+// below in this file)
+static wchar_t *F3WStringData(F3WString *s);
+static void F3WStringReset(F3WString *s);
+static void F3WStringFree(F3WString *s);
+static void F3WStringClear(F3WString *s);
+static void F3WStringAssign(F3WString *s, const wchar_t *src, unsigned int len);
+static void F3WStringNormalizeSeparators(F3WString *s);
+static void XApiErrorReport(int code, int subCode);
+
+// sub_56DFD0 (0x56DFD0 - 0x56E023) -- the cached FNV-1a wide-string hash.
+// [remaining stub] returns 0 (the hash only feeds the verbose log lines and
+// the failure-report dispatch, both inactive in this build).  Matches the
+// file-local stub in engine/luavm.cpp.
+static int GetWideStringHash(const F3WString *s) { (void)s; return 0; }
+
+// The VFS verbose-logging pair (the "OPEN: ..." / "CLOSE: ..." printer):
+// the flag byte (dword_20B5FA8 & 1) gates the printf-style function at
+// dword_20B5FB0 (MSVC printf -- "%S" prints a wide string).
+static unsigned char g_VerboseLogFlag = 0;   // 0x20B5FA8
+static void (WINAPI *g_VerboseLogFn)(const char *, ...) = 0;  // 0x20B5FB0
+
+// Win32FileSystemGetPath  (0x5AF5E0 - 0x5AF62F)  -- copy the wrapper's
+// embedded wide root path (data at +0x0C / SSO, cap at +0x20) into the
+// 36-byte out string: reset (cap 7 / len 0 / SSO NUL) then assign.
+// [NOT byte-identical] placement-dependent (the F3WStringAssign relative
+// call in the original).
+static F3WString *WINAPI Win32FileSystemGetPath(void *obj, F3WString *out)
+{
+    DWORD *o = (DWORD *)obj;
+    const wchar_t *src = (o[8] < 8) ? (const wchar_t *)(o + 3)
+                                    : (const wchar_t *)o[3];
+    F3WStringReset(out);
+    F3WStringAssign(out, src, (unsigned int)wcslen(src));
+    return out;
+}
+
+// ---- LHVFS::CWin32File (72 bytes) -- the disk IFile the open (vt[4])
+//  builds over the CreateFileW handles: +0x08 read handle, +0x0C write
+//  handle, +0x10/+0x14 block words (0x1000 / -0x1000), +0x1C path
+//  description (ref), +0x20 file-system sub-object (ref), +0x30/+0x34
+//  file position, +0x38 wide-path pointer, +0x3C mode selector.
+//  Win32FileInit  (0x18A3960 - 0x18A39CE)  -- build the 72-byte CWin32File
+//  over the caller's LHAlloc'd block: store the CWin32File vtable (the
+//  original first stores the base CAddRelQueryImp<IFile,...> vtable, which
+//  is immediately overwritten), zero the refcount, store the handles and
+//  AddRef the two ref-counted members.  The original reads its +0x0C and
+//  +0x3C slots from its own caller's return-address stack slot (a compiler
+//  placement artifact of the single-word push at the one call site), so
+//  they end up holding that return address (0x18AB679 in the original
+//  binary): the write handle is never a real handle (Write / Seek fail) and
+//  the +0x3C mode selector is always >= 2 (Read takes the synchronous
+//  path).  Reproduced with the caller return address here.  [NOT
+//  byte-identical] placement-dependent (the member AddRef dispatches).
+static __declspec(naked) DWORD * Win32FileCallerReturnAddress(void)
+{
+    __asm
+    {
+        mov eax, [esp]
+        ret
+    }
+}
+
+//  Win32FileDtor  (0x18A38F0)  -- the CWin32File dtor body (run
+//  by the deleting dtor when the refcount drops to zero): CloseHandle the
+//  +0x08 read handle, close the +0x0C write handle when it is a distinct
+//  handle (not -1), the verbose "CLOSE: ..." line, then Release the +0x20
+//  and +0x1C members.  [NOT byte-identical] the member Release dispatches
+//  are relative calls.
+static void WINAPI Win32FileDtor(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    CloseHandle((HANDLE)o[2]);
+    if (o[3] != 0xFFFFFFFF && o[3] != o[2])
+        CloseHandle((HANDLE)o[3]);
+    if ((g_VerboseLogFlag & 1) != 0 && g_VerboseLogFn != 0)
+        g_VerboseLogFn("CLOSE: #%08x #%08x", o[14], (DWORD)obj);
+    if (o[8] != 0)
+        ((void (WINAPI *)(void *))F3_VT((void *)o[8])[2])((void *)o[8]);
+    if (o[7] != 0)
+        ((void (WINAPI *)(void *))F3_VT((void *)o[7])[2])((void *)o[7]);
+    // the original swaps to the base CAddRelQueryImp<IFile,...> vtable
+    // here; the stub release frees the object right after, so it is never
+    // re-dispatched through the old vtable.
+}
+
+//  Win32FileDeletingDtor  (0x5C1550)  -- the CWin32File deleting dtor
+//  (the wrapper vtable's vt[11], run by Win32FileRelease at refcount 0).
+static void WINAPI Win32FileDeletingDtor(void *obj)
+{
+    Win32FileDtor(obj);
+    LHFree(obj);
+}
+
+//  sub_5B5700 (0x5B5700) -- CWin32File AddRef (vt[1]).
+static LONG WINAPI Win32FileAddRef(void *obj)
+{
+    return InterlockedIncrement((volatile LONG *)((DWORD *)obj + 1));
+}
+
+//  sub_5B5740 (0x5B5740) -- CWin32File Release (vt[2]): decrement the
+//  refcount and run the deleting dtor (vt[11]) at zero.
+static LONG WINAPI Win32FileRelease(void *obj)
+{
+    LONG n = InterlockedDecrement((volatile LONG *)((DWORD *)obj + 1));
+    if (n == 0 && obj != 0)
+        ((void (WINAPI *)(void *, int))F3_VT(obj)[11])(obj, 1);
+    return n;
+}
+
+// the CWin32File vtable (original `??_7CWin32File@LHVFS@@6B@`, 13 slots:
+// the base vtable's QueryInterface / AddRef / Release, the 8 IFile methods
+// (sub_18A37C0 / sub_18A39D0 / sub_18A3BA0 / sub_18A3D30 / sub_18A3730 /
+// sub_18A36C0 / sub_18A37A0 / sub_18A36B0 -- remaining stubs), the
+// deleting dtor (sub_5C1550), and the IFile base-class descriptor).
+static void *g_Win32FileVtable[13] =
+{
+    0,                          // [0] sub_5B57A0 (QueryInterface -- stub)
+    (void *)Win32FileAddRef,    // [1] sub_5B5700
+    (void *)Win32FileRelease,   // [2] sub_5B5740
+    0, 0, 0, 0, 0, 0, 0, 0,     // [3..10] the IFile methods (remaining stubs)
+    (void *)Win32FileDeletingDtor,  // [11] sub_5C1550
+    0                           // [12] the IFile base-class descriptor
+};
+
+static void *Win32FileInit(void *obj, DWORD h, DWORD h2, DWORD pathDesc,
+                           DWORD fsSub, DWORD relPath)
+{
+    (void)h2;  // the original pushes the write handle, but the ctor reads its
+               // own caller's return address into +0x0C instead -- see below
+    DWORD *o = (DWORD *)obj;
+    // The original's +0x0C and +0x3C slots both end up holding the ctor
+    // caller's return address (0x18AB679 in the original binary): a compiler
+    // placement artifact of the single-word push at the one call site.  The
+    // write handle is therefore never a real handle (Write / Seek fail) and
+    // the +0x3C mode selector is always >= 2 (Read takes the synchronous
+    // path).  Capture the caller return address once and store it in both.
+    DWORD ra = (DWORD)Win32FileCallerReturnAddress();
+    o[0]  = (DWORD)g_Win32FileVtable;   // (base-vtable store folded in)
+    o[1]  = 0;                          // refcount
+    o[2]  = h;                          // +0x08 read handle
+    o[3]  = ra;                         // +0x0C (caller retaddr, NOT the handle)
+    o[4]  = 0x1000;                     // +0x10
+    o[5]  = 0xFFFFF000;                 // +0x14
+    o[6]  = 0;                          // +0x18
+    o[7]  = pathDesc;                   // +0x1C (the +0x24 path description)
+    if (pathDesc != 0)
+        ((void (WINAPI *)(void *))F3_VT((void *)pathDesc)[1])((void *)pathDesc);
+    o[8]  = fsSub;                      // +0x20 (the +0x28 sub-object)
+    if (fsSub != 0)
+        ((void (WINAPI *)(void *))F3_VT((void *)fsSub)[1])((void *)fsSub);
+    o[9]  = 0; o[10] = 0; o[11] = 0;    // +0x24..0x2F
+    o[12] = 0; o[13] = 0;               // +0x30..0x37 file position
+    o[14] = relPath;                    // +0x38 wide-path pointer
+    o[15] = ra;                         // +0x3C (caller retaddr, NOT the mode)
+    ((BYTE *)obj)[0x40] = 0;            // +0x40 (LHAlloc zeroes the rest)
+    return obj;
+}
+
+//  Win32FileSystemReportOpenFailure  (0x18AB350 - 0x18AB3BB)  -- the
+//  CreateFileW-failure report (the open's else branch): classify
+//  GetLastError (2/3/5 = access family -> 2; 15/18/21/32/38/161 -> 0;
+//  anything else -> 1) and, when the wrapper's +0x28 file-system
+//  sub-object is live, dispatch its vt[6] (sub, category, path hash)
+//  which returns the status; otherwise XApiErrorReport the code and
+//  report success iff the category was 2.  stdcall, 2 args (retn 8).
+static int WINAPI Win32FileSystemReportOpenFailure(void *obj,
+                                                   const F3WString *path)
+{
+    DWORD err = GetLastError();
+    int hash = GetWideStringHash((const F3WString *)path);
+    int category;
+    switch (err)
+    {
+    case 2: case 3: case 5:
+        category = 2;
+        break;
+    case 15: case 18: case 21: case 32: case 38: case 161:
+        category = 0;
+        break;
+    default:
+        category = 1;
+        break;
+    }
+    DWORD *o = (DWORD *)obj;
+    if (o[10] != 0)
+        return ((int (WINAPI *)(void *, int, int))F3_VT((void *)o[10])[6])
+                   ((void *)o[10], category, hash);
+    XApiErrorReport(err, 0);
+    return (category == 2);
+}
+
+//  Win32FileSystemOpen  (0x18AB470 - 0x18AB768)  -- the CWin32FileSystem
+//  vtable slot 4 (vt+16): the wide-path resolve / open.  It builds the
+//  normalized wide path (sub_5AF180) into a local 36-byte string, then the
+//  disk path: a relative path containing a ':' is used as is, otherwise
+//  the wrapper's embedded root path is prefixed.  The path is converted to
+//  ANSI and CreateFileW'd with up to 10 attempts (Sleep backoff between
+//  failures), the mode selecting the access / disposition / flag combo
+//  (0 = read-write OPEN_ALWAYS, 1 = read, 2 = read-write, 3 = read no-
+//  buffering-light, 4 = read no-buffering, 5 = read-write CREATE_ALWAYS,
+//  anything else = no open).  On success it LHAlloc(72) a CWin32File
+//  (Win32FileInit), AddRefs it, Releases the out slot's previous object,
+//  prints the verbose "OPEN: ... DISK" line, and stores it in the out
+//  slot; on failure it reports through the +0x28 sub-object (or
+//  XApiErrorReport) and leaves the out slot null.  Returns the out slot.
+//  The original is thiscall + retn 0Ch (the wrapper in ECX, the out slot /
+//  path / mode on the stack); here a plain free function per the project
+//  convention.  [NOT byte-identical] placement-dependent (the CreateFileW
+//  / Sleep / LHAlloc IAT + E8 calls) plus the high-VA verbose globals
+//  (dword_20B5FA8 / dword_20B5FB0) and the 0x18AB679 return-address
+//  artifact the CWin32File ctor bakes in.
+static void *WINAPI Win32FileSystemOpen(void *obj, void **out,
+                                        const F3WString *relPath, int mode)
+{
+    DWORD *o = (DWORD *)obj;
+
+    // sub_5AF180: build the normalized wide string (reset, assign, zero
+    // the +28/+32 words, the '/' -> '\\' separator pass).
+    F3WString str;
+    const wchar_t *src = F3WStringData((F3WString *)relPath);
+    F3WStringReset(&str);
+    F3WStringAssign(&str, src, (unsigned int)wcslen(src));
+    F3WStringNormalizeSeparators(&str);
+
+    // compose the disk path (0x800 wchars) from the root + relative path
+    wchar_t destination[0x800];
+    if (src[wcscspn(src, L":")] != 0)
+        wcsncpy_s(destination, 0x800, src, 0x800);
+    else
+    {
+        const wchar_t *root = (o[8] < 8) ? (const wchar_t *)(o + 3)
+                                         : (const wchar_t *)o[3];
+        wcsncpy_s(destination, 0x800, root, 0x800);
+        wcscat_s(destination, 0x800, src);
+    }
+    // the original converts the path to ANSI here (a dead store in this
+    // build -- the open uses the wide path) and is reproduced for fidelity
+    char dst[0x800];
+    wcstombs_s(0, dst, 0x800, destination, (size_t)-1);
+
+    // the 10-attempt CreateFileW retry loop with the Sleep backoff (the
+    // wide path is what the original opens)
+    DWORD h = 0xFFFFFFFF, h2 = 0xFFFFFFFF;
+    int retry = 10;
+    for (;;)
+    {
+        --retry;
+        switch (mode)
+        {
+        case 1:
+            h = (DWORD)CreateFileW(destination, 0x80000000, 3, 0, 3,
+                                   0x48000080, 0);
+            break;
+        case 4:
+            h = (DWORD)CreateFileW(destination, 0x80000000, 3, 0, 3,
+                                   0x60000080, 0);
+            break;
+        case 3:
+            h = (DWORD)CreateFileW(destination, 0x80000000, 3, 0, 3,
+                                   0x00800080, 0);
+            break;
+        case 0:
+            h = h2 = (DWORD)CreateFileW(destination, 0xC0000000, 3, 0, 2,
+                                        0x48000080, 0);
+            break;
+        case 2:
+            h = h2 = (DWORD)CreateFileW(destination, 0xC0000000, 3, 0, 3,
+                                        0x00800080, 0);
+            break;
+        case 5:
+            h = h2 = (DWORD)CreateFileW(destination, 0xC0000000, 3, 0, 4,
+                                        0x08000000, 0);
+            break;
+        default:
+            break;
+        }
+        if (h != 0xFFFFFFFF)
+            break;
+        Sleep((retry >> 1) + 1);
+        if (retry == 0)
+            break;
+    }
+
+    *out = 0;
+    void *file = 0;
+    if (h != 0xFFFFFFFF)
+    {
+        void *mem = LHAlloc(72);
+        if (mem != 0)
+        {
+            file = Win32FileInit(mem, h, h2, o[9], o[10], (DWORD)relPath);
+            if (file != 0)
+                ((void (WINAPI *)(void *))F3_VT(file)[1])(file);   // AddRef
+        }
+        if (*out != 0)
+            ((void (WINAPI *)(void *))F3_VT(*out)[2])(*out);       // Release
+        if ((g_VerboseLogFlag & 1) != 0 && g_VerboseLogFn != 0)
+        {
+            F3WString tmp;
+            Win32FileSystemGetPath(obj, &tmp);
+            g_VerboseLogFn("OPEN: #%08x \"%S\" #%08x DISK",
+                           GetWideStringHash(&str),
+                           (const char *)F3WStringData(&tmp), (DWORD)file);
+            F3WStringClear(&tmp);
+        }
+        *out = file;
+    }
+    else
+    {
+        Win32FileSystemReportOpenFailure(obj, (const F3WString *)relPath);
+    }
+
+    F3WStringFree(&str);
+    return out;
+}
+
+//  Win32FileSystemDeletingDtor  (0x5AF660)  -- the CWin32FileSystem
+//  deleting dtor (the wrapper vtable's vt[10]): the dtor body plus the
+//  heap free.
+static void *WINAPI Win32FileSystemDeletingDtor(void *obj)
+{
+    Win32FileSystemDtor(obj);
+    LHFree(obj);
+    return obj;
+}
+
+// the wrapper vtable (original `??_7CWin32FileSystem@LHVFS@@6B@`, 11
+// slots: the base vtable's QueryInterface / AddRef / Release, the vt[3]
+// hash resolve (sub_18AACA0 -- a stub here), the vt[4] open, the vt[5..7]
+// methods (sub_18AB770 / sub_18AB010 / sub_18AAB50 -- remaining stubs),
+// the vt[8] root-path copy, the vt[9] method (sub_18AAB60 -- a stub), and
+// the vt[10] deleting dtor).
+static void *g_Win32FileSystemVtable[11] =
+{
+    (void *)Win32FileSystemDtor,     // [0] sub_5AFC10 (base dtor shape)
+    (void *)Win32FileSystemAddRef,   // [1] sub_5AFB70 (AddRef)
+    (void *)Win32FileSystemRelease,  // [2] sub_5AFBB0 (Release)
+    0,                               // [3] sub_18AACA0 (remaining stub)
+    (void *)Win32FileSystemOpen,     // [4] sub_18AB470 (vt+16, the open)
+    0, 0, 0,                         // [5..7] remaining stubs
+    (void *)Win32FileSystemGetPath,  // [8] sub_5AF5E0 (root-path copy)
+    0,                               // [9] sub_18AAB60 (remaining stub)
+    (void *)Win32FileSystemDeletingDtor  // [10] sub_5AF660
+};
+
+// sub_1AD3900 (0x1AD3900 - 0x1AD3912) -- the atexit release of the global
+// file-system object.
+static void ReleaseGlobalFileSystem(void)
+{
+    void *o = (void *)g_FileSystemObject;
+    if (o != 0)
+        ((void (WINAPI *)(void *))F3_VT(o)[2])(o);
+}
+
+// sub_17FDDF0 (0x17FDDF0 - 0x17FDE20) -- the global file-system slot
+// getter with lazy init: first use sets the flag byte, nulls the object,
+// and registers ReleaseGlobalFileSystem at exit; returns
+// &g_FileSystemObject.  [NOT byte-identical] placement-dependent (the
+// atexit call) plus the original 0x1E2D7xx high-VA globals.
+static DWORD *GetGlobalFileSystemSlot(void)
+{
+    if ((g_FileSystemFlags & 1) == 0)
+    {
+        g_FileSystemFlags |= 1;
+        g_FileSystemObject = 0;
+        atexit(ReleaseGlobalFileSystem);
+    }
+    return &g_FileSystemObject;
+}
+
+// sub_18ABA60 (0x18ABA60 - 0x18ABB45) -- build the 48-byte
+// CWin32FileSystem wrapper: LHAlloc(48), reference the two singletons
+// (sub_18C4270 -> the dword_212304C path description; sub_18A4670 -> the
+// +0x20 sub-object of the 304-byte CFileSystem at dword_20B5FB4), build
+// the wrapper around them (sub_18AB850), store it in the out slot, and
+// take a reference.  [remaining stub] the singleton getters / path resolve
+// / CFileManifest are out of scope, so the stub builds a zero-member
+// wrapper (the vtable + refcount only).
+static void *CreateFileSystemWrapper(void **out)
+{
+    void *w = LHAlloc(48);
+    void *r = 0;
+    if (w != 0)
+    {
+        DWORD *o = (DWORD *)w;
+        o[0] = (DWORD)g_Win32FileSystemVtable;
+        o[1] = 0;
+        int i = 2;
+        for (i = 2; i < 12; i++)
+            o[i] = 0;
+        r = w;
+    }
+    *out = r;
+    if (r != 0)
+        Win32FileSystemAddRef(r);
+    return out;
+}
+
+// forward decls (defined further below in this file)
+static void F3WStringReset(F3WString *s);
+static void F3WStringClear(F3WString *s);
+
+// the CLegacyMemoryFile vtable (original 0x1BC7FBC, 12 slots): the dtor
+// (sub_18004B0), the open-setup (sub_17FE290), and the IFile method slots
+// (sub_17FDC60 / sub_17FDC80 / sub_17FDCD0 / sub_17FDD20 / sub_17FDD30 /
+// sub_17FD6F0 / sub_17FDD50 / sub_17FDD60 / sub_17FD700 -- remaining
+// stubs; the stub build never dispatches through them).
+static void LegacyMemoryFileStubMethod(void *obj) { (void)obj; }
+static void *CLegacyMemoryFileDtorAddress(void);
+static int CLegacyMemoryFileOpen(void *obj, F3SharedBuffer **slot, int mode, int a4);
+
+static void *g_CLegacyMemoryFileVtable[12] =
+{
+    CLegacyMemoryFileDtorAddress(),      // [0] sub_18004B0
+    (void *)CLegacyMemoryFileOpen,       // [1] sub_17FE290
+    (void *)LegacyMemoryFileStubMethod,  // [2] sub_17FDC60
+    (void *)LegacyMemoryFileStubMethod,  // [3] sub_17FDC80
+    (void *)LegacyMemoryFileStubMethod,  // [4] sub_17FDCD0
+    (void *)LegacyMemoryFileStubMethod,  // [5] sub_17FDD20
+    (void *)LegacyMemoryFileStubMethod,  // [6] sub_17FDD30
+    (void *)LegacyMemoryFileStubMethod,  // [7] sub_17FDD40
+    (void *)LegacyMemoryFileStubMethod,  // [8] sub_17FD6F0 (nullsub)
+    (void *)LegacyMemoryFileStubMethod,  // [9] sub_17FDD50
+    (void *)LegacyMemoryFileStubMethod,  // [10] sub_17FDD60
+    (void *)LegacyMemoryFileStubMethod   // [11] sub_17FD700
+};
+
+// The 16-byte LHSFS::CLegacyMemoryFile object.  The dtor is a real member
+// function so its vtable slot keeps the original thiscall + retn 4
+// dispatch ABI (ReleaseVideoFile calls vt[0](obj, 1) through the vtable).
+struct CLegacyMemoryFile
+{
+    const void *    vtable;   // +0x00
+    F3SharedBuffer *path;     // +0x04 the wide path slot
+    DWORD           file;     // +0x08 the open file handle (an LHVFS IFile)
+    DWORD           extra;    // +0x0C (zeroed by the open-setup)
+
+    // sub_18004B0 (0x18004B0 - 0x1800502) -- the deleting dtor (thiscall +
+    // retn 4, the free-flag on the stack): re-store the CLegacyMemoryFile
+    // vtable, release the file handle (vtable slot 2) and null it, release
+    // the wide path slot (ReleaseSharedSlotWide), swap the vtable to
+    // LHFile::CAFile, and LHFree the object when flag bit 0 is set.
+    int Dtor(int freeFlag)
+    {
+        DWORD *o = (DWORD *)this;
+        o[0] = (DWORD)g_CLegacyMemoryFileVtable;
+        if (o[2] != 0)
+            ((void (WINAPI *)(void *))F3_VT((void *)o[2])[2])((void *)o[2]);
+        o[2] = 0;
+        ReleaseSharedSlotWide((F3SharedBuffer **)(o + 1));
+        o[0] = (DWORD)g_CAFileVtable;
+        if (freeFlag & 1)
+            LHFree(this);
+        return (int)(DWORD)this;
+    }
+};
+
+// sub_17FE290 (0x17FE290 - 0x17FE46B) -- the open-setup (vtable slot 1):
+// take the caller's path-slot block into a private lowercased block (the
+// original aliases its a2 parameter location; modelled with a local),
+// mirror it into the
+// object's +4 wide path slot, and -- when the path starts with the global
+// shape-spawn prefix (an empty slot -> empty prefix -> always matches) --
+// rebuild it as the prefix-stripped substring.  The mode selects: 1/2 =
+// ensure the global CWin32FileSystem wrapper exists, convert the path to
+// the wide string, resolve it through the wrapper's vtable slot 4 (which
+// writes the source IFile back into the mode argument), and when a source
+// came back, open it as a CMemoryFile into +8; 3/4 = swap a fresh EMPTY
+// CMemoryFile into +8; otherwise do nothing.  +0xC is zeroed and the path
+// block released in all cases.  The original is thiscall + retn 0Ch (the
+// object in ECX, the three args on the stack, callee-cleans); here a plain
+// free function per the project convention.  [NOT byte-identical]
+// placement-dependent (the E8 calls) plus the high-VA globals
+// (g_ShapeSpawnPrefixSlot 0x1E2D7BC, the 0x1BD44D7 default string, and the
+// Interlocked IAT slots).
+static int CLegacyMemoryFileOpen(void *obj, F3SharedBuffer **slot, int mode, int a4)
+{
+    (void)a4;
+    DWORD *o = (DWORD *)obj;
+
+    // The original aliases its own a2 parameter location here: the slot's
+    // block is copied into the (a2) parameter location as a private
+    // lowercased block while the caller's slot keeps its original block.
+    // Modelled with a local slot location.
+    F3SharedBuffer *privateBlock = 0;
+    DetachToLowerSharedSlot(slot, &privateBlock);
+    F3SharedBuffer **blockLoc = &privateBlock;
+
+    F3SharedBuffer *wide = 0;
+    SharedSlotToWide(blockLoc, &wide);
+    AssignSharedSlotWide((F3SharedBuffer **)(o + 1), &wide);
+    ReleaseSharedSlotWide(&wide);
+
+    // The prefix check: compare the path against the global prefix
+    // (strncmp over the prefix length; empty slot -> empty prefix).
+    DWORD prefixLen = (g_ShapeSpawnPrefixSlot != 0) ? g_ShapeSpawnPrefixSlot->length : 0;
+    const char *prefixStr = (g_ShapeSpawnPrefixSlot != 0) ? g_ShapeSpawnPrefixSlot->data : g_ShapeSpawnDefaultStr;
+    const char *pathStr = (*blockLoc != 0) ? (*blockLoc)->data : g_ShapeSpawnDefaultStr;
+    int prefixMatch = (strncmp(pathStr, prefixStr, prefixLen) == 0);
+    if (prefixMatch)
+    {
+        DWORD pathLen = (*blockLoc != 0) ? (*blockLoc)->length : 0;
+        F3SharedBuffer *sub = 0;
+        SubstringSharedSlot(blockLoc, &sub, (int)prefixLen, (int)pathLen);
+        CopySharedSlot(blockLoc, &sub);
+        ReleaseSharedSlot(&sub);
+    }
+
+    // The original re-reads the a2 location for the wide-string build (the
+    // prefix branch swapped the block, freeing the pre-branch string).
+    pathStr = (*blockLoc != 0) ? (*blockLoc)->data : g_ShapeSpawnDefaultStr;
+
+    switch (mode)
+    {
+    case 1:
+    case 2:
+    {
+        DWORD *fsSlot = GetGlobalFileSystemSlot();
+        if (*fsSlot == 0)
+        {
+            DWORD wrapper = 0;
+            CreateFileSystemWrapper((void **)&wrapper);
+            SharedRefAssign((void **)fsSlot, (void **)&wrapper);
+            if (wrapper != 0)
+                ((void (WINAPI *)(void *))F3_VT((void *)wrapper)[2])((void *)wrapper);
+        }
+        F3WString wpath;
+        F3WStringReset(&wpath);
+        F3WStringFromAnsi(&wpath, pathStr);
+        // The original writes the resolved source IFile back into the mode
+        // argument location; modelled with a local.
+        void *src = 0;
+        if (*fsSlot != 0)
+            // the original dispatches the wrapper's vt[4] as a virtual
+            // (thiscall) method: the wrapper in ECX, the out slot / path /
+            // mode (1 = read) on the stack.
+            ((void (WINAPI *)(void *, void **, F3WString *, int))
+                F3_VT((void *)*fsSlot)[4])((void *)*fsSlot, &src, &wpath, 1);
+        F3WStringClear(&wpath);
+        if (src != 0)
+        {
+            DWORD handle = 0;
+            OpenMemoryFile((void **)&handle, src, 1);
+            SharedRefAssign((void **)(o + 2), (void **)&handle);
+            if (handle != 0)
+                ((void (WINAPI *)(void *))F3_VT((void *)handle)[2])((void *)handle);
+        }
+        break;
+    }
+    case 3:
+    case 4:
+    {
+        DWORD memFile = 0;
+        CreateEmptyMemoryFile((void **)&memFile);
+        if (memFile != 0)
+            ((void (WINAPI *)(void *))F3_VT((void *)memFile)[1])((void *)memFile);
+        if (o[2] != 0)
+            ((void (WINAPI *)(void *))F3_VT((void *)o[2])[2])((void *)o[2]);
+        o[2] = memFile;
+        if (memFile != 0)
+            ((void (WINAPI *)(void *))F3_VT((void *)memFile)[2])((void *)memFile);
+        break;
+    }
+    default:
+        break;
+    }
+
+    o[3] = 0;
+    return (int)(DWORD)ReleaseSharedSlot(blockLoc);
+}
+
+// the dtor's code address (the member-function-pointer -> void* bit copy;
+// a non-virtual member function pointer is a plain code address)
+static void *CLegacyMemoryFileDtorAddress(void)
+{
+    union
+    {
+        int (CLegacyMemoryFile::*pm)(int);
+        void *p;
+    } u;
+    u.pm = &CLegacyMemoryFile::Dtor;
+    return u.p;
+}
+
+// sub_17FE8B0 (0x17FE8B0 - 0x17FE8E4) -- the LHSFS::CLegacyMemoryFile ctor
+// over the 16-byte object: store the CLegacyMemoryFile vtable, run the
+// wide null-ctor on the +4 path slot (InitSharedSlotWide, sub_19FF580),
+// zero the +8 file handle, then run the open-setup (CLegacyMemoryFileOpen,
+// sub_17FE290) over (path slot, mode, flag) and return the object.  The
+// original is thiscall + retn 0Ch (the object in ECX, the three args on
+// the stack, callee-cleans); here a plain free function per the project
+// convention.  [NOT byte-identical] placement-dependent (the E8 calls to
+// the wide null-ctor and the open-setup) plus the CLegacyMemoryFile
+// vtable ref (original 0x1BC7FBC).
+static void *CLegacyMemoryFileCtor(void *obj, F3SharedBuffer **slot, int mode, int a4)
+{
+    DWORD *o = (DWORD *)obj;
+    o[0] = (DWORD)g_CLegacyMemoryFileVtable;
+    InitSharedSlotWide((F3SharedBuffer **)(o + 1));
+    o[2] = 0;
+    CLegacyMemoryFileOpen(obj, slot, mode, a4);
+    return obj;
+}
+
+// ============================================================
+//  The +0x30 video vector  -- a 24-byte object holding an array of 8-byte
+//  {obj, refblock} pairs (the mounted videos).  Layout (dword offsets):
+//    +0x00  buffer   a 4-byte self-referencing wrapper; buffer[0] == &vector
+//    +0x0C  begin    first element (storage base)
+//    +0x10  current  one past the last element
+//    +0x14  cap_end  one past the end of the allocation
+//
+//  Each refblock is an F3SehBlock {refcount, dtor, obj}; releasing it
+//  decrements the refcount and, at zero, runs dtor(obj) then LHFree's the
+//  block.  CGameEngineCtor sets buffer to the self-ref wrapper and zeroes
+//  begin / current / cap_end.  The original methods are thiscall + `retn N`
+//  (the vector in ECX, the rest on the stack, callee-cleans); here they are
+//  plain free functions with the vector as the first argument, so they are
+//  [NOT byte-identical] but functionally equivalent.
+// ============================================================
+
+// sub_620120 (thiscall) -- destruct one 8-byte {obj, refblock} pair: release
+// the refblock (zero -> dtor + LHFree), then zero both words.
+static void *SehVecDestructElem(void *elem)
+{
+    DWORD *t = (DWORD *)elem;
+    DWORD rb = t[1];
+    if (rb != 0 && InterlockedDecrement((volatile LONG *)rb) == 0)
+    {
+        void **b = (void **)rb;
+        ((void (*)(void *))b[1])(b[2]);
+        LHFree((void *)rb);
+    }
+    t[0] = 0;
+    t[1] = 0;
+    return 0;
+}
+
+// sub_61E6A0 (thiscall) -- copy-assign the 8-byte pair `this = a2`, taking a
+// refblock reference (the shared-pair copy-assign).
+static void *SehVecCopyElem(void *elem, const void *a2)
+{
+    DWORD *t = (DWORD *)elem;
+    t[0] = *(DWORD *)a2;
+    t[1] = *(DWORD *)((char *)a2 + 4);
+    if (t[1] != 0)
+        InterlockedIncrement((volatile LONG *)t[1]);
+    return elem;
+}
+
+// sub_6223A0 (cdecl) -- copy the elements in [srcBegin, srcEnd) to dstBegin,
+// taking a refblock reference on each.  Returns the new dst end.
+static void *SehVecCopy(void *srcBegin, void *srcEnd, void *dstBegin)
+{
+    char *s = (char *)srcBegin, *e = (char *)srcEnd, *d = (char *)dstBegin;
+    if (s == e)
+        return dstBegin;
+    do
+    {
+        if (d != 0)
+        {
+            *(void **)d       = *(void **)s;
+            void *rb          = *(void **)(s + 4);
+            *(void **)(d + 4) = rb;
+            if (rb != 0)
+                InterlockedIncrement((volatile LONG *)rb);
+        }
+        s += 8;
+        d += 8;
+    } while (s != e);
+    return d;
+}
+
+// sub_622BB0 (cdecl) -- fill count 8-byte slots at dstBegin with the value
+// pair, taking a refblock reference on each.
+static void SehVecFill(void *dstBegin, int count, const void *value)
+{
+    char   *d      = (char *)dstBegin;
+    void   *vobj   = *(void **)value;
+    void   *vrb    = *(void **)((char *)value + 4);
+    for (int i = 0; i < count; ++i)
+    {
+        if (d != 0)
+        {
+            *(void **)d       = vobj;
+            *(void **)(d + 4) = vrb;
+            if (vrb != 0)
+                InterlockedIncrement((volatile LONG *)vrb);
+        }
+        d += 8;
+    }
+}
+
+// sub_623320 (stdcall) -- fill count slots, return the new dst end.
+static void * __stdcall SehVecFillRet(void *dstBegin, int count, const void *value)
+{
+    SehVecFill(dstBegin, count, value);
+    return (char *)dstBegin + 8 * count;
+}
+
+// sub_624910 (stdcall) -- copy [srcBegin, srcEnd) to dstBegin, return the new dst end.
+static void * __stdcall SehVecCopyRet(void *srcBegin, void *srcEnd, void *dstBegin)
+{
+    return SehVecCopy(srcBegin, srcEnd, dstBegin);
+}
+
+// sub_621970 (cdecl) -- assign the value pair over the [a1, a2) slots, first
+// releasing each old refblock that differs from the new one.
+static void SehVecAssignRange(void *a1, void *a2, const void *value)
+{
+    char  *s       = (char *)a1, *e = (char *)a2;
+    void  *newObj  = *(void **)value;
+    void  *newRb   = *(void **)((char *)value + 4);
+    while (s != e)
+    {
+        void *oldRb = *(void **)(s + 4);
+        if (oldRb != newRb)
+        {
+            if (oldRb != 0 && InterlockedDecrement((volatile LONG *)oldRb) == 0)
+            {
+                void **b = (void **)oldRb;
+                ((void (*)(void *))b[1])(b[2]);
+                LHFree(oldRb);
+            }
+            *(void **)s       = newObj;
+            *(void **)(s + 4) = newRb;
+            if (newRb != 0)
+                InterlockedIncrement((volatile LONG *)newRb);
+        }
+        s += 8;
+    }
+}
+
+// sub_61F580 (cdecl) -- allocate 8 * count bytes; throws stdext::bad_alloc when
+// the size overflows (0xFFFFFFFF / count < 8).  That path is unreachable here,
+// so the throw is emulated with a plain C++ throw.
+static void *SehVecAlloc(unsigned int count)
+{
+    if (count != 0 && 0xFFFFFFFFu / count < 8u)
+        throw 1;   // the original throws stdext::bad_alloc
+    return LHAlloc(8 * count);
+}
+
+// sub_624480 (thiscall) -- throw std::length_error("vector<T> too long").
+// Unreachable for a video vector this size; emulated with a plain C++ throw.
+static void SehVecThrowLengthError()
+{
+    throw 1;   // the original throws std::length_error("vector<T> too long")
+}
+
+// sub_624D60 (thiscall + retn 0x10) -- insert `count` copies of the `value`
+// 8-byte pair at byte position `position`, growing the allocation when needed.
+//   obj       = the 24-byte video vector
+//   position  = byte offset of the insertion point (== current for push_back)
+//   count     = number of elements to insert
+//   value     = pointer to the 8-byte {obj, refblock} pair to insert
+static void *SehVecInsert(void *obj, void *position, int count, void *value)
+{
+    DWORD *v       = (DWORD *)obj;
+    DWORD  begin   = v[3];
+    DWORD  current = v[4];
+    DWORD  capEnd  = v[5];
+    DWORD  capacity = (begin != 0) ? (capEnd - begin) / 8 : 0;
+
+    if (count == 0)
+        return obj;
+
+    DWORD n = (current - begin) / 8;
+    if (0x1FFFFFFFu - n < (DWORD)count)
+        SehVecThrowLengthError();
+    DWORD newCount = n + (DWORD)count;
+
+    DWORD local[2];   // the insert value; {value pointer, 0} until copied
+    local[0] = (DWORD)value;
+    local[1] = 0;
+
+    char *pos = (char *)position;
+    char *cur = (char *)current;
+
+    if (capacity >= newCount)
+    {
+        // In-place insert: shift [pos, cur) right by count*8 (taking a
+        // reference on the moved elements), fill the vacated [pos, pos+count*8)
+        // (and any slots past the old current) with the value, advance current.
+        // Unreachable for push_back (the grow path always reallocates).
+        SehVecCopyElem(local, value);
+        DWORD tail = (DWORD)(cur - pos) / 8;
+        SehVecCopyRet(pos, cur, pos + 8 * count);
+        SehVecAssignRange(pos, pos + 8 * count, local);
+        if ((DWORD)count > tail)
+            SehVecFill(cur, (int)((DWORD)count - tail), local);
+        v[4] = (DWORD)cur + 8 * count;
+        SehVecDestructElem(local);
+        return obj;
+    }
+
+    // Reallocation: grow by 1.5x (clamped to newCount, overflow -> bad_alloc),
+    // fill the value at the insertion point, move the prefix and suffix into the
+    // new storage, destroy + free the old storage, repoint the vector.
+    DWORD newCap;
+    if (0x1FFFFFFFu - capacity / 2 >= capacity)
+    {
+        DWORD grown = capacity / 2 + capacity;
+        newCap = (grown < newCount) ? newCount : grown;
+    }
+    else
+    {
+        newCap = newCount;
+    }
+    char *newBuf = (char *)SehVecAlloc(newCap);
+    if (newBuf == 0)
+        return obj;
+    DWORD posIndex = (DWORD)(pos - (char *)begin) / 8;
+    SehVecFill(newBuf + 8 * posIndex, count, value);
+    SehVecCopy((char *)begin, pos, newBuf);
+    SehVecCopy(pos, cur, newBuf + 8 * ((DWORD)count + posIndex));
+    if (begin != 0)
+    {
+        // destroy the old elements [begin, current): release each refblock
+        // (zero -> dtor + LHFree).  (The original does this via
+        // SehBlockArrayDtor; the memory is freed immediately after, so the
+        // element zeroing that helper also performs is omitted.)
+        for (char *i = (char *)begin; i != (char *)current; i += 8)
+        {
+            void *block = *(void **)(i + 4);
+            if (block != 0 && InterlockedDecrement((volatile LONG *)block) == 0)
+            {
+                void **b = (void **)block;
+                ((void (*)(void *))b[1])(b[2]);
+                LHFree(block);
+            }
+        }
+        LHFree((void *)begin);
+    }
+    v[3] = (DWORD)newBuf;
+    v[4] = (DWORD)newBuf + 8 * newCount;
+    v[5] = (DWORD)newBuf + 8 * newCap;
+    SehVecDestructElem(local);
+    return obj;
+}
+
+// sub_6213F0 (thiscall + retn 8) -- bounds-checked element access.  `obj` is
+// the {buffer, begin} pair (buffer = the self-ref wrapper, begin = the storage
+// base); the original bounds-checks begin + 8*index against [vector+12, +16]
+// (== [begin, current], reached through buffer[0] == &vector) and, on success,
+// writes {buffer, begin + 8*index} to `out` and returns it.
+static void *SehVecAt(void *obj, void **out, int index)
+{
+    DWORD *pair = (DWORD *)obj;
+    DWORD  buffer = pair[0];
+    if (buffer == 0)
+        return 0;   // the original's __invalid_parameter_noinfo (unreachable)
+    DWORD vec      = *(DWORD *)buffer;
+    DWORD indexPos = pair[1] + 8 * (DWORD)index;
+    if (indexPos < vec + 12 || indexPos > vec + 16)
+        return 0;   // the original's __invalid_parameter_noinfo (out of range)
+    out[0] = (void *)buffer;
+    out[1] = (void *)indexPos;
+    return out;
+}
+
+// sub_625600 (thiscall + retn 0x10) -- the push_back grow path: insert one
+// element at `current` (growing), then return the iterator to it.  The original
+// also validates (current-begin) alignment / ordering; those pass here.
+static void *SehVecPushBackGrow(void *obj, void **out, void *value)
+{
+    DWORD *v = (DWORD *)obj;
+    int index = ((DWORD)v[4] - (DWORD)v[3]) / 8;   // the new element's index
+    out[0] = 0;
+    SehVecInsert(obj, (void *)v[4], 1, value);    // insert at current (grow)
+    void *pair[2];
+    pair[0] = (void *)v[0];   // buffer (self-ref wrapper)
+    pair[1] = (void *)v[3];   // begin (re-read after the grow)
+    return SehVecAt(pair, out, index);
+}
+
+// sub_625E20 (thiscall + retn 4) -- push_back: append the 8-byte {obj, refblock}
+// pair to the video vector, taking a refblock reference.  When the vector is not
+// full the element is written in place; otherwise the grow path reallocates.
+static void SehVecPushBack(void *obj, void *elem)
+{
+    DWORD *v = (DWORD *)obj;
+    DWORD  begin    = v[3];
+    DWORD  capacity = (begin != 0) ? (v[5] - begin) / 8 : 0;
+    DWORD  n        = (v[4] - begin) / 8;
+    if (n >= capacity)
+    {
+        void *dummy[2];   // the grow path's caller-side iterator out-buffer
+        SehVecPushBackGrow(obj, (void **)dummy, elem);
+        return;
+    }
+    DWORD current = v[4];
+    if (current != 0)
+    {
+        *(DWORD *)current       = *(DWORD *)elem;
+        DWORD rb                = *(DWORD *)((char *)elem + 4);
+        *(DWORD *)(current + 4) = rb;
+        if (rb != 0)
+            InterlockedIncrement((volatile LONG *)rb);
+    }
+    v[4] = current + 8;
+}
 
 //  ReleaseVideoFile  (0x61E230 - 0x61E241)  -- the 16-byte video
 //  (CLegacyMemoryFile) wrapper dtor: run the object's vtable slot 0
@@ -4920,21 +6191,21 @@ static int ReleaseVideoFile(void *obj)
 }
 
 //  MountVideoFile  (0x61BFE0 - 0x61C079)  -- mount a video by shared-slot
-//  file id: build the 16-byte CLegacyMemoryFile (sub_17FE8B0 [remaining
-//  stub] over the id with the 1 / 2 flags), wrap it in the 12-byte
+//  file id: build the 16-byte CLegacyMemoryFile (CLegacyMemoryFileCtor
+//  over the path slot with the 1 / 2 flags), wrap it in the 12-byte
 //  { refcount, dtor = ReleaseVideoFile, obj } block, append the value to
-//  the +0x30 sub-object's node list (sub_625E20 [remaining stub]), then
-//  drop the local wrapper reference (the InterlockedDecrement-to-zero ->
-//  dtor -> LHFree idiom).  The original is thiscall + retn 4 (the owner in
-//  ECX, the file id on the stack); here a plain free function.  [NOT
-//  byte-identical] placement-dependent (the E8 calls above) and refs the
+//  the +0x30 video vector (SehVecPushBack), then drop the local wrapper
+//  reference (the InterlockedDecrement-to-zero -> dtor -> LHFree idiom).
+//  The original is thiscall + retn 4 (the owner in ECX, the file id on the
+//  stack); here a plain free function.  [NOT byte-identical]
+//  placement-dependent (the E8 calls above) and refs the
 //  InterlockedDecrement IAT slot at its original high VA.
-static int MountVideoFile(void *obj, int slotId)
+static int MountVideoFile(void *obj, F3SharedBuffer **slotId)
 {
     void *video = 0;
     void *buf = LHAlloc(16);
     if (buf != 0)
-        video = (void *)sub_17FE8B0(buf, slotId, 1, 2);
+        video = (void *)CLegacyMemoryFileCtor(buf, slotId, 1, 2);
     void *value   = video;
     void *wrapper = 0;
     if (video != 0)
@@ -4948,7 +6219,7 @@ static int MountVideoFile(void *obj, int slotId)
             wrapper = w;
         }
     }
-    sub_625E20((char *)obj + 0x30, &value);
+    SehVecPushBack((char *)obj + 0x30, &value);
     int result = 0;
     if (wrapper != 0)
     {
@@ -5181,7 +6452,8 @@ static int RegisterBankContainer(int impl)
 static void sub_61B860(void *obj) { (void)obj; }
 
 // sub_1926050 (0x1926050 - 0x1926119) -- open the "particle_bank.bnk" path
-// as a data-stream file (the shared-slot open sub_17FE8B0, the 0x8000-byte
+// as a data-stream file (the shared-slot open CLegacyMemoryFileCtor,
+// sub_17FE8B0, the 0x8000-byte
 // read-buffer ctor sub_1892420, the NFile::CFileDataInputStream / NTools
 // ctor chain).  Deep dependency chain -- out of scope.  Stub.  The caller
 // discards the return value.  [remaining stub]
@@ -5269,7 +6541,7 @@ static void MountPermanentBanks(void *p)
     CsGuardAcquire(&guard2, &obj->cs2, 0);
     {
         F3SharedBuffer *slot = 0;
-        int fileId = (int)SetSharedSlot(&slot, "data\\art\\videos\\lionhead_logo.bik", -1);
+        F3SharedBuffer **fileId = SetSharedSlot(&slot, "data\\art\\videos\\lionhead_logo.bik", -1);
         MountVideoFile(obj, fileId);
         ReleaseSharedSlot(&slot);
     }
@@ -9248,10 +10520,6 @@ static void *sub_712430(void *obj)
 static void  nullsub_29(void) {}
 static void  sub_18FB930(void) {}
 
-// F3_VT(OBJ): read OBJ's vtable (the first word) as a void ** so its slots
-// can be indexed. (OBJ is a class instance pointer.)
-#define F3_VT(OBJ) ((void **)(*(void **)(OBJ)))
-
 // The 36-byte F3WString wide-path struct now lives in gamemain.h (it is
 // shared with the CLuaManager serialise-script path in engine/luavm.cpp).
 
@@ -10681,7 +11949,8 @@ static int PublishDataObject1(void *obj) { (void)obj; return 0; }
 static int PublishDataObject2(void *obj) { (void)obj; return 0; }
 
 // sub_17FD600: resolve the slot's path ("data\\") into the global data path
-// (dword_1E2D7C4) via sub_1A01BE0.
+// (dword_1E2D7C4) via DetachToLowerSharedSlot (sub_1A01BE0, implemented
+// above in the CLegacyMemoryFile section).
 static long ResolveDataPathSlot(F3SharedBuffer **slot) { (void)slot; return 0; }
 
 // sub_17FD6A0: resolve the "data\\" shared slot into the object's wide path
@@ -11392,7 +12661,7 @@ signedIn:
         sub_18F0180();
         sub_72FAE0((void *)dw[0x9C / 4]);
 
-        int fileId = (int)SetSharedSlot(&v160slot, "data\\art\\videos\\microsoft_logo.bik", -1);
+        F3SharedBuffer **fileId = SetSharedSlot(&v160slot, "data\\art\\videos\\microsoft_logo.bik", -1);
         MountVideoFile(obj, fileId);
         ReleaseSharedSlot(&v160slot);
         sub_61A5E0(obj);

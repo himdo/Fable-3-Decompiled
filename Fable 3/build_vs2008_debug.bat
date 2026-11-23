@@ -98,7 +98,7 @@ pushd "%OUTREL%" || exit /b 1
 :: Add a new module by listing its .cpp in SRCS (paths are relative to the
 :: project root; each .obj is produced in the Debug/Win32 output dir and
 :: then linked below by name).
-set "SRCS=..\..\main.cpp ..\..\framework\framework.cpp ..\..\common\common.cpp ..\..\engine\engine.cpp ..\..\engine\worker.cpp ..\..\engine\manager.cpp ..\..\engine\object_registry.cpp ..\..\engine\xlo_device.cpp ..\..\engine\gameengine.cpp ..\..\engine\gamethread.cpp ..\..\engine\gamemain.cpp ..\..\engine\luavm.cpp ..\..\engine\XLip.cpp ..\..\engine\netinit.cpp ..\..\engine\thread.cpp ..\..\engine\banktree.cpp ..\..\engine\namemap.cpp ..\..\save\save.cpp"
+set "SRCS=..\..\main.cpp ..\..\framework\framework.cpp ..\..\common\common.cpp ..\..\engine\engine.cpp ..\..\engine\worker.cpp ..\..\engine\manager.cpp ..\..\engine\object_registry.cpp ..\..\engine\xlo_device.cpp ..\..\engine\gameengine.cpp ..\..\engine\gamethread.cpp ..\..\engine\gamemain.cpp ..\..\engine\luavm.cpp ..\..\engine\XLip.cpp ..\..\engine\netinit.cpp ..\..\engine\thread.cpp ..\..\engine\banktree.cpp ..\..\engine\namemap.cpp ..\..\engine\subnode.cpp ..\..\save\save.cpp"
 
 for %%F in (%SRCS%) do (
     echo.

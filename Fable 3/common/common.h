@@ -98,6 +98,13 @@ extern F3SharedBuffer *g_slot_1DBD048;
 // The matching destructor is ReleaseSharedSlot (0x1A01320).
 F3SharedBuffer ** InitSharedSlot(F3SharedBuffer **obj);
 
+// InitSharedSlotWide (0x19FF580) - the null constructor of the WIDE (WCHAR)
+// shared-slot family (the wide counterpart to InitSharedSlot, 0x1A00C30).
+// Nulls the slot and registers it in the wide live-slot counter
+// (g_WideSlotCount, 0x02075C4C). Matching destructor: ReleaseSharedSlotWide
+// (0x19FFA70). Same thiscall convention as InitSharedSlot.
+F3SharedBuffer ** InitSharedSlotWide(F3SharedBuffer **obj);
+
 // ReleaseSharedSlot (0x1A01320) - the shared-slot destructor (counterpart to
 // InitSharedSlot). Decrements the control block's refcount, frees the block
 // via SharedBufferFree on zero, nulls the slot, and drops the global

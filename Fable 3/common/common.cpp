@@ -304,6 +304,29 @@ F3SharedBuffer ** InitSharedSlot(F3SharedBuffer **obj)
 }
 
 // ============================================================
+//  InitSharedSlotWide  (0x19FF580 - 0x19FF598)  -- the wide null-ctor
+//  [NOT byte-identical] placement-independent (no relative calls / long
+//  jumps), but refs the high-VA wide live-slot counter g_WideSlotCount
+//  (0x02075C4C) and the InterlockedIncrement IAT slot at original high
+//  VAs not present in this build.
+//
+//  F3SharedBuffer ** __thiscall InitSharedSlotWide(F3SharedBuffer **obj)
+//
+//  The null constructor of the WIDE (WCHAR) shared-slot family (the wide
+//  counterpart to InitSharedSlot, 0x1A00C30): null the slot and register it
+//  in the wide live-slot counter (g_WideSlotCount). Its matching destructor
+//  is ReleaseSharedSlotWide (0x19FFA70). __thiscall in the original (the slot
+//  in ECX, plain retn); declared as a plain free function per the project
+//  convention.
+// ============================================================
+F3SharedBuffer ** InitSharedSlotWide(F3SharedBuffer **obj)
+{
+    *obj = 0;
+    InterlockedIncrement(&g_WideSlotCount);
+    return obj;
+}
+
+// ============================================================
 //  RefSharedSlot  (0x1A012C0 - 0x1A012F5)  -- the ANSI shared-slot copy ctor
 //  [NOT byte-identical] placement-dependent (relative calls to the
 //  InterlockedIncrement / InterlockedDecrement IAT slots and to
