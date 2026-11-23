@@ -11,7 +11,10 @@
 #include "gamemain.h"
 #include "luavm.h"                // ReinitEngineLua (the engine Lua env rebuild)
 #include "xlip.h"                 // F3AString + the XLip module (engine/xlip.h)
+#include "banktree.h"             // BankTreeEraseRange (the bank-tree range erase)
+#include "namemap.h"              // NameMapEraseRange (the +0x94 name-map range erase)
 #include "common/common.h"        // LHAlloc / LHFree / InitSharedSlot / ReleaseSharedSlot
+#include "engine/engine.h"        // SetThreadName (the thread-name announce)
 #include "gameengine.h"           // GetGameEngine (sub_619A90)
 #include "manager.h"              // GetManager
 #include "netinit.h"              // InitNetworking
@@ -27,7 +30,8 @@
 #include <string.h>
 #include <setjmp.h>               // longjmp / jmp_buf (the VM-heap OOM expand)
 #include <wctype.h>               // iswspace (the XLipCultures line trim)
-#include <mbstring.h>             // _mbscmp
+#include <mbstring.h>             // _mbscmp / _mbsicmp
+#include <stdlib.h>               // _atoi64 (the int64 value reader)
 #include <math.h>                 // fabsf
 #include <float.h>                // _controlfp (the FPU round-toward-zero in KoreHeapInitGrow)
 #include <intrin.h>               // __rdtsc (the QPC span accounting in KoreHeapInitGrow)
@@ -522,6 +526,14 @@ static char XmlReadBoolAttr(F3XmlStream *obj, void *name, BYTE *out);
 // sub_17DBE60 (defined below): the real vtable[8] slot (read the current
 // element's value as an int64/hex word into *out)
 static void XmlReadAttrValue64(F3XmlStream *obj, DWORD *out);
+// sub_17DC4B0 (defined below): the real vtable[11] slot (intern the
+// current element's named attribute value and hand back its handle)
+static char XmlReadAttrInterned(F3XmlStream *obj, const char *name, DWORD *outHandle);
+// sub_17E6EF0 (defined below): find the named attribute's value string on a
+// node (the attribute list at node+0x20)
+static const char *XmlFindAttrValue(DWORD *node, const char *name);
+// sub_17E4D10 (defined below): intern an XML string in the global table
+static DWORD InternXmlString(const char *src);
 
 // ============================================================
 //  LHXML report handler (off_1D94CA0)
@@ -618,6 +630,8 @@ static void CXMLReadStreamCtor(F3XmlStream *obj)
         g_CXMLReadStreamVtable[8] = (void *)XmlReadAttrValue64;   // vt[8]
     if (g_CXMLReadStreamVtable[10] == 0)
         g_CXMLReadStreamVtable[10] = (void *)XmlReadBoolAttr;     // vt[10]
+    if (g_CXMLReadStreamVtable[11] == 0)
+        g_CXMLReadStreamVtable[11] = (void *)XmlReadAttrInterned; // vt[11]
 }
 
 // sub_17DBD00 (0x17DBD00 - 0x17DBDB8): open + parse the XML file into the stream
@@ -709,33 +723,287 @@ static char XmlCheckRootSection(F3XmlStream *obj, const char *name)
 }
 
 // sub_17DC3A0 (0x17DC3A0 - 0x17DC3B0): advance the stream to the next sibling
-// element (vtable[3]). [remaining stub] no element is ever current in this
-// build, so it is a no-op (returns 0).
-static int XmlAdvance(F3XmlStream *obj)
+// element (vtable[3]).
+//  [BYTE-IDENTICAL] __thiscall (the stream in ECX, plain `retn`); the body is
+//  pure pointer arithmetic (no calls / long jumps / high-VA refs), so it is
+//  emitted as naked asm matching the original 16 bytes exactly. It loads the
+//  current node (obj->section, +0x0C), stores the node's +0x04 field into
+//  obj->sectionInfo (+0x10), moves obj->section to the node's +0x10 field, and
+//  returns that value. Dispatched as a __thiscall function (the nextSibling
+//  member of F3CXMLReadStreamVT and the thiscall casts at the vtable[3] /
+//  direct-call sites); the plain declaration below only carries the signature.
+//  No element is ever current in this build (the LHXML parse is a remaining
+//  stub), so it is never actually reached here.
+__declspec(naked) int XmlAdvance(F3XmlStream *obj)
 {
-    (void)obj;
-    return 0;
+    __asm
+    {
+        mov     eax, [ecx+0Ch]   ; eax = obj->section (the current node)
+        mov     edx, [eax+4]     ; edx = node->+0x04
+        mov     [ecx+10h], edx   ; obj->sectionInfo = node->+0x04
+        mov     eax, [eax+10h]   ; eax = node->+0x10
+        mov     [ecx+0Ch], eax   ; obj->section = node->+0x10
+        ret                      ; return node->+0x10
+    }
 }
 
 // sub_17DC470 (0x17DC470 - 0x17DC4A8): read the named boolean attribute of
 // the current element into *out (1 when the value is "true") (vtable[10]).
-// [remaining stub] no element is ever current in this build, so it returns 0
-// (leaving *out as is; the caller defaults the attribute to true).
+// [NOT byte-identical] placement-dependent (relative calls to
+// XmlFindAttrValue and the __mbsicmp IAT slot) and refs the high-VA "true"
+// rdata string (0x01BE6254) at its original address. Thiscall + retn 8 in
+// the original (the stream in ECX, name + out on the stack), declared as a
+// plain C function here (the stream first). Works on the current element
+// (obj->section): look up the named attribute's value string through
+// XmlFindAttrValue, compare it case-insensitively to "true" (_mbsicmp), and
+// write 1 / 0 to *out. Returns 1 when the attribute is present, 0 when no
+// element is current or the attribute is absent (leaving *out as is; the
+// caller defaults the attribute to true). No element is ever current in this
+// build (the LHXML parse is a remaining stub), so it returns 0 here, as the
+// original does.
 static char XmlReadBoolAttr(F3XmlStream *obj, void *name, BYTE *out)
 {
-    (void)obj; (void)name; (void)out;
-    return 0;
+    DWORD section = obj->section;
+    if (section == 0)
+        return 0;
+    const char *value = XmlFindAttrValue((DWORD *)section, (const char *)name);
+    if (value == 0)
+        return 0;
+    *out = (_mbsicmp((const unsigned char *)value, (const unsigned char *)"true") == 0);
+    return 1;
 }
 
-// sub_17DBE60 (0x17DBE60 - 0x17DBEB0): read the current element's value as an
-// int64 word (vtable[8]). The original resolves the current node's value
-// string, converts it (decimal, or 0x-prefixed hex via sub_17DBA90) and
-// stores the result in *out. [remaining stub] no element is ever current in
-// this build (the LHXML parse is a remaining stub), so the reader never runs
-// and *out is left as is.
+// ============================================================
+//  int64 value reader (vtable[8] = XmlReadAttrValue64)
+//
+//  The value reader works on the current element (obj->section): it
+//  resolves the element's "type" attribute (vtable[11] =
+//  XmlReadAttrInterned -> XmlFindAttrValue over the node's attribute list,
+//  interned through InternXmlString) into the 8-entry value-type index
+//  (invalid/int/uint/float/string/bool/double/unknown), copies the
+//  element's value string into the thread-shared scratch buffer (the
+//  stru_1E2D778 critical section guards the dword_1E2D790 buffer, sized
+//  through the g_dword_1E2D7A0 pool counter on the LH game heap), trims
+//  the surrounding whitespace / quotes, and converts it to an int64
+//  (decimal via _atoi64, or 0x-prefixed hex via XmlParseHex64). The low
+//  32 bits are stored in *out. [NOT byte-identical] placement-dependent
+//  (relative calls down the chain). In this build the LHXML parse is a
+//  remaining stub, so no element is ever current (obj->section == 0) and
+//  the value string is always "" -> *out = 0, exactly the original's
+//  behavior here.
+// ============================================================
+
+// 0x1E2D778: the scratch-buffer lock (a CRITICAL_SECTION; ends at 0x1E2D790).
+static CRITICAL_SECTION g_stru_1E2D778 = { 0 };
+// 0x1E2D790 / 0x1E2D794: the thread-shared value scratch buffer + capacity.
+static DWORD g_dword_1E2D790 = 0;
+static DWORD g_dword_1E2D794 = 0;
+// 0x1E2D798 / 0x1E2D799: the in-use / lock-initialized flag bytes.
+static BYTE g_byte_1E2D798 = 0;
+static BYTE g_byte_1E2D799 = 0;
+// 0x1D816A0: the LHXML log/report object base (0x212E240 in the original);
+// the hex-conversion error prints to the FILE embedded in the object at
+// +0x40 (0x1D816E0).
+static DWORD g_dword_1D816A0 = 0;
+static FILE  g_file_1D816E0;
+
+// sub_17E6340 (0x17E6340 - 0x17E636D): lazily initialize + enter the lock
+static void XmlScratchLockEnter(void)
+{
+    if (g_byte_1E2D799 == 0)
+    {
+        InitializeCriticalSection(&g_stru_1E2D778);
+        g_byte_1E2D799 = 1;
+    }
+    EnterCriticalSection(&g_stru_1E2D778);
+}
+
+// sub_17E6370 (0x17E6370 - 0x17E6383): leave the lock
+static void XmlScratchLockLeave(void)
+{
+    g_byte_1E2D798 = 0;
+    LeaveCriticalSection(&g_stru_1E2D778);
+}
+
+// sub_17E63A0 (0x17E63A0 - 0x17E63A6): the current scratch buffer
+static DWORD XmlScratchGet(void)
+{
+    return g_dword_1E2D790;
+}
+
+// sub_17E6430 (0x17E6430 - 0x17E6473): grow the scratch buffer to size
+// bytes (LHAlloc / LHFree through the pool counter) and return it
+static DWORD XmlScratchEnsure(unsigned int size)
+{
+    DWORD buf = g_dword_1E2D790;
+    if (buf != 0)
+    {
+        if (g_dword_1E2D794 >= size)
+            return buf;
+        LHFree((void *)buf);
+        g_dword_1E2D7A0--;
+    }
+    g_dword_1E2D7A0++;
+    buf = (DWORD)LHAlloc(size);
+    g_dword_1E2D790 = buf;
+    g_dword_1E2D794 = size;
+    return buf;
+}
+
+// sub_17E7450 (0x17E7450 - 0x17E7488): the 8-entry value-type table
+// (off_1BC5C68) -> index (case-insensitive; 7 = "unknown" on a miss)
+static const char *g_xmlValueTypes[8] =
+{
+    "invalid", "int", "uint", "float", "string", "bool", "double", "unknown"
+};
+static int XmlValueTypeNameIndex(const char *name)
+{
+    for (int i = 0; i < 8; ++i)
+    {
+        if (_mbsicmp((const unsigned char *)name,
+                     (const unsigned char *)g_xmlValueTypes[i]) == 0)
+            return i;
+    }
+    return 7;
+}
+
+// sub_17DBBB0 (0x17DBBB0 - 0x17DBC35): trim the value string in place
+// (surrounding whitespace, one pair of enclosing quotes); returns the
+// last significant character (0 for the empty string)
+static char *XmlTrimValueString(char *str)
+{
+    unsigned int len = (unsigned int)strlen(str);
+    if (len == 0)
+        return 0;
+    char *first = str;
+    while (*first == ' ' || *first == '\t' || *first == '\n' || *first == '\r')
+        ++first;
+    if (*first == '"')
+        ++first;
+    char *last = str + len - 1;
+    while (last > first
+           && (*last == ' ' || *last == '\t' || *last == '\n' || *last == '\r'))
+        --last;
+    if (*last == '"')
+        --last;
+    if (first == str)
+    {
+        *(last + 1) = 0;
+    }
+    else
+    {
+        char *dst = str;
+        while (first <= last)
+            *dst++ = *first++;
+        *dst = 0;
+    }
+    return last;
+}
+
+// sub_17E4250 (0x17E4250 - 0x17E42B6): parse the hex digit string into
+// *out (shift-or); 1 on success, 0 on a bad digit
+static char XmlParseHex64(const char *str, __int64 *out)
+{
+    __int64 value = 0;
+    *out = 0;
+    for (const char *p = str; *p != 0; ++p)
+    {
+        char c = *p;
+        int digit;
+        if (c >= 'a' && c <= 'f')       digit = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F')  digit = c - 'A' + 10;
+        else if (c >= '0' && c <= '9')  digit = c - '0';
+        else return 0;
+        value = (value << 4) | digit;
+    }
+    *out = value;
+    return 1;
+}
+
+// sub_17DBA90 (0x17DBA90 - 0x17DBAE5): convert the value string to an
+// int64 (decimal via _atoi64, or 0x-prefixed hex; a hex parse failure
+// reports through the log object's FILE at 0x1D816E0)
+static __int64 XmlConvertValueToInt64(const char *str)
+{
+    if (str[0] == '0' && str[1] == 'x')
+    {
+        __int64 value = 0;
+        if (XmlParseHex64(str + 2, &value) == 0)
+            fprintf(&g_file_1D816E0, "unable to convert hex value %s\n", str);
+        return value;
+    }
+    return _atoi64(str);
+}
+
+// sub_17E6EF0 (0x17E6EF0 - 0x17E6F31): find the named attribute of the
+// node (the attribute list at node+0x20: +0x04 next, +0x08 name handle,
+// +0x0C value handle) and return the resolved value string
+static const char *XmlFindAttrValue(DWORD *node, const char *name)
+{
+    DWORD *attr = (DWORD *)node[8];
+    if (attr == 0)
+        return 0;
+    for (;;)
+    {
+        const char *attrName = ResolveXmlString((DWORD *)(attr + 2));
+        if (_mbscmp((const unsigned char *)attrName,
+                    (const unsigned char *)name) == 0)
+            return ResolveXmlString((DWORD *)(attr + 3));
+        attr = (DWORD *)attr[1];
+        if (attr == 0)
+            return 0;
+    }
+}
+
+// sub_17DC4B0 (0x17DC4B0 - 0x17DC4E3): read the current element's named
+// attribute value, interned (vtable[11]); 1 on success, 0 when no element
+// is current or the attribute is absent
+static char XmlReadAttrInterned(F3XmlStream *obj, const char *name, DWORD *outHandle)
+{
+    DWORD node = obj->section;
+    if (node == 0)
+        return 0;
+    const char *value = XmlFindAttrValue((DWORD *)node, name);
+    if (value == 0)
+        return 0;
+    *outHandle = InternXmlString(value);
+    return 1;
+}
+
+// sub_17DBC50 (0x17DBC50 - 0x17DBCE4): read the current element's value:
+// resolve the element's "type" attribute to the value-type index in
+// *typeOut, then copy the element's value string (node+0x0C handle) into
+// the scratch buffer, trimmed. ctx is the caller's stack scope marker
+// (unused; forwarded as ECX in the original). Returns the trim result.
+static char *XmlReadElementValue(F3XmlStream *obj, void *ctx, int *typeOut)
+{
+    (void)ctx;
+    InternXmlString("");                    // byte_1BCE523: the empty string
+    DWORD handle = 0;
+    void **vt = (void **)obj->vtable;
+    ((char (*)(F3XmlStream *, const char *, DWORD *))vt[11])(obj, "type", &handle);
+    *typeOut = XmlValueTypeNameIndex(ResolveXmlString((DWORD *)handle));
+    const char *value = ResolveXmlString((DWORD *)obj->section + 3);
+    unsigned int size = (unsigned int)strlen(value) + 1;
+    XmlScratchEnsure(size);
+    char *buf = (char *)XmlScratchGet();
+    strcpy_s(buf, size, value);
+    return XmlTrimValueString(buf);
+}
+
+// sub_17DBE60 (0x17DBE60 - 0x17DBEA8): read the current element's value as an
+// int64 word (vtable[8]). [NOT byte-identical] placement-dependent (relative
+// calls to the lock / value reader / converter). See the header above for the
+// behavior; no element is ever current in this build, so *out = 0.
 static void XmlReadAttrValue64(F3XmlStream *obj, DWORD *out)
 {
-    (void)obj; (void)out;
+    char  ctx = 0;            // the original's v5 scope marker
+    int   typeIndex = 0;      // the original's v6 (the value-type index)
+    XmlScratchLockEnter();
+    XmlReadElementValue(obj, &ctx, &typeIndex);
+    __int64 value = XmlConvertValueToInt64((const char *)XmlScratchGet());
+    *out = (DWORD)value;
+    XmlScratchLockLeave();
 }
 
 // sub_17DC2B0 + sub_17DAA20 (0x17DC2B0 - 0x17DC2DA): the CXMLReadStream dtor
@@ -1245,7 +1513,7 @@ typedef struct F3CXMLReadStreamVT
     void *                                    vt0;
     char (*enterElement)(void *stream, const char *name);  // +0x04
     void *                                    vt2;
-    void (*nextSibling)(void *stream);                      // +0x0C
+    void (__thiscall *nextSibling)(void *stream);           // +0x0C (thiscall, stream in ECX)
     void (*readPath)(void *stream, void *out);              // +0x10
     void (*readBool)(void *stream, BYTE *out);              // +0x14
     void *                                    vt6;
@@ -2072,7 +2340,7 @@ static DWORD ReadXmlNamedValue(F3SharedBuffer **nameSlot, F3XmlStream *stream,
     if (((char (*)(F3XmlStream *, const char *))vt[1])(stream, name) != 0)
     {
         ((void (*)(F3XmlStream *, DWORD *))vt[8])(stream, out);
-        return (DWORD)((DWORD (*)(F3XmlStream *))vt[3])(stream);
+        return (DWORD)((int(__thiscall *)(F3XmlStream *))vt[3])(stream);
     }
     return 0;
 }
@@ -2153,7 +2421,7 @@ LONG InitAccessibilitySettings(void)
                 g_dword_1D9E198 = value;
                 ReadXmlNamedValue(&g_dword_20FC8E4, &stream, (DWORD *)&value);
                 g_dword_1D9E1A0 = value;
-                XmlAdvance(&stream);
+                ((int(__thiscall *)(F3XmlStream *))XmlAdvance)(&stream);
             }
         }
 
@@ -2810,6 +3078,15 @@ static BYTE  g_byte_211C402  = 0;
 static void *g_dword_2075F54 = 0;
 // 0x2075F4D: entity-sync flag (cleared on reset).
 static BYTE  g_byte_2075F4D  = 0;
+// 0x1DB4B58: the type-1 graphics-entity value table (indexed by the
+// descriptor's +0x14 id; a slot whose value changes notifies the device via
+// vtable[57], offset 0xE4).  Sized past the largest id (195) the pool builder
+// writes.
+static DWORD g_dword_1DB4B58[0x200] = {0};
+// 0x1DB4F58: the type-2 graphics-entity value table (indexed 16*slot + code;
+// a changed slot notifies the device via vtable[69], offset 0x114).  Sized
+// past the largest reachable index (16*260 + 11) the pool builder writes.
+static DWORD g_dword_1DB4F58[0x1400] = {0};
 
 // A 32-byte CSurface record / frame-local wrapper: {vtable, surface, type,
 // fmtInfo[5]}.  RefreshCsurfaceSlot (0x18D36C0) / sub_1A046D0 refresh a
@@ -3716,9 +3993,10 @@ static F3CsurfaceSlot *sub_1A046D0(F3CsurfaceSlot *slot, const F3CsurfaceSlot *s
 // by the caller.
 //
 // The remaining graphics-entity callees: RegisterGraphicsEntities
-// (0x18D04D0, the dirty registration) is implemented below, and sub_18D02E0
-// is the tail-called sync step whose one unconditional side effect (clearing
-// the dirty-registration counter) is modelled.
+// (0x18D04D0, the dirty registration) and SyncGraphicsEntities
+// (sub_18D02E0, the tail-called sync step that commits the descriptor values
+// to the device tables, calls SetGraphicsProperty (sub_5A3080) for type-2
+// entities and clears the dirty-registration counter) are implemented below.
 // Non-zero pool field writes (offset from pool base, size, value).
 // The pool is zeroed by ResetGraphicsEntities before the builder runs,
 // so only the non-zero writes are listed.  Sizes: 4 = dword, 2 = word,
@@ -4057,14 +4335,115 @@ static int RegisterGraphicsEntities(void)
 
     return 0;   // original returns the last descriptor's object base (ignored)
 }
-static int sub_18D02E0(void) { g_dword_2073938 = 0; return 0; }  // sync/commit the entities to the device
+// ============================================================
+//  SetGraphicsProperty  (sub_5A3080, 0x5A3080 - 0x5A30C6)  -- record a
+//  type-2 frontend graphics-entity property value in the per-(slot,code)
+//  value table and, on change, notify the device.
+//  [NOT byte-identical] refs the high-VA globals device object
+//  (dword_2075F54) and the value table (dword_1DB4F58) at their original
+//  addresses, and null-guards the device vtable dereference (the original
+//  faults on an unbound device).
+//
+//  int SetGraphicsProperty(int value, unsigned int slot, int code)
+//
+//  slot is the entity id (a full WORD; a value >= 0x101 wraps by -241 for the
+//  table write, matching the device-slot tables in worker.cpp), code is the
+//  sub-field index.  Behavior:
+//    1. If the compare slot table[16*slot + code] already equals value,
+//       return 0.
+//    2. Else write table[16*slot' + code] = value (slot' = slot if slot <
+//       0x101 else slot - 241) and return the device's property setter, device
+//       vtable slot 69 (offset 0x114): vt[69](device, slot, code, value) with
+//       the device object as the first stack argument.
+//
+//  Called from the type-2 branch of SyncGraphicsEntities below (and, in the
+//  original, from the sibling committers sub_18D0360 / sub_18D03E0).  Returns
+//  the device-method result (ignored by the caller here).
+// ============================================================
+static int SetGraphicsProperty(int value, unsigned int slot, int code)
+{
+    void *dev = g_dword_2075F54;
+    unsigned int cmpIdx = 16u * slot + (unsigned)code;
+    if (g_dword_1DB4F58[cmpIdx] == (DWORD)value)
+        return 0;
+    unsigned int writeSlot = (slot >= 0x101) ? (slot - 241) : slot;
+    g_dword_1DB4F58[16u * writeSlot + (unsigned)code] = (DWORD)value;
+    int result = 0;
+    if (dev != 0)   // null-guard; the original would fault pre-device
+        result = ((int (*)(void *, unsigned int, int, int))
+            (*(void ***)dev)[69])(dev, slot, code, value);
+    return result;
+}
+
+// ============================================================
+//  SyncGraphicsEntities  (sub_18D02E0, 0x18D02E0 - 0x18D0357)  -- commit
+//  every frontend graphics-entity descriptor's value to its device table and
+//  notify the device of any change.
+//  [NOT byte-identical] refs the high-VA globals the entity index list
+//  (dword_2073138), the pool count (dword_2063134), the device object
+//  (dword_2075F54), the type-1 value table (dword_1DB4B58) and the
+//  dirty-registration counter (dword_2073938) at their original addresses,
+//  makes a relative call to SetGraphicsProperty (sub_5A3080), and
+//  null-guards the device vtable dereference (the original faults on an
+//  unbound device).
+//
+//  int SyncGraphicsEntities(void)
+//
+//  The index list (dword_2073138 == g_dword_2073134 + 1) is 0-indexed in the
+//  original, so entity k sits at g_dword_2073134[k + 1]; iterate k = 0..
+//  count-1.  For each entity, keyed by the descriptor's type byte (+0x0E):
+//    - type 1: if the type-1 table slot (+0x14) differs from the descriptor
+//      value (+0x04), write it and notify the device, device vtable slot 57
+//      (offset 0xE4): vt[57](device, index, value).
+//    - type 2: record the value through SetGraphicsProperty (the per- (slot,
+//      code) table + device vtable slot 69).
+//    In every case clear the descriptor's dirty byte (+0x18) and copy the
+//    value (+0x04) into the applied-value slot (+0x00).  Finally clear the
+//    dirty-registration counter (dword_2073938).
+//
+//  Tail-called / called from ResetGraphicsEntities (0x18D1960) and, in the
+//  original, sub_19CE6E0 (end) and sub_19D8510 (per-frame commit).  Returns a
+//  value the callers ignore (the original returns a leftover loop EAX), so 0.
+//  Replaces the sub_18D02E0 no-op stub that only cleared the counter.
+// ============================================================
+static int SyncGraphicsEntities(void)
+{
+    DWORD count = g_dword_2063134;
+    DWORD i;
+    for (i = 1; i <= count; i++)
+    {
+        BYTE  *d     = (BYTE *)g_dword_2073134[i];
+        int    type  = d[0x0E];
+        DWORD  value = *(DWORD *)(d + 0x04);
+        DWORD  index = *(DWORD *)(d + 0x14);
+        d[0x18] = 0;
+        if (type == 1)
+        {
+            if (g_dword_1DB4B58[index] != value)
+            {
+                g_dword_1DB4B58[index] = value;
+                if (g_dword_2075F54 != 0)   // null-guard; fault pre-device
+                    ((void (*)(void *, DWORD, DWORD))
+                        (*(void ***)g_dword_2075F54)[57])(g_dword_2075F54, index, value);
+            }
+        }
+        else if (type == 2)
+        {
+            SetGraphicsProperty((int)value, (unsigned)(*(unsigned short *)(d + 0x0C)),
+                                (int)index);
+        }
+        *(DWORD *)d = value;
+    }
+    g_dword_2073938 = 0;
+    return 0;
+}
 
 // ============================================================
 //  ResetGraphicsEntities  (0x18D1960 - 0x18D19AE)  -- reset and rebuild the
 //  frontend graphics-entity pool and rebind it to the device.
 //  [NOT byte-identical] placement-dependent (relative calls to the
 //  graphics-entity subsystem callees BuildGraphicsEntityPool /
-//  RegisterGraphicsEntities / sub_18D02E0
+//  RegisterGraphicsEntities / SyncGraphicsEntities
 //  below and the memset IAT slot) and refs the high-VA globals (the
 //  dword_2120420 pool, the dword_2073938 / dword_2063134 counters, byte_211C402,
 //  dword_2075F54, byte_2075F4D) at their original addresses.
@@ -4077,11 +4456,12 @@ static int sub_18D02E0(void) { g_dword_2073938 = 0; return 0; }  // sync/commit 
 //    5. dword_2075F54 = device;  -- bind the device object.
 //    6. byte_2075F4D = 0;  -- clear the sync flag.
 //    7. RegisterGraphicsEntities();  -- register the dirty entities.
-//    8. return sub_18D02E0();  -- sync/commit the entities to the device.
+//    8. return SyncGraphicsEntities();  -- sync/commit the entities to the
+//       device (tail-called in the original).
 //
 //  Called by ResetGraphicsSurfaces (0x18E6D40) with the current device object
 //  (dword_1E2EEF4) as the argument.  The return value is forwarded from the
-//  tail-called sync step (sub_18D02E0) and ignored by the caller.  Replaces
+//  tail-called sync step (SyncGraphicsEntities) and ignored by the caller.  Replaces
 //  the sub_18D1960 no-op stub in ResetGraphicsSurfaces.
 // ============================================================
 static int ResetGraphicsEntities(void *device)
@@ -4094,7 +4474,7 @@ static int ResetGraphicsEntities(void *device)
     g_dword_2075F54 = device;
     g_byte_2075F4D  = 0;
     RegisterGraphicsEntities();
-    return sub_18D02E0();
+    return SyncGraphicsEntities();
 }
 
 static void ResetGraphicsSurfaces(void)
@@ -4337,7 +4717,626 @@ static void RunGameLoop(void *unused)
     }
     SetFrontendEvent(g_unk_1DBD9E8);
 }
-static void  sub_61C320(void *p) { (void)p; }                     // _beginthread entry (no-op)
+// ============================================================
+//  Forward declarations for helpers defined further down in this file that
+//  the Permanent Bank Mounter thread (MountPermanentBanks, below) drives:
+//  the 36-byte F3WString heap-buffer drop idiom, the global file-subsystem
+//  getter (sub_1801C20), the VFS-config load (sub_1801580), and the
+//  placeholder vtable slot-0 release (the stub-constructed member objects).
+// ============================================================
+static void  F3WStringFree(F3WString *s);
+static void  FileSubsysLoadVfsConfig(void *fs, void *path);
+static void  F3StubRelease(void *obj, int freeIt);
+//  GetFileSubsystem (sub_1801C20) is declared in xlip.h (extern, defined
+//  further down in this file) -- no local forward declaration needed.
+
+//  F3CsGuard  -- the 8-byte local critical-section guard pair (the
+//  this=guard thiscall helpers sub_1A22480 / sub_1A22460 below operate
+//  on it): { the CRITICAL_SECTION, the held flag }.
+typedef struct F3CsGuard
+{
+    CRITICAL_SECTION *cs;
+    int               held;
+} F3CsGuard;
+
+//  CsGuardAcquire  (0x1A22460 pair: 0x1A22480 - 0x1A224B6)  -- enter a
+//  critical section into a local guard: store the section, then either
+//  TryEnterCriticalSection (the held flag = success) or the blocking
+//  EnterCriticalSection (the held flag = 1).  The original is thiscall +
+//  retn 8 (guard in ECX, section + flag on the stack); here a plain free
+//  function per project convention.  [NOT byte-identical] refs the
+//  Enter / TryEnter IAT slots at their original high VAs.
+static F3CsGuard CsGuardAcquire(F3CsGuard *g, CRITICAL_SECTION *cs, char tryIt)
+{
+    g->cs = cs;
+    if (tryIt != 0)
+        g->held = (TryEnterCriticalSection(cs) != 0);
+    else
+    {
+        EnterCriticalSection(cs);
+        g->held = 1;
+    }
+    return *g;
+}
+
+//  CsGuardRelease  (0x1A22460 - 0x1A22478)  -- leave the guard's section
+//  when the held flag is set and clear the flag.  [NOT byte-identical]
+//  refs the Leave IAT slot at its original high VA.
+static void CsGuardRelease(F3CsGuard *g)
+{
+    if (g->held != 0)
+    {
+        LeaveCriticalSection(g->cs);
+        g->held = 0;
+    }
+}
+
+//  SlotPairSet  (0x61FDE0 - 0x61FE34)  -- atomically swap the 8-byte
+//  { value, 12-byte wrapper } slot pair: drop a reference on the current
+//  wrapper (running its { refcount, dtor, obj } destructor block + LHFree
+//  when the last reference goes), store the new pair, and take a reference
+//  on the new wrapper.  The original is thiscall + retn 4 (the slot in
+//  ECX, the { value, wrapper } pointer on the stack); here a plain free
+//  function.  [NOT byte-identical] refs the InterlockedDecrement /
+//  InterlockedIncrement IAT slots at their original high VAs.
+static void *SlotPairSet(void *slot, void **pair)
+{
+    void *value    = pair[0];
+    void *wrapper  = pair[1];
+    void *curWrap  = *(void **)((char *)slot + 4);
+    if (curWrap != wrapper)
+    {
+        if (curWrap != 0 && InterlockedDecrement((volatile LONG *)curWrap) == 0)
+        {
+            (*(void (*)(void *))(*(void **)((char *)curWrap + 4)))(
+                *(void **)((char *)curWrap + 8));
+            LHFree(curWrap);
+        }
+        *(void **)slot          = value;
+        *(void **)((char *)slot + 4) = wrapper;
+        if (wrapper != 0)
+            InterlockedIncrement((volatile LONG *)wrapper);
+    }
+    return slot;
+}
+
+// sub_626770 (0x626770) -- reset the +0x74 bank word-collection (the
+// BankTreeEraseRange analogue for the +0x74 collection type).  Out of scope.
+// Stub: no-op.  [remaining stub]
+static void sub_626770(char *coll, void *tmp, char *heapWord, int val0, int val1, int val2)
+{ (void)coll; (void)tmp; (void)heapWord; (void)val0; (void)val1; (void)val2; }
+
+// sub_624B10 (0x624B10) -- clear the +0x1C string collection: free every
+// non-null node in the node list, then the node list itself and the +0x04
+// buffer word, zeroing the head / capacity / count.  Deep node-teardown
+// chain -- out of scope.  Stub: no-op.  [remaining stub]
+static void sub_624B10(char *str) { (void)str; }
+
+//  DestroyBankContainer  (0x626EF0 - 0x62700C)  -- the 240-byte bank
+//  container's destructor (the InitBankContainer counterpart): reset the
+//  three word-collections (+0xCC via BankTreeEraseRange, +0x94 via
+//  NameMapEraseRange, +0x74 via sub_626770), each followed by the LHFree of
+//  the +0x18 sentinel node + the +0x0 head node and the +0x18 / +0x1C zero; DeleteCritical
+//  Section the +0xB4 section; free the +0x68 word (when non-null) and zero
+//  +0x68 / +0x6C / +0x70; free the +0x5C back-reference node; clear the
+//  +0x1C string (sub_624B10); free the +0x04 string buffer when +0x18 >=
+//  0x10, and reset +0x14 = 0 / +0x18 = 0x0F / the +0x04 flag = 0.
+//  thiscall (obj in ECX).  [NOT byte-identical] placement-dependent (the
+//  E8 calls) and refs the LHFree / DeleteCriticalSection high-VA slots.
+static void DestroyBankContainer(void *obj)
+{
+    char *o = (char *)obj;
+    DWORD *w = (DWORD *)o;
+
+    // +0xCC word-collection (the bank-tree range erase, cleared to empty).
+    {
+        DWORD tmp[2];
+        void *head = *(void **)(o + 0xCC);          // the tree's head node
+        void *sent = *(void **)(o + 0xE4);          // the tree's sentinel node
+        BankTreeEraseRange(o + 0xCC, tmp, head, *(void **)(sent), head, sent);
+        LHFree((void *)w[0xE4 / 4]);
+        LHFree((void *)w[0xCC / 4]);
+        w[0xE4 / 4] = 0;
+        w[0xE8 / 4] = 0;
+    }
+    DeleteCriticalSection((CRITICAL_SECTION *)(o + 0xB4));
+
+    // +0x94 word-collection (the u32 -> name map range erase, cleared to
+    // empty).
+    {
+        DWORD tmp[2];
+        void *head = *(void **)(o + 0x94);          // the tree's head node
+        void *sent = *(void **)(o + 0xAC);          // the tree's sentinel node
+        NameMapEraseRange(o + 0x94, tmp, head, *(void **)(sent), head, sent);
+        LHFree((void *)w[0xAC / 4]);
+        LHFree((void *)w[0x94 / 4]);
+        w[0xAC / 4] = 0;
+        w[0xB0 / 4] = 0;
+    }
+
+    // +0x74 word-collection.
+    {
+        DWORD tmp[2];
+        sub_626770(o + 0x74, &tmp, o + 0x8C, w[0x74 / 4], w[0x8C / 4], w[0x74 / 4]);
+        LHFree((void *)w[0x8C / 4]);
+        LHFree((void *)w[0x74 / 4]);
+        w[0x8C / 4] = 0;
+        w[0x90 / 4] = 0;
+    }
+
+    if (w[0x68 / 4] != 0)
+        LHFree((void *)w[0x68 / 4]);
+    w[0x68 / 4] = 0;
+    w[0x6C / 4] = 0;
+    w[0x70 / 4] = 0;
+    LHFree((void *)w[0x5C / 4]);
+
+    sub_624B10(o + 0x1C);
+    if (w[0x18 / 4] >= 0x10u)
+        LHFree((void *)w[4 / 4]);
+    w[0x14 / 4] = 0;
+    w[0x18 / 4] = 0x0F;
+    o[4] = 0;
+}
+
+//  ReleaseBankObject  (0x627060 - 0x62707B)  -- the 12-byte wrapper block's
+//  stored destructor for the bank container: destroy the container
+//  (DestroyBankContainer) and LHFree it.  cdecl (the container pointer on
+//  the stack).
+static void ReleaseBankObject(void *obj)
+{
+    if (obj != 0)
+    {
+        DestroyBankContainer(obj);
+        LHFree(obj);
+    }
+}
+
+// sub_17FE8B0 (0x17FE8B0 - 0x17FE8E4) -- CLegacyMemoryFile ctor over the
+// 16-byte object: store the vtable, the wide shared-string ctor at +4
+// (sub_19FF580), the +8 count zero, then open the shared-slot file
+// (sub_17FE290 with the slot, 1, 2 flags).  Deep file-subsystem chain --
+// out of scope.  Stub: returns 0 (the video never opens).  [remaining stub]
+static long sub_17FE8B0(void *obj, int slotId, int a3, int a4)
+{ (void)obj; (void)slotId; (void)a3; (void)a4; return 0; }
+
+// sub_625E20 (0x625E20 - 0x625E99) -- append a { value, refcount } node to
+// the +0x30 sub-object's node list (capacity check against +0x3C / +0x40,
+// the sub_625600 grow path, the InterlockedIncrement of the appended
+// reference).  Out of scope.  Stub: no-op.  [remaining stub]
+static void sub_625E20(void *list, void **value) { (void)list; (void)value; }
+
+//  ReleaseVideoFile  (0x61E230 - 0x61E241)  -- the 16-byte video
+//  (CLegacyMemoryFile) wrapper dtor: run the object's vtable slot 0
+//  (release, the free-it flag = 1) when the pointer is nonzero.  cdecl.
+static int ReleaseVideoFile(void *obj)
+{
+    if (obj != 0)
+    {
+        void **vt = (void **)(*(void **)obj);
+        return (int)((int(__thiscall *)(void *, int))vt[0])(obj, 1);
+    }
+    return 0;
+}
+
+//  MountVideoFile  (0x61BFE0 - 0x61C079)  -- mount a video by shared-slot
+//  file id: build the 16-byte CLegacyMemoryFile (sub_17FE8B0 [remaining
+//  stub] over the id with the 1 / 2 flags), wrap it in the 12-byte
+//  { refcount, dtor = ReleaseVideoFile, obj } block, append the value to
+//  the +0x30 sub-object's node list (sub_625E20 [remaining stub]), then
+//  drop the local wrapper reference (the InterlockedDecrement-to-zero ->
+//  dtor -> LHFree idiom).  The original is thiscall + retn 4 (the owner in
+//  ECX, the file id on the stack); here a plain free function.  [NOT
+//  byte-identical] placement-dependent (the E8 calls above) and refs the
+//  InterlockedDecrement IAT slot at its original high VA.
+static int MountVideoFile(void *obj, int slotId)
+{
+    void *video = 0;
+    void *buf = LHAlloc(16);
+    if (buf != 0)
+        video = (void *)sub_17FE8B0(buf, slotId, 1, 2);
+    void *value   = video;
+    void *wrapper = 0;
+    if (video != 0)
+    {
+        void *w = LHAlloc(12);
+        if (w != 0)
+        {
+            *(DWORD *)w = 1;
+            *(void **)((char *)w + 4) = (void *)ReleaseVideoFile;
+            *(void **)((char *)w + 8) = video;
+            wrapper = w;
+        }
+    }
+    sub_625E20((char *)obj + 0x30, &value);
+    int result = 0;
+    if (wrapper != 0)
+    {
+        result = (int)InterlockedDecrement((volatile LONG *)wrapper);
+        if (result == 0)
+        {
+            (*(void (*)(void *))(*(void **)((char *)wrapper + 4)))(
+                *(void **)((char *)wrapper + 8));
+            LHFree(wrapper);
+        }
+    }
+    return result;
+}
+
+// 0x2075EAC: the GDB loader wrapper (published by CreateGdbLoader).
+static void *g_dword_2075EAC = 0;
+
+// sub_50A540 (unresolved in this build) -- the 56-byte GDB file-reader ctor
+// (thiscall, the reader in ECX).  Out of scope.  Stub: returns the object.
+//  [remaining stub]
+static void *sub_50A540(void *obj) { return obj; }
+
+//  CreateGdbLoader  (0x1A19D20 - 0x1A19D69)  -- allocate the 4-byte wrapper
+//  holding the 56-byte GDB file reader (sub_50A540 [remaining stub]) and
+//  publish the wrapper in dword_2075EAC; returns the wrapper (0 on
+//  allocation failure, in which case the global is cleared).
+//  [NOT byte-identical] placement-dependent (the LHAlloc E8 calls) and refs
+//  the high-VA global dword_2075EAC (0x02075EAC).
+static void *CreateGdbLoader(void)
+{
+    void *wrapper = LHAlloc(4);
+    if (wrapper != 0)
+    {
+        void *reader = LHAlloc(0x38);
+        *(void **)wrapper = (reader != 0) ? sub_50A540(reader) : 0;
+        g_dword_2075EAC = wrapper;
+        return wrapper;
+    }
+    g_dword_2075EAC = 0;
+    return 0;
+}
+
+// 0x1DBD032: the dev-build flag (the dev_roots_built.txt gate in
+// LoadGlobalGdbFiles); zero in this build.
+static BYTE g_byte_1DBD032 = 0;
+
+// sub_1A19E10 (0x1A19E10 - 0x1A19F76) -- load one GDB file through the
+// reader (the sub_1A19D70 file lookup, the sub_402F00 hash build, the
+// SetSharedSlot + sub_17FE870 memory-file open, the reader vtable slot 10
+// load dispatch, the sub_17FD970 close).  Deep dependency chain -- out of
+// scope.  Stub: returns 0 (the file did not load).  [remaining stub]
+static long sub_1A19E10(void *loader, const char *path, int a3)
+{ (void)loader; (void)path; (void)a3; return 0; }
+
+// sub_17FE870 / sub_61D800 / sub_17FD970 -- the memory-file open / read / close
+// trio used only by LoadGlobalGdbFiles' dead dev_roots branch.  Stubs.
+//  [remaining stub]
+static void *sub_17FE870(void *obj, void *slot, int a3, int a4)
+{ (void)obj; (void)slot; (void)a3; (void)a4; return 0; }
+static void  sub_61D800(void *obj, void *slot) { (void)obj; (void)slot; }
+static void  sub_17FD970(void *obj) { (void)obj; }
+
+//  LoadGlobalGdbFiles  (0x61A100 - 0x61A211)  -- load the five permanent
+//  global GDB files through the GDB loader: Globals.gdb, gui.gdb,
+//  SpeechAction.gdb, InteractiveCutscenes.gdb, and animatedcutscenes.gdb,
+//  then -- only in the dev build (byte_1DBD032 set, not running from disk)
+//  -- reads Globals\\dev_roots_built.txt through the memory-file trio and
+//  loads Entity.gdb when it begins with "true".  The last load's result is
+//  returned.  The original is thiscall + retn 4 (the ECX this is never used
+//  -- the loader from the stack arg is threaded into every load); here a
+//  plain free function.  [NOT byte-identical] placement-dependent (the E8
+//  calls) and refs the high-VA string literals + byte_1DBD032 / byte_1DBD02A.
+static int LoadGlobalGdbFiles(void *loader)
+{
+    long result = sub_1A19E10(loader, "data\\Globals\\Globals.gdb", 0);
+    sub_1A19E10(loader, "data\\Art\\GUI\\gui.gdb", 0);
+    sub_1A19E10(loader, "data\\Globals\\SpeechAction.gdb", 0);
+    sub_1A19E10(loader, "data\\InteractiveCutscenes\\InteractiveCutscenes.gdb", 0);
+    result = sub_1A19E10(loader, "data\\animatedcutscenes\\animatedcutscenes.gdb", 0);
+    if (g_byte_1DBD032 != 0 && g_byte_1DBD02A == 0)
+    {
+        F3SharedBuffer *outSlot  = 0;
+        F3SharedBuffer *fileSlot = 0;
+        F3SharedBuffer *memBuf   = 0;
+        InitSharedSlot(&outSlot);
+        SetSharedSlot(&fileSlot, "Globals\\dev_roots_built.txt", -1);
+        void *memFile = sub_17FE870(&memBuf, &fileSlot, 1, 2);
+        sub_61D800(memFile, &outSlot);
+        sub_17FD970(&memBuf);
+        ReleaseSharedSlot(&fileSlot);
+        const char *s = (outSlot != 0 && outSlot->data != 0) ? outSlot->data : "";
+        int isTrue = (strncmp(s, "true", 4) == 0);
+        result = ReleaseSharedSlot(&outSlot);
+        if (isTrue != 0)
+            result = sub_1A19E10(loader, "data\\Entity\\Entity.gdb", 0);
+    }
+    return (int)result;
+}
+
+// sub_72C220 / sub_7281F0 / sub_5AA8F0 / sub_6527D0 -- the 192-byte bank
+// container's sub-object initializers (the +0x1C string with the 0x4000
+// capacity, the +0x74 / +0x94 / +0xCC collections seeded from the 0x4000
+// word).  Deep dependency chains -- out of scope.  Stubs.  [remaining stub]
+static void sub_72C220(void *obj, int capacity) { (void)obj; (void)capacity; }
+static void sub_7281F0(void *obj, void *a, void *b) { (void)obj; (void)a; (void)b; }
+static void sub_5AA8F0(void *obj, void *a, void *b) { (void)obj; (void)a; (void)b; }
+static void sub_6527D0(void *obj, void *a, void *b) { (void)obj; (void)a; (void)b; }
+
+//  InitBankContainer  (0x7201B0 - 0x720248)  -- construct the 192-byte
+//  bank container in place: +0x18 = 15 (the string SSO capacity), +0x14 / +4
+//  = 0, the +0x1C string init (sub_72C220 [remaining stub] with the 0x4000
+//  word), the 4-byte back-reference node into +0x5C, the +0x68 / +0x6C /
+//  +0x70 zero words, the +0x74 / +0x94 / +0xCC collection inits (sub_7281F0
+//  / sub_5AA8F0 / sub_6527D0 [remaining stubs] seeded with the 0x4000
+//  word), the +0xB4 critical section (the CRT InitializeCriticalSection
+//  thunk, unknown_libname_2585), and the +0xEC flag zero.  Returns this.
+//  The original is thiscall + retn 8 (the 0x32 word is unused); here a
+//  plain free function.  [NOT byte-identical] placement-dependent (the E8
+//  calls) and refs the InitializeCriticalSection IAT slot.
+static void *InitBankContainer(void *obj, int unused, int capacity)
+{
+    (void)unused;
+    char *o = (char *)obj;
+    *(DWORD *)(o + 0x18) = 15;
+    *(DWORD *)(o + 0x14) = 0;
+    o[4] = 0;
+    sub_72C220(o + 0x1C, capacity);
+    void *node = LHAlloc(4);
+    if (node != 0)
+        *(void **)node = o + 0x5C;
+    *(void **)(o + 0x5C) = node;
+    *(DWORD *)(o + 0x68) = 0;
+    *(DWORD *)(o + 0x6C) = 0;
+    *(DWORD *)(o + 0x70) = 0;
+    sub_7281F0(o + 0x74, &capacity, &capacity);
+    sub_5AA8F0(o + 0x94, &capacity, &capacity);
+    InitializeCriticalSection((CRITICAL_SECTION *)(o + 0xB4));
+    sub_6527D0(o + 0xCC, &capacity, &capacity);
+    o[0xEC] = 0;
+    return obj;
+}
+
+// Placeholder vtable for the stub-constructed NUI::CGUI member (the engine's
+// +0xB8 object): the original ctor (sub_6AFD50) stores the real NUI::CGUI
+// vtable (0x6AFEE0), whose slot 0 (release, the free-it flag) and slot 1
+// (the activate dispatch RebuildGuiObject tail-calls) are unimplemented in
+// this build, so both are callable no-ops.
+static int F3StubInt(void *obj) { (void)obj; return 0; }
+static void *g_CGuiVtable[2] = { (void *)F3StubRelease, (void *)F3StubInt };
+
+// sub_6AFD50 (0x6AFD50 - 0x6AFFD0) -- the NUI::CGUI ctor over the 400-byte
+// object (the full GUI / options / packet-callback sub-construct).  Deep
+// dependency chain -- out of scope.  Stub: store the placeholder vtable and
+// return this.  [remaining stub]
+static void *InitGuiObject(void *obj)
+{
+    *(void **)obj = g_CGuiVtable;
+    return obj;
+}
+
+//  RebuildGuiObject  (0x61A7C0 - 0x61A832)  -- replace the engine's +0xB8
+//  NUI::CGUI object: run the old object's vtable slot 4 (the shutdown
+//  dispatch) then slot 0 (release, free-it = 1) and clear the slot, build a
+//  fresh 400-byte CGUI (LHAlloc + sub_6AFD50 [remaining stub]), release the
+//  now-old value again (the free-it flag) if it reappeared, store the new
+//  object, and tail-call its vtable slot 1 (the activate dispatch).
+//  The original is thiscall (the engine in ECX); here a plain free function.
+//  [NOT byte-identical] placement-dependent (the E8 calls + the tail jump).
+static int RebuildGuiObject(void *obj)
+{
+    char *o = (char *)obj;
+    void *cur = *(void **)(o + 0xB8);
+    if (cur != 0)
+    {
+        void **vt = (void **)(*(void **)cur);
+        ((void(__thiscall *)(void *))vt[4])(cur);
+        if (*(void **)cur != 0)
+            ((void(__thiscall *)(void *, int))(void *)((void **)(*(void **)cur))[0])(cur, 1);
+        *(void **)(o + 0xB8) = 0;
+    }
+    void *buf = LHAlloc(0x190);
+    void *fresh = (buf != 0) ? InitGuiObject(buf) : 0;
+    void *cur2 = *(void **)(o + 0xB8);
+    if (cur2 != 0)
+        ((void(__thiscall *)(void *, int))(void *)((void **)(*(void **)cur2))[0])(cur2, 1);
+    *(void **)(o + 0xB8) = fresh;
+    void **vt2 = (void **)(*(void **)fresh);
+    return (int)((int(__thiscall *)(void *))vt2[1])(fresh);
+}
+
+// sub_1801620 (unresolved in this build) -- the file-subsystem collection
+// mount: (fs, out-slot, callback, data) with the callback populating the
+// out-slot.  Out of scope.  Stub: leaves the out-slot 0.  [remaining stub]
+static void sub_1801620(void *fs, void **out, void *callback, int data)
+{ (void)fs; (void)*out; (void)callback; (void)data; }
+
+// sub_719CA0 (0x719CA0 - 0x719D64) -- the file-subsystem mount callback for
+// the bank container: reload "language\\text\\book.babel" through the VFS
+// archive collection (GetVfsArchiveCollection + VfsReloadFileEntry) and
+// rebuild the 192-byte container over the entry.  Deep dependency chain --
+// out of scope.  Stub.  [remaining stub]
+static char sub_719CA0(int impl) { (void)impl; return 0; }
+
+//  RegisterBankContainer  (0x719D70 - 0x719D9D)  -- register the bank
+//  container with the global file subsystem: the collection mount (sub_1801620
+//  [remaining stub] with the sub_719CA0 callback), and when the mount
+//  produced an entry, dispatch its vtable slot 2 (thiscall, the entry also
+//  as the stack arg).  Returns the dispatch (or the entry pointer).
+//  [NOT byte-identical] placement-dependent (the E8 calls + the entry vtable
+//  dispatch).
+static int RegisterBankContainer(int impl)
+{
+    void *fs = GetFileSubsystem(0);
+    void *out = 0;
+    sub_1801620(fs, &out, (void *)sub_719CA0, impl);
+    if (out != 0)
+    {
+        void **vt = (void **)(*(void **)out);
+        return (int)((int(__thiscall *)(void *, int))vt[2])(out, (int)out);
+    }
+    return (int)out;
+}
+
+// sub_61B860 (0x61B860 - 0x61B91A) -- mount the "fable2_anims.bnk" bank +
+// register the "data\\" archive over the engine (the wide-string build
+// sub_625D10, the file-subsystem sub_1801620 mount with the sub_61B730
+// callback, the data-archive shared-slot publish into dword_20FD138, the
+// sub_18ED640 registration).  Deep dependency chain -- out of scope.  Stub.
+//  [remaining stub]
+static void sub_61B860(void *obj) { (void)obj; }
+
+// sub_1926050 (0x1926050 - 0x1926119) -- open the "particle_bank.bnk" path
+// as a data-stream file (the shared-slot open sub_17FE8B0, the 0x8000-byte
+// read-buffer ctor sub_1892420, the NFile::CFileDataInputStream / NTools
+// ctor chain).  Deep dependency chain -- out of scope.  Stub.  The caller
+// discards the return value.  [remaining stub]
+static void sub_1926050(void *pathSlot) { (void)pathSlot; }
+
+// sub_61C170 (0x61C170 - 0x61C236) -- mount one .bnk speech / lipsync bank
+// over the engine's +0xC8 sub-object (the GetWideStringHash cache lookup in
+// sub_622E70, the sub_625D10 wide-string build, the file-subsystem
+// sub_1801620 mount with the sub_61B730 callback, and the cache update
+// sub_626D20 / sub_6254B0).  Deep dependency chain -- out of scope.  Stub.
+//  [remaining stub]
+static void sub_61C170(void *obj, F3WString *ws, int a3)
+{ (void)obj; (void)ws; (void)a3; }
+
+// sub_719C80 (0x719C80 - 0x719C9C) -- register the global speech callback
+// with the file subsystem (GetFileSubsystem + sub_71B6A0 over the
+// dword_1DC27D4 state with the sub_719A00 callback).  Out of scope.  Stub.
+//  [remaining stub]
+static int sub_719C80(void) { return 0; }
+
+// sub_61C080 (0x61C080 - 0x61C119) -- the speech-bank table pass: the
+// sub_616650 flag read, the file-subsystem sub_1801620 mount with the
+// sub_61ACA0 callback over the engine's +0xBC slot, and the [dword_1DBD0F8,
+// dword_1DBD0FC) 36-byte record loop (the byte_1BCE523 prefix tests
+// sub_1A00E00 with the per-record sub_61B990 / sub_61A9B0 dispatches).  The
+// record globals are 0 in this build, so the loop is dead.  Out of scope.
+//  Stub.  [remaining stub]
+static void sub_61C080(void *obj) { (void)obj; }
+
+// 0x1DBE2CC: the settings-directory base shared slot (the sibling of
+// g_dword_1DBE2F0); .bss (starts null, populated by the settings init that
+// is not built yet).
+static F3SharedBuffer *g_unk_1DBE2CC = 0;
+
+// ============================================================
+//  MountPermanentBanks  (0x61C320 - 0x61C521)  -- the "Permanent Bank
+//  Mounter" thread entry (the _beginthread callback RunFrontEnd starts with
+//  the CGameEngine as its argument, on a 0x40000-stack thread).
+//
+//  void MountPermanentBanks(void *obj)   (obj = the CGameEngine, 356 bytes)
+//
+//  The original is cdecl (the engine pointer on the stack, hoisted into
+//  ESI) with a __security_cookie prologue.  The thread, in order:
+//    1. announces its name (SetThreadName "Permanent Bank Mounter") and
+//       mounts the fable2_anims.bnk bank (sub_61B860 [remaining stub]);
+//    2. under the engine's +0x60 critical section (the CsGuardAcquire /
+//       CsGuardRelease guard), builds the
+//       "data\\art\\videos\\lionhead_logo.bik" shared slot and mounts it as
+//       a video file (MountVideoFile);
+//    3. builds the settings-directory "particle_bank.bnk" path
+//       (MakeSettingsFilePath over the unk_1DBE2CC settings base) and opens
+//       it as a data stream (sub_1926050 [remaining stub]);
+//    4. creates the GDB loader (CreateGdbLoader) and, when created, loads
+//       the five permanent global GDB files (LoadGlobalGdbFiles);
+//    5. allocates + constructs the 192-byte bank container
+//       (InitBankContainer), wraps it in the 12-byte { refcount, dtor =
+//       ReleaseBankObject, obj } block, publishes both words into the
+//       engine's +0xA0 slot pair (SlotPairSet), registers the container
+//       with the file subsystem (RegisterBankContainer), and drops the
+//       local reference (the InterlockedDecrement-to-zero -> dtor -> LHFree
+//       release idiom);
+//    6. rebuilds the engine's +0xB8 NUI::CGUI object (RebuildGuiObject);
+//    7. mounts the two lipsync banks (sub_61C170 [remaining stub] over
+//       "language/lipsync/lipsync.bnk" and
+//       "language/lipsync/expressions.bnk", each freed after the mount),
+//       registers the speech callback (sub_719C80 [remaining stub]), loads
+//       "language/speech/cutscenes.vfsconfig" into the file subsystem
+//       (FileSubsysLoadVfsConfig), and runs the speech-bank table pass
+//       (sub_61C080 [remaining stub]);
+//    8. sets the engine's +0x84 "banks mounted" flag under the +0x48
+//       critical section.
+//  [NOT byte-identical] placement-dependent: the relative E8 calls to every
+//  step above, the InterlockedDecrement IAT slot at its original high VA,
+//  and the __security_cookie prologue.
+// ============================================================
+static void MountPermanentBanks(void *p)
+{
+    CGameEngine *obj = (CGameEngine *)p;
+    char *base = (char *)obj;
+
+    SetThreadName("Permanent Bank Mounter");
+    sub_61B860(obj);
+
+    F3CsGuard guard2;
+    CsGuardAcquire(&guard2, &obj->cs2, 0);
+    {
+        F3SharedBuffer *slot = 0;
+        int fileId = (int)SetSharedSlot(&slot, "data\\art\\videos\\lionhead_logo.bik", -1);
+        MountVideoFile(obj, fileId);
+        ReleaseSharedSlot(&slot);
+    }
+    CsGuardRelease(&guard2);
+
+    {
+        F3SharedBuffer *slot = 0;
+        F3SharedBuffer **dst = MakeSettingsFilePath(&slot, &g_unk_1DBE2CC, "particle_bank.bnk");
+        sub_1926050(dst);
+        ReleaseSharedSlot(&slot);
+    }
+
+    void *loader = CreateGdbLoader();
+    if (loader != 0)
+        LoadGlobalGdbFiles(loader);
+
+    void *container = 0;
+    void *buf = LHAlloc(0xF0);
+    if (buf != 0)
+        container = InitBankContainer(buf, 0x32, 0x4000);
+    void *pair[2] = { container, 0 };
+    if (container != 0)
+    {
+        void *w = LHAlloc(12);
+        if (w != 0)
+        {
+            *(DWORD *)w = 1;
+            *(void **)((char *)w + 4) = (void *)ReleaseBankObject;
+            *(void **)((char *)w + 8) = container;
+            pair[1] = w;
+        }
+    }
+    SlotPairSet(base + 0xA0, pair);
+    RegisterBankContainer((int)container);
+    if (pair[1] != 0)
+    {
+        if (InterlockedDecrement((volatile LONG *)pair[1]) == 0)
+        {
+            (*(void (*)(void *))(*(void **)((char *)pair[1] + 4)))(
+                *(void **)((char *)pair[1] + 8));
+            LHFree(pair[1]);
+        }
+    }
+
+    RebuildGuiObject(obj);
+
+    F3WString ws;
+    F3WStringFromAnsi(&ws, "language/lipsync/lipsync.bnk");
+    sub_61C170(obj, &ws, 0);
+    F3WStringFree(&ws);
+    F3WStringFromAnsi(&ws, "language/lipsync/expressions.bnk");
+    sub_61C170(obj, &ws, 0);
+    F3WStringFree(&ws);
+
+    sub_719C80();
+
+    F3WStringFromAnsi(&ws, "language/speech/cutscenes.vfsconfig");
+    FileSubsysLoadVfsConfig(GetFileSubsystem(0), &ws);
+    F3WStringFree(&ws);
+
+    sub_61C080(obj);
+
+    F3CsGuard guard1;
+    CsGuardAcquire(&guard1, &obj->cs1, 0);
+    obj->member0x84 = 1;
+    CsGuardRelease(&guard1);
+}
 // sub_6A66C0 is the canonical GetNetManager (netinit.cpp / netinit.h);
 // sub_6A6960 is the canonical CNetManagerGetUserManager (netinit.cpp).
 static int   sub_6A69A0(int a) { (void)a; return 0; }
@@ -4783,7 +5782,7 @@ static void VfsWorkerAddCallback(int worker, int data, void *fn) { (void)worker;
 
 // VfsWorkerCallbackRegister  (0x1476D00 - 0x1476D5D)  -- register an 8-byte
 //  {vtable, function} callback pair with worker slot `index` (0..6) under that
-//  worker's critical section (sub_1A22480/sub_1A22460 over stru_1DDCA90 +
+//  worker's critical section (the CsGuardAcquire/CsGuardRelease pair (sub_1A22480/sub_1A22460) over stru_1DDCA90 +
 //  index*24) and its per-worker list (g_dword_1DDC9C8 / g_dword_1DDC9DC).
 //  No-op for index >= 7; the add is the VfsWorkerAddCallback stub above (the CS
 //  enter/leave wraps it but is omitted -- the workers are not spawned in this
@@ -7955,7 +8954,8 @@ cleanup:
 //  success it CXMLReadStreamCtor's the stream, ReopenXmlFileBlock's the
 //  file block, XmlCheckRootSection's against the "marketplace" slot, and
 //  (when found) walks the "offer" items reading their "offerId" /
-//  "packageCollection" / "licenseMask" attributes (sub_17DC4B0), resolving
+//  "packageCollection" / "licenseMask" attributes (XmlReadAttrInterned,
+//  sub_17DC4B0), resolving
 //  the two date strings (sub_1A00C80 hex parse), and splicing an 8-byte
 //  encoded-date record into the CPackageData+0x9C list (sub_76F9E0). The
 //  teardown releases the file block (vtable slot 2), the CXMLReadStream,
@@ -8000,7 +9000,8 @@ static int CPackageDataLoadOfferData(void *obj)
         goto done2;
     }
     // [remaining stub] the "offer" item walk (sub_17DC640 / sub_17DC140 /
-    // sub_17DC4B0 / sub_1A00C80 / sub_76F9E0) is unreachable in this build
+    // XmlReadAttrInterned (sub_17DC4B0) / sub_1A00C80 / sub_76F9E0) is
+    // unreachable in this build
     // (the LHXML parse is a stub, so the root section is never found).
 done2:
     if (fileData != 0)
@@ -8232,7 +9233,8 @@ static void  sub_72FB10(void *obj, void *argList, void *a, void *b)
 { (void)obj; (void)argList; (void)a; (void)b; }
 static void  sub_18F0180(void) {}
 static void  sub_72FAE0(void *obj) { (void)obj; }
-static void  sub_61BFE0(void *obj, int a) { (void)obj; (void)a; }
+// MountVideoFile (0x61BFE0, the video-slot mount over the +0x30 sub-object)
+// is now implemented above (the MountPermanentBanks block).
 static void  sub_61A5E0(void *obj) { (void)obj; }
 // sub_731B80 -- NUI::CFullScreenMoviePlayer ctor (8 bytes): stub stores the
 // placeholder vtable and zeroes +4.
@@ -9466,8 +10468,8 @@ static int FileSubsysLoadVfsConfigFile(void *fs, void *entry, void *path)
 //  inconsistent in this build).  Dead in this build: no entries are ever
 //  registered in g_fileSubsys, so the loop body never runs.  Six call sites
 //  in the original: RunFrontEnd ("startup.vfsconfig") and the speech / lipsync /
-//  cutscene config loaders (sub_61C320 / sub_719DA0 / sub_9F4B50 /
-//  sub_11C4C30, all still stubs).  [NOT byte-identical] placement-dependent
+//  cutscene config loaders (MountPermanentBanks 0x61C320 / sub_719DA0 /
+//  sub_9F4B50 / sub_11C4C30, the latter three still stubs).  [NOT byte-identical] placement-dependent
 //  (relative calls to __invalid_parameter_noinfo / sub_1813850 / the entry
 //  vtable dispatches).
 static void FileSubsysLoadVfsConfig(void *fs, void *path)
@@ -10391,12 +11393,12 @@ signedIn:
         sub_72FAE0((void *)dw[0x9C / 4]);
 
         int fileId = (int)SetSharedSlot(&v160slot, "data\\art\\videos\\microsoft_logo.bik", -1);
-        sub_61BFE0(obj, fileId);
+        MountVideoFile(obj, fileId);
         ReleaseSharedSlot(&v160slot);
         sub_61A5E0(obj);
 
         base[0x84] = 0;
-        dw[0x80 / 4] = (DWORD)_beginthread(sub_61C320, 0x40000u, obj);
+        dw[0x80 / 4] = (DWORD)_beginthread(MountPermanentBanks, 0x40000u, obj);
 
         void *p8b = LHAlloc(8);
         int   v62 = (p8b != 0) ? (int)sub_731B80(p8b) : 0;

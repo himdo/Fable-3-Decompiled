@@ -9172,13 +9172,13 @@ static void CLuaManagerImplInitialisePermanents(void *impl) { (void)impl; }
 static int CLuaManagerImplInitialiseSerialise(void *impl) { (void)impl; return 0; }
 
 // sub_627FC0 (0x627FC0 - 0x6280FA) -- KoreModulePacing: pace / throttle a Kore
-// module: build a local guard object (sub_1A22480
+// module: build a local guard object (CsGuardAcquire (sub_1A22480)
 // over stru_1DC4B40), set byte_1DBDB9C = 1, read param 3 (KoreModuleSetParam),
 // and -- when the flag is set or the param exceeds 1.1x the cached
 // dword_1C8B12C -- stamp the engine time (GetEngineTime) and reset params 2 / 0
 // / 3; otherwise set param 5 (250) in a busy-wait until GetEngineTime() +
 // dbl_1C8B100 elapses (param 5 = 250), then clear byte_1DBDB9C and release the
-// guard (sub_1A22460).  cdecl (the Kore module in a1, the flag in a2).  VM-
+// guard (CsGuardRelease (sub_1A22460)).  cdecl (the Kore module in a1, the flag in a2).  VM-
 // internal -- out of scope.  Stub.
 static void KoreModulePacing(int koreModule, int flag) { (void)koreModule; (void)flag; }
 
