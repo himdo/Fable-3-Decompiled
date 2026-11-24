@@ -36,6 +36,13 @@ void F3AStringReset(F3AString *s);
 // thiscall, returns the string.
 F3AString *F3AStringAssign(F3AString *s, const char *src, unsigned int len);
 
+// sub_50AD00 (the append variant of the F3AString family, the same
+// growth / null-terminate semantics as F3AStringAssign): append (src, len)
+// to the string's current contents.  SSO: copy in place past the current
+// len; heap: reallocate newLen + 1 bytes, copy the old data, free the old
+// buffer, and null-terminate.  Returns the string (this).
+F3AString *F3AStringAppend(F3AString *s, const char *src, unsigned int len);
+
 // the "if (cap >= 16) LHFree(heap ptr)" dtor idiom.
 void F3AStringFree(F3AString *s);
 

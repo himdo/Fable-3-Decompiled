@@ -36,93 +36,63 @@
 "source": "gamemain"
 },
 {
-"name": "?sub_17FE870@@YAPAXPAX0HH@Z",
-"rva": 20965488,
-"size": 53,
-"source": "gamemain"
-},
-{
-"name": "?sub_61D800@@YAXPAX0@Z",
-"rva": 2217984,
-"size": 103,
-"source": "gamemain"
-},
-{
-"name": "?sub_17FD970@@YAXPAX@Z",
-"rva": 20961648,
-"size": 55,
-"source": "gamemain"
-},
-{
 "name": "?sub_72C220@@YAXPAXH@Z",
 "rva": 3326496,
 "size": 222,
 "source": "gamemain"
 },
 {
-"name": "?sub_7281F0@@YAXPAX00@Z",
-"rva": 3310064,
-"size": 116,
+"name": "?sub_625D10@@YAHPAX0H@Z",
+"rva": 2252048,
+"size": 114,
 "source": "gamemain"
 },
 {
-"name": "?sub_5AA8F0@@YAXPAX00@Z",
-"rva": 1747184,
-"size": 51,
+"name": "?sub_18EBEB0@@YAHXZ",
+"rva": 21937840,
+"size": 22,
 "source": "gamemain"
 },
 {
-"name": "?sub_6527D0@@YAXPAX00@Z",
-"rva": 2435024,
-"size": 116,
+"name": "?sub_18ED640@@YAHPAX@Z",
+"rva": 21943872,
+"size": 1081,
 "source": "gamemain"
 },
 {
-"name": "?sub_1801620@@YAXPAXPAPAX0H@Z",
-"rva": 20977184,
-"size": 211,
+"name": "?sub_6240F0@@YAHPAX@Z",
+"rva": 2244848,
+"size": 99,
 "source": "gamemain"
 },
 {
-"name": "?sub_719CA0@@YADH@Z",
-"rva": 3251360,
-"size": 196,
+"name": "?sub_1892420@@YAPAXPAX0H@Z",
+"rva": 21570592,
+"size": 121,
 "source": "gamemain"
 },
 {
-"name": "?sub_61B860@@YAXPAX@Z",
-"rva": 2209888,
-"size": 186,
+"name": "?sub_1922280@@YAXPAX@Z",
+"rva": 22160000,
+"size": 370,
 "source": "gamemain"
 },
 {
-"name": "?sub_1926050@@YAXPAX@Z",
-"rva": 22175824,
-"size": 201,
+"name": "?sub_18917A0@@YAHPAX@Z",
+"rva": 21567392,
+"size": 97,
 "source": "gamemain"
 },
 {
-"name": "?sub_61C170@@YAXPAXPAUF3WString@@H@Z",
-"rva": 2212208,
-"size": 198,
+"name": "?sub_626D20@@YAPAXPAXPAH@Z",
+"rva": 2256160,
+"size": 402,
 "source": "gamemain"
 },
 {
-"name": "?sub_719C80@@YAHXZ",
-"rva": 3251328,
-"size": 28,
-"source": "gamemain"
-},
-{
-"name": "?sub_61C080@@YAXPAX@Z",
-"rva": 2211968,
-"size": 153,
-"source": "gamemain"
-},
-{
-"name": "?sub_67E460@@YAPAXXZ",
-"rva": 2614368,
-"size": 48,
+"name": "?sub_6254B0@@YAPAXPAX0@Z",
+"rva": 2249904,
+"size": 260,
 "source": "gamemain"
 },
 {

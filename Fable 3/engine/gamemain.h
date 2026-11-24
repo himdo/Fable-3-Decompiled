@@ -114,20 +114,22 @@ int GetWideStringHash(F3WString *s);
 // Exposed for the CLuaManager serialise-script path (engine/luavm.cpp).
 F3SharedBuffer **SharedSlotConcatLiteral(F3SharedBuffer **dst, const char *lit, F3SharedBuffer **src);
 
-// sub_17FE870 (0x17FE870 - 0x17FE8A5) -- the LHSFS::CLegacyFile ctor over a
+// LegacyFileCtor (0x17FE870 - 0x17FE8A5) -- the LHSFS::CLegacyFile ctor over a
 // 16-byte block (vtable + shared slot + two zeroed words) followed by the
-// sub_17FE0A0 open-setup over the path slot (a documented stub, so the +8
-// file slot stays 0 and LegacyFileHasData is false in this build).  thiscall
-// in the original (the block in ECX, the slot address + mode + flags on the
-// stack); declared as a plain free function per the project convention.
-void LegacyFileCtor(void *obj, F3SharedBuffer **slot, int a3, int a4);
+// CLegacyFileOpen open-setup over the path slot (CLegacyFileOpen: private
+// lowercased path block, prefix check + substring rebuild, one-time atexit
+// registration, lazy 48-byte file-system wrapper, vt[4] open, file+8 store).
+//  thiscall in the original (the block in ECX, the slot address + mode +
+// flags on the stack); declared as a plain free function per the project
+// convention.
+void *LegacyFileCtor(void *obj, F3SharedBuffer **slot, int a3, int a4);
 
 // sub_17FDC30 (0x17FDC30 - 0x17FDC39) -- is the legacy file's +8 file slot
 // set (did the open succeed)?
 int LegacyFileHasData(const void *obj);
 
-// sub_17FD970 (0x17FD970 - 0x17FD9A7) -- the LHSFS::CLegacyFile dtor
-// (release +12 / +8, release the shared slot, reset the vtable to
+// LegacyFileDtor (0x17FD970 - 0x17FD9A7) -- the LHSFS::CLegacyFile dtor
+// (release +0xC / +8, release the shared slot, reset the vtable to
 // LHFile::CAFile).  Returns the slot release's new g_Addend count.
 long LegacyFileDtor(void *obj);
 

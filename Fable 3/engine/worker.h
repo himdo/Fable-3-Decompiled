@@ -88,6 +88,18 @@ int InitEngineTime(void);
 // the engine to reach the current CWorkerWin32.
 void *GetWorker(void);
 
+// 0x18CB6A0 - flush the pending device-operation object lists of the 64-byte
+// container (0x20FC988). Called from FlushRenderFrame (0x18F1F60).
+// cdecl, no args, returns the current FPS record index * 3.
+int FlushDeviceOperationLists(void);
+
+// 0x18F0460 - the per-frame interpolated frame time reconstructed from the
+// current FPS record + the global frame counter. Called from FlushRenderFrame
+// (0x18F1F60), whose result is stored into dbl_20FC960 under the device CS.
+// Fills the 44-byte scratch record through the sub_18CB350 callee and then
+// computes (dword_1E2ED74 / flt_1E2ED78) * (globalFrameCounter - recordFrameCounter + 1) + recordFrameTime.
+double GetInterpolatedFrameTime(void);
+
 // 0x18F7C50 - the worker's "run the game" step (called by the manager's run
 // dispatch, CManagerWin32_RunGame). See worker.cpp.
 char CWorkerWin32_RunGame(void *worker, int a2, int a3, int a4, int a5,

@@ -8,8 +8,8 @@
 //  module re-implements the family's range erase
 //  (SubNodeEraseRange, the 0x626770 range erase) and the
 //  single-node erase + rotation / iterator / free-subtree helpers
-//  it depends on.  Only the range erase is public; the helpers
-//  are static inside subnode.cpp.
+//  it depends on.  Only the range erase and the tree-object init are
+//  public; the helpers are static inside subnode.cpp.
 // ============================================================
 #ifndef F3_SUBNODE_H
 #define F3_SUBNODE_H
@@ -31,5 +31,18 @@
 // container's +0x74 tree).
 void *SubNodeEraseRange(void *obj, void *out, void *bound0, void *start,
                         void *bound1, void *end);
+
+// sub_7281F0 (0x7281F0 - 0x728264) -- the SubNode tree object init (the
+// +0x74 SubNode collection's counterpart to SubNodeEraseRange).  thiscall
+// + `retn 8` (obj in ECX, two stack args unused), declared object-first.
+// Initializes the 32-byte tree object in place: +0x00 = the 4-byte
+// self-referencing head node (the block stores the tree object pointer),
+// +0x18 = the freshly allocated 44-byte sentinel node (left / parent / right
+// all self-referencing, color +0x28 = black, sentinel flag +0x29 = 1, the
+// three self-reference dwords self-pointing at the block, the payload words
+// left untouched -- the original does not zero them -- and the node count
+// zeroed in +0x1C).  Replaces the no-op sub_7281F0 stub in gamemain.cpp
+// (called from InitBankContainer 0x7201B0 for the container's +0x74 tree).
+void *InitSubNodeTree(void *obj);
 
 #endif  // F3_SUBNODE_H

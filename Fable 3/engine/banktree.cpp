@@ -544,3 +544,48 @@ generic:
     *(void **)((char *)out + 4) = start;               // out[1] = node
     return out;
 }
+
+// ============================================================
+//  InitBankTree  (0x6527D0 - 0x652841)  -- the bank-tree object init
+//  [NOT byte-identical] placement-dependent (the E8 calls to LHAlloc).
+//
+//  void *InitBankTree(void *obj)   -- thiscall + retn 8 in the original
+//  (obj in ECX, two stack args unused), declared object-first here.
+//
+//  Initializes the 24-byte bank-tree object in place: +0x00 = the 4-byte
+//  self-referencing head node (the block stores the tree object pointer;
+//  NULL when the allocation fails), +0x18 = the freshly allocated 24-byte
+//  sentinel node (left / parent / right = the block itself -- the RB head
+//  self-loop -- color +0x14 = black, sentinel flag +0x15 = 1, the three
+//  self-reference dwords self-pointing at the block), and the node count
+//  zeroed in +0x1C.  The payload words (+0x0C..+0x13) are left untouched,
+//  exactly as the original does.  The original's OOM path is a wild write
+//  (it stores through a NULL sentinel unconditionally), so the OOM
+//  stand-in stores NULL / leaves the count zeroed instead of trapping.
+// ============================================================
+void *InitBankTree(void *obj)
+{
+    // +0x00: the 4-byte self-referencing head node.
+    DWORD *head = (DWORD *)LHAlloc(4);
+    if (head != 0)
+        head[0] = (DWORD)obj;
+    *(DWORD *)obj = (DWORD)head;
+
+    // +0x18: the 24-byte sentinel node; +0x1C: the node count (0).
+    DWORD *sent = (DWORD *)LHAlloc(24);
+    *(DWORD *)((char *)obj + 0x18) = (DWORD)sent;
+    *(DWORD *)((char *)obj + 0x1C) = 0;
+    if (sent != 0)
+    {
+        sent[0] = 0;                                  // left
+        sent[1] = 0;                                  // parent
+        sent[2] = 0;                                  // right
+        *(BYTE *)((char *)sent + 0x15) = 0;           // sentinel flag = 0
+        *(BYTE *)((char *)sent + 0x14) = 1;           // color = black
+        *(BYTE *)((char *)sent + 0x15) = 1;           // sentinel flag = 1
+        sent[1] = (DWORD)sent;                        // parent = the block
+        sent[0] = (DWORD)sent;                        // left = the block
+        sent[2] = (DWORD)sent;                        // right = the block
+    }
+    return obj;
+}

@@ -30,6 +30,7 @@
 // and the low word of the buffer field = 0 (the empty-string reset).
 
 #include <stdexcept>
+#include <new>            // std::bad_alloc (NameMapAllocBlock overflow path)
 
 #include "namemap.h"
 #include "common/common.h"   // LHFree
@@ -508,4 +509,91 @@ generic:
         }
         NameMapEraseNode(obj, v14, bound0, oldStart);
     }
+}
+
+// ============================================================
+//  NameMapAllocBlock  (0x5AD050 - 0x5AD0CF)  -- allocate 48 * count bytes
+//  [NOT byte-identical] placement-dependent (the E8 call to LHAlloc).
+//
+//  The overflow-guarded allocator the sentinel ctor uses (and the
+//  name-map code later): when the count is nonzero and 0xFFFFFFFF /
+//  count is below 0x30 the allocation is refused (the original throws
+//  stdext::bad_alloc through std::_Throw over the vftable-backed
+//  exception block; the reachable a1 == 1 path never trips it, so the
+//  throw is emulated with a plain exception).  Otherwise the block is
+//  48 * count bytes from the heap.
+// ============================================================
+static DWORD *NameMapAllocBlock(unsigned int count)
+{
+    if (count != 0 && 0xFFFFFFFFu / count < 0x30u)
+        throw std::bad_alloc();   // the original throws stdext::bad_alloc
+    return (DWORD *)LHAlloc(48u * count);
+}
+
+// ============================================================
+//  InitNameMapSentinel  (0x5AABE0 - 0x5AAC3C)  -- the name-map sentinel node init
+//  [NOT byte-identical] placement-dependent (the E8 calls to
+//  NameMapAllocBlock / LHAlloc).
+//
+//  void *InitNameMapSentinel(void *obj)   -- thiscall + retn 0 in the original
+//  (obj in ECX), declared object-first here.
+//
+//  Builds the 48-byte self-looped sentinel node of the name-map tree
+//  object and stores it at +0x18 (the tree's sentinel slot), zeroing
+//  the +0x1C count.  The node: left / parent / right = the block itself
+//  (the RB head self-loop), color +0x2C = black, sentinel flag +0x2D = 1;
+//  the payload words (+0x0C..+0x27) are left untouched, exactly as the
+//  original does.  The original's OOM path is a wild write (it stores
+//  through a NULL sentinel unconditionally), so the OOM stand-in stores
+//  NULL / leaves the count zeroed instead of trapping (the same approach
+//  as InitSubNodeTree for the +0x74 tree).
+// ============================================================
+static void *InitNameMapSentinel(void *obj)
+{
+    DWORD *block = (DWORD *)NameMapAllocBlock(1);
+
+    *(DWORD *)((char *)obj + 0x18) = (DWORD)block;   // +0x18: the sentinel slot
+    *(DWORD *)((char *)obj + 0x1C) = 0;               // +0x1C: the node count
+    if (block != 0)
+    {
+        block[0] = 0;                                  // left
+        block[1] = 0;                                  // parent
+        block[2] = 0;                                  // right
+        *(BYTE *)((char *)block + 0x2C) = 1;          // color = black
+        *(BYTE *)((char *)block + 0x2D) = 0;          // sentinel flag = 0
+        *(BYTE *)((char *)block + 0x2D) = 1;          // sentinel flag = 1
+        block[0] = (DWORD)block;                       // left = the block
+        block[1] = (DWORD)block;                       // parent = the block
+        block[2] = (DWORD)block;                       // right = the block
+    }
+    return block;
+}
+
+// ============================================================
+//  InitNameMapTree  (0x5AA8F0 - 0x5AA923)  -- the +0x94 name-map tree object init
+//  [NOT byte-identical] placement-dependent (the E8 calls to LHAlloc /
+//  InitNameMapSentinel).
+//
+//  void *InitNameMapTree(void *obj)   -- thiscall + retn 8 in the original
+//  (obj in ECX, two stack args unused), declared object-first here.
+//
+//  Initializes the 0x20-byte name-map tree object in place: +0x00 = the
+//  4-byte self-referencing head node (the block stores the tree object
+//  pointer; NULL when the allocation fails), then the +0x18 sentinel
+//  node via InitNameMapSentinel (the 48-byte self-looped sentinel +
+//  the +0x1C count zero).  Returns the object.  Replaces the no-op
+//  sub_5AA8F0 stub in gamemain.cpp (called from InitBankContainer
+//  0x7201B0 for the container's +0x94 tree).
+// ============================================================
+void *InitNameMapTree(void *obj)
+{
+    // +0x00: the 4-byte self-referencing head node.
+    DWORD *head = (DWORD *)LHAlloc(4);
+    if (head != 0)
+        head[0] = (DWORD)obj;
+    *(DWORD *)obj = (DWORD)head;
+
+    // +0x18: the 48-byte sentinel node; +0x1C: the node count (0).
+    InitNameMapSentinel(obj);
+    return obj;
 }

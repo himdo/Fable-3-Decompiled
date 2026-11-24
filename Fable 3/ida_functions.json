@@ -100489,7 +100489,7 @@
     },
     "0x0061d800": {
       "size": 103,
-      "name": "sub_61D800"
+      "name": "CopyFileToSharedSlot"
     },
     "0x0061d8a0": {
       "size": 10,
@@ -142617,7 +142617,7 @@
     },
     "0x007281f0": {
       "size": 116,
-      "name": "sub_7281F0"
+      "name": "InitSubNodeTree"
     },
     "0x00728270": {
       "size": 116,
@@ -622065,7 +622065,7 @@
     },
     "0x017fe0a0": {
       "size": 465,
-      "name": "sub_17FE0A0"
+      "name": "CLegacyFileOpen"
     },
     "0x017fe290": {
       "size": 475,
@@ -622081,7 +622081,7 @@
     },
     "0x017fe870": {
       "size": 53,
-      "name": "sub_17FE870"
+      "name": "LegacyFileCtor"
     },
     "0x017fe8b0": {
       "size": 52,
@@ -719241,7 +719241,7 @@
     },
     "0x01ad38e0": {
       "size": 18,
-      "name": "sub_1AD38E0"
+      "name": "ReleaseLegacyFileSystem"
     },
     "0x01ad3900": {
       "size": 18,

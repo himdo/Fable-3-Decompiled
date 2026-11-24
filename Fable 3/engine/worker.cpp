@@ -3962,7 +3962,11 @@ struct F3ObjectListNode
     F3ObjectListNode *next;   // +0
     F3ObjectListNode *prev;   // +4
     void *obj;                // +8  wrapped vtable object
+    DWORD pad0C;              // +0x0C (opaque, copied verbatim by the flush path)
+    DWORD data16_lo;          // +0x10 (the 8-byte opaque payload, low word)
+    DWORD data16_hi;          // +0x14 (the 8-byte opaque payload, high word)
 };
+// 24 bytes, matching the LHAlloc(24) allocation of the original node layout.
 
 struct F3ObjectList
 {
@@ -4047,6 +4051,277 @@ static void __stdcall FreeObjectListContainer(F3ObjectListContainer *c)
             F3ListRemoveNode(list, out, head, last);
         }
     }
+}
+
+// ============================================================
+//  F3ObjectListSizeAdd  (0x5A4A80)  -- increment a list's count
+//  [NOT byte-identical] placement-dependent (LHAlloc exception machinery).
+//
+//  int F3ObjectListSizeAdd(F3ObjectList *list)
+//
+//  Checks the count against the 0xFFFFFFF "list too long" limit and, on
+//  overflow, throws std::length_error("list<T> too long") (the original builds
+//  the same exception via sub_402F00 / sub_401BD0 and throws it with
+//  std::_Throw). On success increments the count and returns
+//  0xFFFFFFF - count (the value before the increment).
+// ============================================================
+static int F3ObjectListSizeAdd(F3ObjectList *list)
+{
+    int result = 0xFFFFFFF - list->count;
+    if (list->count == 0xFFFFFFF)
+        throw std::length_error("list<T> too long");
+    ++list->count;
+    return result;
+}
+
+// ============================================================
+//  F3ObjectListAddNode  (0x5A47D0)  -- insert a new node at the end of
+//  the list
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc and
+//  F3ObjectListSizeAdd) and refs the heap table (dword_2075B24) at its
+//  original high VA.
+//
+//  void F3ObjectListAddNode(F3ObjectList *list, const void *obj,
+//                           DWORD pad0C, DWORD data16_lo, DWORD data16_hi)
+//
+//  Allocates the 24-byte node, sets { next = sentinel, prev = sentinel->prev
+//  (the old last real node), obj = obj, pad0C = pad0C, data16 =
+//  {lo, hi} }, increments the count (F3ObjectListSizeAdd), and links it
+//  after the old last real node (old last->next = new node,
+//  sentinel->prev = new node). On allocation failure throws std::bad_alloc
+//  (unreachable in practice -- a 24-byte LHAlloc).
+// ============================================================
+static void F3ObjectListAddNode(F3ObjectList *list, void *obj,
+                                DWORD pad0C, DWORD data16_lo, DWORD data16_hi)
+{
+    F3ObjectListNode *sentinel = list->tail;
+    F3ObjectListNode *newNode =
+        (F3ObjectListNode *)LHAlloc(sizeof(F3ObjectListNode));
+
+    if (newNode == 0)
+        throw std::bad_alloc();
+
+    F3ObjectListNode *oldLast = sentinel->prev;
+    newNode->next = sentinel;
+    newNode->prev = oldLast;
+    newNode->obj  = obj;
+    newNode->pad0C = pad0C;
+    newNode->data16_lo = data16_lo;
+    newNode->data16_hi = data16_hi;
+
+    F3ObjectListSizeAdd(list);
+
+    sentinel->prev = newNode;
+    oldLast->next = newNode;
+}
+
+// ============================================================
+//  F3ListRemoveTail  (0x5A4740)  -- remove + free the last real node
+//  [NOT byte-identical] placement-dependent (relative call to F3ListRemoveNode).
+//
+//  void F3ListRemoveTail(F3ObjectList *list, F3ObjectListNode **outLast)
+//
+//  Reads the last real node (sentinel->prev) and removes it via
+//  F3ListRemoveNode (splice + LHFree + count--). outLast receives the node
+//  pointer (so the caller can release / re-wrap its wrapped object). The
+//  original carries __invalid_parameter_noinfo asserts that are no-ops in a
+//  healthy build.
+// ============================================================
+static void F3ListRemoveTail(F3ObjectList *list, F3ObjectListNode **outLast)
+{
+    F3ObjectListNode *last = list->tail->prev;
+    DWORD out[2] = { 0, 0 };
+    F3ListRemoveNode(list, out, list->head, last);
+    *outLast = last;
+}
+
+// ============================================================
+//  EnsureObjectListInit  (0x18CB5A0)  -- one-time list init
+//  [NOT byte-identical] placement-dependent (LHAlloc).
+//
+//  void EnsureObjectListInit(F3ObjectList *list)
+//
+//  Lazily creates the 24-byte sentinel node for the list (next = prev =
+//  itself, count = 0). The original allocates a 4-byte head-slot block and
+//  stores the sentinel in the tail slot; this build keeps the sentinel
+//  directly in the tail slot.
+// ============================================================
+static void EnsureObjectListInit(F3ObjectList *list)
+{
+    if (list->tail != 0)
+        return;
+
+    F3ObjectListNode *sentinel =
+        (F3ObjectListNode *)LHAlloc(sizeof(F3ObjectListNode));
+    if (sentinel == 0)
+        throw std::bad_alloc();
+    sentinel->next = sentinel;
+    sentinel->prev = sentinel;
+    sentinel->obj  = 0;
+    sentinel->pad0C = 0;
+    sentinel->data16_lo = 0;
+    sentinel->data16_hi = 0;
+
+    list->tail = sentinel;
+    list->head = 0;
+    list->count = 0;
+}
+
+// ============================================================
+//  FlushDeviceOperationLists  (0x18CB6A0 - 0x18CB95F)  -- flush the pending
+//  device-operation object lists
+//  [NOT byte-identical] placement-dependent (relative calls to LHAlloc /
+//  GetEngineTime / Sleep / FreeObjectListContainer / F3ListRemoveNode) and
+//  refs the container (0x20FC988) and the FPS records (0x2074548 / 0x20B5F70)
+//  at their original high VAs.
+//
+//  int FlushDeviceOperationLists(void)   -- no args (cdecl), returns int
+//
+//  Flush the pending device-operation lists of the 64-byte container:
+//  - while the +0x20 list (l20) holds pending operations, ask the wrapped
+//    object's vtable[7] (offset 28, stdcall with the object on the stack,
+//    args 0 / 0 / 1) whether it is done. If it returns non-zero and is not
+//    1 (or the flush took longer than dbl_1DBBFE0 seconds), free both lists
+//    (FreeObjectListContainer) and jump to the tail. If it returns 1 and
+//    the flush is still within the threshold, Sleep(0) and keep flushing.
+//    If it returns 0, move the last operation node from l20 to the +0x04
+//    list (l04) -- copying its wrapped object and opaque payload verbatim --
+//    via F3ObjectListAddNode and remove + free the old l20 node.
+//  - when l04 is empty at the end, ask the device's vtable[118] (offset
+//    472) to produce a new operation into a 20-byte buffer (arg 8) and add
+//    it as an l04 node if the call returns 0.
+//  - if l04 is still non-empty at the end, release the last l04 node's
+//    wrapped object (vtable[6], offset 24, stdcall with the object on the
+//    stack, args 1) and re-add it to l20 (F3ObjectListAddNode).
+//  Then bump the container counter, stamp the engine time into the current
+//  FPS record, and return the record index * 3.
+// ============================================================
+static double g_dbl_1DBBFE0 = 1.0;       // 0x1DBBFE0  flush time threshold (seconds)
+static DWORD  g_dword_20B5F74 = 0;        // 0x20B5F74  current FPS record index
+static DWORD  g_dword_20B5F70 = 0;        // 0x20B5F70  global frame counter
+static double g_dbl_2074580 = 0.0;        // 0x2074580  last flush time
+static double g_dbl_2074578 = 0.0;        // 0x2074578  last flush time (copy)
+
+// 24-byte FPS record: frame time (+0), previous frame time (+8), frame
+// counter (+0x10), interlocked counter (+0x14).
+static struct F3FpsRecord
+{
+    double frameTime;        // +0
+    double prevFrameTime;    // +8
+    DWORD  frameCounter;     // +0x10
+    long   interlocked;      // +0x14
+} g_FpsRecords[128];
+
+int FlushDeviceOperationLists(void)
+{
+    EnsureObjectListInit(&g_stru_20FC988.l04);
+    EnsureObjectListInit(&g_stru_20FC988.l20);
+
+    double engineTime = GetEngineTime();
+    int result = 0;
+
+    while (g_stru_20FC988.l20.count != 0)
+    {
+        F3ObjectList *l20 = &g_stru_20FC988.l20;
+        F3ObjectListNode *sentinel = l20->tail;
+        F3ObjectListNode *last = sentinel->prev;   // the last real node
+        void *obj = last->obj;
+
+        void **ovt = *(void ***)obj;
+        int (__stdcall *op)(void *, int, int, int) =
+            (int (__stdcall *)(void *, int, int, int))ovt[7];  // offset 28
+        int v4 = op(obj, 0, 0, 1);
+
+        if (v4 != 0)
+        {
+            if (v4 != 1 || GetEngineTime() - engineTime > g_dbl_1DBBFE0)
+            {
+                FreeObjectListContainer(&g_stru_20FC988);
+                goto f3_flush_done;
+            }
+            Sleep(0);
+            continue;
+        }
+
+        // v4 == 0: move the last operation node from l20 to l04
+        DWORD pad0C = last->pad0C;
+        DWORD data16_lo = last->data16_lo;
+        DWORD data16_hi = last->data16_hi;
+
+        F3ObjectListAddNode(&g_stru_20FC988.l04, obj, pad0C, data16_lo, data16_hi);
+
+        F3ObjectListNode *head = l20->head;
+        DWORD out[2] = { 0, 0 };
+        F3ListRemoveNode(l20, out, head, last);
+    }
+
+    // l20 is empty: re-check l04
+    if (g_stru_20FC988.l04.count == 0)
+    {
+        DWORD dev = g_stru_20FC988.f00;
+        if (dev != 0)
+        {
+            void **devVTable = *(void ***)dev;
+            int (__stdcall *acq)(DWORD, int, BYTE *) =
+                (int (__stdcall *)(DWORD, int, BYTE *))devVTable[118];  // offset 472
+
+            BYTE buffer[20] = { 0 };
+            if (acq(dev, 8, buffer) == 0)
+            {
+                void *wrappedObj = *(void **)buffer;
+            DWORD pad0C = (DWORD)(buffer[4] | (buffer[5] << 8) | (buffer[6] << 16) | ((DWORD)buffer[7] << 24));
+            DWORD data16_lo = (DWORD)(buffer[8] | (buffer[9] << 8) | (buffer[10] << 16) | ((DWORD)buffer[11] << 24));
+            DWORD data16_hi = (DWORD)(buffer[12] | (buffer[13] << 8) | (buffer[14] << 16) | ((DWORD)buffer[15] << 24));
+            F3ObjectListAddNode(&g_stru_20FC988.l04, wrappedObj, pad0C, data16_lo, data16_hi);
+            }
+        }
+    }
+
+    if (g_stru_20FC988.l04.count > 0)
+    {
+        // release the last l04 node's wrapped object via vtable[6] (offset 24)
+        // and re-add it to l20
+        F3ObjectList *l04 = &g_stru_20FC988.l04;
+        F3ObjectListNode *last = l04->tail->prev;
+
+        void *obj = last->obj;
+        DWORD pad0C = last->pad0C;
+        DWORD data16_lo = last->data16_lo;
+        DWORD data16_hi = last->data16_hi;
+
+        F3ListRemoveTail(l04, &last);
+
+        if (obj != 0)
+        {
+            void **ovt = *(void ***)obj;
+            void (__stdcall *release)(void *, int) =
+                (void (__stdcall *)(void *, int))ovt[6];  // offset 24
+            release(obj, 1);
+        }
+
+        F3ObjectListAddNode(&g_stru_20FC988.l20, obj, pad0C, data16_lo, data16_hi);
+    }
+
+    f3_flush_done:
+    ;
+
+    // counter bump
+    ++g_stru_20FC988.f3C[0];
+
+    // FPS record update
+    g_dbl_2074580 = GetEngineTime();
+    F3FpsRecord *rec = &g_FpsRecords[g_dword_20B5F74];
+    rec->prevFrameTime = rec->frameTime;
+    rec->frameTime = g_dbl_2074580;
+
+    result = 3 * (int)g_dword_20B5F74;
+
+    ++rec->frameCounter;
+
+    g_dbl_2074578 = g_dbl_2074580;
+    ++g_dword_20B5F70;
+
+    return result;
 }
 
 // ============================================================
@@ -4203,18 +4478,102 @@ static int DestroyDevice(void)
 // ============================================================
 //  XLO device-build state globals (sub_18F1B30 / CreateXloDevice and its
 //  helpers).  All zero in the image; here they live as static globals in this
-//  module.
+//  module (g_dword_2074540 is the one engine-wide exception - it is an
+//  extern declared in common/common.h and shared with gamemain.cpp).
 // ============================================================
 static DWORD  g_dword_1DB11F4[11];   // 0x1DB11F4  the last 44-byte display-mode request
 static DWORD  g_dword_20FC984 = 0;   // 0x20FC984  format-table index (request field[0])
 // (g_dword_1E2ED74 is defined at the top of the ResetXloDevice cluster.)
 static float  g_flt_1E2ED78 = 0.0f;  // 0x1E2ED78  device refresh rate
 static float  g_flt_20FC968 = 0.0f;  // 0x20FC968  device refresh rate (mirror)
-static DWORD  g_dword_2074540 = 0;   // 0x2074540  the built device (mirror of 1E2EEF4)
+DWORD          g_dword_2074540 = 0;   // 0x2074540  the built device (mirror of 1E2EEF4; engine-wide extern, see common/common.h)
 static DWORD  g_dword_1E2EEF0 = 0;   // 0x1E2EEF0  NVAPI device-registration scratch
 static DWORD  g_dword_1E2EE7C = 0;   // 0x1E2EE7C  text-caps threshold (low byte + 10*byte1)
 // 0x1BD3030: the rdata display-mode flags table (4 valid values + 0 sentinel).
 static const DWORD g_dword_1BD3030[5] = { 0x47, 0x4B, 0x4D, 0x50, 0 };
+
+// ============================================================
+//  FillFpsRecordStackStruct  (0x18CB350 - 0x18CB3C6)  -- snapshot the
+//  current FPS record + the globals into a 44-byte stack struct. The
+//  original is a __usercall (the scratch struct in ESI, returns ESI);
+//  here it is a plain free function whose pointer arg is named `out`.
+//  [NOT byte-identical] placement-dependent (relative calls to the
+//  InterlockedIncrement / InterlockedDecrement IAT slots) and refs the
+//  high-VA globals (dbl_2074548 / dword_20B5F74 / dword_20B5F70 /
+//  qword_2074580 / qword_2074578) at their original addresses.
+//
+//  void *FillFpsRecordStackStruct(void *out)  -- fills *out (a 44-byte
+//  stack scratch record) and returns it.
+//
+//  Fills the scratch record from the current FPS record (frameTime at
+//  record +0, prevFrameTime at +8, frameCounter at +0x10) and the
+//  globals: last flush time (qword_2074580) at scratch +0, last flush
+//  time copy (qword_2074578) at +8, global frame counter (dword_20B5F70)
+//  at +0x10, record frameTime at +0x18, record prevFrameTime at +0x20,
+//  record frameCounter at +0x28. The record's interlocked guard (record
+//  +0x14) is incremented for the read and decremented on the way out
+//  (net zero). Only the +0x10 / +0x18 / +0x28 fields are read back --
+//  the scratch record is written for the whole struct to keep the
+//  original's callee-writes-44-bytes / caller-reads-a-few structure.
+// ============================================================
+static void *FillFpsRecordStackStruct(void *out)
+{
+    F3FpsRecord *rec = &g_FpsRecords[g_dword_20B5F74];
+    InterlockedIncrement((volatile LONG *)&rec->interlocked);
+
+    double *pd = (double *)out;
+    DWORD  *pi = (DWORD *)out;
+
+    pd[0] = g_dbl_2074580;      // last flush time (qword_2074580)
+    pd[1] = g_dbl_2074578;      // last flush time (copy)
+    pi[4] = g_dword_20B5F70;    // global frame counter (dword_20B5F70)
+    pd[3] = rec->frameTime;     // current record's frame time
+    pd[4] = rec->prevFrameTime; // current record's previous frame time
+    pi[10] = rec->frameCounter; // current record's frame counter
+
+    InterlockedDecrement((volatile LONG *)&rec->interlocked);
+    return out;
+}
+
+// ============================================================
+//  GetInterpolatedFrameTime  (0x18F0460 - 0x18F04B0)  -- the per-frame
+//  interpolated frame time reconstructed from the current FPS record and
+//  the global frame counter.
+//  [NOT byte-identical] placement-dependent (relative calls to the
+//  __security_check_cookie IAT slot and the record-read helper) and refs
+//  the high-VA globals dword_1E2ED74 (render-mode class) / flt_1E2ED78
+//  (device refresh rate) / dbl_2074548 / dword_20B5F74 / dword_20B5F70 at
+//  their original addresses.
+//
+//  double GetInterpolatedFrameTime(void)  -- no args, returns double
+//
+//  Fills the 44-byte scratch record through FillFpsRecordStackStruct
+//  (sub_18CB350), then computes, in excess precision,
+//    (dword_1E2ED74 / flt_1E2ED78) * (globalFrameCounter - recordFrameCounter + 1)
+//      + recordFrameTime
+//  exactly as the original's fild / fdiv / inc / fild / fmulp / fadd
+//  sequence does (the security-cookie check is omitted, as everywhere in
+//  this build). Sole caller FlushRenderFrame (0x18F1F60), which stores the
+//  result into dbl_20FC960 under the device CS.
+// ============================================================
+double GetInterpolatedFrameTime(void)
+{
+    struct F3FpsStackSnapshot
+    {
+        double lastFlushTime;       // +0
+        double lastFlushTimeCopy;   // +8
+        DWORD  globalFrameCounter;  // +0x10
+        double frameTime;           // +0x18
+        double prevFrameTime;       // +0x20
+        DWORD  recordFrameCounter;  // +0x28
+    };
+
+    F3FpsStackSnapshot s;
+    FillFpsRecordStackStruct(&s);
+    return (double)g_dword_1E2ED74 / (double)g_flt_1E2ED78
+           * (double)((int)s.globalFrameCounter - (int)s.recordFrameCounter + 1)
+           + s.frameTime;
+}
 
 // ============================================================
 //  F3FindFormatRow  -- walk the texture source-descriptor table

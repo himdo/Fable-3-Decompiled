@@ -102,6 +102,12 @@ extern DWORD g_WideSlotCount;
 // device written in one file was invisible to the others.)
 extern void *g_dword_1E2EEF4;
 
+// 0x2074540 - the built device (mirror of 1E2EEF4). The worker's device-build
+// path stores the same device pointer here, and the per-frame graphics-state
+// flush (FlushFrameStateBuffers, gamemain.cpp) dispatches the device vtable
+// through it, so it must be a single engine-wide global.
+extern DWORD g_dword_2074540;
+
 // 0x1E2ED80 - the 56-byte (14 DWORD) XLO device-caps block (the D3DPRESENT_
 // PARAMETERS handed to XLiveOnCreateDevice / XLiveOnResetDevice). Written by
 // the device-build path (worker.cpp), read by the XLO callbacks.

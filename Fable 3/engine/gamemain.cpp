@@ -13,7 +13,8 @@
 #include "xlip.h"                 // F3AString + the XLip module (engine/xlip.h)
 #include "banktree.h"             // BankTreeEraseRange (the bank-tree range erase)
 #include "namemap.h"              // NameMapEraseRange (the +0x94 name-map range erase)
-#include "subnode.h"              // SubNodeEraseRange (the +0x74 SubNode range erase)
+                                    // / InitNameMapTree (the +0x94 name-map tree-object init)
+#include "subnode.h"              // SubNodeEraseRange / InitSubNodeTree (the +0x74 SubNode tree)
 #include "common/common.h"        // LHAlloc / LHFree / JmpLHAllocAligned / LHFreeAligned / JmpLHFreeAligned /
 // InitSharedSlot / ReleaseSharedSlot
 #include "engine/engine.h"        // SetThreadName (the thread-name announce)
@@ -1528,7 +1529,7 @@ static DWORD *FindIntOptionValue(F3OptionMap *obj, F3SharedBuffer **keySlot)
 {
     (void)obj;
     (void)keySlot;
-    // [remaining stub] the tree key lookup / insert (sub_4122E0 / sub_403F10 /
+    // [remaining stub] the tree key lookup / insert (sub_4122E0 / SpeechBankStrCompare /
     // sub_776BF0) is out of scope; the value store lands in a static word.
     return &g_stubIntOptionValue;
 }
@@ -4987,6 +4988,18 @@ static F3SharedBuffer *g_ShapeSpawnPrefixSlot = 0;
 // (the image holds the wide "UseShapeSpawnDir"; read as an ANSI string it
 // is empty, so an empty slot makes the prefix check a no-op).
 static const char g_ShapeSpawnDefaultStr[1] = { 0 };
+// 0x1E2D7A8: the legacy-file (CLegacyFile, CLegacyFileOpen) wrapper's init flag
+// (bit 0 = first use).  Distinct from 0x1E2D7B0 (the CLegacyMemoryFileOpen
+// path's flag); a different handler (ReleaseLegacyFileSystem).
+static BYTE  g_LegacyFileSystemFlags = 0;
+// 0x1E2D7A4: the legacy-file (CLegacyFile, CLegacyFileOpen) wrapper object (created
+// lazily on first use, released at exit).  Distinct from 0x1E2D7AC.
+static DWORD g_LegacyFileSystemObject = 0;
+// 0x1E2D7C4: the global data-path prefix slot (a pointer to the 8-byte
+// {str, len} record the open-setup strncmp-compares against; null = no
+// prefix).  The startup writer (sub_17FD600, ResolveDataPathSlot) is not
+// yet implemented, so this stays null and the prefix check is a no-op.
+static DWORD g_LegacyDataPathRecord = 0;
 
 // sub_1A01BE0 (0x1A01BE0 - 0x1A01C38) -- copy `src`'s block into `out`
 // (RefSharedSlot: out is nulled, g_Addend bumped, the block shared with a
@@ -5607,6 +5620,16 @@ static void ReleaseGlobalFileSystem(void)
         ((void (WINAPI *)(void *))F3_VT(o)[2])(o);
 }
 
+// ReleaseLegacyFileSystem (0x1AD38E0 - 0x1AD38F2) -- the atexit release of the global
+// legacy-file system object (the CLegacyFile open-setup's own wrapper,
+// distinct from the CLegacyMemoryFileOpen path's ReleaseGlobalFileSystem).
+static void ReleaseLegacyFileSystem(void)
+{
+    void *o = (void *)g_LegacyFileSystemObject;
+    if (o != 0)
+        ((void (WINAPI *)(void *))F3_VT(o)[2])(o);
+}
+
 // sub_17FDDF0 (0x17FDDF0 - 0x17FDE20) -- the global file-system slot
 // getter with lazy init: first use sets the flag byte, nulls the object,
 // and registers ReleaseGlobalFileSystem at exit; returns
@@ -5855,6 +5878,124 @@ static void *CLegacyMemoryFileCtor(void *obj, F3SharedBuffer **slot, int mode, i
     o[2] = 0;
     CLegacyMemoryFileOpen(obj, slot, mode, a4);
     return obj;
+}
+
+// CLegacyFileOpen (0x17FE0A0 - 0x17FE271) -- the LHSFS::CLegacyFile open-setup:
+// take the caller's path-slot
+// block into a private lowercased block (the original aliases its a2
+// parameter location; modelled with a local), mirror it into the object's
+// +4 path slot, and -- when the path starts with the global data-path
+// prefix (an empty/null record -> empty prefix -> always matches) --
+// rebuild it as the prefix-stripped substring.  The mode selects the
+// vt[4] open mode (1 -> the caller's flag decides 4 or 1; 2/3 -> 5; 4 ->
+// 0; anything else -> the slot value).  Then the one-time atexit registration
+// (ReleaseLegacyFileSystem) and the lazy 48-byte file-system wrapper, resolves the path through the wrapper's vt[4] (which writes the
+// resolved source IFile into the out slot), stores the resolved source in
+// +8, and releases the path block.  [NOT byte-identical] placement-
+// dependent (E8 calls) plus the original 0x1E2D7xx high-VA globals and
+// the Interlocked IAT slots.
+static int CLegacyFileOpen(void *obj, F3SharedBuffer **slot, int mode, int a4)
+{
+    DWORD *o = (DWORD *)obj;
+
+    // the original aliases its own a2 parameter location: the slot's block
+    // is copied into the (a2) parameter location as a private lowercased
+    // block while the caller's slot keeps its original block.  Modelled
+    // with a local slot location.
+    F3SharedBuffer *privateBlock = 0;
+    DetachToLowerSharedSlot(slot, &privateBlock);
+    F3SharedBuffer **blockLoc = &privateBlock;
+
+    CopySharedSlot((F3SharedBuffer **)(o + 1), blockLoc);
+
+    // the prefix check: strncmp over the prefix length (empty record ->
+    // empty prefix) against the (lowercased) path.
+    const char *prefixStr = g_ShapeSpawnDefaultStr;
+    DWORD prefixLen = 0;
+    if (g_LegacyDataPathRecord != 0)
+    {
+        DWORD *rec = (DWORD *)g_LegacyDataPathRecord;
+        prefixStr = (const char *)rec[0];
+        prefixLen = (DWORD)rec[1];
+        if (prefixStr == 0)
+            prefixStr = g_ShapeSpawnDefaultStr;
+    }
+    const char *pathStr = (*blockLoc != 0) ? (*blockLoc)->data : g_ShapeSpawnDefaultStr;
+    if (strncmp(pathStr, prefixStr, prefixLen) == 0)
+    {
+        DWORD pathLen = (*blockLoc != 0) ? (*blockLoc)->length : 0;
+        F3SharedBuffer *sub = 0;
+        SubstringSharedSlot(blockLoc, &sub, (int)prefixLen, (int)pathLen);
+        CopySharedSlot(blockLoc, &sub);
+        ReleaseSharedSlot(&sub);
+    }
+
+    // the mode value: 1 -> (a4 & 8) ? 4 : 1; 2/3 -> 5; 4 -> 0; default ->
+    // the slot value (the private block pointer).
+    int v11;
+    switch (mode)
+    {
+    case 1:
+        v11 = (a4 & 8) ? 4 : 1;
+        break;
+    case 2:
+    case 3:
+        v11 = 5;
+        break;
+    case 4:
+        v11 = 0;
+        break;
+    default:
+        v11 = (int)*blockLoc;
+        break;
+    }
+
+    // one-time atexit registration (the flag + the handler).
+    if ((g_LegacyFileSystemFlags & 1) == 0)
+    {
+        g_LegacyFileSystemFlags |= 1;
+        g_LegacyFileSystemObject = 0;
+        atexit(ReleaseLegacyFileSystem);
+    }
+
+    // the lazy 48-byte wrapper (first call only): add a ref, release the
+    // old global (dead in the first-call path), store the new wrapper,
+    // and release the slot-held reference.
+    if (g_LegacyFileSystemObject == 0)
+    {
+        DWORD wrapper = 0;
+        CreateFileSystemWrapper((void **)&wrapper);
+        if (wrapper != 0)
+            ((void (WINAPI *)(void *))F3_VT((void *)wrapper)[1])((void *)wrapper);
+        if (g_LegacyFileSystemObject != 0)
+            ((void (WINAPI *)(void *))F3_VT((void *)g_LegacyFileSystemObject)[2])((void *)g_LegacyFileSystemObject);
+        g_LegacyFileSystemObject = wrapper;
+        if (wrapper != 0)
+            ((void (WINAPI *)(void *))F3_VT((void *)wrapper)[2])((void *)wrapper);
+    }
+
+    // the wide string build (re-read the block -- the prefix branch may
+    // have swapped it), then the wrapper's vt[4] resolve: the resolved
+    // source IFile is written into the out slot.
+    pathStr = (*blockLoc != 0) ? (*blockLoc)->data : g_ShapeSpawnDefaultStr;
+    F3WString wstr;
+    F3WStringReset(&wstr);
+    F3WStringFromAnsi(&wstr, pathStr);
+    void *source = 0;
+    if (g_LegacyFileSystemObject != 0)
+        ((void (WINAPI *)(void *, void **, F3WString *, int))
+            F3_VT((void *)g_LegacyFileSystemObject)[4])((void *)g_LegacyFileSystemObject, &source, &wstr, v11);
+    F3WStringFree(&wstr);
+
+    if (source != 0)
+        ((void (WINAPI *)(void *))F3_VT((void *)source)[1])((void *)source);   // AddRef
+    if (o[2] != 0)
+        ((void (WINAPI *)(void *))F3_VT((void *)o[2])[2])((void *)o[2]);       // release old +8
+    o[2] = (DWORD)source;
+    if (source != 0)
+        ((void (WINAPI *)(void *))F3_VT((void *)source)[2])((void *)source);   // release the out-slot copy
+
+    return (int)(DWORD)ReleaseSharedSlot(blockLoc);
 }
 
 // ============================================================
@@ -6245,21 +6386,15 @@ static void *CreateGdbLoader(void)
 // LoadGlobalGdbFiles); zero in this build.
 static BYTE g_byte_1DBD032 = 0;
 
+static void CopyFileToSharedSlot(void *file, F3SharedBuffer **out);
+
 // sub_1A19E10 (0x1A19E10 - 0x1A19F76) -- load one GDB file through the
 // reader (the sub_1A19D70 file lookup, the sub_402F00 hash build, the
-// SetSharedSlot + sub_17FE870 memory-file open, the reader vtable slot 10
+// SetSharedSlot + LegacyFileCtor memory-file open, the reader vtable slot 10
 // load dispatch, the sub_17FD970 close).  Deep dependency chain -- out of
 // scope.  Stub: returns 0 (the file did not load).  [remaining stub]
 static long sub_1A19E10(void *loader, const char *path, int a3)
 { (void)loader; (void)path; (void)a3; return 0; }
-
-// sub_17FE870 / sub_61D800 / sub_17FD970 -- the memory-file open / read / close
-// trio used only by LoadGlobalGdbFiles' dead dev_roots branch.  Stubs.
-//  [remaining stub]
-static void *sub_17FE870(void *obj, void *slot, int a3, int a4)
-{ (void)obj; (void)slot; (void)a3; (void)a4; return 0; }
-static void  sub_61D800(void *obj, void *slot) { (void)obj; (void)slot; }
-static void  sub_17FD970(void *obj) { (void)obj; }
 
 //  LoadGlobalGdbFiles  (0x61A100 - 0x61A211)  -- load the five permanent
 //  global GDB files through the GDB loader: Globals.gdb, gui.gdb,
@@ -6285,9 +6420,9 @@ static int LoadGlobalGdbFiles(void *loader)
         F3SharedBuffer *memBuf   = 0;
         InitSharedSlot(&outSlot);
         SetSharedSlot(&fileSlot, "Globals\\dev_roots_built.txt", -1);
-        void *memFile = sub_17FE870(&memBuf, &fileSlot, 1, 2);
-        sub_61D800(memFile, &outSlot);
-        sub_17FD970(&memBuf);
+        void *memFile = LegacyFileCtor(&memBuf, &fileSlot, 1, 2);
+        CopyFileToSharedSlot(memFile, &outSlot);
+        LegacyFileDtor(&memBuf);
         ReleaseSharedSlot(&fileSlot);
         const char *s = (outSlot != 0 && outSlot->data != 0) ? outSlot->data : "";
         int isTrue = (strncmp(s, "true", 4) == 0);
@@ -6298,21 +6433,19 @@ static int LoadGlobalGdbFiles(void *loader)
     return (int)result;
 }
 
-// sub_72C220 / sub_7281F0 / sub_5AA8F0 / sub_6527D0 -- the 192-byte bank
-// container's sub-object initializers (the +0x1C string with the 0x4000
-// capacity, the +0x74 / +0x94 / +0xCC collections seeded from the 0x4000
-// word).  Deep dependency chains -- out of scope.  Stubs.  [remaining stub]
+// sub_72C220 -- the 192-byte bank container's +0x1C string init.
+// Deep dependency chain -- out of scope.  Stub.  [remaining stub]
+// (sub_7281F0 is now InitSubNodeTree, engine/subnode.cpp;
+// sub_5AA8F0 is now InitNameMapTree, engine/namemap.cpp;
+// sub_6527D0 is now InitBankTree, engine/banktree.cpp.)
 static void sub_72C220(void *obj, int capacity) { (void)obj; (void)capacity; }
-static void sub_7281F0(void *obj, void *a, void *b) { (void)obj; (void)a; (void)b; }
-static void sub_5AA8F0(void *obj, void *a, void *b) { (void)obj; (void)a; (void)b; }
-static void sub_6527D0(void *obj, void *a, void *b) { (void)obj; (void)a; (void)b; }
 
 //  InitBankContainer  (0x7201B0 - 0x720248)  -- construct the 192-byte
 //  bank container in place: +0x18 = 15 (the string SSO capacity), +0x14 / +4
 //  = 0, the +0x1C string init (sub_72C220 [remaining stub] with the 0x4000
 //  word), the 4-byte back-reference node into +0x5C, the +0x68 / +0x6C /
-//  +0x70 zero words, the +0x74 / +0x94 / +0xCC collection inits (sub_7281F0
-//  / sub_5AA8F0 / sub_6527D0 [remaining stubs] seeded with the 0x4000
+//  +0x70 zero words, the +0x74 / +0x94 / +0xCC collection inits (InitSubNodeTree
+//  / InitNameMapTree / InitBankTree seeded with the 0x4000
 //  word), the +0xB4 critical section (the CRT InitializeCriticalSection
 //  thunk, unknown_libname_2585), and the +0xEC flag zero.  Returns this.
 //  The original is thiscall + retn 8 (the 0x32 word is unused); here a
@@ -6333,10 +6466,10 @@ static void *InitBankContainer(void *obj, int unused, int capacity)
     *(DWORD *)(o + 0x68) = 0;
     *(DWORD *)(o + 0x6C) = 0;
     *(DWORD *)(o + 0x70) = 0;
-    sub_7281F0(o + 0x74, &capacity, &capacity);
-    sub_5AA8F0(o + 0x94, &capacity, &capacity);
+    InitSubNodeTree(o + 0x74);
+    InitNameMapTree(o + 0x94);
     InitializeCriticalSection((CRITICAL_SECTION *)(o + 0xB4));
-    sub_6527D0(o + 0xCC, &capacity, &capacity);
+    InitBankTree(o + 0xCC);
     o[0xEC] = 0;
     return obj;
 }
@@ -6389,31 +6522,157 @@ static int RebuildGuiObject(void *obj)
     return (int)((int(__thiscall *)(void *))vt2[1])(fresh);
 }
 
-// sub_1801620 (unresolved in this build) -- the file-subsystem collection
-// mount: (fs, out-slot, callback, data) with the callback populating the
-// out-slot.  Out of scope.  Stub: leaves the out-slot 0.  [remaining stub]
-static void sub_1801620(void *fs, void **out, void *callback, int data)
-{ (void)fs; (void)*out; (void)callback; (void)data; }
+//  FileSubsysMountCollection  (0x1801620 - 0x18016F3)  -- the file-subsystem
+//  collection mount (the +0x4C self-tag / +0x58-begin / +0x5C-end debug-
+//  iterator loop over the file-entry collection).  [NOT byte-identical]
+//  placement-dependent (the E8 calls to the __invalid_parameter_noinfo IAT
+//  slot and the entry vtable slot dispatches).
+//
+//  (void *)FileSubsysMountCollection(void *fs, void **out,
+//                                    unsigned char (__cdecl *callback)(int, int),
+//                                    int data)
+//
+//  Iterates the file-entry collection [begin = +0x58, end = +0x5C) of the
+//  0x8C-byte file-subsystem object, one element per 4-byte slot: for each
+//  entry it locks the entry (vtable slot 1, the original's stdcall dispatch),
+//  then calls the mount callback with (entry, data); on a callback failure
+//  (returns 0) the entry is stored in *out, re-locked + unlocked (vtable slots
+//  1 and 2) and returned via *out.  When the collection runs to the end the
+//  whole collection was processed and *out = 0 is written.  The MSVC
+//  debug-iterator bounds checks (the live begin/end words and the self-tag
+//  block at +0x4C) are reproduced as `F3InvalidParam` calls, matching the
+//  original __invalid_parameter_noinfo sequence.
+//  The original is thiscall + retn 0Ch (the object in ECX, the out slot in
+//  EDX, the callback + data on the stack, callee cleans via retn 12); it is
+//  declared as a plain free function here (the project convention).
+static void *FileSubsysMountCollection(void *fs, void **out,
+                                       unsigned char (__cdecl *callback)(int, int),
+                                       int data)
+{
+    DWORD *o = (DWORD *)fs;
+    DWORD tag = o[0x4C / 4];      // the +0x4C self-tag block pointer
+    DWORD begin = o[0x58 / 4];    // the collection begin (a 4-byte element ptr)
+    DWORD end = o[0x5C / 4];      // the collection end
 
-// sub_719CA0 (0x719CA0 - 0x719D64) -- the file-subsystem mount callback for
-// the bank container: reload "language\\text\\book.babel" through the VFS
-// archive collection (GetVfsArchiveCollection + VfsReloadFileEntry) and
-// rebuild the 192-byte container over the entry.  Deep dependency chain --
-// out of scope.  Stub.  [remaining stub]
-static char sub_719CA0(int impl) { (void)impl; return 0; }
+    if (begin > end)
+        F3InvalidParam();
+
+    DWORD element = 0;            // the slot written to *out below
+    for (DWORD i = begin; ; i += 4)
+    {
+        end = o[0x5C / 4];
+        if (o[0x58 / 4] > end)
+            F3InvalidParam();
+        if (tag == 0 || tag != o[0x4C / 4])
+            F3InvalidParam();
+        if (i == end)
+        {
+            *out = 0;
+            return out;
+        }
+
+        DWORD m;
+        if (tag != 0)
+            m = *(DWORD *)tag;
+        else
+        {
+            F3InvalidParam();
+            m = 0;
+        }
+        if ((DWORD)i >= *(DWORD *)(m + 0x10))
+            F3InvalidParam();
+
+        element = *(DWORD *)i;
+        if (element != 0)
+            ((void (WINAPI *)(void *))F3_VT((void *)element)[1])((void *)element);
+        if (callback((int)element, data) == 0)
+            break;
+        if (element != 0)
+            ((void (WINAPI *)(void *))F3_VT((void *)element)[2])((void *)element);
+
+        DWORD m2;
+        if (tag != 0)
+            m2 = *(DWORD *)tag;
+        else
+        {
+            F3InvalidParam();
+            m2 = 0;
+        }
+        if ((DWORD)i >= *(DWORD *)(m2 + 0x10))
+            F3InvalidParam();
+    }
+
+    *out = (void *)(DWORD)element;
+    if (element != 0)
+    {
+        ((void (WINAPI *)(void *))F3_VT((void *)element)[1])((void *)element);
+        ((void (WINAPI *)(void *))F3_VT((void *)element)[2])((void *)element);
+    }
+    return out;
+}
+
+//  ReloadTextBookBank  (0x719CA0 - 0x719D64)  -- the file-subsystem mount
+//  callback for the bank container: reload "language\\text\\book.babel"
+//  through the VFS archive collection (GetVfsArchiveCollection +
+//  VfsReloadFileEntry) and rebuild the 240-byte bank container over the
+//  reloaded entry (InitBankContainer + sub_721F60 + sub_7217B0 +
+//  DestroyBankContainer + the entry's vtable slot 2).  The original is
+//  cdecl with a __security_cookie prologue.  The two deep leaves
+//  (sub_721F60 / sub_7217B0 -- the container-load / container-sync steps)
+//  are remaining no-op stubs; the container-build block is unreachable in
+//  this build because the VFS reload never matches a provider (VfsReloadFileEntry
+//  writes a null out slot).  [NOT byte-identical] placement-dependent
+//  (the E8 calls + the __security_cookie prologue).
+static void *GetVfsArchiveCollection(void);   // sub_180D9B0 (defined below)
+static void *VfsReloadFileEntry(void *collection, void **out, void *entry, void *path); // sub_180D220 (defined below)
+//  sub_721F60 -- the deep "reload the container over the reloaded entry"
+//  step: takes the entry (the mount's file-entry handle), re-reads it and
+//  folds it into the just-built bank container.  Deep dependency chain
+//  (sub_18A6660 / sub_4C7540 / sub_721840 / sub_4C8020 -- VM / SEH / container
+//  internals) -- out of scope.  Stub.  [remaining stub]
+static char ReloadBankContainerEntry(void *container, int entry) { (void)container; (void)entry; return 0; }
+//  sub_7217B0 -- the deep "sync the impl's bank container with the just-built
+//  stack container" step: CsGuardAcquire the impl's +0xB4 critical section,
+//  then replay the +0x1C / +0x58 / +0x74 / +0x94 members.  Deep dependency
+//  chain (CsGuardAcquire / sub_72C5F0 / sub_720250 / sub_71FD20 / sub_720010) --
+//  out of scope.  Stub.  [remaining stub]
+static char SyncImplWithBankContainer(int impl, void *container) { (void)impl; (void)container; return 1; }
+
+static char ReloadTextBookBank(int entry, int container)
+{
+    void *collection = GetVfsArchiveCollection();                 // sub_180D9B0
+    F3WString name;
+    F3WStringFromAnsi(&name, "language\\text\\book.babel");       // sub_5AF180 + sub_4357C0
+    void *outEntry = 0;
+    VfsReloadFileEntry(collection, &outEntry, (void *)entry, &name);   // sub_180D220
+    if (name.cap >= 8)                                            // the cap >= 8 LHFree idiom
+        LHFree((void *)name.u.ptr);
+    if (outEntry != 0)
+    {
+        char buf[0xF0];
+        InitBankContainer(buf, 50, 0x4000);                       // sub_7201B0
+        ReloadBankContainerEntry(buf, (int)outEntry);             // sub_721F60 [remaining stub]
+        SyncImplWithBankContainer(container, buf);                // sub_7217B0 [remaining stub]
+        DestroyBankContainer(buf);                                // sub_626EF0
+        if (outEntry != 0)
+            ((void (WINAPI *)(void *))F3_VT(outEntry)[2])(outEntry);   // the entry's vtable slot 2 (stdcall)
+    }
+    return 1;
+}
 
 //  RegisterBankContainer  (0x719D70 - 0x719D9D)  -- register the bank
-//  container with the global file subsystem: the collection mount (sub_1801620
-//  [remaining stub] with the sub_719CA0 callback), and when the mount
-//  produced an entry, dispatch its vtable slot 2 (thiscall, the entry also
-//  as the stack arg).  Returns the dispatch (or the entry pointer).
+//  container with the global file subsystem: the collection mount
+//  (FileSubsysMountCollection (0x1801620) with the ReloadTextBookBank
+//  callback), and when the mount produced an entry, dispatch its vtable slot 2
+//  (thiscall, the entry also as the stack arg).  Returns the dispatch (or the
+//  entry pointer).
 //  [NOT byte-identical] placement-dependent (the E8 calls + the entry vtable
 //  dispatch).
 static int RegisterBankContainer(int impl)
 {
     void *fs = GetFileSubsystem(0);
     void *out = 0;
-    sub_1801620(fs, &out, (void *)sub_719CA0, impl);
+    FileSubsysMountCollection(fs, &out, (unsigned char (__cdecl *)(int, int))ReloadTextBookBank, impl);
     if (out != 0)
     {
         void **vt = (void **)(*(void **)out);
@@ -6422,45 +6681,495 @@ static int RegisterBankContainer(int impl)
     return (int)out;
 }
 
-// sub_61B860 (0x61B860 - 0x61B91A) -- mount the "fable2_anims.bnk" bank +
-// register the "data\\" archive over the engine (the wide-string build
-// sub_625D10, the file-subsystem sub_1801620 mount with the sub_61B730
-// callback, the data-archive shared-slot publish into dword_20FD138, the
-// sub_18ED640 registration).  Deep dependency chain -- out of scope.  Stub.
+// 0x20FD138 (dword_20FD138): the data-archive shared slot -- the slot the
+// MountAnimsBank publish (SetSharedSlot / CopySharedSlot / ReleaseSharedSlot)
+// writes the "data\\" archive into.  Sibling of the dword_1DBE2CC settings
+// base (g_unk_1DBE2CC).
+static F3SharedBuffer *g_dword_20FD138 = 0;
+
+// 0x1DBD0E8 (unk_1DBD0E8): the 4-byte global the sub_18ED640 registration
+// reads (a char* the registration function dereferences).  Deep dependency
+// chain -- stubbed.
+static char *g_unk_1DBD0E8 = 0;
+
+//  sub_61B730 -- the per-entry "fable2_anims.bnk" mount callback: takes the
+//  file-entry handle, resolves the archive slot, registers the entry against
+//  the wide outblock (the GetVfsArchiveCollection / sub_180D3F0 / sub_1806060
+//  / GetArchiveSlot / LHFree / vtable dispatch chain).  Deep dependency chain
+//  -- out of scope.  Stub.  [remaining stub]
+static unsigned char AnimsBankMount(int entry, int out) { (void)entry; (void)out; return 1; }
+
+//  sub_625D10 -- the wide-string build over the 36-byte F3WString, folding it
+//  into the 64-byte out block (this: this + 4..60 -- the +0x14/+0x18 layout,
+//  the LHAlloc(4) self-ref wrapper, the sub_435B20 string-assign core).
+//  Deep dependency chain (sub_435B20) -- out of scope.  Stub.  [remaining stub]
+static int sub_625D10(void *obj, void *str, int a3) { (void)obj; (void)str; (void)a3; return 0; }
+
+//  sub_18EBEB0 -- the one-shot global init thunk: reads byte_2075F28, runs the
+//  sub_18E3860 global-zero-init (the 0x200000-byte memset + globals) once, then
+//  sets byte_2075F28 = 1.  Deep dependency chain -- out of scope.  Stub.
 //  [remaining stub]
-static void sub_61B860(void *obj) { (void)obj; }
+static int sub_18EBEB0(void) { return 0; }
 
-// sub_1926050 (0x1926050 - 0x1926119) -- open the "particle_bank.bnk" path
-// as a data-stream file (the shared-slot open CLegacyMemoryFileCtor,
-// sub_17FE8B0, the 0x8000-byte
-// read-buffer ctor sub_1892420, the NFile::CFileDataInputStream / NTools
-// ctor chain).  Deep dependency chain -- out of scope.  Stub.  The caller
-// discards the return value.  [remaining stub]
-static void sub_1926050(void *pathSlot) { (void)pathSlot; }
+//  sub_18ED640 -- the global registration thunk (the 0x84-byte VFS object ctor
+//  / the wide-string / FileSubsysMountCollection / vtable release chain) over
+//  unk_1DBD0E8.  Deep dependency chain -- out of scope.  Stub.  [remaining stub]
+static int sub_18ED640(void *arg) { (void)arg; return 0; }
 
-// sub_61C170 (0x61C170 - 0x61C236) -- mount one .bnk speech / lipsync bank
-// over the engine's +0xC8 sub-object (the GetWideStringHash cache lookup in
-// sub_622E70, the sub_625D10 wide-string build, the file-subsystem
-// sub_1801620 mount with the sub_61B730 callback, and the cache update
-// sub_626D20 / sub_6254B0).  Deep dependency chain -- out of scope.  Stub.
-//  [remaining stub]
-static void sub_61C170(void *obj, F3WString *ws, int a3)
-{ (void)obj; (void)ws; (void)a3; }
+//  sub_6240F0 -- the 64-byte out-block destructor (the sub_573390 release +
+//  LHFree idioms, the +0x14/+0x18 reset).  Deep dependency chain -- out of
+//  scope.  Stub.  [remaining stub]
+static int sub_6240F0(void *obj) { (void)obj; return 0; }
 
-// sub_719C80 (0x719C80 - 0x719C9C) -- register the global speech callback
-// with the file subsystem (GetFileSubsystem + sub_71B6A0 over the
-// dword_1DC27D4 state with the sub_719A00 callback).  Out of scope.  Stub.
-//  [remaining stub]
-static int sub_719C80(void) { return 0; }
+//  MountAnimsBank  (0x61B860 - 0x61B91A)  -- mount the "fable2_anims.bnk" bank
+//  and register the "data\\" archive over the engine: the wide-string build
+//  (sub_625D10), the file-subsystem FileSubsysMountCollection (0x1801620)
+//  mount with the sub_61B730 (AnimsBankMount) callback, the entry vtable slot
+//  2 dispatch, the one-shot sub_18EBEB0 registration, the "data\\" shared-slot
+//  publish into dword_20FD138 (SetSharedSlot / CopySharedSlot /
+//  ReleaseSharedSlot), the sub_18ED640 registration, and the out-block dtor
+//  (sub_6240F0).  [NOT byte-identical] placement-dependent (the E8 calls to the
+//  wide-string build / FileSubsysMountCollection / sub_18EBEB0 / SetSharedSlot /
+//  CopySharedSlot / ReleaseSharedSlot / sub_18ED640 / sub_6240F0 + the
+//  __security_cookie prologue).
+static int MountAnimsBank(void *obj)
+{
+    (void)obj;
 
-// sub_61C080 (0x61C080 - 0x61C119) -- the speech-bank table pass: the
-// sub_616650 flag read, the file-subsystem sub_1801620 mount with the
-// sub_61ACA0 callback over the engine's +0xBC slot, and the [dword_1DBD0F8,
-// dword_1DBD0FC) 36-byte record loop (the byte_1BCE523 prefix tests
-// sub_1A00E00 with the per-record sub_61B990 / sub_61A9B0 dispatches).  The
-// record globals are 0 in this build, so the loop is dead.  Out of scope.
+    F3WString ws;
+    F3WStringFromAnsi(&ws, "fable2_anims.bnk");                 // sub_5AF180 + sub_4357C0
+
+    char outblock[64];                                           // the 64-byte out block (v6)
+    sub_625D10(outblock, &ws, 0);                                 // sub_625D10 [remaining stub]
+
+    if (ws.cap >= 8)                                              // the cap >= 8 LHFree idiom
+        LHFree((void *)ws.u.ptr);
+
+    void *fs = GetFileSubsystem(0);                               // sub_1801C20
+    void *entry = 0;                                               // the mount out slot (v3)
+    FileSubsysMountCollection(fs, &entry,
+                              (unsigned char (__cdecl *)(int, int))AnimsBankMount,
+                              (int)outblock);                    // sub_1801620
+    if (entry != 0)
+        ((void (WINAPI *)(void *))F3_VT(entry)[2])(entry);        // the entry's vtable slot 2 (stdcall)
+
+    sub_18EBEB0();                                                 // sub_18EBEB0 [remaining stub]
+
+    F3SharedBuffer *slot = 0;
+    SetSharedSlot(&slot, "data\\", -1);                          // sub_1A01CC0
+    CopySharedSlot(&g_dword_20FD138, &slot);                       // sub_1A01270
+    ReleaseSharedSlot(&slot);                                      // sub_1A01320
+
+    sub_18ED640(&g_unk_1DBD0E8);                                    // sub_18ED640 [remaining stub]
+
+    return sub_6240F0(outblock);                                   // sub_6240F0 [remaining stub]
+}
+
+// sub_17FDE20 (0x17FDE20 - 0x17FDE5D) -- release the legacy-file object:
+// re-store the CLegacyMemoryFile vtable, release the +8 file handle through
+// vtable slot 2 (vt[2]), null +8, release the +4 wide path slot
+// (ReleaseSharedSlotWide), swap the vtable to LHFile::CAFile, and return the
+// ReleaseSharedSlotWide result.  (The original's second vtable-slot-2 block
+// is unreachable -- +8 is nulled immediately after the first dispatch, so the
+// re-read of +8 can never be non-null -- so it is omitted.)  [NOT
+// byte-identical] placement-dependent (the E8 calls) + the high-VA vtable refs.
+static LONG ReleaseLegacyMemoryFile(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    o[0] = (DWORD)g_CLegacyMemoryFileVtable;
+    if (o[2] != 0)
+        ((void (WINAPI *)(void *))F3_VT((void *)o[2])[2])((void *)o[2]);
+    o[2] = 0;
+    LONG r = ReleaseSharedSlotWide((F3SharedBuffer **)(o + 1));
+    o[0] = (DWORD)g_CAFileVtable;
+    return r;
+}
+
+// sub_1892420 (0x1892420 - 0x1892496)  [remaining stub] -- the 0x8000-byte
+// read-buffer ctor over the 40-byte NFile::CFileDataInputStream object (the
+// buffer alloc + the vt[9] / vt[7] dispatches over the legacy-file object
+// are the deep chain -- not implemented in this build).
+static void *sub_1892420(void *stream, void *legacyFile, int size)
+{ (void)stream; (void)legacyFile; (void)size; return stream; }
+
+// sub_1922280 (0x1922280 - 0x19223F1)  [remaining stub] -- the wide-load step
+// (the dword_20FC310 state read + the sub_1893EB0 block build + SharedBufferBlocksEqual
+// + sub_1891540 + the 9 sub-dispatch chain over the 40-byte stream object).
+static void sub_1922280(void *stream)
+{ (void)stream; }
+
+// sub_18917A0 (0x18917A0 - 0x1891800)  [remaining stub] -- the stream-object
+// finalize step (buffer free + vtable dispatches + the field nulls).
+static int sub_18917A0(void *stream)
+{ (void)stream; return 0; }
+
+// Placeholder vtables for the stream object's dead vtable stores (the original
+// refs the NFile::CFileDataInputStream / NTools::CBaseClass vftables at their
+// .rdata VAs; the stream object is discarded before anything dispatches
+// through it).
+static void *g_CFileDataInputStreamVtable[10] = { 0 };   // 0x1BF90CC
+static void *g_NToolsCBaseClassVtable[10]    = { 0 };    // 0x1AF6E74
+
+// OpenDataStreamFile  (0x1926050 - 0x1926119)  -- open the settings-directory
+// "particle_bank.bnk" path (the slot's block data) as a data-stream file:
+// build the ANSI shared slot from the path (or the empty default string when
+// the slot is null), open it as an LHSFS::CLegacyMemoryFile (CLegacyMemoryFileCtor,
+// sub_17FE8B0, mode 1 + flag 2), drop the local slot reference (the
+// InterlockedDecrement-to-zero -> SharedBufferFree idiom), drop the global
+// live-slot counter, then release the legacy-file object (ReleaseLegacyMemoryFile,
+// sub_17FDE20) and return its result.  The stream-build / load / finalize steps
+// (sub_1892420 / sub_1922280 / sub_18917A0) are out of scope -- the 40-byte
+// NFile::CFileDataInputStream object, the 0x8000-byte read buffer, the vt[9] /
+// vt[7] dispatches over the legacy-file object, and the wide-load chain
+// (dword_20FC310 + sub_1893EB0 + SharedBufferBlocksEqual + sub_5493E0 + the
+// sub_1913F40 / sub_1913690 / sub_1912E10 / sub_19124C0 dispatch chain) are all
+// [remaining stub]s.  The stream object is local and discarded at the end of
+// the function, so the stubs keep the call graph honest without fabricating
+// the file reads.  The caller (MountPermanentBanks) discards the return value.
+// [NOT byte-identical] placement-dependent (the E8 calls + the Interlocked
+// Decrement IAT slot + the high-VA global g_Addend).
+static LONG OpenDataStreamFile(F3SharedBuffer **pathSlot)
+{
+    const char *src = (*pathSlot != 0) ? (*pathSlot)->data : g_ShapeSpawnDefaultStr;   // empty default
+
+    F3SharedBuffer *slot = 0;
+    SetSharedSlot(&slot, src, -1);                                                     // sub_1A01CC0
+
+    CLegacyMemoryFile v4;                                                               // the 16-byte object
+    CLegacyMemoryFileCtor(&v4, &slot, 1, 2);                                            // sub_17FE8B0
+
+    if (slot != 0)
+    {
+        if (InterlockedDecrement((volatile LONG *)&slot->refcount) <= 0 && slot != 0)
+            SharedBufferFree(slot);
+        slot = 0;
+    }
+    InterlockedDecrement(&g_Addend);                                                    // (0x2075C48)
+
+    DWORD stream[10];                                                                   // the 40-byte stream object (discarded)
+    sub_1892420(&stream, &v4, 0x8000);                                                  // sub_1892420 [remaining stub]
+    sub_1922280(&stream);                                                                // sub_1922280 [remaining stub]
+    stream[0] = (DWORD)g_CFileDataInputStreamVtable;                                     // the CFileDataInputStream vftable
+    sub_18917A0(&stream);                                                                // sub_18917A0 [remaining stub]
+    stream[0] = (DWORD)g_NToolsCBaseClassVtable;                                         // the CBaseClass vftable (dead write)
+
+    return ReleaseLegacyMemoryFile(&v4);                                                 // sub_17FDE20
+}
+
+//  FindBankCacheEntry  (0x622E70 - 0x622F16)  -- the bank-cache lookup over the
+//  engine's +0xC8 sub-object (the 44-byte sentinel/head block + 4-byte head node +
+//  the +0x1C count, the hash-keyed red-black tree the sub_626D20 / sub_6254B0
+//  update side descends into): walks the tree keyed by the wide-string hash
+//  (the dword at +0x0C of each node; the tree is empty at this point, so the
+//  sentinel -- flagged by byte at +0x29 -- terminates the loop immediately) and
+//  writes the {node, block} pair it finds into *out.  The mount path
+//  (MountLipsyncBank) gates its work on that pair: out[0] must equal the +0xC8
+//  node and out[1] must equal the block pointer.  [NOT byte-identical]
+//  placement-dependent (the relative calls to F3InvalidParam / the tree walk).
+static DWORD *FindBankCacheEntry(void *obj, DWORD *out, const int *hash)
+{
+    DWORD *sub = (DWORD *)obj;                  // the +0xC8 sub-object
+    DWORD *block = (DWORD *)sub[6];             // the 44-byte sentinel block (+0x18)
+    DWORD *node = block;                        // v6: the node this lookup last visited
+    DWORD *cur = (DWORD *)(block[1]);           // v5: the second dword of the block (the sentinel, self-ref)
+
+    while (*(BYTE *)((BYTE *)cur + 0x29) == 0)
+    {
+        if ((unsigned int)cur[3] >= (unsigned int)*hash)
+        {
+            node = cur;
+            cur = (DWORD *)cur[0];
+        }
+        else
+        {
+            cur = (DWORD *)cur[2];
+        }
+    }
+
+    DWORD v7 = sub[0];                           // the +0xC8 node (back-referencing)
+    if (v7 == 0)
+        F3InvalidParam();                        // original: __invalid_parameter_noinfo (no return)
+
+    DWORD v13[2] = { v7, (DWORD)block };
+    DWORD v14[2] = { v7, (DWORD)node };
+    DWORD *v9;
+
+    if (node == block || (unsigned int)*hash < (unsigned int)node[3])
+        v9 = v13;
+    else
+        v9 = v14;
+
+    out[0] = v9[0];
+    out[1] = v9[1];
+    return out;
+}
+
+//  sub_626D20 -- the bank-cache update (the +0xC8 sub-object tree insert: the
+//  4-byte owner wrapper, the sub_624FA0 node init, the sub_626AA0 node build, the
+//  sub_573390 release + LHFree idioms).  Deep dependency chain -- out of scope.
 //  Stub.  [remaining stub]
-static void sub_61C080(void *obj) { (void)obj; }
+static void *sub_626D20(void *obj, int *hash) { (void)obj; (void)hash; return (void *)obj; }
+
+//  sub_6254B0 -- the bank-cache slot helper (the dest/source copy-or-grow over the
+//  +0x18/+0x1C/+0x20 list words: sub_623420 / sub_621870 / sub_573390 /
+//  sub_622A10 / sub_571BB0 / LHFree).  Deep dependency chain -- out of scope.
+//  Stub.  [remaining stub]
+static void *sub_6254B0(void *thisArg, void *srcList) { (void)thisArg; (void)srcList; return thisArg; }
+
+//  MountLipsyncBank  (0x61C170 - 0x61C236)  -- mount one .bnk speech / lipsync bank
+//  over the engine's +0xC8 sub-object: the GetWideStringHash cache lookup
+//  (FindBankCacheEntry), the sub_625D10 wide-string build, the file-subsystem
+//  FileSubsysMountCollection (0x1801620) mount with the sub_61B730 (AnimsBankMount)
+//  callback, the entry vtable slot 2 dispatch, and the cache update
+//  (sub_626D20 / sub_6254B0).  The deep dependency chain (sub_625D10 / sub_626D20
+//  / sub_6254B0 / sub_6240F0 / AnimsBankMount) remains stubbed; the wide-string
+//  build + out-block dtor run as no-ops.  [NOT byte-identical] placement-dependent
+//  (the relative E8 calls to GetWideStringHash / FindBankCacheEntry / GetFileSubsystem
+//  / sub_625D10 / FileSubsysMountCollection / sub_626D20 / sub_6254B0 / sub_6240F0
+//  + the entry vtable slot 2 dispatch + the __security_cookie prologue).
+static void MountLipsyncBank(void *obj, F3WString *ws, int a3)
+{
+    CGameEngine *g = (CGameEngine *)obj;
+    char *base = (char *)obj;
+
+    int hash = GetWideStringHash(ws);            // sub_56DFD0
+
+    DWORD v9[2] = { 0, 0 };
+    FindBankCacheEntry(base + 0xC8, v9, &hash);   // 0x622E70
+
+    if (v9[0] == 0 || v9[0] != (DWORD)g->sub0xC8Node)
+        F3InvalidParam();                         // original: __invalid_parameter_noinfo (no return)
+
+    if (v9[1] == (DWORD)g->sub0xE0Block)
+    {
+        void *fs = GetFileSubsystem((void *)v9[0]);   // sub_1801C20
+        char outblock[64];                              // the 64-byte out block (v10)
+        memset(outblock, 0, 64);
+        sub_625D10(outblock, ws, a3);                   // sub_625D10 [remaining stub]
+
+        FileSubsysMountCollection(fs, (void **)&v9[0],
+                                  (unsigned char (__cdecl *)(int, int))AnimsBankMount,
+                                  (int)outblock);        // sub_1801620
+
+        if (v9[0] != 0)
+            ((void (WINAPI *)(void *))F3_VT((void *)v9[0])[2])((void *)v9[0]);  // the entry's vtable slot 2 (stdcall)
+
+        void *cacheNode = sub_626D20(base + 0xC8, &hash);   // sub_626D20 [remaining stub]
+        BYTE v11[24];                                       // the uninitialized 24-byte source block (dead)
+        memset(v11, 0, 24);
+        sub_6254B0(cacheNode, v11);                          // sub_6254B0 [remaining stub]
+
+        sub_6240F0(outblock);                               // the out-block dtor [remaining stub]
+    }
+}
+
+//  0x719A00: the global speech callback (sub_719A00).  The original is a
+//  large thiscall function (char thiscall sub_719A00(void *this, int a2,
+//  int a3) -- this in ECX, two stack args, retn 8) that loads the
+//  "language/gui/gui_texture_headers.bnk" + "language/gui/gui_textures.bnk"
+//  archives and rebuilds the speech / gui state; the whole chain is an
+//  unimplemented deep stub in this build.  Kept as a no-op returning the
+//  original's success value (0).  [remaining stub]
+static char SpeechCallback(void *this_, int entry, int data)
+{
+    (void)this_; (void)entry; (void)data;
+    return 0;
+}
+
+//  FileSubsysInvokeCallback  (0x71B6A0 - 0x71B78B)  -- the file-subsystem
+//  collection callback walk: iterate the [begin, end) range at +0x58 / +0x5C
+//  of the 0x8C-byte file-subsystem object under the +0x4C self-tag block,
+//  locking each entry (vtable slot 1, AddRef), invoking the callback over
+//  it (thiscall: ECX = the tag, the locked entry + the data word on the
+//  stack), and releasing the entry (vtable slot 2).  A callback return of 0
+//  releases the entry and returns; a non-zero return releases the entry and
+//  continues the walk.  The MSVC debug-iterator bounds checks (the live
+//  begin/end words and the self-tag block at +0x4C) are reproduced as
+//  F3InvalidParam calls, matching the original __invalid_parameter_noinfo
+//  sequence.  The wrapper at +0x4C is the "tag" kept live for the whole walk.
+static DWORD *GetDword1DC27D4(void);   // 0x717C20 (defined below, after MountPermanentBanks)
+
+static void FileSubsysInvokeCallback(void *fs, int tag, char (__thiscall *callback)(void *, int, int), int data)
+{
+    DWORD *o = (DWORD *)fs;
+    DWORD begin = o[0x58 / 4];
+    DWORD end = o[0x5C / 4];
+    if (begin > end)
+        F3InvalidParam();
+
+    DWORD wrapper0 = o[0x4C / 4];
+    for (DWORD i = begin; ; i += 4)
+    {
+        end = o[0x5C / 4];
+        if (o[0x58 / 4] > end)
+            F3InvalidParam();
+        DWORD wrapper = o[0x4C / 4];
+        if (wrapper0 == 0 || wrapper0 != wrapper)
+            F3InvalidParam();
+        if (i == end)
+            break;
+
+        DWORD m = *(DWORD *)wrapper;                 // the wrapper's pointee: fs + 0x4C
+        if ((DWORD)i >= *(DWORD *)(m + 0x10))        // i >= end (dead in practice)
+            F3InvalidParam();
+
+        DWORD element = *(DWORD *)i;
+        if (element != 0)
+            ((void (WINAPI *)(void *))F3_VT((void *)element)[1])((void *)element);  // vtable slot 1 (Lock)
+        if (callback((void *)tag, (int)element, data) == 0)
+        {
+            if (element != 0)
+                ((void (WINAPI *)(void *))F3_VT((void *)element)[2])((void *)element);  // vtable slot 2 (Release)
+            return;
+        }
+        if (element != 0)
+            ((void (WINAPI *)(void *))F3_VT((void *)element)[2])((void *)element);  // vtable slot 2 (Release)
+
+        if ((DWORD)i >= *(DWORD *)(m + 0x10))
+            F3InvalidParam();
+    }
+}
+
+//  RegisterSpeechCallback  (0x719C80 - 0x719C9C)  -- the global speech
+//  callback registration driver: ensure the global file subsystem is
+//  initialized (GetFileSubsystem, 0x1801C20), then invoke the collection
+//  callback over the [+0x58, +0x5C) collection with the dword_1DC27D4 state
+//  as the tag and data, and the speech callback (SpeechCallback, the
+//  sub_719A00 stand-in).  Returns 0 (the original's return slot is left
+//  holding whatever the collection walk leaves behind -- the caller
+//  discards it).  [NOT byte-identical] placement-dependent (the E8 calls
+//  to GetFileSubsystem / the collection walk + the __security_cookie
+//  prologue of the callee).
+static int RegisterSpeechCallback(void)
+{
+    void *fs = GetFileSubsystem(0);           // sub_1801C20
+    FileSubsysInvokeCallback(fs, (int)GetDword1DC27D4(),
+                            (char (__thiscall *)(void *, int, int))SpeechCallback,
+                            (int)GetDword1DC27D4());
+    return 0;
+}
+
+// 0x1DBD0F8 / 0x1DBD0FC: the speech-bank record-array bounds (the [start,
+// end) range of 36-byte records SpeechBankTablePass walks).  .bss (both 0
+// in this build, so the loop is dead).
+static DWORD g_dword_1DBD0F8 = 0;   // 0x1DBD0F8
+static DWORD g_dword_1DBD0FC = 0;   // 0x1DBD0FC
+// 0x1C86C50: the "speech-bank table pass" flag byte read by the
+// SpeechBankFlagRead prologue.  .rdata-ish; 1 in the original, 0 here (the read is discarded
+// by the caller anyway).
+static char  g_byte_1C86C50 = 0;    // 0x1C86C50
+
+// SpeechBankFlagRead (0x616650, formerly sub_616650) -- the flag reader: returns byte_1C86C50.
+static char SpeechBankFlagRead(void) { return g_byte_1C86C50; }
+
+// SpeechBankStrCompare (0x403F10, formerly sub_403F10) -- the generic byte-wise
+// C string compare: 0 equal / -1 less / 1 greater (signed 8-bit bytes
+// compared pairwise, length is not part of the comparison).
+static int SpeechBankStrCompare(const char *a1, const char *a2)
+{
+    while (1)
+    {
+        char v4 = *a1;
+        if (*a1 == 0 && *a2 == 0)
+            return 0;
+        if (v4 < *a2)
+            return -1;
+        if (v4 > *a2)
+            break;
+        ++a1;
+        ++a2;
+    }
+    return 1;
+}
+
+// SpeechBankPrefixTest (0x1A00E00, formerly sub_1A00E00) -- the per-record prefix test: ECX is the record's
+// +4 slot address (holding the address of the name char*); when the slot
+// holds an address the test compares the record's name string against the
+// argument, else it compares the argument against the empty string
+// (byte_1BCE523, len 0).
+static char SpeechBankPrefixTest(const char **nameSlotAddr, const char *a2)
+{
+    if (*nameSlotAddr != 0)
+        return (char)(SpeechBankStrCompare(*(const char **)*nameSlotAddr, a2) != 0);
+    return (char)(strcmp(a2, "") != 0);
+}
+
+// SpeechBankMount (0x61ACA0, formerly sub_61ACA0) -- the file-subsystem mount callback for the
+// speech-bank table pass.  Deep dependency chain (SharedSlotConcat /
+// sub_18AED30 / sub_18C4AE0 / RefSharedSlot / SubstringSharedSlot /
+// SharedSlotToWide / GetLocalizedString / sub_5AF180 / ReleaseSharedSlotWide /
+// the vtable dispatches / LHAlloc / sub_616660) -- out of scope.  Stub.
+// [remaining stub]
+static unsigned char SpeechBankMount(int entry, int data)
+{
+    (void)entry; (void)data;
+    return 1;
+}
+
+// SpeechBankRecordMount (0x61B990, formerly sub_61B990) -- the per-record "speech.adb" mount + entry
+// dispatch (the 9-word record walk over the [1DBD0F8, 1DBD0FC) table, the
+// name compare, the "speech.adb" shared-slot build + the collection mount
+// with the sub_61B920 callback, the per-element GetHeapManager / sub_18FAE20
+// dispatches).  Deep dependency chain -- out of scope.  Stub.  [remaining stub]
+static void SpeechBankRecordMount(const char **nameSlotAddr)
+{
+    (void)nameSlotAddr;
+}
+
+// SpeechBankRecordReload (0x61A9B0, formerly sub_61A9B0) -- the per-record "reload the current record"
+// dispatch (the same name walk, then the +0x21 flag byte check + the
+// GetHeapManager / sub_18FADD0 re-write of the record's +0x08 word).  Deep
+// dependency chain (sub_18FADD0 / sub_145D550) -- out of scope.  Stub.
+// [remaining stub]
+static void SpeechBankRecordReload(const char **nameSlotAddr)
+{
+    (void)nameSlotAddr;
+}
+
+//  SpeechBankTablePass  (0x61C080 - 0x61C119)  -- the speech-bank table pass:
+//  the SpeechBankFlagRead flag read, the file-subsystem FileSubsysMountCollection
+//  (0x1801620) mount with the SpeechBankMount (sub_61ACA0) callback over the
+//  engine's +0xBC slot, and the [g_dword_1DBD0F8, g_dword_1DBD0FC) 36-byte
+//  record loop (the prefix tests SpeechBankPrefixTest with the per-record
+//  SpeechBankRecordMount / SpeechBankRecordReload dispatches).  The record
+//  globals are 0 in this build, so the loop is dead.  [NOT byte-identical]
+//  placement-dependent (the E8 calls to GetFileSubsystem /
+//  FileSubsysMountCollection / SpeechBankPrefixTest + the entry
+//  vtable slot-2 dispatch + the __security_cookie prologue).
+static int SpeechBankTablePass(void *obj)
+{
+    (void)SpeechBankFlagRead();                       // the flag read (result discarded)
+    void *fs = GetFileSubsystem(obj);                 // sub_1801C20
+    int entry = 0;
+    FileSubsysMountCollection(fs, (void **)&entry,
+                              (unsigned char (__cdecl *)(int, int))SpeechBankMount,
+                              *(DWORD *)((char *)obj + 0xBC));   // sub_1801620
+    int result = entry;
+    if (entry != 0)
+        result = (int)((int (WINAPI *)(void *))F3_VT((void *)entry)[2])((void *)entry);
+
+    DWORD v5 = g_dword_1DBD0F8;
+    if (v5 != g_dword_1DBD0FC)
+    {
+        DWORD v6 = v5 + 4;
+        do
+        {
+            result = (int)SpeechBankPrefixTest((const char **)(DWORD *)v6, "");
+            if ((BYTE)result != 0)
+                SpeechBankRecordMount((const char **)(DWORD *)v6);
+            if (*(BYTE *)((char *)v6 + 0x1C) == 0)
+            {
+                result = (int)SpeechBankPrefixTest((const char **)(DWORD *)v5, "");
+                if ((BYTE)result != 0)
+                    SpeechBankRecordReload((const char **)(DWORD *)v5);
+            }
+            v5 += 36;
+            v6 += 36;
+        }
+        while (v5 != g_dword_1DBD0FC);
+    }
+    return result;
+}
 
 // 0x1DBE2CC: the settings-directory base shared slot (the sibling of
 // g_dword_1DBE2F0); .bss (starts null, populated by the settings init that
@@ -6477,14 +7186,14 @@ static F3SharedBuffer *g_unk_1DBE2CC = 0;
 //  The original is cdecl (the engine pointer on the stack, hoisted into
 //  ESI) with a __security_cookie prologue.  The thread, in order:
 //    1. announces its name (SetThreadName "Permanent Bank Mounter") and
-//       mounts the fable2_anims.bnk bank (sub_61B860 [remaining stub]);
+//       mounts the fable2_anims.bnk bank (MountAnimsBank);
 //    2. under the engine's +0x60 critical section (the CsGuardAcquire /
 //       CsGuardRelease guard), builds the
 //       "data\\art\\videos\\lionhead_logo.bik" shared slot and mounts it as
 //       a video file (MountVideoFile);
 //    3. builds the settings-directory "particle_bank.bnk" path
 //       (MakeSettingsFilePath over the unk_1DBE2CC settings base) and opens
-//       it as a data stream (sub_1926050 [remaining stub]);
+//       it as a data stream (OpenDataStreamFile);
 //    4. creates the GDB loader (CreateGdbLoader) and, when created, loads
 //       the five permanent global GDB files (LoadGlobalGdbFiles);
 //    5. allocates + constructs the 192-byte bank container
@@ -6495,13 +7204,13 @@ static F3SharedBuffer *g_unk_1DBE2CC = 0;
 //       local reference (the InterlockedDecrement-to-zero -> dtor -> LHFree
 //       release idiom);
 //    6. rebuilds the engine's +0xB8 NUI::CGUI object (RebuildGuiObject);
-//    7. mounts the two lipsync banks (sub_61C170 [remaining stub] over
+//    7. mounts the two lipsync banks (MountLipsyncBank over
 //       "language/lipsync/lipsync.bnk" and
 //       "language/lipsync/expressions.bnk", each freed after the mount),
-//       registers the speech callback (sub_719C80 [remaining stub]), loads
+//       registers the speech callback (RegisterSpeechCallback), loads
 //       "language/speech/cutscenes.vfsconfig" into the file subsystem
 //       (FileSubsysLoadVfsConfig), and runs the speech-bank table pass
-//       (sub_61C080 [remaining stub]);
+//       (SpeechBankTablePass);
 //    8. sets the engine's +0x84 "banks mounted" flag under the +0x48
 //       critical section.
 //  [NOT byte-identical] placement-dependent: the relative E8 calls to every
@@ -6514,7 +7223,7 @@ static void MountPermanentBanks(void *p)
     char *base = (char *)obj;
 
     SetThreadName("Permanent Bank Mounter");
-    sub_61B860(obj);
+    MountAnimsBank(obj);
 
     F3CsGuard guard2;
     CsGuardAcquire(&guard2, &obj->cs2, 0);
@@ -6529,7 +7238,7 @@ static void MountPermanentBanks(void *p)
     {
         F3SharedBuffer *slot = 0;
         F3SharedBuffer **dst = MakeSettingsFilePath(&slot, &g_unk_1DBE2CC, "particle_bank.bnk");
-        sub_1926050(dst);
+        OpenDataStreamFile(dst);
         ReleaseSharedSlot(&slot);
     }
 
@@ -6569,19 +7278,19 @@ static void MountPermanentBanks(void *p)
 
     F3WString ws;
     F3WStringFromAnsi(&ws, "language/lipsync/lipsync.bnk");
-    sub_61C170(obj, &ws, 0);
+    MountLipsyncBank(obj, &ws, 0);
     F3WStringFree(&ws);
     F3WStringFromAnsi(&ws, "language/lipsync/expressions.bnk");
-    sub_61C170(obj, &ws, 0);
+    MountLipsyncBank(obj, &ws, 0);
     F3WStringFree(&ws);
 
-    sub_719C80();
+    RegisterSpeechCallback();
 
     F3WStringFromAnsi(&ws, "language/speech/cutscenes.vfsconfig");
     FileSubsysLoadVfsConfig(GetFileSubsystem(0), &ws);
     F3WStringFree(&ws);
 
-    sub_61C080(obj);
+    SpeechBankTablePass(obj);
 
     F3CsGuard guard1;
     CsGuardAcquire(&guard1, &obj->cs1, 0);
@@ -6713,19 +7422,439 @@ static BYTE  g_unk_1DDC7EC[16] = { 0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF,
     0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF };   // 0x1DDC7EC: GetDefaultAudioInterface out buffer
 static F3SharedBuffer *g_dword_1DDC7F0 = 0;   // 0x1DDC7F0: "cannot be null" msg slot
 static DWORD g_dword_1DDC7F4 = 0;     // 0x1DDC7F4: installed fallback-VFS object
-// A safe no-op IMMNotificationClient: the real client the game registers with
-// the enumerator (vtable 0x01B6F408) is not implemented in this build, so its
-// first field is a live no-op vtable.  RegisterEndpointNotificationCallback
-// AddRefs it (and any audio-event callback resolves to safe code), so the
-// first field of the object (the vtable) must be a mapped address, not
-// 0x01B6F408.  Each method is a plain __stdcall entry with the exact parameter
-// arity so it cleans the right number of stack bytes.
+// An IMMNotificationClient kept in this build (the real client the game
+// registers with the enumerator -- vtable 0x01B6F408 -- is not implemented).
+// Its first field is a live vtable so RegisterEndpointNotificationCallback
+// AddRefs it (any audio-event callback resolves to safe code); the first
+// field of the object (the vtable) must be a mapped address, not
+// 0x01B6F408.  QueryInterface (F3AudioNotifQI, 0x145DB60), AddRef
+// (F3AudioNotifAddRef, 0x145DBC0), Release (F3AudioNotifRelease, 0x145E400)
+// and Added (F3AudioNotifAdded, 0x145DB00) are implemented for real; the
+// remaining methods are plain __stdcall no-op entries with the exact
+// parameter arity so they clean the right number of stack bytes.
 struct F3AudioPropKey { int d1; short d2, d3; char d4[8]; int d5; };   // 20-byte PROPERTYKEY (by value)
-static long __stdcall F3AudioNotifQI(void *self, const void *riid, void **ppv) { (void)self; (void)riid; if (ppv) *ppv = 0; return (long)0x80004002; }
-static long __stdcall F3AudioNotifAddRef(void *self)   { return 1; }
-static long __stdcall F3AudioNotifRelease(void *self)  { return 1; }
-static long __stdcall F3AudioNotifStateChanged(void *self, void *id, unsigned st) { return 0; }
-static long __stdcall F3AudioNotifAdded(void *self, void *id)   { return 0; }
+// The two IIDs the QI accessor accepts, kept at their original addresses
+// (0x1BC57FC = IUnknown, 0x1D6A710 = the IMMNotificationClient).
+static const IID   g_riid_1BC57FC  = { 0, 0, 0, { 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };   // 0x1BC57FC: IUnknown IID
+static const IID   g_riid_1D6A710  = { 0x7991eec9, 0x7e89, 0x4d85,
+    { 0x83, 0x90, 0x6c, 0x70, 0x3c, 0xec, 0x60, 0xc0 } };    // 0x1D6A710: IMMNotificationClient IID
+// ===============================================================
+// Wide-slot array machinery (the IMMNotificationClient's slot array).
+//
+// These helpers implement the resize / insert path that
+// F3AudioNotifStateChanged (sub_145E560) drives through
+// sub_145FD10 (0x145FD10 - 0x145FD77).  The wide-slot array lives at
+// self+0x14 (start, void**), self+0x18 (end, void**), self+0x1C (spare,
+// void**) inside the sub-struct at self+8; each element is 8 bytes
+// ([0] = F3SharedBuffer*, [1] = state DWORD).  All are [NOT
+// byte-identical] placement-dependent (the LHAlloc / LHFree IAT slots and the
+// CopySharedSlotWide / ReleaseSharedSlotWide family).
+//
+//   sub_404A40 (0x404A40 - 0x404A65)  -- the wide-string sort comparator.
+static int CompareWideStrings(const WCHAR *a1, const WCHAR *a2)
+{
+    for (;;)
+    {
+        WCHAR v = *a1;
+        if (*a1 == 0 && *a2 == 0)
+            return 0;
+        if (v < *a2)
+            return -1;
+        if (v > *a2)
+            break;
+        ++a1;
+        ++a2;
+    }
+    return 1;
+}
+
+//   sub_145E9F0 (0x145E9F0 - 0x145E98E)  -- the wide array allocator.
+//   8*count bytes via LHAlloc; throws stdext::bad_alloc on overflow.
+static BYTE *WideArrayAlloc(unsigned int count)
+{
+    if (count != 0 && 0xFFFFFFFFu / count < 8u)
+        throw 1;   // the original throws stdext::bad_alloc
+    return (BYTE *)LHAlloc(8 * count);
+}
+
+//   sub_145F4F0 (0x145F4F0 - 0x145F52A)  -- fill `count` slots at `dest` with
+//   the content of the source slot (block pointer + state).
+static long WideSlotFill(BYTE *dest, int count, F3SharedBuffer **src)
+{
+    long result = 0;
+    for (int i = count; i != 0; --i)
+    {
+        if (dest != 0)
+        {
+            CopySharedSlotWide((F3SharedBuffer **)dest, src);
+            result = (long)((DWORD *)src)[1];
+            ((DWORD *)dest)[1] = (DWORD)result;
+        }
+        dest += 8;
+    }
+    return result;
+}
+
+//   sub_145F320 (0x145F320 - 0x145F358)  -- copy [start, end) into `dest`
+//   (8 bytes per slot).
+static BYTE *WideSlotCopy(BYTE *start, BYTE *end, BYTE *dest)
+{
+    if (start == end)
+        return dest;
+    BYTE *p = dest;
+    for (BYTE *s = start; s != end; s += 8)
+    {
+        if (p != 0)
+        {
+            CopySharedSlotWide((F3SharedBuffer **)p, (F3SharedBuffer **)s);
+            ((DWORD *)p)[1] = ((DWORD *)s)[1];
+        }
+        p += 8;
+    }
+    return p;
+}
+
+//   sub_145F710 (0x145F710 - 0x145F735)  -- release the wide slots in
+//   [start, end) (8 bytes per slot).
+static long ReleaseWideSlots(F3SharedBuffer **start, F3SharedBuffer **end)
+{
+    long result = 0;
+    for (F3SharedBuffer **p = start; p != end; p += 2)
+        result = ReleaseSharedSlotWide(p);
+    return result;
+}
+
+//   sub_145F940 (0x145F940 - 0x145FBA4)  -- the wide-slot array resize engine.
+//   obj = the sub-struct pointer (self+8); newSlot = the 8-byte wide slot to
+//   add ([0] = block pointer, [1] = state).  Allocates a new array, copies the
+//   old slots, fills the new array at index `used` with the new slot, frees
+//   the old array, and re-points the sub-struct at the new array.
+//   [NOT byte-identical] placement-dependent E8 calls to sub_145E9F0 /
+//   sub_145F4F0 / sub_145F320 / sub_145F710 / LHFree.
+static void ResizeWideArray(BYTE *obj, F3SharedBuffer **newSlot)
+{
+    BYTE *start = *(BYTE **)(obj + 0x0C);
+    BYTE *spare = *(BYTE **)(obj + 0x14);
+    BYTE *end   = *(BYTE **)(obj + 0x10);
+    unsigned int capacity = start != 0 ? ((unsigned int)(spare - start) >> 3) : 0u;
+    unsigned int used = (unsigned int)(end - start) >> 3;
+
+    if (0x1FFFFFFFu - used < 1u)
+        throw 1;   // the original throws std::length_error
+
+    // new capacity: 1.5x, clamped to used + 1
+    unsigned int newCount;
+    if (0x1FFFFFFF - (capacity >> 1) >= capacity)
+        newCount = capacity + (capacity >> 1);
+    else
+        newCount = 0;
+    if (newCount < used + 1u)
+        newCount = used + 1u;
+
+    BYTE *newArray = WideArrayAlloc(newCount);
+
+    // fill the new slot at index `used` (the next empty slot)
+    WideSlotFill(newArray + 8 * used, 1, newSlot);
+
+    // copy the old slots into the new array
+    WideSlotCopy(start, end, newArray);
+
+    // release and free the old array
+    if (start != 0)
+    {
+        ReleaseWideSlots((F3SharedBuffer **)start, (F3SharedBuffer **)end);
+        LHFree(start);
+    }
+
+    // repoint the array
+    *(BYTE **)(obj + 0x0C) = newArray;                 // start
+    *(BYTE **)(obj + 0x14) = newArray + 8 * newCount;  // spare
+    *(BYTE **)(obj + 0x10) = newArray + 8 * (used + 1);// end
+}
+
+//   sub_145FC60 (0x145FC60 - 0x145FC98)  -- the resize wrapper called from the
+//   RESIZE branch of sub_145FD10.  Reproduces the fall-through guard block
+//   (boundary checks against the notification-object cluster) and then calls
+//   sub_145F940 (ResizeWideArray).  The caller discards the return value
+//   (the resize result block) -- the side effects are the resize itself.
+static void ResizeWideArrayWrap(BYTE *obj, F3SharedBuffer **newSlot)
+{
+    BYTE *start = *(BYTE **)(obj + 0x0C);
+    BYTE *end   = *(BYTE **)(obj + 0x10);
+    const BYTE *notif = *(BYTE **)obj;   // the notification object pointer
+
+    // (end - start) is always a multiple of 8 for a well-formed array; the
+    // misalignment guard is never taken on this path.
+    if ((end - start) & ~7u)
+    {
+        if (start > end)
+            F3InvalidParam();
+        if (notif == 0)
+            F3InvalidParam();
+    }
+
+    // the notification-object pointer is always valid here (the original
+    // warns via the v11/v13 checks below and falls through).
+    if (notif == 0)
+        F3InvalidParam();
+
+    ResizeWideArray(obj, newSlot);
+
+    // boundary checks on the new start (fall-through warnings)
+    BYTE *newStart = *(BYTE **)(obj + 0x0C);
+    if (newStart > *(BYTE **)(obj + 0x10))
+        F3InvalidParam();
+
+    const BYTE *nObj = *(BYTE **)obj;
+    if (nObj != 0)
+    {
+        // the notification object's first DWORD is a pointer; the original
+        // compares the new start against [firstField + 0x10] and [firstField + 0x0C]
+        BYTE *firstField = *(BYTE **)nObj;
+        unsigned int v12 = (unsigned int)newStart;
+        if (v12 > *(DWORD *)(firstField + 0x10))
+            F3InvalidParam();
+        if (v12 < *(DWORD *)(firstField + 0x0C))
+            F3InvalidParam();
+    }
+}
+
+//   sub_145FD10 (0x145FD10 - 0x145FD77)  -- the wide-slot array insert/resize.
+//   obj = the sub-struct pointer (self+8); newSlot = the 8-byte wide slot to
+//   add ([0] = block pointer, [1] = state).  Returns the state of the new
+//   slot (or 0 on the resize path).
+static DWORD WideArrayInsert(BYTE *obj, F3SharedBuffer **newSlot)
+{
+    BYTE *start = *(BYTE **)(obj + 0x0C);
+    BYTE *spare = *(BYTE **)(obj + 0x14);
+    BYTE *end   = *(BYTE **)(obj + 0x10);
+
+    unsigned int capacity = start != 0 ? ((unsigned int)(spare - start) >> 3) : 0u;
+    unsigned int used = (unsigned int)(end - start) >> 3;
+
+    if (used >= capacity)
+    {
+        // RESIZE path -- the array is full
+        if (start > end)
+            F3InvalidParam();
+        ResizeWideArrayWrap(obj, newSlot);
+        return 0;
+    }
+
+    // INSERT path -- the array has room
+    DWORD result = 0;
+    if (end != 0)
+    {
+        CopySharedSlotWide((F3SharedBuffer **)end, newSlot);
+        result = ((DWORD *)newSlot)[1];
+        ((DWORD *)end)[1] = result;
+    }
+    *(BYTE **)(obj + 0x10) = end + 8;
+    return result;
+}
+
+// F3AudioNotifQI  (0x145DB60 - 0x145DBC0)  -- QueryInterface for the IMMNotificationClient.
+// stdcall, 3 stack args (self / riid / ppv), retn 0x0C.  If ppv is NULL it
+// returns 0x80070057; otherwise *ppv is cleared, then if riid matches neither
+// accepted IID the call returns 0x80004002 (E_NOINTERFACE).  On a match, *ppv
+// is set to the caller and the object's vtable[1] (AddRef) is dispatched, and
+// S_OK (0) is returned.  [NOT byte-identical] placement-dependent (relative
+// E8 call to the 16-byte IID compare sub_5AE060 + the indirect AddRef dispatch
+// through the object's vtable + the high-VA IID globals).
+static long __stdcall F3AudioNotifQI(void *self, const void *riid, void **ppv)
+{
+    if (ppv == NULL)
+        return (long)0x80070057;   // 0x80070057: no ppv
+    *ppv = 0;
+    if (memcmp(riid, &g_riid_1BC57FC, sizeof(IID)) != 0 &&
+        memcmp(riid, &g_riid_1D6A710, sizeof(IID)) != 0)
+        return (long)0x80004002;   // E_NOINTERFACE
+    *ppv = self;
+    ((void (WINAPI *)(void *))F3_VT(self)[1])(self);   // AddRef (vtable[1])
+    return 0;                                          // S_OK
+}
+// F3AudioNotifAddRef  (0x145DBC0 - 0x145DBD5)  -- AddRef on the IMMNotificationClient.
+// stdcall, 1 stack arg (self), retn 4.  InterlockedIncrement the LONG at self+4
+// and return the new value (read back from memory, as the original does).
+// [NOT byte-identical] (placement-dependent E8 call to the InterlockedIncrement
+// IAT slot -- the original 21-byte body is push esi / mov esi,[esp+4] / add esi,4
+// / push esi / call __imp_InterlockedIncrement / mov eax,[esi] / pop esi / retn 4).
+static long __stdcall F3AudioNotifAddRef(void *self)
+{
+    LONG *p = (LONG *)((BYTE *)self + 4);
+    InterlockedIncrement(p);
+    return (long)(*p);
+}
+// F3AudioNotifSubStructDtor  (0x145F770 - 0x145F7B6)  -- destroy the wide
+// slot-array sub-struct inside the IMMNotificationClient (thiscall in the
+// original: this in ecx, plain `retn`; declared as a free function here).
+// The sub-struct lives at self+8. Its fields: [+0x0C] = the wide-slot array
+// start (void**), [+0x10] = the array end (void**), [+0x14] = a spare pointer.
+// When the start is non-null the array is walked (8 bytes per 8-byte element,
+// the slot at element offset 0) and each slot is released via
+// ReleaseSharedSlotWide, then the array itself is freed with LHFree. The three
+// fields are always zeroed. [NOT byte-identical] (placement-dependent E8 calls
+// to ReleaseSharedSlotWide / LHFree).
+static void F3AudioNotifSubStructDtor(BYTE *obj)
+{
+    BYTE *start = *(BYTE **)(obj + 0x0C);
+    if (start != 0)
+    {
+        BYTE *end = *(BYTE **)(obj + 0x10);
+        for (BYTE *p = start; p != end; p += 8)
+            ReleaseSharedSlotWide((F3SharedBuffer **)p);
+        LHFree(start);
+    }
+    *(DWORD *)(obj + 0x0C) = 0;
+    *(DWORD *)(obj + 0x10) = 0;
+    *(DWORD *)(obj + 0x14) = 0;
+}
+// F3AudioNotifRelease  (0x145E400 - 0x145E43C)  -- Release on the
+// IMMNotificationClient (vtable slot 2, 0x01B6F408).
+// stdcall, 1 stack arg (self), retn 4.  InterlockedDecrement the LONG at
+// self+4; if the new value is 0 the sub-struct at self+8 is torn down
+// (F3AudioNotifSubStructDtor), the inner 4-byte heap block at self+8 is freed
+// via LHFree, and the whole object is freed via LHFree. Returns the
+// decremented refcount.  [NOT byte-identical] (placement-dependent E8 calls to
+// the InterlockedDecrement IAT slot, F3AudioNotifSubStructDtor, and LHFree).
+static long __stdcall F3AudioNotifRelease(void *self)
+{
+    LONG v1 = InterlockedDecrement((LONG *)((BYTE *)self + 4));
+    if (*(DWORD *)((BYTE *)self + 4) == 0)
+    {
+        F3AudioNotifSubStructDtor((BYTE *)self + 8);
+        LHFree(*(void **)((BYTE *)self + 8));
+        LHFree(self);
+    }
+    return v1;
+}
+// F3AudioNotifAdded  (0x145DB00 - 0x145DB1E)  -- IMMNotificationClient "Added" callback (vtable slot 4, 0x01B6F408).
+// stdcall, 2 stack args (self / id), retn 8.  The first argument is a wide
+// string carried in the notification; the second is the (ignored) notification
+// id.  The body is the sub_1A00310 wide-slot ctor followed immediately by the
+// ReleaseSharedSlotWide destructor:
+//   1. the slot (the address of the first parameter) is nulled, and the wide
+//      live-slot counter is bumped (InterlockedIncrement on g_WideSlotCount);
+//   2. when the wide string is non-empty (non-NULL and not an empty string),
+//      a fresh 16-byte wide block is built from it via SharedBlockFromWide
+//      (LHAlloc(16), the block's data buffer, length = wcslen -- the -1 case)
+//      and stored in the slot;
+//   3. the slot is destroyed on the spot by ReleaseSharedSlotWide -- the
+//      block's refcount (1) is dropped, on zero it is freed through the
+//      family's SharedBufferFree, and the slot is nulled -- so the build/tear-
+//      down nets to a no-op that returns 0 (the wide counter goes +1/-1).
+// The sub_1A00310 ctor's old-block-release branch (the `*this != 0` test
+// after the null-store) is dead at this point -- the slot is always 0 there --
+// so it is not reproduced.  [NOT byte-identical] placement-dependent (relative
+// E8 calls to the InterlockedIncrement IAT slot, SharedBlockFromWide and the
+// ReleaseSharedSlotWide/SharedBufferFree family -- the original 0x1E-byte body
+// is `mov eax,[esp+arg_4]` / `push 0xFFFFFFFFh` / `push eax` / `lea ecx,
+// [esp+8+arg_4]` / `call sub_1A00310` / `lea ecx,[esp+arg_4]` / `call
+// ReleaseSharedSlotWide` / `xor eax,eax` / `retn 8`).
+static long __stdcall F3AudioNotifAdded(void *self, void *id)
+{
+    WCHAR *wide = (WCHAR *)self;   // the wide string carried in the first arg
+    self = 0;                       // ctor: *this = 0
+    InterlockedIncrement(&g_WideSlotCount);
+    if (wide != 0 && wide[0] != 0)
+        self = (void *)SharedBlockFromWide(wide, -1);
+    // (the ctor's old-block release branch is dead: the slot is 0 here)
+    ReleaseSharedSlotWide((F3SharedBuffer **)&self);
+    (void)id;
+    return 0;
+}
+// F3AudioNotifStateChanged (sub_145E560)  -- IMMNotificationClient "StateChanged" callback.
+// stdcall, 3 stack args (self / id / st), retn 0x0C.  The first parameter is the
+// IMMNotificationClient object (self); the second (id) is the wide-string
+// notification payload carried by the event; the third (st) is the state word.
+// The body is:
+//   1. sub_1A00310 (the wide-slot ctor): the id slot (the address of the second
+//      parameter) is nulled, the wide live-slot counter is bumped
+//      (InterlockedIncrement on g_WideSlotCount), and when the wide string is
+//      non-empty a fresh 16-byte wide block is built from it via
+//      SharedBlockFromWide (the -1 auto-count case) and stored in the slot.
+//   2. The sub-struct at self+8 is walked: [self+0x14] (start) is validated
+//      against [self+0x18] (end); each slot is compared against the fresh id
+//      block (by block pointer, or by length + data contents via
+//      CompareWideStrings).  On a match the slot's state (second DWORD) is
+//      overwritten with the state word; the fresh id block is released and
+//      the function returns 0.
+//   3. No match (the slot is empty / the scan walked past `end`) -- the ADDED
+//      path: a fresh local wide slot is initialised (InitSharedSlotWide), the
+//      id's block is assigned into it (AssignSharedSlotWide), the state is
+//      stored, the slot-array sub-struct is resized to add the new slot
+//      (sub_145FD10 / ResizeWideArray, grow-new-array path), the local new
+//      slot and the fresh id block are released, and the function returns 0.
+// [NOT byte-identical] placement-dependent (the InterlockedIncrement IAT slot,
+// SharedBlockFromWide, the CopySharedSlotWide / ReleaseSharedSlotWide family,
+// LHAlloc / LHFree and the wide-slot array resize helpers).
+static long __stdcall F3AudioNotifStateChanged(void *self, void *id, unsigned st)
+{
+    // the wide-slot ctor (sub_1A00310): null the id slot, bump the counter,
+    // build a fresh wide block from the id (the -1 auto-count case).
+    WCHAR *wide = (WCHAR *)id;
+    id = 0;
+    InterlockedIncrement(&g_WideSlotCount);
+    if (wide != 0 && wide[0] != 0)
+        id = (void *)SharedBlockFromWide(wide, -1);
+
+    BYTE *start = *(BYTE **)((BYTE *)self + 0x14);
+    BYTE *end   = *(BYTE **)((BYTE *)self + 0x18);
+    BYTE *raw   = *(BYTE **)((BYTE *)self + 8);   // the notification object pointer
+    F3SharedBuffer *newSlot = (F3SharedBuffer *)id;
+
+    if ((unsigned int)start > (unsigned int)end)
+        F3InvalidParam();
+    if (*(DWORD *)((BYTE *)self + 0x14) > (unsigned int)end)
+        F3InvalidParam();
+
+    for (;;)
+    {
+        if (raw == 0)
+            F3InvalidParam();
+        if (start == end)
+        {
+            // ADDED path -- no matching slot; the array is empty or the scan
+            // walked past `end`.  Allocate a fresh local wide slot, seed it
+            // with the fresh id block, set the state, and resize the array.
+            BYTE localSlot[8];
+            InitSharedSlotWide((F3SharedBuffer **)localSlot);
+            AssignSharedSlotWide((F3SharedBuffer **)localSlot, (F3SharedBuffer **)&id);
+            ((DWORD *)localSlot)[1] = (DWORD)st;
+            WideArrayInsert((BYTE *)self + 8, (F3SharedBuffer **)localSlot);
+            ReleaseSharedSlotWide((F3SharedBuffer **)localSlot);
+            ReleaseSharedSlotWide((F3SharedBuffer **)&id);
+            return 0;
+        }
+        // the boundary check against the notification-object cluster
+        // (fall-through warning)
+        if (raw != 0 && (unsigned int)start >= *(DWORD *)(*(BYTE **)raw + 0x10))
+            F3InvalidParam();
+        F3SharedBuffer *slot = *(F3SharedBuffer **)start;
+        if (slot == newSlot ||
+            (slot != 0 && newSlot != 0 &&
+             ((DWORD *)slot)[1] == ((DWORD *)newSlot)[1] &&
+             CompareWideStrings((WCHAR *)((F3SharedBuffer *)slot)->data,
+                                (WCHAR *)((F3SharedBuffer *)newSlot)->data) == 0))
+        {
+            // matched -- the state slot is updated in place
+            break;
+        }
+        // the boundary check again (fall-through warning)
+        if (raw != 0 && (unsigned int)start >= *(DWORD *)(*(BYTE **)raw + 0x10))
+            F3InvalidParam();
+        start += 8;
+    }
+
+    // the matched slot: write the new state word and release the fresh id block
+    if (raw == 0)
+        F3InvalidParam();
+    if (raw != 0 && (unsigned int)start >= *(DWORD *)(*(BYTE **)raw + 0x10))
+        F3InvalidParam();
+    *(DWORD *)(start + 4) = (DWORD)st;
+    ReleaseSharedSlotWide((F3SharedBuffer **)&id);
+    return 0;
+}
 static long __stdcall F3AudioNotifRemoved(void *self, void *id) { return 0; }
 static long __stdcall F3AudioNotifDefaultFlow(void *self, unsigned a, unsigned b, void *c) { return 0; }
 static long __stdcall F3AudioNotifDefaultRole(void *self, unsigned a, unsigned b, void *c) { return 0; }
@@ -10111,7 +11240,7 @@ static int CPackageDataMergeCollections(int slot, void *list15, void *list16,
 //  thiscall + 1 stack arg (retn 4), returns 1. An empty list15 (the test
 //  path) returns 1 immediately. Otherwise it walks list15's entries, and
 //  for each it searches the CPackageData+0x04 list for a matching interned
-//  name (sub_EEC630 + the [block+4] word compare + sub_403F10); a match
+//  name (sub_EEC630 + the [block+4] word compare + SpeechBankStrCompare); a match
 //  releases / re-binds the entry's ref pair (vt[1] / vt[9], sub_7649C0,
 //  sub_EEC700) and, when the entry's flag byte (+0x14 bits 0/1) is set,
 //  moves the pair into the entry (sub_EED4C0 / sub_EED4D0); an unmatched
@@ -10172,7 +11301,7 @@ static int CPackageDataWriteConfig(void *obj, void *listA, void *fileSubsys)
 //  the accumulator immediately. Otherwise it walks the CPackageData+0x04
 //  entries and their containers; for each package entry it searches listB
 //  for a matching id with the sub_EEB910 version compare and a set
-//  sub_403F10 flag (PackageEntryGetFlag24) and, on a match, ORs bit 1 into
+//  SpeechBankStrCompare flag (PackageEntryGetFlag24) and, on a match, ORs bit 1 into
 //  the accumulator (sub_EEB8C0(1)).
 //  [NOT byte-identical] placement-dependent.
 static int CPackageDataCollectVersionFlags(void *obj, void *listB)
@@ -10728,13 +11857,242 @@ static int EntitySubObject(void *obj)
     return *(DWORD *)(v4 + 8);
 }
 
-// sub_67E460 (0x67E460 - 0x67E48F) -- the one-time atexit install + return of
-// &unk_1DBE300 (the pause-debug instance header).  [STUB] the atexit
-// registration (sub_1AC26C0) and the &unk_1DBE300 global are not modelled;
-// returns a static scratch buffer so the sub_67D070 write that follows is
-// harmless.
-static BYTE g_unk_1DBE300[0x100] = { 0 };   // 0x1DBE300: pause-debug instance header
-static void *sub_67E460(void) { return g_unk_1DBE300; }
+// ===============================================================
+//  PauseDebugInstance -- the one-time pause-debug instance
+//  (unk_1DBE300, 0x1DBE300..0x1DBE3A8).  [NOT byte-identical] refs the
+//  high-VA globals (unk_1DBE300 / dword_1DBE3A8) and the relative E8 calls
+//  (InitSharedSlot / InitSharedSlotWide / LHAlloc / the CRT
+//  InitializeCriticalSection / GetNetManager / NetRegisterPacketCallback).
+//
+//  The pause-debug instance is a 0xA8-byte object, built on first use by
+//  GetPauseDebugInstance (sub_67E460): two -1 owner words, the shared slot
+//  at +0x08, the wide slot at +0x50, the critical section at +0x34, the 1.0f
+//  floats at +0x5C / +0x60, the byte flags at +0x54..+0x5A, the linked
+//  owner block at +0x68 (a 4-byte owner block holding &obj+0x68, plus a 24-byte
+//  self-linked sentinel block at +0x7C), the CNetPacketCallback DNameNode
+//  base at +0x88, and the +0x90 self back-pointer -- plus the two packet
+//  registrations (519 / 520) on the net manager's packet manager.
+// ===============================================================
+static BYTE g_unk_1DBE300[0xA8] = { 0 };   // 0x1DBE300: pause-debug instance
+static DWORD g_dword_1DBE3A8 = 0;          // 0x1DBE3A8: one-time-install flag
+
+// The packet manager is the CNetManager's +0x04 slot (sub_6A6820): mov eax,
+// [ecx+4]; retn.  Static copy (the same one-liner lives in gamethread.cpp,
+// unexported).  NULL net manager -> NULL packet manager (the real game reads
+// it unconditionally; a null manager here is possible pre-start, so the NULL
+// is carried through, matching the CNetSaveGameCtor idiom).
+static void *PauseDebugPacketManager(void *obj)
+{
+    return (void *)*(DWORD *)((char *)obj + 4);
+}
+
+// sub_77DB70 (0x77DB70 - 0x77DB78) -- the 8-byte _ReaderWriterLock ctor:
+// zero both words.  The original is thiscall; a C call cannot stage ECX, so
+// zero the passed buffer directly (identical result).
+static void PauseDebugLockCtor(void *lock)
+{
+    DWORD *dw = (DWORD *)lock;
+    dw[0] = 0;
+    dw[1] = 0;
+}
+
+// sub_A1AA30 (0xA1AA30) -- the packet-callback registration on the net
+// manager's packet manager.  [STUB] the body is out of scope (the net
+// manager's packet manager is 0 in this build, so no packets are ever
+// delivered); the registration is a no-op, preserving all observable behavior
+// (the ids / locks / handlers / callback pointers are identical in shape).
+static void PauseDebugRegisterPacket(void *pm, int id, void *lock,
+                                     void *callback, void *recv, void *ser)
+{
+    (void)pm; (void)id; (void)lock; (void)callback; (void)recv; (void)ser;
+}
+
+// The two packet registrations of the pause-debug instance (the receive /
+// serialize handler pairs 519 and 520).  [STUB] each body is out of scope;
+// the packet manager is 0 and no packets are ever delivered, so the handlers
+// are never called (only their addresses are registered).
+static void PauseDebugRecv519(void *pkt, void *obj) { (void)pkt; (void)obj; }
+static void PauseDebugSer519(void *out, void *in)  { (void)out; (void)in; }
+static void PauseDebugRecv520(void *pkt, void *obj) { (void)pkt; (void)obj; }
+static void PauseDebugSer520(void *out, void *in)  { (void)out; (void)in; }
+
+// Placeholder vtable for the CNetPacketCallback DNameNode base at +0x88:
+// nothing dispatches through it in this build (CNetPacketCallbackDtor does
+// not virtual-call), so the zeroed 8-slot placeholder preserves the
+// observable behavior (the netinit.cpp g_CNetPacketCallbackVtable pattern).
+static void *g_PauseDebugPacketCallbackVtable[8] = { 0 };   // NPacketCallback::CNetPacketCallback::`vftable'
+
+// PauseDebugInstanceCtor  (0x67E310 - 0x67E45C) -- construct the pause-debug
+// instance in place.  [NOT byte-identical] placement-dependent (relative E8
+// calls / the CRT InitializeCriticalSection / GetNetManager / the packet-
+// manager helpers / the two NetRegisterPacketCallback calls).
+//
+// thiscall in the original (obj in ECX); a C call cannot stage ECX, so the
+// obj is passed explicitly.  Faithful port of the original control flow:
+// the two -1 owner words, InitSharedSlot at +0x08 / +0x0C, the +0x10 flag,
+// the +0x2C / +0x30 zeroes, the +0x34 critical section, InitSharedSlot at
+// +0x4C, InitSharedSlotWide at +0x50, the +0x54..+0x5A byte flags and the
+// +0x5C / +0x60 1.0f floats, the +0x68 owner chain (a 4-byte block holding
+// &obj+0x68, and a 24-byte self-linked sentinel block at +0x7C), the
+// +0x88 CNetPacketCallback base, the +0x98 / +0xA0 zeroes, and the two packet
+// registrations (519 / 520) on the net manager's packet manager.
+static void *PauseDebugInstanceCtor(void *obj)
+{
+    char *b = (char *)obj;
+    *(DWORD *)(b + 0x00) = (DWORD)-1;                       // +0x00
+    *(DWORD *)(b + 0x04) = (DWORD)-1;                       // +0x04
+    InitSharedSlot((F3SharedBuffer **)(b + 0x08));          // +0x08
+    InitSharedSlot((F3SharedBuffer **)(b + 0x0C));          // +0x0C
+    *(DWORD *)(b + 0x10) = 1;                               // +0x10
+    *(DWORD *)(b + 0x2C) = 0;                               // +0x2C
+    *(DWORD *)(b + 0x30) = 0;                               // +0x30
+    InitializeCriticalSection((CRITICAL_SECTION *)(b + 0x34));   // +0x34
+    InitSharedSlot((F3SharedBuffer **)(b + 0x4C));          // +0x4C
+    InitSharedSlotWide((F3SharedBuffer **)(b + 0x50));       // +0x50
+    b[0x54] = 1;                                            // +0x54
+    b[0x55] = 1;                                            // +0x55
+    b[0x56] = 0;                                            // +0x56..+0x5A
+    b[0x57] = 0;
+    b[0x58] = 0;
+    b[0x59] = 0;
+    b[0x5A] = 0;
+    *(float *)(b + 0x5C) = 1.0f;                            // +0x5C (dword_1AE4618)
+    *(float *)(b + 0x60) = 1.0f;                            // +0x60
+
+    // The +0x68 owner block: a 4-byte block (*block = &obj+0x68).
+    DWORD *v2 = (DWORD *)(b + 0x68);
+    DWORD *v3 = (DWORD *)LHAlloc(4);
+    if (v3 != 0)
+        *v3 = (DWORD)v2;
+    else
+        v3 = 0;
+    *v2 = (DWORD)v3;                                        // +0x68
+
+    // The +0x7C self-linked sentinel block (24 bytes, words 0 and 1 = self).
+    DWORD *v4 = (DWORD *)LHAlloc(24);
+    if (v4 != 0)
+        *v4 = (DWORD)v4;
+    if (v4 != (DWORD *)-4)
+        v4[1] = (DWORD)v4;
+    *(DWORD *)(b + 0x7C) = (DWORD)v4;                        // +0x7C
+    *(DWORD *)(b + 0x80) = 0;                                // +0x80
+    *(DWORD *)(b + 0x84) = 0;                                // +0x84
+
+    // The +0x88 CNetPacketCallback DNameNode base: the CBaseObject vtable
+    // store is overwritten immediately by the derived vtable, so only the
+    // derived shape is stored (the netinit.cpp pattern).
+    *(void **)(b + 0x88) = g_PauseDebugPacketCallbackVtable;
+    *(DWORD *)(b + 0x8C) = 0;                                // +0x8C
+
+    // +0x98 = 0.0 / +0xA0 = 0
+    *(double *)(b + 0x98) = 0.0;
+    b[0xA0] = 0;
+
+    // The self back-pointer (stored before each registration, as the original).
+    *(DWORD *)(b + 0x90) = (DWORD)obj;                       // +0x90
+
+    void *nm = GetNetManager();
+    void *pm = (nm != 0) ? PauseDebugPacketManager(nm) : 0;
+
+    unsigned char lock[8];
+    PauseDebugLockCtor(lock);                                // sub_77DB70
+    PauseDebugRegisterPacket(pm, 519, lock, b + 0x88,
+                             (void *)PauseDebugRecv519, (void *)PauseDebugSer519);
+
+    void *nm2 = GetNetManager();
+    void *pm2 = (nm2 != 0) ? PauseDebugPacketManager(nm2) : 0;
+    PauseDebugLockCtor(lock);                                // sub_77DB70 (re-zeroed)
+    PauseDebugRegisterPacket(pm2, 520, lock, b + 0x88,
+                             (void *)PauseDebugRecv520, (void *)PauseDebugSer520);
+    return obj;
+}
+
+// PauseDebugLinkedChainRelease  (sub_67F4D0, 0x67F4D0 - 0x67F50D) -- the
+// +0x68 owner-chain teardown.  [NOT byte-identical] placement-dependent
+// (relative E8 calls to ReleaseSharedSlotWide / LHFree).  The original is
+// thiscall (obj in ECX, a pointer to the +0x68 block); a C call cannot stage
+// ECX, so the obj is passed explicitly.
+//
+// Per the original (this == the +0x68 block): v4 = *(obj+0x14) (the +0x7C
+// sentinel block); [*v4] = v4; [v4+4] = v4; [obj+0x18] = 0; and when the
+// sentinel chain is non-self-linked (v4's first word != v4 -- never happens
+// in this build, since the ctor always sets the self-pointer), release every
+// node in the chain (ReleaseSharedSlotWide + LHFree) walking the chain.
+static void PauseDebugLinkedChainRelease(void *obj)
+{
+    char *o = (char *)obj;
+    DWORD *v4 = (DWORD *)*(DWORD *)(o + 0x14);
+    DWORD *v3 = (DWORD *)*v4;
+    *v4 = (DWORD)v4;
+    *(DWORD *)(v4 + 1) = (DWORD)v4;
+    *(DWORD *)(o + 0x18) = 0;
+    if (v3 != (DWORD *)*(DWORD *)(o + 0x14))
+    {
+        for (;;)
+        {
+            DWORD *v5 = (DWORD *)*v3;
+            ReleaseSharedSlotWide((F3SharedBuffer **)(v3 + 2));
+            LHFree(v3);
+            v3 = v5;
+            if (v5 == (DWORD *)*(DWORD *)(o + 0x14))
+                break;
+        }
+    }
+}
+
+// PauseDebugInstanceAtExit  (sub_1AC26C0, 0x1AC26C0 - 0x1AC26DA) -- the
+// atexit teardown of the pause-debug instance.  [NOT byte-identical]
+// placement-dependent (relative E8 calls to CNetPacketCallbackDtor /
+// PauseDebugLinkedChainRelease / LHFree / ReleaseSharedSlotWide /
+// ReleaseSharedSlot / the CRT DeleteCriticalSection).
+//
+// Tears the instance down in the original order: the +0x88 CNetPacketCallback
+// (CNetPacketCallbackDtor), the +0x68 owner chain (PauseDebugLinkedChainRelease),
+// the +0x7C sentinel block and the +0x68 owner block (LHFree each, the +0x7C
+// slot zeroed after the first free), the +0x50 wide slot
+// (ReleaseSharedSlotWide), the +0x4C slot (ReleaseSharedSlot), the +0x34
+// critical section (DeleteCriticalSection), the +0x0C slot (ReleaseSharedSlot)
+// and the +0x08 slot (ReleaseSharedSlot).
+static void __cdecl PauseDebugInstanceAtExit(void)
+{
+    char *b = (char *)g_unk_1DBE300;
+    CNetPacketCallbackDtor(b + 0x88);                       // +0x88
+    PauseDebugLinkedChainRelease(b + 0x68);                 // +0x68 chain
+
+    DWORD *v4 = (DWORD *)*(DWORD *)(b + 0x7C);
+    LHFree(v4);                                             // the +0x7C sentinel block
+    DWORD *v3 = (DWORD *)*(DWORD *)(b + 0x68);
+    LHFree(v3);                                             // the +0x68 owner block
+    *(DWORD *)(b + 0x7C) = 0;
+
+    ReleaseSharedSlotWide((F3SharedBuffer **)(b + 0x50));   // +0x50
+    ReleaseSharedSlot((F3SharedBuffer **)(b + 0x4C));       // +0x4C
+    DeleteCriticalSection((CRITICAL_SECTION *)(b + 0x34));  // +0x34
+    ReleaseSharedSlot((F3SharedBuffer **)(b + 0x0C));       // +0x0C
+    ReleaseSharedSlot((F3SharedBuffer **)(b + 0x08));       // +0x08
+}
+
+// GetPauseDebugInstance  (0x67E460 - 0x67E48F) -- the one-time atexit-install
+// + return of &unk_1DBE300.  [NOT byte-identical] placement-dependent
+// (relative E8 calls to PauseDebugInstanceCtor / atexit / the high-VA flag
+// dword_1DBE3A8).
+//
+// The one-time pause-debug instance install: while the flag is clear, set it
+// (bit 0), construct the instance in place (PauseDebugInstanceCtor) and
+// register the atexit teardown (PauseDebugInstanceAtExit, sub_1AC26C0); the
+// instance is then returned (&g_unk_1DBE300).  The atexit hook fires once per
+// process.
+static void *GetPauseDebugInstance(void)
+{
+    if ((g_dword_1DBE3A8 & 1) == 0)
+    {
+        g_dword_1DBE3A8 |= 1;
+        PauseDebugInstanceCtor(g_unk_1DBE300);
+        atexit(PauseDebugInstanceAtExit);
+    }
+    return (void *)g_unk_1DBE300;
+}
+
 
 // sub_67D070 (0x67D070 - 0x67D078) -- thiscall: sets *(this + 0x59) = a2 and
 // returns a2.
@@ -10967,7 +12325,7 @@ static int PauseGameOnVMState(void)
 
         if (result == 10)
         {
-            void *p = sub_67E460();
+            void *p = GetPauseDebugInstance();
             TurnOnPauseArmed(p, 1);   // sets *(p + 0x59) = 1
         }
         else
@@ -10977,7 +12335,7 @@ static int PauseGameOnVMState(void)
             if (g_byte_1DBD9E1 != 0)
                 return result;
 
-            // Release the pause-debug instance (the one sub_67E460 installed).
+            // Release the pause-debug instance (the one GetPauseDebugInstance installed).
             int v9 = (int)(DWORD)LHAlloc(0x44);
             int v10 = (v9 != 0) ? (int)(DWORD)PauseDebugCtor((void *)v9) : 0;
             DWORD local[2];
@@ -12488,18 +13846,19 @@ static void FileSubsysRegisterDir(void *obj, void *a2, void *a3)
         ((void (*)(void *))F3_VT(node)[2])(node);           // vtable slot 2 (Release)
 }
 
-// sub_17FE870 (0x17FE870 - 0x17FE8A5): the LHSFS::CLegacyFile ctor over a
+// LegacyFileCtor (0x17FE870 - 0x17FE8A5): the LHSFS::CLegacyFile ctor over a
 // 16-byte block (vtable + shared slot + two zeroed words). 'slot' (a2) is
 // the caller's path-string shared slot (the address of the F3SharedBuffer
-// * field), handed to the sub_17FE0A0 open-setup (a remaining stub here).
-void LegacyFileCtor(void *obj, F3SharedBuffer **slot, int a3, int a4)
+// * field), handed to the CLegacyFileOpen open-setup.
+void *LegacyFileCtor(void *obj, F3SharedBuffer **slot, int a3, int a4)
 {
     DWORD *b = (DWORD *)obj;
     b[0] = (DWORD)g_CLegacyFileVtable;
     InitSharedSlot((F3SharedBuffer **)&b[1]);
     b[2] = 0;
     b[3] = 0;
-    (void)slot; (void)a3; (void)a4;
+    CLegacyFileOpen(obj, slot, a3, a4);
+    return obj;
 }
 
 // sub_17FDC30 (0x17FDC30 - 0x17FDC39): does the legacy file have data (the
@@ -12622,11 +13981,10 @@ static long InitFrontendData(void *obj, int regB, int regP, int regD, int regS)
     F3WString       langSet  = { 0 };      // the 36-byte "language" name slot
     F3WString       bookPath = { 0 };      // the 36-byte bnk / book path slot
     F3WString       langPath = { 0 };      // the 36-byte "data\\language" path slot
-    DWORD           fileObj[4]   = { 0 };  // the 16-byte data-file object
     F3SharedBuffer *dataHandle = 0;        // the resolved data dir / archive handle
     F3SharedBuffer *tmpHandle  = 0;        // the re-resolve out slot
     void           *streamMgr  = 0;        // the 84-byte streaming manager
-    DWORD           fileBlock[4] = { 0 };  // the 16-byte build_version file
+    DWORD           fileBlock[4] = { 0 };  // the 16-byte data-file object (the build_version file)
     F3SharedBuffer *fileSlot  = 0;        // the temporary path-string shared slot (v40)
 
     // 1. SetCurrentDirectoryA to the exe's directory (when it is one).
@@ -12713,7 +14071,7 @@ afterArchive:
     F3WStringAssign(&langPath, L"data\\language", 13);
     F3WStringNormalize(&langPath);
     tmpHandle = (F3SharedBuffer *)ResolveArchivePath(&tmpHandle, &langPath, 0, 0);
-    DataFileRegisterEntry(fileObj, (tmpHandle != 0) ? (void *)tmpHandle->data : 0,
+    DataFileRegisterEntry(fileBlock, (tmpHandle != 0) ? (void *)tmpHandle->data : 0,
                           &langSet.u, 2, 1);
     if (tmpHandle != 0 && F3_VT(tmpHandle) != 0)
         ((void (*)(void *))F3_VT(tmpHandle)[2])(tmpHandle);
@@ -12722,7 +14080,7 @@ afterArchive:
     // 7. The two Bink banks (levels.bnk, then streaming.bnk).
     F3WStringAssign(&bookPath, L"levels.bnk", 10);
     tmpHandle = (F3SharedBuffer *)LookupBnk(&tmpHandle, cwdSlot, &bookPath, 0);
-    DataFileRegisterEntry(fileObj, (tmpHandle != 0) ? (void *)tmpHandle->data : 0,
+    DataFileRegisterEntry(fileBlock, (tmpHandle != 0) ? (void *)tmpHandle->data : 0,
                           &bookPath, 2, 1);
     if (tmpHandle != 0 && F3_VT(tmpHandle) != 0)
         ((void (*)(void *))F3_VT(tmpHandle)[2])(tmpHandle);
@@ -12730,7 +14088,7 @@ afterArchive:
 
     F3WStringAssign(&bookPath, L"streaming.bnk", 13);
     tmpHandle = (F3SharedBuffer *)LookupBnk(&tmpHandle, cwdSlot, &bookPath, 0);
-    DataFileRegisterEntry(fileObj, (tmpHandle != 0) ? (void *)tmpHandle->data : 0,
+    DataFileRegisterEntry(fileBlock, (tmpHandle != 0) ? (void *)tmpHandle->data : 0,
                           &bookPath, 2, 0);
     if (tmpHandle != 0 && F3_VT(tmpHandle) != 0)
         ((void (*)(void *))F3_VT(tmpHandle)[2])(tmpHandle);
@@ -12771,10 +14129,10 @@ dataSubsys:
     // CLegacyFile (fileBlock) is constructed separately, and the slot is
     // released afterwards.
     SetSharedSlot(&fileSlot, "build_version.txt", -1);
-    LegacyFileCtor(fileBlock, &fileSlot, 1, 2);           // sub_17FE870
+    LegacyFileCtor(fileBlock, &fileSlot, 1, 2);           // LegacyFileCtor
     ReleaseSharedSlot(&fileSlot);
-    if (LegacyFileHasData(fileObj) != 0)                  // sub_17FDC30(v45)
-        CopyFileToSharedSlot(fileObj, &g_unk_1DBDA78);    // sub_61D800(&unk_1DBDA78)
+    if (LegacyFileHasData(fileBlock) != 0)                // sub_17FDC30(v45)
+        CopyFileToSharedSlot(fileBlock, &g_unk_1DBDA78);  // sub_61D800(&unk_1DBDA78)
     PublishDataObject1(archive);                          // sub_17FDE60(v44)
 
     SetSharedSlot(&fileSlot, "data\\", -1);
@@ -12785,7 +14143,7 @@ dataSubsys:
     SetSharedSlot(&fileSlot, "data\\", -1);
     LegacyFileSetDataPath(fileSlot);                      // sub_17FD6A0
     ReleaseSharedSlot(&fileSlot);
-    LegacyFileDtor(fileObj);                              // sub_17FD970(v45)
+    LegacyFileDtor(fileBlock);                            // sub_17FD970(v45)
 
     // 10. Final releases (the original's order).
     if (dataHandle != 0 && F3_VT(dataHandle) != 0)

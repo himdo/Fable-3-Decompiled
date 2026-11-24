@@ -143,6 +143,39 @@ F3AString *F3AStringAssign(F3AString *s, const char *src, unsigned int len)
     return s;
 }
 
+// sub_50AD00 (the append variant of the F3AString family, the same growth /
+// null-terminate semantics as F3AStringAssign): append (src, len) to the
+// string's current contents.  SSO: copy in place past the current len; heap:
+// reallocate newLen + 1 bytes, copy the old data, free the old buffer, and
+// null-terminate.  Returns the string (this).  [NOT byte-identical]
+// placement-dependent (the LHAlloc / LHFree E8 calls).
+F3AString *F3AStringAppend(F3AString *s, const char *src, unsigned int len)
+{
+    if (s == 0 || src == 0 || len == 0)
+        return s;
+    unsigned int newLen = s->len + len;
+    if (newLen > s->cap)
+    {
+        char *oldData = (s->cap < 16) ? s->u.buf : (char *)s->u.ptr;
+        char *newBuf = (char *)LHAlloc(newLen + 1);
+        if (newBuf == 0)
+            return s;
+        memcpy(newBuf, oldData, s->len);
+        if (s->cap >= 16)
+            LHFree((void *)s->u.ptr);
+        s->u.ptr = (DWORD)newBuf;
+        s->cap = newLen + 1;
+        s->len = newLen;
+        newBuf[newLen] = 0;
+        return s;
+    }
+    char *dst = (s->cap < 16) ? s->u.buf : (char *)s->u.ptr;
+    memcpy(dst + s->len, src, len);
+    dst[newLen] = 0;
+    s->len = newLen;
+    return s;
+}
+
 // the "if (cap >= 16) LHFree(heap ptr)" dtor idiom.
 void F3AStringFree(F3AString *s)
 {
@@ -3542,7 +3575,7 @@ static int XLipApplyComponentSettings(char *pSettings)
 }
 // sub_403AF0 (0x403AF0 - 0x403B17) -- counted-buffer equality (thiscall +
 // retn 4): the +4 lengths are equal and the data strings compare equal
-// (sub_403F10: the generic byte-wise C string compare, 0 equal / -1 less /
+// (SpeechBankStrCompare, formerly sub_403F10: the generic byte-wise C string compare, 0 equal / -1 less /
 // 1 greater -- _strcmp semantics).
 static int SharedBufferBlocksEqual(F3SharedBuffer *a, F3SharedBuffer *b)
 {

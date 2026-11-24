@@ -9874,8 +9874,8 @@ static int ClearOptionalStartupScriptList(void)
 
 // sub_616710 (0x616710 - 0x616894) -- RunLuaStartupScripts: report the
 // broken-Lua-script marker files after the engine Lua environment rebuild.
-// Build the 16-byte LHSFS::CLegacyFile (the sub_17FE870 ctor + the
-// sub_17FE0A0 open-setup, a documented stub) over the caller's
+// Build the 16-byte LHSFS::CLegacyFile (the LegacyFileCtor ctor + the
+// CLegacyFileOpen open-setup) over the caller's
 // startup-script path slot (the "Data\Scripts\Startup\" + "startup.lua"
 // slot ReinitEngineLua concats) and, when that marker file opens
 // (sub_17FDC30: the +8 file slot set), log "Lua startup script has an
@@ -9888,16 +9888,17 @@ static int ClearOptionalStartupScriptList(void)
 // "Optional startup script \"<name>\" has an error in it"
 // (SharedSlotConcatLiteral + MakeSettingsFilePath + LogScriptError),
 // finally clearing the list (sub_55F120).  Returns the main file
-// object's dtor result (sub_17FD970 -> ReleaseSharedSlot's new g_Addend
+// object's dtor result (LegacyFileDtor -> ReleaseSharedSlot's new g_Addend
 // count).  cdecl (the Lua module as arg 0, the path-slot address as
 // arg 1); the sole caller is ReinitEngineLua (0x61A54E), which discards
 // the result.
 // [NOT byte-identical] placement-dependent (the relative calls to the
 // shared-slot / file / logging helpers + the __security_check_cookie IAT
-// slot) and it refs the high-VA list + path-prefix globals.  The
-// file-open setup (sub_17FE0A0) and the log emitter (LogScriptError,
-// sub_629660) are the documented stubs, so the marker files never open
-// and the error branch is not taken in this build; the original's
+// slot) and it refs the high-VA list + path-prefix globals.  The log
+// emitter (LogScriptError, sub_629660) is the documented stub; the marker
+// files open via the implemented LegacyFileCtor / CLegacyFileOpen, but
+// the disk open typically fails (no marker files on disk in this build),
+// so the error branch is not taken; the original's
 // __invalid_parameter_noinfo list-iterator guards are unreachable for the
 // same reason.
 //
@@ -9906,7 +9907,7 @@ static long RunLuaStartupScripts(int luaModule, F3SharedBuffer **scriptSlot)
 {
     DWORD file[4];   // v14: the main startup-script marker file (CLegacyFile)
 
-    LegacyFileCtor(file, scriptSlot, 1, 2);            // sub_17FE870
+    LegacyFileCtor(file, scriptSlot, 1, 2);            // LegacyFileCtor
     if (LegacyFileHasData(file) != 0)                  // sub_17FDC30
     {
         F3SharedBuffer *msg  = 0;   // v12: the error message slot (reused per node)
@@ -9932,7 +9933,7 @@ static long RunLuaStartupScripts(int luaModule, F3SharedBuffer **scriptSlot)
 
             SharedSlotConcat(&msg, &g_unk_1DBE2B4, (F3SharedBuffer **)(node + 2));
             DWORD optFile[4];   // v13: the optional-script marker file
-            LegacyFileCtor(optFile, &msg, 1, 2);       // sub_17FE870
+            LegacyFileCtor(optFile, &msg, 1, 2);       // LegacyFileCtor
             if (LegacyFileHasData(optFile) != 0)       // sub_17FDC30
             {
                 SharedSlotConcatLiteral(&lit, "Optional startup script \"", &msg);
@@ -9941,13 +9942,13 @@ static long RunLuaStartupScripts(int luaModule, F3SharedBuffer **scriptSlot)
                 ReleaseSharedSlot(&full);
                 ReleaseSharedSlot(&lit);
             }
-            LegacyFileDtor(optFile);                   // sub_17FD970
+            LegacyFileDtor(optFile);                   // LegacyFileDtor
             ReleaseSharedSlot(&msg);
             node = (int *)(size_t)node[0];             // ++it
         }
         ClearOptionalStartupScriptList();              // sub_55F120
     }
-    return LegacyFileDtor(file);                       // sub_17FD970
+    return LegacyFileDtor(file);                       // LegacyFileDtor
 }
 
 // sub_6ECE40 / sub_6ECEC0 (0x6ECE40-0x6ECEB4 / 0x6ECEC0-0x6ECF34) -- the
