@@ -100189,7 +100189,7 @@
     },
     "0x00619990": {
       "size": 5,
-      "name": "sub_619990"
+      "name": "JmpLHAllocAligned"
     },
     "0x006199a0": {
       "size": 5,
@@ -660449,7 +660449,7 @@
     },
     "0x01a03630": {
       "size": 46,
-      "name": "sub_1A03630"
+      "name": "LHAllocAligned"
     },
     "0x01a03660": {
       "size": 196,

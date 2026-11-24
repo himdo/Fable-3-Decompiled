@@ -126,36 +126,6 @@
 "source": "gamemain"
 },
 {
-"name": "?sub_754DE0@@YAPAXPAX@Z",
-"rva": 3493344,
-"size": 722,
-"source": "gamemain"
-},
-{
-"name": "?sub_627690@@YAXPAX@Z",
-"rva": 2258576,
-"size": 651,
-"source": "gamemain"
-},
-{
-"name": "?sub_619990@@YAXXZ",
-"rva": 2202000,
-"size": 5,
-"source": "gamemain"
-},
-{
-"name": "?sub_6199A0@@YAXXZ",
-"rva": 2202016,
-"size": 5,
-"source": "gamemain"
-},
-{
-"name": "?sub_18FA3F0@@YAXXZ",
-"rva": 21996528,
-"size": 61,
-"source": "gamemain"
-},
-{
 "name": "?sub_741E50@@YAXH@Z",
 "rva": 3415632,
 "size": 203,

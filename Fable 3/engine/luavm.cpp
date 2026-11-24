@@ -9121,21 +9121,14 @@ static void *CLuaManagerCtor(void *obj, void *luaModule, void *sortedMap)
 }
 
 // ============================================================
-//  The six VM-internal callees of CLuaManagerImplRunSerialiseScript.  All are
-//  deep VM / Kore / localisation internals (out of scope for this module), so
-//  each is a documented no-op stub -- the same pattern as the
-//  CLuaManagerImplCtor / CLuaManagerImplDtor stubs above.  Each keeps its
-//  original IDA address in the comment.
+//  The VM-internal callees of CLuaManagerImplRunSerialiseScript.  All but
+//  GetWideStringHash (sub_56DFD0, now implemented in gamemain.cpp with the
+//  F3WString family and declared in gamemain.h) are deep VM / Kore /
+//  localisation internals (out of scope for this module), so each is a
+//  documented no-op stub -- the same pattern as the CLuaManagerImplCtor /
+//  CLuaManagerImplDtor stubs above.  Each keeps its original IDA address in
+//  the comment.
 // ============================================================
-
-// sub_56DFD0 (0x56DFD0 - 0x56E023) -- GetWideStringHash: the cached FNV-1a
-// 32-bit hash of a wide path string, stored in the string's own +28 word.  The
-// original returns the cached hash at +28; when it is 0 and the +20 length is
-// non-zero it computes sub_56DFA0 (FNV-1a, offset basis 0x81000005) over the
-// string's data (the SSO buffer at +4, or the heap pointer, up to 0x800 wchars
-// via wcsnlen), caches and returns it (0 for an empty string).  VM-internal --
-// out of scope.  Stub: returns 0 (empty/uncached).
-static int GetWideStringHash(const F3WString *s) { (void)s; return 0; }
 
 // sub_180AF10 (0x180AF10 - 0x180AF64) -- ScriptHashHasError: test a Lua script
 // hash for a recorded error.  The original builds a small stack query
@@ -9201,8 +9194,9 @@ static void KoreModulePacing(int koreModule, int flag) { (void)koreModule; (void
 // caller: the CLuaManagerRunSerialiseScript wrapper (0x6F9883).
 // [NOT byte-identical] placement-dependent (the relative calls to the shared-
 // slot / wide-string / release helpers + the __security_check_cookie) and it
-// reads the high-VA serialise-script globals; the six VM-internal callees are
-// the documented no-op stubs above.
+// reads the high-VA serialise-script globals; the five remaining
+// VM-internal callees are the documented no-op stubs above (the sixth,
+// GetWideStringHash sub_56DFD0, is implemented in gamemain.cpp).
 //
 //  int CLuaManagerImplRunSerialiseScript(void *impl)
 static int CLuaManagerImplRunSerialiseScript(void *impl)

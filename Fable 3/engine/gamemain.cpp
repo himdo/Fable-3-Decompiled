@@ -14,9 +14,11 @@
 #include "banktree.h"             // BankTreeEraseRange (the bank-tree range erase)
 #include "namemap.h"              // NameMapEraseRange (the +0x94 name-map range erase)
 #include "subnode.h"              // SubNodeEraseRange (the +0x74 SubNode range erase)
-#include "common/common.h"        // LHAlloc / LHFree / InitSharedSlot / ReleaseSharedSlot
+#include "common/common.h"        // LHAlloc / LHFree / JmpLHAllocAligned / LHFreeAligned / JmpLHFreeAligned /
+// InitSharedSlot / ReleaseSharedSlot
 #include "engine/engine.h"        // SetThreadName (the thread-name announce)
 #include "gameengine.h"           // GetGameEngine (sub_619A90)
+#include "gamethread.h"           // CNetSaveGameCtor/Dtor (the 0x2E0-byte co-op net object ctor/dtor)
 #include "manager.h"              // GetManager
 #include "netinit.h"              // InitNetworking
 #include "save/save.h"            // SetSaveGamePath (the shared-slot string setter)
@@ -477,29 +479,8 @@ DWORD *GetDefaultResolution(DWORD *out)
 //  the copy / destroy paths below are all reproduced.
 // ============================================================
 
-// The 24-byte option-map tree node (the red-black tree backing each map).
-typedef struct F3OptionNode
-{
-    F3OptionNode *  link0;    // +0x00
-    F3OptionNode *  link1;    // +0x04
-    F3OptionNode *  link2;    // +0x08
-    F3SharedBuffer *key;      // +0x0C: the 16-byte key block (a ref)
-    DWORD           keyLen;   // +0x10
-    BYTE            color;    // +0x14 (byte 20)
-    BYTE            leaf;     // +0x15 (byte 21)
-    BYTE            pad22;    // +0x16
-    BYTE            pad23;    // +0x17
-} F3OptionNode;               // 24 bytes
-
-// The 32-byte option-map object; three sit side by side in the 96-byte
-// video-options triple (Int at +0x00, Float at +0x20, Detail at +0x40).
-typedef struct F3OptionMap
-{
-    DWORD *       wrapper;    // +0x00: the 4-byte heap block { &obj }
-    DWORD         pad[5];     // +0x04..+0x17: untouched by the ctor / copy
-    F3OptionNode *root;       // +0x18: the sentinel node
-    DWORD         count;      // +0x1C: the element count
-} F3OptionMap;                // 32 bytes
+// The F3OptionNode (24-byte) / F3OptionMap (32-byte) option-map types
+// live in gamemain.h (moved for CNetSaveGameCtor in gamethread.cpp).
 
 // The 24-byte LHXML::CXMLReadStream stack object (sub_17DC290 / sub_17DC2B0).
 typedef struct F3XmlStream
@@ -1122,7 +1103,7 @@ static void InitOptionMapBase(F3OptionMap *obj, void *a2, void *a3)
 }
 static void InitIntOptionMap(F3OptionMap *obj, void *a2, void *a3)    { InitOptionMapBase(obj, a2, a3); }   // sub_40E6D0
 static void InitFloatOptionMap(F3OptionMap *obj, void *a2, void *a3)  { InitOptionMapBase(obj, a2, a3); }   // sub_40E780
-static void InitDetailOptionMap(F3OptionMap *obj, void *a2, void *a3) { InitOptionMapBase(obj, a2, a3); }   // sub_40E830
+void InitDetailOptionMap(F3OptionMap *obj, void *a2, void *a3) { InitOptionMapBase(obj, a2, a3); }   // sub_40E830 (declared in gamemain.h for gamethread.cpp)
 
 // sub_1A012C0 (0x1A012C0 - 0x1A0131C): take a ref of the source slot's block
 F3SharedBuffer **EngRefSharedSlot(F3SharedBuffer **dst, F3SharedBuffer **src)   // xlip.h
@@ -5283,11 +5264,9 @@ static void F3WStringAssign(F3WString *s, const wchar_t *src, unsigned int len);
 static void F3WStringNormalizeSeparators(F3WString *s);
 static void XApiErrorReport(int code, int subCode);
 
-// sub_56DFD0 (0x56DFD0 - 0x56E023) -- the cached FNV-1a wide-string hash.
-// [remaining stub] returns 0 (the hash only feeds the verbose log lines and
-// the failure-report dispatch, both inactive in this build).  Matches the
-// file-local stub in engine/luavm.cpp.
-static int GetWideStringHash(const F3WString *s) { (void)s; return 0; }
+// sub_56DFD0 (0x56DFD0 - 0x56E023) -- the cached FNV wide-string hash
+// (GetWideStringHash): now implemented below with the F3WString family,
+// declared in gamemain.h (shared with engine/luavm.cpp).
 
 // The VFS verbose-logging pair (the "OPEN: ..." / "CLOSE: ..." printer):
 // the flag byte (dword_20B5FA8 & 1) gates the printf-style function at
@@ -5443,7 +5422,7 @@ static int WINAPI Win32FileSystemReportOpenFailure(void *obj,
                                                    const F3WString *path)
 {
     DWORD err = GetLastError();
-    int hash = GetWideStringHash((const F3WString *)path);
+    int hash = GetWideStringHash((F3WString *)path);
     int category;
     switch (err)
     {
@@ -6879,6 +6858,7 @@ static void *VfsRefCountCtor(void *obj)
 static const DWORD kCProcessDelegateThiscallVftable = 0x01B6FCC0;  // ??_7 CProcessDelegateThiscall<CEngine>::`vftable'
 static const DWORD kCProcessDelegateStaticVftable   = 0x01B6F768;  // ??_7 CProcessDelegateStatic::`vftable'
 
+static F3SharedBuffer *g_dword_1DDC818 = 0;   // 0x1DDC818: the audio mastering-profile path slot
 static BYTE  g_byte_1DDC828 = 0;              // 0x1DDC828: InitVirtualFileSystem done flag
 static DWORD g_dword_1DDC820 = 0;             // 0x1DDC820: the CProcessDelegateThiscall object (16 bytes)
 static DWORD g_dword_1DDC824 = 0;             // 0x1DDC824: query-table mode (2 = drain)
@@ -6986,6 +6966,102 @@ static int VfsAllocCacheInit(void)
 
 // VfsAllocCacheIdentity  (0x146D870 - 0x146D872)  -- identity thiscall.
 static void *VfsAllocCacheIdentity(void *obj) { return obj; }
+
+// VfsAllocCacheAlloc  (0x1473D70 - 0x1473E12)  -- stage an allocation from a
+//  28-byte LHVFS allocation cache (thiscall, retn 4: the cache in ECX, the
+//  wait flag on the stack).  Returns 0 (no critical section taken) when the
+//  cache is not initialised (+0x18 == 0).  Otherwise, under the cache
+//  critical section (+0x1C, sub_1A00A60 / sub_1A00A50 wrappers): when no
+//  staged object is pending (+0x0C == 0), free = cb[+0x100] - cb[+0x10C]
+//  (cb = the 272-byte control block pointed to by the cache's +0x04 slot);
+//  with the wait flag an alertable SleepEx(0, 1) spins until free >= the
+//  element size (+0x14).  When there is room, the staged pointer =
+//  cb + 0x110 + cb[+0x104] (the cursor) is stored in +0x0C and returned --
+//  leaving the critical section LOCKED (VfsAllocCacheFinalize releases it).
+//  0 otherwise (section released).  96 audio-comms command wrappers use the
+//  pair; returns 0 in this build (g_unk_1DDC830 is zero BSS pre-VFS-init).
+//  [NOT byte-identical] placement-dependent (relative calls to the
+//  critical-section / SleepEx IAT thunks) and refs the high-VA cache object.
+static void *VfsAllocCacheAlloc(void *cache, int wait)
+{
+    DWORD *o = (DWORD *)cache;
+    if (o[0x18 / 4] == 0)
+        return 0;
+    EnterCriticalSection((LPCRITICAL_SECTION)((char *)cache + 0x1C));
+    void *staged = 0;
+    if (o[0x0C / 4] == 0) {
+        DWORD *cb = (DWORD *)o[1];          // the +0x04 slot
+        cb = (DWORD *)cb[0];                // ...points to the 272-byte control block
+        DWORD free = cb[0x100 / 4] - cb[0x10C / 4];
+        if (wait) {
+            while (free < o[0x14 / 4]) {
+                SleepEx(0, 1);
+                free = cb[0x100 / 4] - cb[0x10C / 4];
+            }
+        }
+        if (free >= o[0x14 / 4]) {
+            staged = (char *)cb + 0x110 + cb[0x104 / 4];
+            o[0x0C / 4] = (DWORD)staged;
+            return staged;                  // the CS stays locked on success
+        }
+    }
+    LeaveCriticalSection((LPCRITICAL_SECTION)((char *)cache + 0x1C));
+    return 0;
+}
+
+// VfsAllocCacheFree  (0x1474240 - 0x14742AF)  -- return a staged slot to the
+//  pool (thiscall, retn 4: the cache's +0x04 slot in ECX, the size on the
+//  stack).  newCursor = cb[+0x104] + size (cb = the control block the slot
+//  points at); `int 3` when it would run past the limit cb[+0x100] (a ring),
+//  wrap the cursor to 0 exactly at the limit, store it at cb[+0x104], add
+//  the size to the used counter (cb[+0x10C], InterlockedExchangeAdd), and
+//  return SetEvent(*(slot + 0x84)) (0x18C4540) to wake a sleeping allocator.
+//  [NOT byte-identical] placement-dependent (relative calls to the SetEvent
+//  IAT thunk).
+static int VfsAllocCacheFree(void *slot, unsigned size)
+{
+    DWORD *cb = (DWORD *)slot;
+    cb = (DWORD *)cb[0];                    // the 272-byte control block
+    DWORD cur = cb[0x104 / 4] + size;
+    if (cur > cb[0x100 / 4])
+        __debugbreak();
+    cb[0x104 / 4] = (cur == cb[0x100 / 4]) ? 0 : cur;
+    InterlockedExchangeAdd((volatile LONG *)&cb[0x10C / 4], (LONG)size);
+    return SetEvent(*(HANDLE *)((char *)slot + 0x84));   // 0x18C4540
+}
+
+// VfsAllocCacheFinalize  (0x1473E20 - 0x1473E5F)  -- commit / release the
+//  staged object (thiscall in ECX, plain retn).  No-op (the EAX is left to
+//  the caller in the original; 0 here) when the cache is not initialised
+//  (+0x18 == 0) or nothing is staged (+0x0C == 0).  Otherwise r = the staged
+//  object's ICommand slot 1 (the size getter); when r <= the element size
+//  (+0x14) the slot is returned to the pool (VfsAllocCacheFree), +0x0C is
+//  cleared, and the critical section taken by VfsAllocCacheAlloc is released
+//  (tail call into sub_1A00A50); when r > the element size +0x0C is simply
+//  cleared (the original leaves the critical section locked on that path).
+//  96 audio-comms command wrappers use the pair with VfsAllocCacheAlloc.
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  VfsAllocCacheFree / the critical-section IAT thunks).
+static int VfsAllocCacheFinalize(void *cache)
+{
+    DWORD *o = (DWORD *)cache;
+    if (o[0x18 / 4] == 0)
+        return 0;
+    DWORD staged = o[0x0C / 4];
+    if (staged == 0)
+        return 0;
+    int elem = o[0x14 / 4];
+    void **vt = *(void ***)staged;
+    int r = ((int (*)(void *))vt[1])((void *)staged);                    // ICommand slot 1
+    if (r <= elem) {
+        int ret = VfsAllocCacheFree((void *)o[1], (unsigned)elem);
+        o[0x0C / 4] = 0;
+        LeaveCriticalSection((LPCRITICAL_SECTION)((char *)cache + 0x1C));
+        return ret;
+    }
+    o[0x0C / 4] = 0;                         // the CS stays locked (as in the original)
+    return r;
+}
 
 // VfsCacheQueryImpl  (0x14972C0 - 0x149731C)  -- one-time (g_dword_1DDCD74)
 //  concurrency init: the 8-byte Concurrency reader-writer lock + the 56-byte
@@ -10398,11 +10474,119 @@ void *CVersionTableGetVersion1(void *obj)
     }
 }
 
-static void *sub_754DE0(void *obj) { return obj; }
-static void  sub_627690(void *obj) { (void)obj; }
-static void  sub_619990(void) {}
-static void  sub_6199A0(void) {}
-static void  sub_18FA3F0(void) {}
+// ============================================================
+//  StageLoadMasteringProfiles  (0x14611B0 - 0x14611EA)  -- stage the
+//  8-byte CLoadMasteringProfiles command object into the main (80/4096)
+//  allocation cache (g_unk_1DDC830, built by InitVirtualFileSystem)
+//
+//  int StageLoadMasteringProfiles(const char *source)   -- cdecl
+//
+//  Stage an 84-byte pool slot (VfsAllocCacheAlloc, sub_1473D70, wait = 1):
+//  on success install the CLoadMasteringProfiles vtable, null-ctor the +4
+//  path slot (InitSharedSlot) and store the source path (SetSaveGamePath),
+//  then finalize (VfsAllocCacheFinalize, sub_1473E20 -- the original is a
+//  tail call): the staged object's ICommand slot 1 reports its 8-byte size,
+//  which fits the 84-byte element, so the slot is returned to the pool
+//  (VfsAllocCacheFree) and the cache critical section released.  Returns 0
+//  when the pool is not initialised (VfsAllocCacheAlloc returns 0 -- the
+//  only path live in this build, where g_unk_1DDC830 is zero BSS because
+//  InitVirtualFileSystem is never reached, the archive slot being null).
+//  [NOT byte-identical] placement-dependent (relative calls to the pool /
+//  slot callees) and refs the high-VA globals g_unk_1DDC830 (0x01DDC830) and
+//  the CLoadMasteringProfiles vtable at its original VA (0x01B6F8D0).
+//
+//  The lambda class is `NLHAudio::NFramework::NComms::
+//  LoadMasteringProfiles(char const *)'::`2'::CLoadMasteringProfiles` -- an
+//  8-byte ICommand: {+0 vtable, +4 the path slot (an F3SharedBuffer
+//  pointer)}.  Slot 0 is the deleting destructor (sub_1463730, thiscall
+//  retn 4, the free flag on the stack): release the path slot, overwrite
+//  the vtable with ICommand's (0x01B6F458), LHFree the object when the free
+//  flag is set, return this.  Slot 1 (sub_14623C0) reports the object size
+//  (8).  Slot 2 (sub_1460510) executes the command through the process
+//  delegate g_dword_1DDC820 (sub_146E150 with the path slot as argument) --
+//  [STUB] the delegate invoke is unimplemented here, treated as its 0
+//  return value.  Slot 3 is the rdata
+//  entry 0x01C41624 at its original VA (the next vtable at 0x01B6F8E0 belongs
+//  to a neighboring lambda class: dtor sub_1463760 / size sub_14623E0 /
+//  exec sub_1460520 / rdata 0x01C41674).
+static void *CLoadMasteringProfilesDtor(void *obj, int free)
+{
+    ReleaseSharedSlot((F3SharedBuffer **)((DWORD *)obj + 1));
+    *(DWORD *)obj = 0x01B6F458;   // &NLHAudio::NThreading::ICommand::`vftable' (original VA)
+    if (free & 1)
+        LHFree(obj);
+    return obj;
+}
+static int CLoadMasteringProfilesSize(void) { return 8; }     // sub_14623C0 / sub_14623E0
+static int CLoadMasteringProfilesExec(void *path)             // sub_1460510 / sub_1460520 (stub)
+{ (void)path; return 0; }
+static const void *kCLoadMasteringProfilesVftable[] = {
+    (const void *)CLoadMasteringProfilesDtor,   // 0x1463730
+    (const void *)CLoadMasteringProfilesSize,   // 0x14623C0
+    (const void *)CLoadMasteringProfilesExec,   // 0x1460510
+    (const void *)0x01C41624                     // rdata entry, original VA
+};
+
+static int StageLoadMasteringProfiles(const char *source)
+{
+    DWORD *obj = (DWORD *)VfsAllocCacheAlloc(g_unk_1DDC830, 1);
+    if (obj != 0) {
+        obj[0] = (DWORD)kCLoadMasteringProfilesVftable;
+        InitSharedSlot((F3SharedBuffer **)(obj + 1));
+        SetSaveGamePath((F3SharedBuffer **)(obj + 1), source);
+        return VfsAllocCacheFinalize(g_unk_1DDC830);
+    }
+    return 0;
+}
+
+//  LoadMasteringProfiles  (0x145D870 - 0x145D88B)  -- the NLHAudio::
+//  NFramework::NComms::LoadMasteringProfiles(char const*) stdcall wrapper
+//  (the ECX the caller stages is ignored):
+//
+//  int LoadMasteringProfiles(const char *source)   -- stdcall, retn 4
+//
+//  Publish the profile path into the global slot (dword_1DDC818) via
+//  SetSaveGamePath, then stage the loader command
+//  (StageLoadMasteringProfiles) and return its result.  Sole caller:
+//  LoadAudioMasteringProfiles (sub_18FA3F0).
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  SetSaveGamePath / StageLoadMasteringProfiles) and refs the high-VA global
+//  g_dword_1DDC818 (0x01DDC818).
+static int LoadMasteringProfiles(const char *source)
+{
+    SetSaveGamePath(&g_dword_1DDC818, source);
+    return StageLoadMasteringProfiles(source);
+}
+
+// ============================================================
+//  LoadAudioMasteringProfiles  (0x18FA3F0 - 0x18FA42D)  -- load the audio
+//  mastering profiles from "audio/profiles.amp"
+//
+//  int LoadAudioMasteringProfiles(void)   -- cdecl (plain retn)
+//
+//  The compiler-generated empty local (the identity ctor sub_145D7C0
+//  `mov eax, ecx; retn` + the nullsub_124 `retn` dtor on a 1-byte stack
+//  object) is side-effect free and omitted, as is the __security_cookie
+//  frame check.  Sets the profile path (the global slot g_dword_1DDC818)
+//  and stages the CLoadMasteringProfiles ICommand into the audio-comms
+//  allocation pool (LoadMasteringProfiles, sub_145D870), with the literal
+//  "audio/profiles.amp" (0x01BD359C); returns its result (0 while the pool
+//  is uninitialised).  Callers: RunFrontEnd (0x61D422 -- right after the
+//  Havok aligned-alloc/free thunks are stored in off_1D8C850 / off_1D8C854)
+//  and the vtable thunk 0x619B00 (both discard the value); replaces the
+//  sub_18FA3F0 no-op stub in RunFrontEnd.
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  LoadMasteringProfiles + the __security_check_cookie IAT slot) and refs
+//  the high-VA "audio/profiles.amp" string (0x01BD359C) at its original
+//  address.
+// ============================================================
+static int LoadAudioMasteringProfiles(void)
+{
+    return LoadMasteringProfiles("audio/profiles.amp");
+}
+//  0x619990 (the Havok aligned-allocate thunk) and 0x6199A0 (the aligned-
+//  free thunk) are now the real JmpLHAllocAligned / JmpLHFreeAligned in
+//  common/common.cpp.
 //  WaitForEvent  (0x18C4560 - 0x18C45B3)  -- block on the event stored in
 //  the frontend object (handle at obj+0x80; sibling SetFrontendEvent does
 //  SetEvent on the same slot, sub_18C45E0 does CloseHandle). Wraps
@@ -10625,6 +10809,45 @@ F3WString *F3WStringFromAnsi(F3WString *obj, const char *src)
     F3WStringAssignAnsi(obj, src);
     F3WStringNormalizeSeparators(obj);
     return obj;
+}
+
+//  F3FnvHash  (0x56DFA0 - 0x56DFC5)  -- the FNV 32-bit hash primitive:
+//  h = seed, then per 16-bit unit (up to the NUL word) h = (h * 0x1000193) ^
+//  (the unit's low byte).  cdecl (the wide string in a1, the seed in a2) --
+//  the FNV-1 iteration order (multiply, then xor) with the standard 32-bit
+//  offset basis / prime, over the low byte of each wide unit.
+static DWORD F3FnvHash(const wchar_t *s, DWORD seed)
+{
+    while (*s != 0)
+    {
+        seed = seed * 16777619u ^ (DWORD)(unsigned char)*s;
+        s++;
+    }
+    return seed;
+}
+
+//  GetWideStringHash  (0x56DFD0 - 0x56E023)  -- the cached FNV 32-bit hash of
+//  the 36-byte F3WString's data, stored in the string's own +28 word (e1): when
+//  e1 is 0 and len is non-zero, take the data (the SSO buffer at +4 when
+//  cap < 8, else the heap pointer -- F3WStringData) and, when it is non-null
+//  and non-empty (wcsnlen up to 0x800 wchars), cache + return
+//  F3FnvHash(data, 0x811C9DC5); otherwise cache 0.  Always returns the
+//  (now-cached) e1 word.  thiscall in the original (the string in ECX).
+//  [NOT byte-identical] placement-dependent (the _wcsnlen IAT slot + the
+//  relative E8 call to F3FnvHash).  Exposed (non-static) for the CLuaManager
+//  serialise-script path (engine/luavm.cpp) and the CWin32FileSystem verbose
+//  open log / failure report; declared in gamemain.h.
+int GetWideStringHash(F3WString *s)
+{
+    if (s->e1 == 0 && s->len != 0)
+    {
+        const wchar_t *data = F3WStringData(s);
+        if (data != 0 && wcsnlen(data, 0x800) != 0)
+            s->e1 = F3FnvHash(data, 0x811C9DC5u);
+        else
+            s->e1 = 0;
+    }
+    return (int)s->e1;
 }
 
 // sub_718250 (0x718250 - 0x718686) -- register one asset file into the
@@ -12572,18 +12795,18 @@ signedIn:
         ReinitEngineLua(obj, 0);
 
         void *p736 = LHAlloc(0x2E0);
-        int   v44 = (p736 != 0) ? (int)sub_754DE0(p736) : 0;
+        int   v44 = (p736 != 0) ? (int)CNetSaveGameCtor(p736) : 0;
         void *v45 = (void *)dw[0xA8 / 4];
         if (v45 != 0)
         {
-            sub_627690(v45);
+            CNetSaveGameDtor(v45);   // 0x627690
             LHFree(v45);
         }
         dw[0xA8 / 4] = (DWORD)v44;
 
-        g_off_1D8C850 = (void *)sub_619990;
-        g_off_1D8C854 = (void *)sub_6199A0;
-        sub_18FA3F0();
+        g_off_1D8C850 = (void *)JmpLHAllocAligned;   // 0x619990 (the real aligned-alloc thunk)
+        g_off_1D8C854 = (void *)JmpLHFreeAligned;    // 0x6199A0 (the real aligned-free thunk)
+        LoadAudioMasteringProfiles();
 
         g_byte_1DBD9E0 = 0;
         WaitForEvent(&g_unk_1DBD9E8, -1, 0);

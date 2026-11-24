@@ -96,6 +96,16 @@ typedef struct F3WString
 // path (engine/luavm.cpp, CLuaManagerImplRunSerialiseScript).
 F3WString *F3WStringFromAnsi(F3WString *obj, const char *src);
 
+// sub_56DFD0 (0x56DFD0 - 0x56E023) -- GetWideStringHash: the cached FNV
+// 32-bit hash of the wide string's data (seed 0x811C9DC5; per 16-bit unit
+// h = (h * 0x1000193) ^ low byte, through sub_56DFA0), stored in the string's
+// own +28 word (e1). thiscall in the original (the string in ECX); declared
+// as a free function per the project convention. [NOT byte-identical]
+// placement-dependent (the _wcsnlen IAT slot + the F3FnvHash relative call).
+// Exposed for the CLuaManager serialise-script path (engine/luavm.cpp) and
+// the CWin32FileSystem verbose open log / failure report (engine/gamemain.cpp).
+int GetWideStringHash(F3WString *s);
+
 // sub_1A02200 (0x1A02200 - 0x1A02228) -- set dst to a literal, then append
 // src: SetSharedSlot(dst, lit, -1) followed by SharedSlotAppendSlot(dst, src);
 // returns dst. cdecl. The two-arg sibling of the already-exposed
@@ -172,5 +182,39 @@ LONG SaveSettingsBeforeExit(void);
 extern DWORD g_dword_1D9E18C;
 extern DWORD g_dword_1D9E194;
 extern BYTE  g_byte_1D9E19C[4];
+
+// ============================================================
+//  F3OptionMap -- the 24-byte option-map tree node + the 32-byte
+//  option-map object (the red-black tree backing each option map: the
+//  video-options triple in gamemain.cpp is three of them side by side,
+//  and CNetSaveGameCtor (gamethread.cpp) builds the CNetSaveGame +0x08
+//  detail-option map from it).
+// ============================================================
+typedef struct F3OptionNode
+{
+    F3OptionNode *    link0;    // +0x00
+    F3OptionNode *    link1;    // +0x04
+    F3OptionNode *    link2;    // +0x08
+    F3SharedBuffer *  key;      // +0x0C: the 16-byte key block (a ref)
+    DWORD             keyLen;   // +0x10
+    BYTE              color;    // +0x14 (byte 20)
+    BYTE              leaf;     // +0x15 (byte 21)
+    BYTE              pad22;    // +0x16
+    BYTE              pad23;    // +0x17
+} F3OptionNode;               // 24 bytes
+
+typedef struct F3OptionMap
+{
+    DWORD *       wrapper;    // +0x00: the 4-byte heap block { &obj }
+    DWORD         pad[5];     // +0x04..+0x17: untouched by the ctor / copy
+    F3OptionNode *root;       // +0x18: the sentinel node
+    DWORD         count;      // +0x1C: the element count
+} F3OptionMap;                // 32 bytes
+
+// InitDetailOptionMap (sub_40E830) -- the 32-byte option-map ctor (the
+// 4-byte head { &obj } + the 24-byte self-linked sentinel; the (a2, a3)
+// args are dead in the original). Defined in gamemain.cpp (formerly
+// static; exposed for CNetSaveGameCtor in gamethread.cpp).
+void InitDetailOptionMap(F3OptionMap *obj, void *a2, void *a3);
 
 #endif  // F3_GAMEMAIN_H

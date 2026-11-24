@@ -128,6 +128,122 @@ void *LHAlloc(unsigned int size)
 }
 
 // ============================================================
+//  LHAllocAligned  (0x1A03630 - 0x1A0365E)  -- the aligned allocator built
+//  on the game heap (the heap's _aligned_malloc)
+//  [NOT byte-identical] placement-dependent (relative call to LHAlloc).
+//
+//  void *LHAllocAligned(unsigned int size, unsigned int align)
+//
+//  The aligned counterpart of LHAlloc: allocate (size + align + 8) bytes
+//  from the game heap, round the raw block up to the next multiple of
+//  `align` (power of two), and write the 8-byte header just before the
+//  aligned result: [result-8] = result - raw (the front offset into the raw
+//  block -- the counterpart free, LHFreeAligned, recovers the raw pointer via
+//  it and frees it through the heap table's free slot) and [result-4] =
+//  align. Returns the aligned pointer. This is the allocator Havok's global
+//  memory interface is wired to: RunFrontEnd (0x61D40E) installs the
+//  5-byte jmp thunk JmpLHAllocAligned (0x619990, below) into off_1D8C850
+//  (the aligned-allocate slot; the free slot off_1D8C854 gets the sibling
+//  thunk JmpLHFreeAligned -> LHFreeAligned), and the Havok hkFreeListMemoryServer /
+//  hkDefaultFreeListMemoryServer objects call through that slot pair
+//  (e.g. sub_186E690: off_1D8C850(16, 16)).
+//
+//  Original body (46 bytes, 8B 44 24 04 ... 5E C3):
+//      mov eax, [esp+4]          ; eax = size
+//      push esi; mov esi, [esp+4+arg_4]   ; esi = align
+//      lea ecx, [eax+esi+8]; push ecx; call LHAlloc
+//      mov ecx, eax; mov edx, esi; neg edx
+//      lea eax, [ecx+esi+7]; and eax, edx ; align the raw block up
+//      mov edx, eax; add esp, 4; sub edx, ecx ; edx = aligned - raw
+//      mov [eax-4], esi; mov [eax-8], edx
+//      pop esi; retn
+// ============================================================
+void *LHAllocAligned(unsigned int size, unsigned int align)
+{
+    char *raw = (char *)LHAlloc(size + align + 8);
+    char *p   = (char *)((unsigned int)(raw + align + 7) & (0u - align));
+    *(unsigned int *)(p - 4) = align;
+    *(unsigned int *)(p - 8) = (unsigned int)(p - raw);
+    return p;
+}
+
+// ============================================================
+//  JmpLHAllocAligned  (0x619990 - 0x619995)  -- 5-byte `jmp LHAllocAligned`
+//  thunk, stored in Havok's global aligned-allocate slot (off_1D8C850)
+//  [NOT byte-identical] placement-dependent: the near `jmp LHAllocAligned` is
+//  rebased to this build's LHAllocAligned (the original displacement
+//  0x013E9C9B targets 0x1A03630).
+//
+//  A raw tail jump with no arg handling of its own: (size, align) are
+//  cdecl stack args and pass straight through to LHAllocAligned. RunFrontEnd
+//  stores this thunk's address (not the implementation's) in the slot, so
+//  the thunk is its own function in the original (a sibling of JmpLHFree,
+//  0x615870, in the 0x619xxx engine-thunk cluster).
+// ============================================================
+__declspec(naked) void *JmpLHAllocAligned(unsigned int, unsigned int)
+{
+    __asm { jmp LHAllocAligned }
+}
+
+// ============================================================
+//  LHFreeAligned  (0x1A034D0 - 0x1A034ED)  -- the free counterpart of
+//  LHAllocAligned (the heap's _aligned_free)
+//  [NOT byte-identical] placement-independent, but refs the heap-table
+//  pointer global (0x02075B24) at the original high VA not present in this
+//  build.
+//
+//  void LHFreeAligned(void *obj)
+//
+//  The counterpart free of LHAllocAligned (0x1A03630): recover the raw
+//  block pointer via the 8-byte front header the allocator wrote
+//  ([result-8] = the front offset into the raw block) and free the raw
+//  block through the heap table's free slot. Null is a no-op. This is the
+//  free Havok's global memory interface calls through the JmpLHFreeAligned
+//  thunk (0x6199A0, RunFrontEnd stores it in off_1D8C854, the paired slot
+//  next to JmpLHAllocAligned's off_1D8C850). cdecl (the pointer on the
+//  stack).
+//
+//  Original body (29 bytes, 8B 44 24 04 ... FFE0 C3):
+//      mov eax, [esp+arg_0]    ; eax = obj (the aligned pointer)
+//      test eax, eax
+//      jz short L_ret          ; null is a no-op
+//      mov edx, dword_2075B24  ; edx = heap table
+//      mov ecx, eax
+//      sub ecx, [eax-8]        ; ecx = raw block (aligned - front offset)
+//      mov eax, [edx+10h]      ; eax = the table's free slot
+//      mov [esp+arg_0], ecx    ; free the raw block, not the aligned one
+//      jmp eax                 ; tail-call the free (this + stack arg = raw)
+//  L_ret:
+//      retn
+// ============================================================
+void LHFreeAligned(void *obj)
+{
+    if (obj != 0)
+    {
+        char *raw = (char *)obj - *(unsigned int *)((char *)obj - 8);
+        LHFree(raw);
+    }
+}
+
+// ============================================================
+//  JmpLHFreeAligned  (0x6199A0 - 0x6199A5)  -- 5-byte `jmp LHFreeAligned`
+//  thunk, stored in Havok's global aligned-free slot (off_1D8C854)
+//  [NOT byte-identical] placement-dependent: the near `jmp LHFreeAligned` is
+//  rebased to this build's LHFreeAligned (the original displacement
+//  0x013E9B2B targets 0x1A034D0).
+//
+//  A raw tail jump with no arg handling of its own: the aligned pointer is
+//  a cdecl stack arg and passes straight through to LHFreeAligned.
+//  RunFrontEnd stores this thunk's address (not the implementation's) in the
+//  slot, so the thunk is its own function in the original (the sibling of
+//  JmpLHAllocAligned, 0x619990, in the 0x619xxx engine-thunk cluster).
+// ============================================================
+__declspec(naked) void JmpLHFreeAligned(void *obj)
+{
+    __asm { jmp LHFreeAligned }
+}
+
+// ============================================================
 //  LHFree  (0x1A032C0 - 0x1A032CB)  -- the game heap free (counterpart to
 //  LHAlloc)
 //  [NOT byte-identical] placement-independent, but refs the heap-table

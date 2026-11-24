@@ -868,9 +868,580 @@ static int   sub_72F8E0(void *obj) { (void)obj; return 0; }
 static void  sub_72F7E0(void *obj) { (void)obj; }
 static void  sub_72F7D0(void *obj) { (void)obj; }
 
-// sub_627690 (0x627690) -- the 0x2E0-byte net object's dtor (nine nested
-//   lists + CNetPacketCallbackDtor + ReleaseSharedSlot). Remaining stub.
-static void  sub_627690(void *obj) { (void)obj; }
+// ============================================================
+//  CNetSaveGameCtor  (0x754DE0 - 0x7550B2)  -- the 0x2E0-byte (736-byte)
+//  CNetSaveGame frontend co-op net object's constructor
+//  [NOT byte-identical] placement-dependent (E8 relative calls to
+//  InitSharedSlot / InitDetailOptionMap / the map-container ctors /
+//  GetNetManager / NetRegisterPacketCallback) and refs the high-VA data
+//  (qword_1BF9468 (-infinity), the CExternalAppDataMap descriptor at
+//  0x01AF5D54, the CNetPacketCallback vtable at 0x01AEE610).
+//
+//  void *CNetSaveGameCtor(void *obj)
+//
+//  thiscall on the 0x2E0-byte CNetSaveGame (RunFrontEnd's 0x61D3D0:
+//  LHAlloc(0x2E0) + this ctor, stored at CGameEngine +0xA8 after the old
+//  object's CNetSaveGameDtor + LHFree). Builds, in original order:
+//    +0x00 / +0x04   the two shared slots (InitSharedSlot),
+//    +0x08           the 32-byte detail-option map (InitDetailOptionMap,
+//                    sub_40E830: the 4-byte head {&map} + 24-byte sentinel),
+//    +0x28 / +0xC0   the two 149-byte vec-pair containers (NetSaveVecPairCtor,
+//                    sub_74CBB0 -- {0, 3, 0.0f, 0.0f, 0} + two 24-byte zeroed
+//                    heap blocks (the +0x98/+0xAC / +0x130/+0x144 12-byte
+//                    conditional heap objects the dtor frees) + 0.0f at +0x90
+//                    + flag 1 at +0x94 + 0x18..0x68 zeroed),
+//    +0x158..+0x16B  { 0, 0, -inf (qword_1BF9468), -1 },
+//    +0x16C          the 32-byte map (NetSaveMapCtor21, sub_75C710: the
+//                    4-byte head + 40-byte sentinel, flag +0x21),
+//    +0x18C / +0x1AC the two 32-byte maps (NetSaveMapCtor11, sub_533920:
+//                    the 4-byte head + 20-byte sentinel, flag +0x11),
+//    +0x1CC          the 32-byte map (NetSaveMapCtor19, sub_75C690: the
+//                    4-byte head + 32-byte sentinel, flag +0x19),
+//    +0x1EC          the 108-byte screen-params struct (NetSaveScreenParamsCtor,
+//                    sub_747510),
+//    +0x260 / +0x264 { 0, 0 },
+//    +0x268 / +0x28C the two 36-byte CExternalAppDataMap objects (the
+//                    descriptor pointer 0x01AF5D54 + NetSaveAppDataMapCtor,
+//                    sub_75C790: the 4-byte head + 56-byte sentinel, flag
+//                    +0x35, the 12-byte +0x28 payload the dtor frees),
+//    +0x2B0..+0x2BC  the 13-byte flags {0,0,0,0,1,1,0,1,0,1,0,0,0} (+0x2B7 is
+//                    the saving-as-allowed flag the 587 handler compares),
+//    +0x2C0..+0x2DF  the 32-byte CNetPacketCallback (the DNameNode base ctor
+//                    0x18984B0's {CBaseObject vtable, 0} + the derived
+//                    overwrite: vtable 0x01AEE610, 0 at +0x04/+0x08, byte 0
+//                    at +0x0C, 0.0 at +0x10, the NULL load-screen pointers
+//                    at +0x18/+0x1C),
+//  then runs the co-op packet group on the net manager's packet manager
+//  (GetNetManager -> CNetManagerGetPacketManager, sub_6A6820) six times, each
+//  time re-storing the +0x2C8 back-pointer (this), a fresh zeroed 8-byte
+//  stack _ReaderWriterLock (F3ReaderWriterLockCtor, sub_77DB70), the +0x2C0
+//  callback, and the {receive, serialize} pair:
+//    518 CNetFakeLoadScreenPacket, 557 CNetACSLoadScreenPacket,
+//    538 CNetSaveGamePacket, 539 CNetReceivedSaveGamePacket,
+//    540 CNetSetLoadingScreenEnabledPacket, 587 CNetSetSavingAsAllowedPacket.
+//  Returns obj.
+// ============================================================
+
+// sub_6A6820 (0x6A6820 - 0x6A6824) -- the CNetManager +0x04 (the packet
+// manager) getter: mov eax, [ecx+4]; retn.  The original is a thiscall getter
+// that reads the CNetManager's +0x04 slot from ECX (the caller stages the
+// GetNetManager result into ECX first).  A C call cannot stage ECX, so read
+// the slot directly on the passed argument (identical result) -- the same
+// idiom as CNetManagerGetUserManager in netinit.cpp.  The net manager's
+// +0x04 slot is 0 in this build (CNetManagerCtor's placeholder zero-fill),
+// so this returns NULL until the real packet manager is implemented.
+static void *CNetManagerGetPacketManager(void *obj)
+{
+    return (void *)*(DWORD *)((char *)obj + 4);
+}
+
+// sub_77DB70 (0x77DB70 - 0x77DB78) -- the 8-byte _ReaderWriterLock ctor:
+// zero both words.  The original is thiscall (zero [ecx] and [ecx+4]); a C
+// call cannot stage ECX, so zero the passed argument directly (identical
+// result).
+static void F3ReaderWriterLockCtor(void *lock)
+{
+    DWORD *dw = (DWORD *)lock;
+    dw[0] = 0;
+    dw[1] = 0;
+}
+
+// sub_A1AA30 (0xA1AA30, 299 bytes) -- the packet-callback registration on
+// the net manager's packet manager (the CNetManager +0x04 sub-object):
+// validates the id (>= 0xFE) and the non-null handlers, allocates the entry,
+// copies the {callback obj, lock, receive, serialize} tuple, and registers it
+// in the packet manager's dispatch lists.
+// [STUB] The body is out of scope for CNetSaveGameCtor; in this build the
+// packet manager is 0 (CNetManagerGetPacketManager returns NULL) and no
+// packets are ever delivered, so a no-op preserves all observable behavior.
+static void NetRegisterPacketCallback(void *pm, int id, void *lock,
+                                      void *cb, void *recv, void *ser)
+{
+    (void)pm; (void)id; (void)lock; (void)cb; (void)recv; (void)ser;
+}
+
+// The six co-op packet receive handlers (sub_755FD0 / sub_7578A0 / sub_760CA0
+// / sub_756000 / sub_756020 / sub_756030) and serializers (sub_75D130 /
+// sub_75D210 / sub_75D300 / sub_75D3F0 / sub_75D4D0 / sub_75D5B0) that
+// CNetSaveGameCtor registers.
+// [STUB] Each body is out of scope; in this build the packet manager is 0 and
+// no packets are ever delivered, so the handlers are never called (only their
+// addresses are registered).
+static void NetFakeLoadScreenOnReceive(void *pkt, void *obj)       { (void)pkt; (void)obj; }
+static void NetACSLoadScreenOnReceive(void *pkt, void *obj)        { (void)pkt; (void)obj; }
+static void NetSaveGameOnReceive(void *pkt, void *obj)             { (void)pkt; (void)obj; }
+static void NetReceivedSaveGameOnReceive(void *pkt, void *obj)     { (void)pkt; (void)obj; }
+static void NetSetLoadingScreenEnabledOnReceive(void *pkt, void *obj) { (void)pkt; (void)obj; }
+static void NetSetSavingAsAllowedOnReceive(void *pkt, void *obj)   { (void)pkt; (void)obj; }
+static void NetFakeLoadScreenSerialize(void *out, void *in)        { (void)out; (void)in; }
+static void NetACSLoadScreenSerialize(void *out, void *in)         { (void)out; (void)in; }
+static void NetSaveGameSerialize(void *out, void *in)              { (void)out; (void)in; }
+static void NetReceivedSaveGameSerialize(void *out, void *in)      { (void)out; (void)in; }
+static void NetSetLoadingScreenEnabledSerialize(void *out, void *in) { (void)out; (void)in; }
+static void NetSetSavingAsAllowedSerialize(void *out, void *in)    { (void)out; (void)in; }
+
+// The six co-op packet registrations, in original order (packet id, receive
+// handler, serializer).
+typedef struct F3CNetSaveGameReg
+{
+    int   id;
+    void (*recv)(void *, void *);
+    void (*ser)(void *, void *);
+} F3CNetSaveGameReg;
+
+static const F3CNetSaveGameReg kCNetSaveGameRegs[6] =
+{
+    { 518, NetFakeLoadScreenOnReceive,          NetFakeLoadScreenSerialize },
+    { 557, NetACSLoadScreenOnReceive,           NetACSLoadScreenSerialize },
+    { 538, NetSaveGameOnReceive,                NetSaveGameSerialize },
+    { 539, NetReceivedSaveGameOnReceive,        NetReceivedSaveGameSerialize },
+    { 540, NetSetLoadingScreenEnabledOnReceive, NetSetLoadingScreenEnabledSerialize },
+    { 587, NetSetSavingAsAllowedOnReceive,      NetSetSavingAsAllowedSerialize },
+};
+
+// sub_74CBB0 (0x74CBB0 - 0x74CC92) -- the 149-byte vec-pair container ctor
+// (CNetSaveGame +0x28 / +0xC0; the family cluster at 0x74DE00..0x750311 uses
+// the same layout): { 0, 3, 0.0f, 0.0f, 0 } at +0x00..+0x14, two 24-byte
+// zeroed heap blocks (stored at +0x70/+0x74/+0x78 and +0x84/+0x88/+0x8C as
+// { block, block+24, block+24 } -- the +0x98/+0xAC / +0x130/+0x144 12-byte
+// conditional heap objects CNetSaveGameDtor frees), 0.0f at +0x90, flag 1
+// at +0x94, and 0x18..0x68 zeroed.  thiscall + retn 4 (no args).
+static void NetSaveVecPairCtor(void *obj)
+{
+    DWORD *d = (DWORD *)obj;
+    char  *b = (char *)obj;
+    char  *blk;
+
+    d[0] = 0;
+    d[2] = 3;
+    *(float *)(b + 0x0C) = 0.0f;
+    *(float *)(b + 0x10) = 0.0f;
+    d[5] = 0;
+
+    blk = (char *)LHAlloc(24);
+    memset(blk, 0, 24);
+    d[0x70 / 4] = (DWORD)blk;          // the block
+    d[0x78 / 4] = (DWORD)blk + 24;     // block+0x18
+    d[0x74 / 4] = (DWORD)blk + 24;
+
+    blk = (char *)LHAlloc(24);
+    memset(blk, 0, 24);
+    d[0x84 / 4] = (DWORD)blk;          // the block
+    d[0x8C / 4] = (DWORD)blk + 24;     // block+0x18
+    d[0x88 / 4] = (DWORD)blk + 24;
+
+    *(float *)(b + 0x90) = 0.0f;
+    *(BYTE *)(b + 0x94) = 1;
+    memset(b + 0x18, 0, 0x50);         // 0x18..0x68 zeroed
+}
+
+// sub_533C40 (0x533C40 - 0x533CA0, and the same body inlined in
+// sub_75C690 / sub_75C710 / sub_75C790) -- the map container's self-linked
+// sentinel node: LHAlloc(nodeSize); zero +0/+4/+8; byte(flagOff-1) = 1;
+// store it at obj+0x18; byte(flagOff) = 0 then 1; self-link +0/+4/+8; count
+// 0 at obj+0x1C.  thiscall + retn 4 (no args).
+static void NetSaveMapInitSentinel(void *obj, int nodeSize, int flagOff)
+{
+    char *b = (char *)obj;
+    char *s = (char *)LHAlloc(nodeSize);
+
+    if (s != 0)
+    {
+        *(DWORD *)s = 0;
+        *(DWORD *)(s + 4) = 0;
+        *(DWORD *)(s + 8) = 0;
+    }
+    *(BYTE *)(s + flagOff - 1) = 1;
+    *(BYTE *)(s + flagOff) = 0;
+    *(void **)(b + 0x18) = s;
+    *(BYTE *)(s + flagOff) = 1;
+    *(void **)(s + 4) = s;
+    *(void **)s = s;
+    *(void **)(s + 8) = s;
+    *(DWORD *)(b + 0x1C) = 0;
+}
+
+// The shared head + sentinel body of the four 32-byte map-container ctors
+// (sub_533920 / sub_75C690 / sub_75C710 / sub_75C790 -- each thiscall +
+// retn 8 with two dead stack args, ignored here exactly as in the original):
+// the 4-byte head { &obj } at obj+0, then the self-linked sentinel node.
+static void NetSaveMapCtorCommon(void *obj, void *a2, void *a3,
+                                 int nodeSize, int flagOff)
+{
+    char  *b = (char *)obj;
+    DWORD *h;
+
+    (void)a2;
+    (void)a3;
+
+    h = (DWORD *)LHAlloc(4);
+    if (h != 0)
+    {
+        *h = (DWORD)obj;
+        *(DWORD *)b = (DWORD)h;
+    }
+    else
+    {
+        *(DWORD *)b = 0;
+    }
+    NetSaveMapInitSentinel(obj, nodeSize, flagOff);
+}
+
+// sub_533920 (0x533920 - 0x533950) -- the 32-byte map ctor with the 20-byte
+// sentinel (flag +0x11); the CNetSaveGame +0x18C / +0x1AC maps.  The shared
+// sub_533C40 sentinel init is called through it in the original.
+static void NetSaveMapCtor11(void *obj, void *a2, void *a3)
+{ NetSaveMapCtorCommon(obj, a2, a3, 0x14, 0x11); }
+
+// sub_75C690 (0x75C690 - 0x75C70F) -- the 32-byte map ctor with the 32-byte
+// sentinel (flag +0x19); the CNetSaveGame +0x1CC map.
+static void NetSaveMapCtor19(void *obj, void *a2, void *a3)
+{ NetSaveMapCtorCommon(obj, a2, a3, 0x20, 0x19); }
+
+// sub_75C710 (0x75C710 - 0x75C78F) -- the 32-byte map ctor with the 40-byte
+// sentinel (flag +0x21); the CNetSaveGame +0x16C map.
+static void NetSaveMapCtor21(void *obj, void *a2, void *a3)
+{ NetSaveMapCtorCommon(obj, a2, a3, 0x28, 0x21); }
+
+// sub_75C790 (0x75C790 - 0x75C82F) -- the 32-byte map ctor with the 56-byte
+// sentinel (flag +0x35, the 12-byte +0x28 payload the dtor frees); the
+// CNetSaveGame +0x26C / +0x290 CExternalAppDataMap maps.
+static void NetSaveAppDataMapCtor(void *obj, void *a2, void *a3)
+{ NetSaveMapCtorCommon(obj, a2, a3, 0x38, 0x35); }
+
+// sub_747510 (0x747510 - 0x74760B) -- the 108-byte screen-params struct ctor
+// (CNetSaveGame +0x1EC; the family cluster at 0x74DE00..0x750311 builds the
+// same struct): { 0.0, 1.0, 1.0, 1.0, 1.5 } at +0x00..+0x14 (dword_1AEA1E0 =
+// 1.0f, dword_1AE4618 = 1.5f), bytes {0,0,0,1,1,0} at +0x14..+0x19, { 1.5,
+// 1.5, 1.4 } at +0x1C..+0x28 (dword_1AE9F0C = 0x3F666666 = 1.4f), { 0, 2, 3 }
+// at +0x28..+0x34, and 0x44..0xAB zeroed.  thiscall + retn 4 (no args).
+static void NetSaveScreenParamsCtor(void *obj)
+{
+    char *b = (char *)obj;
+
+    *(float *)b = 0.0f;
+    *(float *)(b + 4)  = 1.0f;         // dword_1AEA1E0
+    *(float *)(b + 8)  = 1.0f;
+    *(float *)(b + 12) = 1.0f;
+    *(float *)(b + 16) = 1.5f;         // dword_1AE4618
+    b[0x14] = 0; b[0x15] = 0; b[0x16] = 0;
+    b[0x17] = 1; b[0x18] = 1; b[0x19] = 0;
+    *(float *)(b + 0x1C) = 1.5f;
+    *(float *)(b + 0x20) = 1.5f;
+    *(float *)(b + 0x24) = 1.4f;       // dword_1AE9F0C (0x3F666666)
+    *(DWORD *)(b + 0x28) = 0;
+    *(DWORD *)(b + 0x2C) = 2;
+    *(DWORD *)(b + 0x30) = 3;
+    b[0x44] = 0;
+    memset(b + 0x48, 0, 0x24);         // 0x48..0xAB zeroed
+}
+
+// Placeholder for the NPacketCallback::CNetPacketCallback::`vftable'
+// (0x01AEE610) stored in the +0x2C0 callback: nothing dispatches through it
+// in this build (CNetPacketCallbackDtor does not virtual-call), so the
+// zeroed 8-slot placeholder preserves the observable behavior (the
+// netinit.cpp g_CNetPacketCallbackVtable pattern).
+static void *g_CNetSaveGamePacketCallbackVtable[8] = { 0 };
+
+// The CSaveLoadManager::CExternalAppDataMap::`vftable' descriptor
+// (0x01AF5D54) stored in the two app-data map members (+0x268/+0x28C).  The
+// original stores the literal (it is a data descriptor, not a plain vtable --
+// slot 0 is a function pointer followed by ASCII strings); nothing
+// dereferences it in this build.
+static void *g_CNetSaveGameAppDataMapDesc = (void *)0x01AF5D54;
+
+// qword_1BF9468 -- the -infinity (0x000000000000F0BF as a double) stored at
+// CNetSaveGame +0x160.
+static const BYTE kCNetSaveGameNegInf[8] = { 0, 0, 0, 0, 0, 0, 0xF0, 0xBF };
+
+void *CNetSaveGameCtor(void *obj)
+{
+    char *b = (char *)obj;
+    int   i;
+
+    // The original's two uninitialized stack locals (a byte + an 8-byte
+    // region at esp-9/esp-11), passed as the dead (a2, a3) args to the map
+    // ctors -- every callee ignores them (zeroed here; their contents are
+    // unobservable).
+    unsigned char scratch8[8] = { 0 };
+    unsigned char scratch1 = 0;
+
+    InitSharedSlot((F3SharedBuffer **)b);                     // +0x00
+    InitSharedSlot((F3SharedBuffer **)(b + 4));               // +0x04
+    InitDetailOptionMap((F3OptionMap *)(b + 8), scratch8, &scratch1);   // +0x08
+
+    NetSaveVecPairCtor(b + 0x28);                             // +0x28 (149 bytes)
+    NetSaveVecPairCtor(b + 0xC0);                             // +0xC0 (149 bytes)
+
+    *(DWORD *)(b + 0x158) = 0;
+    *(DWORD *)(b + 0x15C) = 0;
+    memcpy(b + 0x160, kCNetSaveGameNegInf, 8);                // qword_1BF9468 (-inf)
+    *(DWORD *)(b + 0x168) = 0xFFFFFFFF;
+    NetSaveMapCtor21(b + 0x16C, scratch8, &scratch1);         // +0x16C (0x20 bytes)
+
+    NetSaveMapCtor11(b + 0x18C, scratch8, &scratch1);         // +0x18C (0x20 bytes)
+    NetSaveMapCtor11(b + 0x1AC, scratch8, &scratch1);         // +0x1AC (0x20 bytes)
+    NetSaveMapCtor19(b + 0x1CC, scratch8, &scratch1);         // +0x1CC (0x20 bytes)
+
+    NetSaveScreenParamsCtor(b + 0x1EC);                       // +0x1EC (108 bytes)
+
+    *(DWORD *)(b + 0x260) = 0;
+    *(DWORD *)(b + 0x264) = 0;
+    *(void **)(b + 0x268) = g_CNetSaveGameAppDataMapDesc;     // CExternalAppDataMap
+    NetSaveAppDataMapCtor(b + 0x26C, scratch8, &scratch1);    // +0x26C (0x20 bytes)
+    *(void **)(b + 0x28C) = g_CNetSaveGameAppDataMapDesc;     // CExternalAppDataMap
+    NetSaveAppDataMapCtor(b + 0x290, scratch8, &scratch1);    // +0x290 (0x20 bytes)
+
+    {
+        static const BYTE kFlags[13] = { 0, 0, 0, 0, 1, 1, 0, 1, 0, 1, 0, 0, 0 };
+        memcpy(b + 0x2B0, kFlags, 13);
+    }
+
+    // The +0x2C0 CNetPacketCallback: the DNameNode base ctor's {vtable, 0}
+    // + the derived overwrite (vtable 0x01AEE610, zeros to +0x2DF).
+    *(void **)(b + 0x2C0) = g_CNetSaveGamePacketCallbackVtable;
+    *(DWORD *)(b + 0x2C4) = 0;
+    *(DWORD *)(b + 0x2C8) = 0;
+    *(BYTE *)(b + 0x2CC) = 0;
+    memset(b + 0x2D0, 0, 0x10);                               // +0x2D0..+0x2DF
+
+    // The six co-op packet registrations (original order; a fresh zeroed
+    // 8-byte stack _ReaderWriterLock per registration).
+    for (i = 0; i < 6; i++)
+    {
+        void *nm = GetNetManager();
+        void *pm = CNetManagerGetPacketManager(nm);
+        unsigned char lock[8];
+
+        *(void **)(b + 0x2C8) = obj;                          // the callback back-pointer
+        F3ReaderWriterLockCtor(lock);
+        NetRegisterPacketCallback(pm, kCNetSaveGameRegs[i].id, lock,
+                                  b + 0x2C0,
+                                  kCNetSaveGameRegs[i].recv,
+                                  kCNetSaveGameRegs[i].ser);
+    }
+    return obj;
+}
+
+// ============================================================
+//  CNetSaveGameDtor  (0x627690 - 0x62791B)  -- the 0x2E0-byte (736-byte)
+//  frontend co-op net object's destructor
+//  [NOT byte-identical] placement-dependent (relative calls to the map
+//  clear / node-dtor family, LHFree, ReleaseSharedSlot) and refs
+//  CNetPacketCallbackDtor / LHFree / ReleaseSharedSlot at their original
+//  high VAs (0x1898510 / 0x1A032C0 / 0x1A01320).
+//
+//  long CNetSaveGameDtor(void *obj)
+//
+//  thiscall on the 0x2E0-byte CNetSaveGame object (CGameEngine +0xA8,
+//  built by CNetSaveGameCtor (sub_754DE0, above), registered on the
+//  net manager for the co-op
+//  save-game / loading-screen packet group: CNetFakeLoadScreenPacket 518,
+//  CNetACSLoadScreenPacket 557, CNetSaveGamePacket 538,
+//  CNetReceivedSaveGamePacket 539, CNetSetLoadingScreenEnabledPacket 540,
+//  CNetSetSavingAsAllowedPacket 587). Tears down in reverse construction
+//  order:
+//   1. the two load-screen objects at +0x2DC / +0x2D8 (vtable slot 2 with
+//      the object as the stdcall arg),
+//   2. the +0x2C0 CNetPacketCallback (CNetPacketCallbackDtor),
+//   3. the seven 32-byte map containers (+0x290 / +0x26C the two
+//      CExternalAppDataMap objects, +0x1CC / +0x1AC / +0x18C / +0x16C
+//      option maps, +0x008 the detail-option map): clear the tree, free
+//      the sentinel (+0x18) then the head (+0x00), zero +0x18/+0x1C,
+//   4. the four conditional 12-byte heap objects (+0x144 / +0x130 /
+//      +0xAC / +0x98): free + zero all three words,
+//   5. ReleaseSharedSlot(+0x04) and tail-return ReleaseSharedSlot(+0x00).
+//
+//  The original's clear calls (sub_6274A0 / sub_624730 / sub_533B50 /
+//  sub_624820 / sub_40F100 -- five identical 226-227-byte thiscall
+//  functions differing only in the node dtor) always receive the map's
+//  live iterator state (a2/a4 = the map+0x00 head, a3 = *sentinel,
+//  a5 = the +0x18 sentinel), so their iterator-invariant checks pass and
+//  the fast path runs: destroy the tree from the sentinel's first
+//  element, self-link the sentinel, zero the count, and write the
+//  {head, sentinel} pair to an 8-byte out buffer (a dead store in the
+//  dtor, dropped here). The `sentinel != 0` guard in F3NetSaveMapTearDown
+//  keeps an unconstructed (zeroed) block a clean no-op in this build; a
+//  constructed map always has both pointers allocated.
+// ============================================================
+
+// sub_411D90 (thiscall): release the two shared slots at +0 / +4 (a node's
+// 8-byte key pair): for each non-null block, drop the block refcount (free
+// the block via SharedBufferFree at 0, zero the slot) and drop the live-
+// slot counter g_Addend -- +4 first, then +0.
+static void F3ReleaseSlotPair(void *p)
+{
+    F3SharedBuffer **s = (F3SharedBuffer **)p;
+    int i;
+    for (i = 1; i >= 0; --i)
+    {
+        if (s[i] != 0)
+        {
+            if (InterlockedDecrement(&s[i]->refcount) <= 0 && s[i] != 0)
+                SharedBufferFree(s[i]);
+            s[i] = 0;
+            InterlockedDecrement(&g_Addend);
+        }
+    }
+}
+
+// sub_534610 / sub_621760 / sub_6217A0 -- the three plain map-node tree
+// dtors (identical shape; the non-sentinel flag byte at +0x11 / +0x19 /
+// +0x21 respectively). Post-order walk over the +0 links while the flag
+// byte is 0: recurse the right child (+8), free the node. thiscall on the
+// map (ECX, unused) + the node as the stdcall arg.
+static void NetSaveNodeDtorFlag(void *map, void *node, int flag)
+{
+    char *n = (char *)node;
+    for (; *(BYTE *)(n + flag) == 0; )
+    {
+        char *next = (char *)*(void **)n;
+        NetSaveNodeDtorFlag(map, *(void **)(n + 8), flag);
+        LHFree(n);
+        n = next;
+    }
+}
+static void NetSaveNodeDtor11(void *map, void *node) { NetSaveNodeDtorFlag(map, node, 0x11); }
+static void NetSaveNodeDtor19(void *map, void *node) { NetSaveNodeDtorFlag(map, node, 0x19); }
+static void NetSaveNodeDtor21(void *map, void *node) { NetSaveNodeDtorFlag(map, node, 0x21); }
+
+// sub_6273D0 -- the +0x290 / +0x26C external-app-data maps' node dtor: the
+// plain post-order walk (flag +0x35) that also frees the node's 12-byte
+// payload at +0x28 and zeroes +0x28/+0x2C/+0x30 before freeing the node.
+static void NetSaveAppDataNodeDtor(void *map, void *node)
+{
+    (void)map;
+    char *n = (char *)node;
+    for (; *(BYTE *)(n + 0x35) == 0; )
+    {
+        char *next = (char *)*(void **)n;
+        NetSaveAppDataNodeDtor(map, *(void **)(n + 8));
+        if (*(void **)(n + 0x28) != 0)
+            LHFree(*(void **)(n + 0x28));
+        *(void **)(n + 0x28) = 0;
+        *(void **)(n + 0x2C) = 0;
+        *(void **)(n + 0x30) = 0;
+        LHFree(n);
+        n = next;
+    }
+}
+
+// sub_410ED0 -- the +0x008 detail-option map's node dtor (DestroyDetail
+// OptionSubtree): the plain post-order walk (flag +0x15) with the node's
+// 8-byte key pair (+0x0C) released through F3ReleaseSlotPair (sub_411D90)
+// before each node free.
+static void NetSaveDetailOptionNodeDtor(void *map, void *node)
+{
+    (void)map;
+    char *n = (char *)node;
+    for (; *(BYTE *)(n + 0x15) == 0; )
+    {
+        char *next = (char *)*(void **)n;
+        NetSaveDetailOptionNodeDtor(map, *(void **)(n + 8));
+        F3ReleaseSlotPair(n + 0x0C);
+        LHFree(n);
+        n = next;
+    }
+}
+
+typedef void (*F3NetSaveNodeDtorFn)(void *map, void *node);
+
+// The common fast path of the five clear functions (see above): destroy
+// the tree from the sentinel's first element (sentinel->link1, +0x04),
+// self-link the sentinel (link0/link1/link2 := sentinel), zero the count
+// (+0x1C), then free the sentinel (map+0x18), zero +0x18/+0x1C, and free
+// the head (map+0x00) -- the head is deliberately left dangling, as in
+// the original.
+static void F3NetSaveMapTearDown(char *map, F3NetSaveNodeDtorFn nodeDtor)
+{
+    void *head = *(void **)map;
+    void *root = *(void **)(map + 0x18);
+
+    if (root != 0)
+    {
+        (*nodeDtor)(map, *(void **)((char *)root + 4));
+        *(void **)root = root;
+        *(void **)(map + 0x1C) = 0;
+        *(void **)((char *)root + 4) = root;
+        *(void **)((char *)root + 8) = root;
+    }
+    LHFree(root);
+    *(void **)(map + 0x18) = 0;
+    *(void **)(map + 0x1C) = 0;
+    LHFree(head);
+}
+
+// The two load-screen objects' release (the original's
+// `mov ecx, [obj]; mov edx, [ecx+8]; push obj; call edx`): vtable slot 2
+// dispatched with the object as the stdcall arg (ECX carries the vtable
+// pointer, which a stdcall callee does not read as input).
+static void F3VtSlot2Release(void *p)
+{
+    void **vt = (void **)*(void **)p;
+    ((void (WINAPI *)(void *))vt[2])(p);
+}
+
+long CNetSaveGameDtor(void *obj)
+{
+    char *b = (char *)obj;
+    void *p;
+
+    // 1-2. The two load-screen objects (+0x2DC first, then +0x2D8).
+    p = *(void **)(b + 0x2DC);
+    if (p != 0)
+        F3VtSlot2Release(p);
+    p = *(void **)(b + 0x2D8);
+    if (p != 0)
+        F3VtSlot2Release(p);
+
+    // 3. The +0x2C0 CNetPacketCallback.
+    CNetPacketCallbackDtor(b + 0x2C0);
+
+    // 4. The seven 32-byte map containers (reverse construction order).
+    F3NetSaveMapTearDown(b + 0x290, NetSaveAppDataNodeDtor);      // sub_6274A0
+    F3NetSaveMapTearDown(b + 0x26C, NetSaveAppDataNodeDtor);      // sub_6274A0
+    F3NetSaveMapTearDown(b + 0x1CC, NetSaveNodeDtor19);           // sub_624730
+    F3NetSaveMapTearDown(b + 0x1AC, NetSaveNodeDtor11);           // sub_533B50
+    F3NetSaveMapTearDown(b + 0x18C, NetSaveNodeDtor11);           // sub_533B50
+    F3NetSaveMapTearDown(b + 0x16C, NetSaveNodeDtor21);           // sub_624820
+
+    // 5. The four conditional 12-byte heap objects.
+    if (*(void **)(b + 0x144) != 0)
+    {
+        LHFree(*(void **)(b + 0x144));
+        *(void **)(b + 0x144) = 0;
+        *(void **)(b + 0x148) = 0;
+        *(void **)(b + 0x14C) = 0;
+    }
+    if (*(void **)(b + 0x130) != 0)
+    {
+        LHFree(*(void **)(b + 0x130));
+        *(void **)(b + 0x130) = 0;
+        *(void **)(b + 0x134) = 0;
+        *(void **)(b + 0x138) = 0;
+    }
+    if (*(void **)(b + 0xAC) != 0)
+    {
+        LHFree(*(void **)(b + 0xAC));
+        *(void **)(b + 0xAC) = 0;
+        *(void **)(b + 0xB0) = 0;
+        *(void **)(b + 0xB4) = 0;
+    }
+    if (*(void **)(b + 0x98) != 0)
+    {
+        LHFree(*(void **)(b + 0x98));
+        *(void **)(b + 0x98) = 0;
+        *(void **)(b + 0x9C) = 0;
+        *(void **)(b + 0xA0) = 0;
+    }
+
+    // 6. The +0x008 detail-option map.
+    F3NetSaveMapTearDown(b + 0x008, NetSaveDetailOptionNodeDtor); // sub_40F100
+
+    // 7. The two shared slots (+0x04, then the tail-return +0x00).
+    ReleaseSharedSlot((F3SharedBuffer **)(b + 4));
+    return ReleaseSharedSlot((F3SharedBuffer **)b);
+}
 
 // ============================================================
 //  SubNodeTreeDtor  (0x625BB0 - 0x625C2F)  -- recursive node-tree destructor
@@ -1030,7 +1601,8 @@ static void VersionListDtor(void **headSlot, void **nodeSlot)
 //  +0xC8 sub-object's list and frees its 44-byte block and 4-byte heap node;
 //  releases member0xC4/member0xC0/member0xB8 (vtable slot 0) and frees the
 //  8-byte SEH wrapper at member0xB4; frees the member0xB0 (0x6234A0) and
-//  member0xA8 (0x627690) objects; releases the direct SEH-block members
+//  member0xA8 CNetSaveGame objects (CNetSaveGameDtor, 0x627690); releases
+//  the direct SEH-block members
 //  member0xA4/member0x94/member0x8C, zeroing their +0xA0/+0x90/+0x88
 //  partners; releases member0x9C (vtable slot 0) and frees the member0x98
 //  object (0x18EB1A0); invokes vtable slot 2 on member0x7C/member0x78 (not
@@ -1151,10 +1723,10 @@ static void CGameEngineDestroy(CGameEngine *obj)
         F3ReleaseOne(obj->member0xAC);
     obj->member0xAC = 0;
 
-    // 10. member0xA8: the 0x2E0-byte object (0x627690 dtor) + free.
+    // 10. member0xA8: the 0x2E0-byte CNetSaveGame (CNetSaveGameDtor, 0x627690) + free.
     if (obj->member0xA8 != 0)
     {
-        sub_627690(obj->member0xA8);
+        CNetSaveGameDtor(obj->member0xA8);
         LHFree(obj->member0xA8);
     }
     obj->member0xA8 = 0;

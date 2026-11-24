@@ -45,6 +45,14 @@ void *CNetManagerGetUserManager(void *obj);
 // slot zeroed. thiscall, no stack args.
 void CNetManagerShutdown(void *obj);
 
+// CNetPacketCallbackDtor (0x1898510 - 0x1898553) -- the CNetPacketCallback
+// (DNameNode base) dtor: the CBaseObject vtable store, the +4 node release
+// through the heap (LHFree when the node's +4 field is 0), then the
+// CBaseClass vtable store + node zero. Called from CNetManagerDtorBody (the
+// +0x3C callback) and from CNetSaveGameDtor (0x627690, the +0x2C0 callback).
+// thiscall; returns the node (discarded).
+void *CNetPacketCallbackDtor(void *obj);
+
 // The 32-byte per-user sign-in record held in the CNetUserManager's sign-in
 // array (CNetUserManager +0x14 .. +0x18, 32-byte elements, one per local
 // user). Offsets are the ones CNetUserManagerRefreshSignin (0x772190) reads

@@ -19,4 +19,31 @@ void *GetGameBuffer(void);
 // until the list resolves (done flag at +0x24).
 void CGameEngineShutdown(CGameEngine *obj);
 
+// CNetSaveGameCtor (0x754DE0 - 0x7550B2) -- the 0x2E0-byte (736-byte)
+// CNetSaveGame frontend co-op net object's constructor (the counterpart
+// of CNetSaveGameDtor): the two shared slots, the 32-byte detail-option
+// map, the two 149-byte vec-pair containers, the { 0, 0, -inf, -1 } quad,
+// the five 32-byte map containers, the 108-byte screen-params struct,
+// the two CExternalAppDataMap objects, the 13-byte flag block, the
+// 32-byte CNetPacketCallback, then the six co-op packet registrations
+// (518/557/538/539/540/587) on the net manager's packet manager.
+// Returns the object. (The 512-byte sub_7550B0 sibling is a separate
+// object family.) See gamethread.cpp.
+void *CNetSaveGameCtor(void *obj);
+
+// CNetSaveGameDtor (0x627690 - 0x62791B) -- the 0x2E0-byte (736-byte)
+// CNetSaveGame frontend co-op net object's (CGameEngine +0xA8; the owner
+// of the co-op save-game / loading-screen packet group: CNetFakeLoadScreen
+// Packet 518, CNetACSLoadScreenPacket 557, CNetSaveGamePacket 538,
+// CNetReceivedSaveGamePacket 539, CNetSetLoadingScreenEnabledPacket 540,
+// CNetSetSavingAsAllowedPacket 587) destructor: the two +0x2DC/+0x2D8
+// load-screen objects (vtable slot 2), the +0x2C0 CNetPacketCallback
+// (CNetPacketCallbackDtor), the seven 32-byte map containers (+0x290 /
+// +0x26C / +0x1CC / +0x1AC / +0x18C / +0x16C / +0x008: tree clear +
+// sentinel/head free + count zero), the four conditional 12-byte heap
+// objects (+0x144 / +0x130 / +0xAC / +0x98), and the two shared slots
+// (+0x04, +0x00 -- the tail return). Returns the last ReleaseSharedSlot
+// result (discarded by both callers). See gamethread.cpp.
+long CNetSaveGameDtor(void *obj);
+
 #endif  // F3_GAMETHREAD_H

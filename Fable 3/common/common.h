@@ -35,6 +35,31 @@ void *LHAlloc(unsigned int size);
 // underlying free(NULL) is a no-op).
 void LHFree(void *p);
 
+// LHFreeAligned (0x1A034D0) - the free counterpart of LHAllocAligned (the
+// heap's _aligned_free): recovers the raw block pointer via the 8-byte
+// front header LHAllocAligned wrote ([result-8] = front offset) and frees
+// it through the allocator table's free slot. Null is a no-op.
+void LHFreeAligned(void *obj);
+
+// LHAllocAligned (0x1A03630) - the aligned allocator built on the game heap
+// (the _aligned_malloc of the heap): LHAlloc(size + align + 8), round the raw
+// block up to the next multiple of `align` (power of two), and write an 8-byte
+// header just before the aligned result ([result-8] = front offset into the
+// raw block, [result-4] = align). Returns the aligned pointer.
+void *LHAllocAligned(unsigned int size, unsigned int align);
+
+// JmpLHAllocAligned (0x619990) - the 5-byte `jmp LHAllocAligned` thunk that
+// RunFrontEnd (0x61D40E) installs into Havok's global aligned-allocate slot
+// (off_1D8C850; the free slot off_1D8C854 gets the sibling thunk
+// JmpLHFreeAligned -> LHFreeAligned). Raw tail jump: (size, align) pass through.
+void *JmpLHAllocAligned(unsigned int size, unsigned int align);
+
+// JmpLHFreeAligned (0x6199A0) - the 5-byte `jmp LHFreeAligned` thunk that
+// RunFrontEnd (0x61D40E) installs into Havok's global aligned-free slot
+// (off_1D8C854; the sibling of JmpLHAllocAligned in the 0x619xxx
+// engine-thunk cluster). Raw tail jump: the aligned pointer passes through.
+void JmpLHFreeAligned(void *obj);
+
 // SharedBufferAssign (0x403FE0) - assign (src, len) into the counted buffer at this_:
 // frees any old payload, allocates a fresh aligned buffer, copies src,
 // null-terminates and zeroes the trailing padding, updates length + capacity.

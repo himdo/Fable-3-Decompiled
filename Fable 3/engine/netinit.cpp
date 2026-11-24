@@ -39,7 +39,8 @@ static BYTE g_CNetLiveSystem[0x4D8] = { 0 };   // 0x1DBDDA8
 
 // Placeholder vtables for the objects the (stubbed) ctors construct.
 static void *g_CNetLiveSystemVtable[8]       = { 0 };
-static void *g_NToolsCBaseClassVtable[1]     = { 0 };
+static void *g_NToolsCBaseObjectVtable[1]    = { 0 };   // NTools::CBaseObject::`vftable' (0x01BF901C)
+static void *g_NToolsCBaseClassVtable[1]     = { 0 };   // NTools::CBaseClass::`vftable' (0x01AF6E74)
 static void *g_CNetPacketCallbackVtable[8]   = { 0 };
 
 // Forward declarations so the vtable (below) can reference the deleting
@@ -546,14 +547,47 @@ void CNetManagerShutdown(void *obj)
 }
 
 // ============================================================
-//  CNetPacketCallbackDtor  (0x1898510 - 0x1898553)  -- [remaining stub]
+//  CNetPacketCallbackDtor  (0x1898510 - 0x1898553)  -- the CNetPacketCallback
+//  (DNameNode base) dtor
+//  [NOT byte-identical] refs the high-VA vtables (NTools::CBaseObject at
+//  0x01BF901C, NTools::CBaseClass at 0x01AF6E74) and the heap table
+//  (dword_2075B24, 0x02075B24) at their original high VAs.
 //
-//  The CNetManager's +0x3C CNetPacketCallback (DNameNode base) dtor: stores
-//  the NTools::CBaseObject vtable, releases the +4 node through the heap,
-//  then stores the NTools::CBaseClass vtable and zeroes the node. Out of
-//  scope: the packet-callback object is a placeholder in this build.
+//  void *CNetPacketCallbackDtor(void *obj)
+//
+//  thiscall on the 8-byte DNameNode-base object (the CNetManager's +0x3C / the
+//  CNetSaveGame's +0x2C0 CNetPacketCallback: +0x00 vtable, +0x04 name-node
+//  pointer). The shared base dtor of the whole CNetPacketCallback class family
+//  (~500 call sites in the original): store the NTools::CBaseObject vtable;
+//  if the +4 node is live, store 0 into the node's own vtable slot (the
+//  dead-object marker) and, when the node's +4 field is 0, free the node
+//  through the heap table's free slot (the original's
+//  `mov eax, dword_2075B24; mov ecx, [eax+10h]; call ecx` -- LHFree here),
+//  then zero the +4 slot; store the NTools::CBaseClass vtable and zero +4
+//  again. thiscall; returns the tracked EAX (0 if the node was null, else the
+//  node -- in the free branch the original returns the free's eax, which is
+//  unobservable: every caller discards it). Called from CNetManagerDtorBody
+//  (the +0x3C callback) and CNetSaveGameDtor (the +0x2C0 callback); the
+//  extern declaration is in netinit.h.
 // ============================================================
-static void *CNetPacketCallbackDtor(void *obj) { (void)obj; return obj; }
+void *CNetPacketCallbackDtor(void *obj)
+{
+    char *b = (char *)obj;
+    void *node = *(void **)(b + 4);
+
+    *(void **)b = g_NToolsCBaseObjectVtable;   // NTools::CBaseObject::`vftable' (0x01BF901C)
+    if (node != 0)
+    {
+        *(void **)node = 0;                    // dead-object marker in the node
+        node = *(void **)(b + 4);              // reloaded (same value)
+        if (*(void **)((char *)node + 4) == 0)
+            LHFree(node);                      // the original's [dword_2075B24+16] indirect free
+        *(void **)(b + 4) = 0;
+    }
+    *(void **)b = g_NToolsCBaseClassVtable;    // NTools::CBaseClass::`vftable' (0x01AF6E74)
+    *(void **)(b + 4) = 0;
+    return node;
+}
 
 // 0x18984C0 -- the NTools::CBaseClass base dtor (vtable store).
 static void CNetBaseClassDtor(void *obj)
