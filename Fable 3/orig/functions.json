@@ -120,21 +120,9 @@
 "source": "gamemain"
 },
 {
-"name": "?sub_6A69A0@@YAHH@Z",
-"rva": 2779552,
-"size": 4,
-"source": "gamemain"
-},
-{
-"name": "?sub_741E50@@YAXH@Z",
-"rva": 3415632,
-"size": 203,
-"source": "gamemain"
-},
-{
-"name": "?sub_61A330@@YAXXZ",
-"rva": 2204464,
-"size": 215,
+"name": "?sub_67E460@@YAPAXXZ",
+"rva": 2614368,
+"size": 48,
 "source": "gamemain"
 },
 {

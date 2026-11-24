@@ -1,6 +1,7 @@
 LIBRARY xlive.dll
 EXPORTS
     XNotifyCreateListener@8 @5270
+    XHVCreateEngine@12 @5008
     XNotifyGetNext@16 @651
     XUserGetSigninState@4 @5262
     XUserGetSigninInfo@12 @5267

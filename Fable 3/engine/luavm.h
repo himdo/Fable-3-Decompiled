@@ -6,6 +6,11 @@
 #ifndef F3_LUAVM_H
 #define F3_LUAVM_H
 
+// int KoreGetVMCore(void)   (sub_673C50, 0x673C50 - 0x673C56)
+// -- the 6-byte getter of the Kore VM core object (g_dword_1DBDD4C;
+// 0 = no live VM).  5963 callers in the original.
+int KoreGetVMCore(void);
+
 // void DestroyLuaModule(int luaModule)   (sub_6281B0, 0x6281B0 - 0x6281B5)
 // -- release the engine's "Fable 3" Lua module (the 1032-byte KoreVM host)
 // by forwarding to DestroyLuaModuleBody (sub_5EDFE0).

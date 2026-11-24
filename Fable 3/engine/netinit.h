@@ -37,6 +37,53 @@ void *GetNetManager(void);
 // GetNetManager())`.
 void *CNetManagerGetUserManager(void *obj);
 
+// void *CNetManagerGetVoiceManager(void *obj)   (0x6A69A0, byte-identical)
+// -- the CNetManager's +0x30 getter: returns the 104-byte CNetVoiceManager
+// (the XLive voice object built by CNetManagerStart via LHAlloc(104) +
+// sub_7425C0; its methods are the sub_741xxx / sub_742xxx cluster, incl.
+// the XNotify/XHV voice bring-up CNetVoiceManagerInit (sub_741E50), which
+// RunFrontEnd calls on it). ~5 call sites, all `CNetManagerGetVoiceManager(
+// GetNetManager())`.
+void *CNetManagerGetVoiceManager(void *obj);
+
+// ---------------------------------------------------------------------------
+// int CNetVoiceManagerInit(void *obj)   (sub_741E50 - 0x741F1B, thiscall)
+//
+// The CNetVoiceManager (the 104-byte CNetManager +0x30 sub-object)'s voice
+// bring-up:
+//   1. XNotifyCreateListener(3, 0) -> this+0x60 (the voice-notification
+//      listener handle).
+//   2. Build a 28-byte XHV_CONFIG on the stack (a 4-byte header word + seven
+//      config words; the two self-pointers reference the header word).
+//   3. GetManager() -> manager vtable[8] (CManagerWin32_GetWindow), result
+//      stored in a local and never used.
+//   4. XHVCreateEngine(config, 0, this+0x08)  (create the Havoc voice engine
+//      at this+0x08).
+//   5. On success (>= 0): nm = GetNetManager();
+//         state = CNetManagerGetSlot24(nm);   (the CNetManager +0x24 object)
+//         CNetVoiceRouteInit(state, this+0x04);
+//         CNetVoiceEnableUsers(this);
+//         return CNetVoiceResetUsers(this);
+//      Else return the XHVCreateEngine error code.
+//
+// [NOT byte-identical] C++ reimplementation (relative calls to the xlive
+// imports and the callees). A null guard (obj == 0) is added: in this build
+// the CNetVoiceManager is not constructed (CNetManagerStart is a partial stub
+// that leaves +0x30 = 0), so the voice manager is absent and this returns
+// immediately -- the same observable behavior as the no-op stub it replaces
+// (in the real game the voice manager is always present and the body runs).
+// ---------------------------------------------------------------------------
+int  CNetVoiceManagerInit(void *obj);
+
+// ---------------------------------------------------------------------------
+// void *CNetManagerGetSlot24(void *obj)   (sub_6A6940 - 0x6A6944, thiscall)
+//
+// The CNetManager's +0x24 sub-object getter (the voice route/state object that
+// CNetVoiceManagerInit hands to CNetVoiceRouteInit). Byte-identical naked
+// thiscall: `mov eax, [ecx+24h]; retn`.
+// ---------------------------------------------------------------------------
+void *CNetManagerGetSlot24(void *obj);
+
 // CNetManagerShutdown (0x6A70F0 - 0x6A720C) — the 80-byte CNetManager teardown:
 // sub_6834D0(slot+0x10, 0) + LHFree(slot+0x38) up front (unconditional), then
 // sub_6A84C0 + LHFree of slot+0x34, vtable[0](slot, 1) releases of

@@ -28,6 +28,12 @@ extern "C" {
 // ---- xlive.dll imports driven by RunFrontEnd (0x61CB70) ----
 // XNotifyCreateListener  ordinal 5270  stdcall @8
 int   __stdcall XNotifyCreateListener(int dwFilter, int bAsync);
+// XHVCreateEngine        ordinal 5008  stdcall @12
+// Create a Havoc (XHV) voice engine. pConfig = the 28-byte XHV_CONFIG (the
+// CNetVoiceManagerInit stack struct); ppEngine = out pointer (0 = none);
+// pEngine = the XHV_ENGINE record to initialize (CNetVoiceManager +0x08).
+// Returns 0 (XHV_SUCCESS) or a negative XHV_ERROR code.
+int   __stdcall XHVCreateEngine(void *pConfig, int *ppEngine, void *pEngine);
 // XNotifyGetNext         ordinal 651   stdcall @16
 int   __stdcall XNotifyGetNext(int hListener, int dwFlags,
                      void *pExtendedData, void *pNotificationData);

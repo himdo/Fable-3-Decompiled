@@ -10,6 +10,7 @@
 #include "common/common.h"        // LHAlloc / LHFree
 #include "worker.h"               // CWorkerWin32 / GetWorker / SetPreTranslate
 #include "object_registry.h"      // F3SehBlock
+#include "manager.h"              // GetManager (the CNetVoiceManagerInit manager dispatch)
 #include "xlive.h"                // the xlive.dll (XLiveAPI) import declarations
 #include "save/save.h"            // SetSaveGamePath (the shared-slot string setter)
 
@@ -761,6 +762,38 @@ void *CNetManagerGetUserManager(void *obj)
 }
 
 // ============================================================
+//  CNetManagerGetVoiceManager  (0x6A69A0 - 0x6A69A4)  -- the
+//  CNetManager's +0x30 CNetVoiceManager getter
+//
+//  void *CNetManagerGetVoiceManager(void *obj)   (obj = the CNetManager)
+//
+//  thiscall getter: returns *(obj + 0x30), the 104-byte CNetVoiceManager
+//  (the XLive voice object; CNetManagerStart constructs it with
+//  LHAlloc(104) + sub_7425C0). Its methods are the sub_741xxx / sub_742xxx
+//  cluster: the XNotify-listener + XHV-engine init (sub_741E50), the
+//  4-user voice enable pass (sub_741DD0) and the voice packet handlers.
+//  5 call sites: RunFrontEnd (0x61D48E: GetNetManager() -> this getter ->
+//  sub_741E50 init) and four Lua/net-state handlers (0x1330B4F, 0x13E6D95,
+//  0x13E7155, 0x13E728D) that stage the manager in ECX and read it back.
+//  The offset siblings (0x6A69A0 / 0x6A69B0, two per offset) are the
+//  compiler-generated const overloads; 0x6A69A0 is the live one for +0x30
+//  (its twin 0x6A69B0 is unreferenced).
+//
+//  Byte-identical: the original 4 bytes are `mov eax,[ecx+30h]; retn`
+//  (no calls, no globals, no absolute refs). `__declspec(naked)` inline
+//  asm so /Ob2 doesn't swap the out-of-line body for a 5-byte stack-
+//  argument thunk.
+// ============================================================
+__declspec(naked)
+void *CNetManagerGetVoiceManager(void *obj)
+{
+    __asm {
+        mov eax, [ecx+30h]
+        retn
+    }
+}
+
+// ============================================================
 //  CNetUserManagerRefreshSignin  (0x00772190 - 0x00772421)  --
 //  Re-read local user 0's XLive sign-in state and refresh the
 //  CNetUserManager's first 32-byte sign-in record
@@ -869,6 +902,315 @@ void CNetUserManagerRefreshSignin(void *obj)
             rec->xuidLo = rec->xuidA_lo;         // +0x0C
         }
     }
+}
+
+// ============================================================
+//  CNetVoiceManager  (the CNetManager's +0x30 104-byte voice manager)
+//
+//  CNetVoiceManagerInit (sub_741E50 - 0x741F1B, thiscall): the voice bring-up
+//  (XNotifyCreateListener + XHVCreateEngine + the 4-user voice enable/reset
+//  pass). See netinit.h for the full description.
+//
+//  CNetManagerGetSlot24 (sub_6A6940 - 0x6A6944, thiscall): the CNetManager
+//  +0x24 sub-object getter (byte-identical).
+//
+//  The success-path callees CNetVoiceRouteInit (sub_C1AC70),
+//  CNetVoiceEnableUsers (sub_741DD0) and CNetVoiceResetUsers (sub_741440)
+//  are faithful ports of the original control flow; their deep callees (the
+//  route-list / sign-in / mute-list cluster) are the remaining no-op stubs
+//  below.
+// ============================================================
+
+__declspec(naked) void *CNetManagerGetSlot24(void *obj)
+{
+    __asm {
+        mov eax, [ecx+24h]   // sub_6A6940: mov eax, [ecx+24h]; retn
+        retn
+    }
+}
+
+// --- the deep callees (remaining no-op stubs; the voice route-list / sign-in
+//     / mute-list cluster is out of scope). Signatures match the original
+//     thiscall + retn-N conventions so the faithful ports above compile. ---
+
+// sub_C1D950 (6 args): the voice route-list tree lookup. Fills *out =
+// { input, found-node } and returns out. The stub reports "not found"
+// (found == 0) so the caller's insert branch is skipped.
+static DWORD *C1D950Lookup(DWORD *out, DWORD input, DWORD a3, DWORD a4, DWORD a5, int a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    out[0] = input;   // a2 (the input key)
+    out[1] = 0;       // not found
+    return out;
+}
+
+// sub_C1DDD0 (stdcall, 3 args): inserts a route into the user's packet list.
+static void C1DDD0List(DWORD a1, DWORD a2, int *a3)
+{
+    (void)a1; (void)a2; (void)a3;
+}
+
+// sub_771DB0 (thiscall + retn 4): is the user present and unmuted? The
+// CNetUserManager 32-byte record (start = *(um+0x14), end = *(um+0x18),
+// 32-byte elements): state byte != 0 and sign-in flag byte == 0.
+static int CNetUserManagerUserPresent(void *um, int idx)
+{
+    if (um == 0 || idx > 3) return 0;
+    DWORD *umdw = (DWORD *)um;
+    DWORD start = umdw[5];   // *(um+0x14): user array start
+    DWORD end   = umdw[6];   // *(um+0x18): user array end
+    if ((DWORD)idx >= (end - start) / 32) return 0;   // bounds
+    const unsigned char *r = (const unsigned char *)(start + 32 * idx);
+    return (r[0] != 0 && r[2] == 0) ? 1 : 0;
+}
+
+// sub_741770 (thiscall + retn 4): enable voice for user idx.
+static void CNetVoiceEnableUser(void *obj, int idx)
+{
+    (void)obj; (void)idx;
+}
+
+// sub_7412C0 (thiscall + retn 4): clear/reset the user voice slot for idx.
+static void CNetVoiceClearUser(void *obj, int idx)
+{
+    (void)obj; (void)idx;
+}
+
+// sub_740430 (thiscall + retn 8): is the source user muted for this route?
+static int CNetVoiceMutedCheck(void *obj, int slot, int child)
+{
+    (void)obj; (void)slot; (void)child;
+    return 0;
+}
+
+// sub_740790 (thiscall + retn 12): is the (child, child1) route present in
+// the user's +0x10 packet list?
+static int CNetVoiceFindRoute(void *obj, unsigned i, unsigned child, unsigned child1)
+{
+    (void)obj; (void)i; (void)child; (void)child1;
+    return 0;
+}
+
+// sub_740CE0 (thiscall + retn 12): erase the (child, child1) route from the
+// user's +0x10 packet list.
+static void CNetVoiceEraseRoute(void *obj, unsigned i, int child, int child1)
+{
+    (void)obj; (void)i; (void)child; (void)child1;
+}
+
+// sub_745970 (thiscall + retn 4): append the route to the user's +0x10
+// packet list (growable; sub_7455E0).
+static int CNetVoiceListAppend(void *obj, void *val)
+{
+    (void)obj; (void)val;
+    return 0;
+}
+
+// sub_742BE0 (thiscall): advance the voice route-list iterator (the node
+// sentinel at +0x2D).
+static void *CNetVoiceListNext(void *list)
+{
+    return list;
+}
+
+// sub_741160 (thiscall + retn 4): send the CNetVoiceMuteListPacket for user
+// idx (iterates the voice packet list, sub_740580 per node).
+static int CNetVoiceSendMuteList(void *obj, int idx)
+{
+    (void)obj; (void)idx;
+    return 0;
+}
+
+// sub_740DB0 (thiscall): the main per-user voice packet processor (iterates
+// the 4 user slots + the voice packet list, XHV engine vtable[18] per
+// packet).
+static void CNetVoiceSyncRoutes(void *obj)
+{
+    (void)obj;
+}
+
+static void CNetVoiceRouteInit(void *obj, int a2);
+static int  CNetVoiceEnableUsers(void *obj);
+static int  CNetVoiceResetUsers(void *obj);
+
+// ---------------------------------------------------------------------------
+// void CNetVoiceRouteInit(void *obj, int a2)   (sub_C1AC70 - 0xC1AD05,
+// thiscall + retn 4): the voice route-init lookup.
+//
+// obj = the CNetManager's +0x24 voice route/state sub-object. Reads
+// v7 = *(obj+0x24) and v8 = *(obj+0x38), runs the route-list tree lookup
+// (C1D950Lookup), and on a match inserts the route into the user's list
+// (C1DDD0List). Faithful port of the original control flow; the two deep
+// callees are remaining no-op stubs.
+// ---------------------------------------------------------------------------
+static void CNetVoiceRouteInit(void *obj, int a2)
+{
+    if (obj == 0) return;
+    DWORD *dw = (DWORD *)obj;
+    DWORD v7 = dw[9];       // *(obj+0x24)
+    DWORD v8 = dw[14];      // *(obj+0x38)
+    DWORD v9[8];
+    DWORD *v4 = C1D950Lookup(v9, v7, v8, v7, v8, a2);
+    if (v4 == 0 || *v4 == 0 || *v4 != v7)
+        return;   // __invalid_parameter_noinfo in the original
+    if (v4[1] == v8)
+        C1DDD0List(v7, v8, &a2);   // sub_C1DDD0(*(obj+0x24), *(obj+0x38), &a2)
+}
+
+// ---------------------------------------------------------------------------
+// int CNetVoiceEnableUsers(void *obj)   (sub_741DD0 - 0x741E4E, thiscall):
+// the 4-user voice enable pass.
+//
+// For each of the 4 local users (48-byte slots in the CNetVoiceManager's
+// user array, start at obj+0x1C, end at obj+0x20): if the user is present
+// (CNetUserManagerUserPresent), enable voice for the slot (CNetVoiceEnable-
+// User); otherwise, if the slot's +4 flag is set, clear the slot
+// (CNetVoiceClearUser). Tail-calls CNetVoiceResetUsers (sub_741440).
+// Faithful port of the original control flow.
+// ---------------------------------------------------------------------------
+static int CNetVoiceEnableUsers(void *obj)
+{
+    if (obj == 0) return 0;
+    DWORD *dw = (DWORD *)obj;
+    void *um = CNetManagerGetUserManager(GetNetManager());   // the +0x28 user manager
+    for (int i = 0; i < 4; ++i)
+    {
+        if (CNetUserManagerUserPresent(um, i))
+        {
+            CNetVoiceEnableUser(obj, i);   // sub_741770
+        }
+        else
+        {
+            if ((DWORD)i >= (dw[8] - dw[7]) / 48)
+                return 0;   // __invalid_parameter_noinfo in the original
+            if (*(unsigned char *)(dw[7] + (DWORD)i * 48 + 4) != 0)
+                CNetVoiceClearUser(obj, i);   // sub_7412C0
+        }
+    }
+    return CNetVoiceResetUsers(obj);   // tail jmp sub_741440
+}
+
+// ---------------------------------------------------------------------------
+// int CNetVoiceResetUsers(void *obj)   (sub_741440 - 0x74176F, thiscall):
+// the 4-user voice route sync/reset pass (the CNetVoiceEnableUsers tail call).
+//
+// For each of the 4 local users (48-byte slots): if the slot's +4 flag is
+// set, walk the voice route lists (obj+0x40 list A and obj+0x28 list B) in
+// lockstep; for each route pair, decide (CNetVoiceMutedCheck + CNetVoice-
+// FindRoute) whether to add (CNetVoiceListAppend) or remove (CNetVoice-
+// EraseRoute) the route from the user's +0x10 packet list, and mark the
+// changed flag. When the flag is set, send the mute list (CNetVoiceSendMute-
+// List, sub_741160). After the 4-user loop, run the per-user voice packet
+// processor (CNetVoiceSyncRoutes, sub_740DB0).
+//
+// Faithful port of the original control flow; the deep callees are remaining
+// no-op stubs. The original's many __invalid_parameter_noinfo element bounds
+// checks are condensed to the outer count guard (the inner route-list
+// structural assertions are not replicated -- unreachable in this build
+// because the route lists are empty while the voice manager is absent).
+// ---------------------------------------------------------------------------
+static int CNetVoiceResetUsers(void *obj)
+{
+    if (obj == 0) return 0;
+    DWORD *dw = (DWORD *)obj;
+    int i  = 0;      // user index
+    int v2 = 0;      // user byte offset (0, 48, 96, 144)
+    while (v2 < 0xC0)
+    {
+        if ((DWORD)i >= (dw[8] - dw[7]) / 48)
+            return 0;   // __invalid_parameter_noinfo
+        if (*(unsigned char *)(dw[7] + (DWORD)v2 + 4) != 0)
+        {
+            int  changed = 0;
+            void *slot  = (void *)(dw[7] + (DWORD)v2);   // user slot base
+            void *listA = (void *)dw[16];                // obj+0x40 (route list A)
+            void *listB = (void *)dw[10];                // obj+0x28 (route list B)
+            void *headA = (listA != 0) ? *(void **)listA : 0;
+            for (void *nodeA = headA; listA != 0 && nodeA != listA; nodeA = (char *)nodeA + 0x28)
+            {
+                char *n = (char *)nodeA;
+                void *child = *(void **)(n + 0x1C);
+                void *next  = *(void **)(n + 0x20);
+                if (child == next)
+                {
+                    listB = CNetVoiceListNext(listB);   // sub_742BE0
+                }
+                else
+                {
+                    unsigned child1 = (unsigned)(DWORD)*(void **)((char *)child + 4);
+                    if (CNetVoiceMutedCheck(obj, (int)(DWORD)slot, (int)(DWORD)child))   // sub_740430
+                    {
+                        if (!CNetVoiceFindRoute(obj, (unsigned)i, (unsigned)(DWORD)child, child1))   // sub_740790
+                            CNetVoiceListAppend((void *)((char *)slot + 0x10), (void *)&child);   // sub_745970
+                    }
+                    else if (CNetVoiceFindRoute(obj, (unsigned)i, (unsigned)(DWORD)child, child1))   // sub_740790
+                    {
+                        CNetVoiceEraseRoute(obj, (unsigned)i, (int)(DWORD)child, (int)child1);   // sub_740CE0
+                    }
+                    changed = 1;
+                }
+            }
+            if (changed != 0)
+                CNetVoiceSendMuteList(obj, i);   // sub_741160
+        }
+        v2 += 48;
+        i++;
+    }
+    CNetVoiceSyncRoutes(obj);   // sub_740DB0
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// int CNetVoiceManagerInit(void *obj)   (sub_741E50 - 0x741F1B, thiscall):
+// the CNetVoiceManager's voice bring-up. See netinit.h for the full
+// description. [NOT byte-identical] C++ reimplementation.
+// ---------------------------------------------------------------------------
+int CNetVoiceManagerInit(void *obj)
+{
+    if (obj == 0)
+        return 0;   // voice manager absent in this build (CNetManagerStart leaves +0x30 = 0)
+
+    DWORD *dw = (DWORD *)obj;
+    char *cobj = (char *)obj;
+
+    // 1. The voice-notification listener (type 3, sync) -> this+0x60 (dw[24]).
+    dw[24] = (DWORD)XNotifyCreateListener(3, 0);
+
+    // 2. The 28-byte XHV_CONFIG (a 4-byte header word + 7 config words), built
+    //    on the stack. XHVCreateEngine's arg 1 is &cfg[1] (B+4); the two
+    //    self-pointers (cfg[3], cfg[5]) reference the header word (B = &cfg[0]).
+    DWORD cfg[8];
+    cfg[0] = 2;                       // B+0  (header)
+    cfg[1] = 0x1E;                    // B+4  = 30
+    cfg[2] = 1;                       // B+8
+    cfg[3] = (DWORD)&cfg[0];          // B+0C = B (self pointer)
+    cfg[4] = 1;                       // B+10
+    cfg[5] = (DWORD)&cfg[0];          // B+14 = B (self pointer)
+    cfg[6] = 1;                       // B+18
+    cfg[7] = 0;                       // B+1C
+
+    // 3. GetManager() -> manager vtable[8] (CManagerWin32_GetWindow), result
+    //    stored in a local and never used (the original discards it).
+    void *mgr = GetManager();
+    if (mgr != 0)
+    {
+        void **vt = (void **)*(void **)mgr;
+        (void)((DWORD (*)(void *))vt[8])(mgr);
+    }
+
+    // 4. XHVCreateEngine(config, 0, this+0x08) -- create the Havoc voice engine
+    //    at this+0x08.
+    int result = XHVCreateEngine((void *)&cfg[1], 0, (void *)(cobj + 8));
+
+    if (result >= 0)
+    {
+        void *nm    = GetNetManager();
+        void *state = CNetManagerGetSlot24(nm);                       // sub_6A6940: the +0x24 sub-object
+        CNetVoiceRouteInit(state, (int)(DWORD)(cobj + 4));           // sub_C1AC70(state, this+0x04)
+        CNetVoiceEnableUsers(obj);                                   // sub_741DD0(obj)
+        return CNetVoiceResetUsers(obj);                             // sub_741440(obj)
+    }
+    return result;
 }
 
 // ============================================================

@@ -10166,7 +10166,7 @@ static void KoreBeginMistInstance(void *buffer, int a2, void *direction)
 { (void)buffer; (void)a2; (void)direction; }
 // sub_673C50 (0x673C50) -- 6-byte getter of the Kore VM core object
 // (g_dword_1DBDD4C; 0 = no live VM).  5963 callers.  Stub: the global.
-static int KoreGetVMCore(void)
+int KoreGetVMCore(void)
 { return g_dword_1DBDD4C; }
 // sub_7E2470 (0x7E2470) -- 6-byte engine-state query (mov eax,[?]; retn).
 // 83 callers.  Stub: 0.

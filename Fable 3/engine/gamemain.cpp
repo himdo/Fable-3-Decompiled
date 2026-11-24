@@ -6589,8 +6589,8 @@ static void MountPermanentBanks(void *p)
     CsGuardRelease(&guard1);
 }
 // sub_6A66C0 is the canonical GetNetManager (netinit.cpp / netinit.h);
-// sub_6A6960 is the canonical CNetManagerGetUserManager (netinit.cpp).
-static int   sub_6A69A0(int a) { (void)a; return 0; }
+// sub_6A6960 is the canonical CNetManagerGetUserManager (netinit.cpp);
+// sub_6A69A0 is the canonical CNetManagerGetVoiceManager (netinit.cpp).
 // sub_772190 is now CNetUserManagerRefreshSignin (netinit.cpp).
 static void *g_dword_2075ED8 = 0;   // 0x2075ED8: the 144-byte manager object
 static CRITICAL_SECTION g_cs_20FC8AC;   // 0x20FC8AC: the manager critical section (zeroed)
@@ -10650,11 +10650,360 @@ static int __stdcall SetSoundHWND(int hwnd)
     g_dword_1DDC934 = (DWORD)hwnd;
     return (int)g_dword_1DDC934;
 }
-static void  sub_741E50(int a) { (void)a; }
+// CNetVoiceManagerInit (sub_741E50 - 0x741F1B) is the CNetVoiceManager's voice
+// bring-up (XNotifyCreateListener + XHVCreateEngine + the 4-user voice enable/
+// reset pass); it is implemented in netinit.cpp and called from the frontend
+// below as CNetVoiceManagerInit(CNetManagerGetVoiceManager(GetNetManager())).
 
 // Worker callback functions the frontend installs (their addresses are stored
 // in the worker at +0x25C/+0x260/+0x264/+0x268 by the sub_18F6Cxx setters).
-static void  sub_61A330(void) {}
+// PauseGameOnVMState  (0x61A330 - 0x61A407)
+// -- the VM-state-driven worker callback (registered by RunFrontEnd on the
+// worker at +0x25C via sub_18F6C90).  Reads the VM core's state byte (0x674320);
+// while the VM reports something active, dispatches the entity's vtable[1] step.
+// On the pause-worthy result (10) — or, when the result is not 2 and the
+// one-shot release flag is clear, releases the previous pause-debug instance
+// (LHAlloc(0x44) + the +0x40/+0x41/+0x59 setup) and then runs the pause
+// sequence.  The pause sequence (shared by both) re-reads the net manager
+// twice, sends the pause packet through sub_687D90(v, 1, 1) and tail-calls
+// sub_685520 with the +0x10 sub-object.  Returns the send's result; returns
+// the raw state byte when the VM reports nothing.  Calls that are no-ops in
+// this build (the worker callback is never invoked: sub_18F6C90 is a no-op)
+// are left as documented stubs.
+//   [NOT byte-identical] refs the high-VA globals g_dword_1DBDD4C (via
+// KoreGetVMCore) + byte_1DBD9E1 (0x1DBD9E1, kept static here) and ~13
+// unimplemented engine callees (marked [STUB] below); placement-dependent
+// (relative E8 calls throughout).
+static BYTE g_byte_1DBD9E1 = 0;   // 0x1DBD9E1: the one-shot pause release flag
+
+// sub_674320 (0x674320 - 0x674336) -- reads the VM core's state byte:
+// *(VMCore + 0x0C -> +0xC2); 0 when there is no live VM.
+static int VMStateByte(void)
+{
+    int core = KoreGetVMCore();
+    if (core == 0)
+        return 0;
+    return (int)(signed char)*(unsigned char *)(*(DWORD *)(core + 0x0C) + 0xC2);
+}
+
+// sub_673F70 (0x673F70 - 0x673F77) -- the entity address read: *(VMCore+0x0C)+0x30.
+static int VMEntityOfCore(int core)
+{
+    return (int)*(DWORD *)(*(DWORD *)(core + 0x0C) + 0x30);
+}
+
+// sub_6E2BB0 (0x6E2BB0 - 0x6E2BF2) -- EntitySubObject (thiscall, plain retn):
+// the entity sub-object build/validate.  Reads *(this + 4) as the sub-object
+// pointer, validates it, then returns the live value at *(v4 + 0x8) of the
+// sub-object it produced.  [NOT byte-identical] placement-dependent (relative
+// E8 calls to __invalid_parameter_noinfo) so C++ reimplementation.
+//
+// The body (three invalid-parameter checks, each reports via F3InvalidParam and
+// continues):
+//   v1 = this->+4;  v2 = *v1;
+//   if (v2 == 0) -> invalid-parameter (the original is noreturn here; this build
+//                  reports and returns 0 so we do not wild-read below)
+//   v3 = *(v1 + 0x14);  v4 = *(v3 + 4);
+//   v5 = *v2;  if (v4 == *(v5 + 0x14)) -> invalid-parameter
+//   v2 = *v2;  if (v4 == *(v2 + 0x14)) -> invalid-parameter (identical check to
+//                  the previous one: the re-deref yields the same value)
+//   return *(v4 + 0x8);
+static int EntitySubObject(void *obj)
+{
+    DWORD v1 = ((DWORD *)obj)[1];       // this + 4
+    DWORD v2 = *(DWORD *)v1;            // *v1 (ESI = the sub-object pointer)
+    if (v2 == 0)
+    {
+        F3InvalidParam();
+        return 0;                      // original: __invalid_parameter_noinfo (no return)
+    }
+    DWORD v3 = *(DWORD *)(v1 + 0x14);  // *(v1 + 0x14) (EDI = the guard word)
+    DWORD v4 = *(DWORD *)(v3 + 4);     // v4 = *(v3 + 4)
+    DWORD v5 = *(DWORD *)v2;           // EAX = *v2 (ESI != 0 here)
+    if (v4 == *(DWORD *)(v5 + 0x14))
+        F3InvalidParam();
+    v2 = *(DWORD *)v2;                  // re-deref (ESI = *ESI)
+    if (v4 == *(DWORD *)(v2 + 0x14))
+        F3InvalidParam();
+    return *(DWORD *)(v4 + 8);
+}
+
+// sub_67E460 (0x67E460 - 0x67E48F) -- the one-time atexit install + return of
+// &unk_1DBE300 (the pause-debug instance header).  [STUB] the atexit
+// registration (sub_1AC26C0) and the &unk_1DBE300 global are not modelled;
+// returns a static scratch buffer so the sub_67D070 write that follows is
+// harmless.
+static BYTE g_unk_1DBE300[0x100] = { 0 };   // 0x1DBE300: pause-debug instance header
+static void *sub_67E460(void) { return g_unk_1DBE300; }
+
+// sub_67D070 (0x67D070 - 0x67D078) -- thiscall: sets *(this + 0x59) = a2 and
+// returns a2.
+static int TurnOnPauseArmed(void *obj, int a2)
+{
+    *(unsigned char *)((char *)obj + 0x59) = (unsigned char)a2;
+    return a2;
+}
+
+// sub_6A68A0 (0x6A68A0 - 0x6A68A4) -- thiscall: returns *(this + 0x10).
+static int NetManagerSlot10(void *obj)
+{
+    return (int)*(DWORD *)((char *)obj + 0x10);
+}
+
+// sub_687D90 (0x687D90 - 0x687DD5) -- the PauseGamePacket build + send step.
+// [STUB] the PauseGamePacket serializer (sub_9EDBB0 / sub_686DE0 / sub_9EDB40)
+// is unimplemented; its result is discarded by both callers.
+static int SendPauseGamePacket(void *obj, int a2, int a3) { (void)obj; (void)a2; (void)a3; return 0; }
+
+// sub_685520 (0x685520 - 0x685534) -- thiscall: the paused-state send tail-call.
+// [STUB] the packet-send chain (sub_6850A0 / sub_684F10) is unimplemented.
+static int SendPausedState(void *obj) { (void)obj; return 0; }
+
+// sub_6E4720 (0x6E4720 - 0x6E4739) -- the pause-debug instance ctor step:
+// leaves +0x40 / +0x41 zeroed and installs the CGameModePauseDebug vftable.
+// Its CGameModePause ctor call (sub_E5F9D0) is unimplemented [STUB].
+static void *PauseDebugCtor(void *obj)
+{
+    ((char *)obj)[0x40] = 0;
+    ((char *)obj)[0x41] = 0;
+    *(DWORD *)obj = 0;   // [STUB] the CGameModePauseDebug vftable is not modelled
+    return obj;
+}
+
+// sub_61E040 (0x61E040 - 0x61E050) -- the thunk's release fn: vftable[0](obj, 1).
+static void PauseDebugRelease(DWORD ctx)
+{
+    if (ctx == 0)
+        return;
+    // [STUB] the CGameModePauseDebug deleting dtor is not modelled; the
+    // original would dispatch vtable[0](ctx, 1).
+}
+
+// sub_61FEC0 (0x61FEC0 - 0x61FF0B) -- the 12-byte thunk-record writer:
+// *this = a2; when a2 != 0, allocate the {1, releaseFn, a2} block and store
+// it at *(this+4); otherwise leave *(this+4) = 0.  Returns this.
+static DWORD *PauseDebugThunk(DWORD *obj, int a2)
+{
+    *obj = (DWORD)a2;
+    if (a2 == 0)
+    {
+        obj[1] = 0;
+        return obj;
+    }
+    DWORD *v3 = (DWORD *)LHAlloc(12);
+    if (v3 != 0)
+    {
+        DWORD v4 = *obj;
+        v3[0] = 1;
+        v3[1] = (DWORD)(void (*)(DWORD))PauseDebugRelease;  // sub_61E040 (cdecl: 1 stack arg)
+        v3[2] = v4;
+        obj[1] = (DWORD)v3;
+    }
+    else
+    {
+        obj[1] = 0;
+    }
+    return obj;
+}
+
+// sub_6E4220 (0x6E4220 - 0x6E4332) -- the entity instance list-size increment.
+// [NOT byte-identical] placement-dependent (relative E8 calls down the
+// std::logic_error / std::length_error throw chain and the dword_1DDCFC8
+// exception hook).  Thiscall + retn 4: ECX = the entity instance (this), the
+// stack arg is the amount n.  If 0x1FFFFFFF - *(obj + 0x18) < n (unsigned) it
+// builds and throws std::length_error("list<T> too long") (invoking the
+// non-NULL callback at dword_1DDCFC8 first); otherwise *(obj + 0x18) += n and
+// returns n.  The caller discards the result.
+static int EntityInstanceSizeAdd(DWORD *obj, int n)
+{
+    unsigned *size = (unsigned *)((char *)obj + 0x18);
+    if (0x1FFFFFFFu - *size < (unsigned)n)
+    {
+        std::length_error err("list<T> too long");
+        if (g_dword_1DDCFC8 != 0)
+            g_dword_1DDCFC8(&err);
+        throw err;
+    }
+    *size += (unsigned)n;
+    return n;
+}
+
+// sub_6E3E20 (0x6E3E20 - 0x6E3E60) -- the entity instance sub-object
+// validator.  [NOT byte-identical] placement-dependent (relative E8 calls to
+// __invalid_parameter_noinfo) so C++ reimplementation.  Thiscall + plain retn;
+// ECX = the entity instance (this).  Reads *(this) as v1 (the sub-instance
+// pointer) and *(this + 0x14) as v2 (the guard word slot), validates the
+// chain, and returns v3 + 8 where v3 = *(v2 + 4) (the 3rd slot of the
+// sub-object at v2).  The twin checks (the guard word compared against the
+// *v1's +0x14 slot, then against the re-derefed v1) are preserved verbatim.
+static DWORD EntityInstanceSubPtr(DWORD *obj)
+{
+    DWORD v1 = *(DWORD *)obj;
+    if (v1 == 0)
+    {
+        F3InvalidParam();
+        return 0;   // original: __invalid_parameter_noinfo (no return)
+    }
+    DWORD v2 = *(DWORD *)((char *)obj + 0x14);
+    DWORD v3 = *(DWORD *)(v2 + 4);
+    DWORD v4 = *(DWORD *)v1;              // ESI != 0 here (checked above)
+    if (v3 == *(DWORD *)(v4 + 0x14))
+        F3InvalidParam();
+    v1 = *(DWORD *)v1;                    // re-deref (same value as v4)
+    if (v3 == *(DWORD *)(v1 + 0x14))
+        F3InvalidParam();
+    return (DWORD)(v3 + 8);
+}
+
+// sub_6E4370 (0x6E4370 - 0x6E43D6) -- the entity instance release-block writer.
+// [NOT byte-identical] placement-dependent (relative E8 calls to LHAlloc /
+// InterlockedIncrement and the helper EntityInstanceSizeAdd) so C++
+// reimplementation.  __stdcall + retn 0Ch (the caller pushes a1/a2/a3);
+// ECX = the entity instance (the object whose +0x18 counter is bumped
+// below): a1 = *(this) is unused, a2 = *(this + 0x14) (the guard slot) is
+// the second stack arg, a3 = the caller's thunk-local is the third.  Builds
+// the 16-byte release block
+// {a2, old_sub_object_ptr, *a3, a3[1]}, increments the refcount of
+// a3[1] (the thunk block) when non-zero, bumps the entity's list size (this
+// object +0x18, via EntityInstanceSizeAdd), stores the block at *(a2 + 4)
+// (overwriting the old sub-object pointer), writes the block at *(old_
+// sub_object_ptr), and returns the old sub-object pointer.
+static DWORD *EntityInstanceReleaseBlock(DWORD *obj, DWORD *local)
+{
+    DWORD a2 = obj[5];
+    DWORD v3 = *(DWORD *)(a2 + 4);
+    DWORD *v4 = (DWORD *)LHAlloc(16);
+    if (v4 != 0)
+        v4[0] = a2;
+    if (v4 != (DWORD *)-4)
+        v4[1] = v3;
+    if (v4 != (DWORD *)-8)
+    {
+        v4[2] = *local;
+        v4[3] = local[1];
+        if (local[1] != 0)
+            InterlockedIncrement((volatile LONG *)local[1]);
+    }
+    EntityInstanceSizeAdd(obj, 1);
+    *(DWORD *)(a2 + 4) = (DWORD)v4;
+    *(DWORD *)v3 = (DWORD)v4;
+    return (DWORD *)v3;
+}
+
+// sub_6E32C0 (0x6E32C0 - 0x6E32FC) -- the entity-instance teardown.
+// [NOT byte-identical] placement-dependent (relative E8 calls down the
+// entity-instance chain) so C++ reimplementation.  Thiscall + retn 4:
+// ECX = the entity instance (this), a2 = the caller's thunk-local (the
+// pause-debug release record).  When *(this + 0x18) != 0, validate the
+// entity chain through EntityInstanceSubPtr and tail-call the vtable slot 8
+// (offset 32) of the sub-instance view at v3 (the returned sub-object pointer
+// + 8): ecx = *(v3), eax = *(ecx), call *(eax + 0x20).  Then, unconditionally,
+// builds the release block through EntityInstanceReleaseBlock (the guard
+// slot + the refcount bump + the list-size bump), and tail-calls the
+// vtable slot 5 (offset 0x14) of the thunk-local's object (local[0]) with
+// local[0] as the this argument -- the return value of that dispatch is the
+// function's return.  [STUB] the callers (pause-debug teardown) are dead in
+// this build (the worker callback is never invoked), so this is exercised
+// only when the worker setters are wired up.
+static int EntityInstanceTeardown(DWORD *obj, DWORD *local)
+{
+    DWORD *P = (DWORD *)obj[1];
+    if (P[6] != 0)
+    {
+        DWORD v3 = (DWORD)EntityInstanceSubPtr(P);
+        DWORD ecx = *(DWORD *)v3;
+        DWORD eax = *(DWORD *)ecx;
+        void (*vtable8)(DWORD) = (void (*)(DWORD))(*(DWORD *)(eax + 0x20));
+        vtable8(ecx);
+    }
+    EntityInstanceReleaseBlock(P, local);   // result discarded by the original
+    DWORD ecx2 = local[0];
+    DWORD eax2 = *(DWORD *)ecx2;
+    int (*vtable5)(DWORD) = (int (*)(DWORD))(*(DWORD *)(eax2 + 0x14));
+    return (int)vtable5(ecx2);
+}
+
+// sub_61FF10 (0x61FF10 - 0x61FF4B) -- the thunk-record release: decrement the
+// thunk block's refcount; at zero, call the release fn (vtable[0](context, 1))
+// and LHFree the block; zero both words of the local.  Returns the LHFree result.
+static DWORD PauseDebugThunkRelease(DWORD *obj)
+{
+    DWORD result;
+
+    result = obj[1];
+    if (result != 0)
+    {
+        result = (DWORD)InterlockedDecrement((volatile LONG *)result);
+        if (result == 0)
+        {
+            DWORD *block = (DWORD *)obj[1];
+            ((void (*)(DWORD))block[1])(block[2]);   // sub_61E040(context): vtable[0](context, 1)
+            LHFree(block);   // [STUB] LHFree is void in this build; the original returns its result
+        }
+    }
+    obj[0] = 0;
+    obj[1] = 0;
+    return result;
+}
+
+// j_GetNetManager_1 (0x673C30 - 0x673C38) -- thiscall thunk: returns GetNetManager().
+static void *j_GetNetManager_1(void *obj) { (void)obj; return GetNetManager(); }
+
+static int PauseGameOnVMState(void)
+{
+    int result = VMStateByte();
+
+    if (result != 0)
+    {
+        int core = KoreGetVMCore();
+        int v2 = VMEntityOfCore(core);
+        int v3 = EntitySubObject((void *)v2);
+
+        // The vtable[1] dispatch (the original calls it unconditionally).
+        // v3 is the real return of EntitySubObject (*(v4 + 8));
+        // keep the null guard so the dispatch stays safe when the entity
+        // build/validate failed (the original would null-deref on a null v3).
+        result = (v3 != 0) ? ((int (*)(int))((void **)v3)[1])(v3) : 0;
+
+        if (result == 10)
+        {
+            void *p = sub_67E460();
+            TurnOnPauseArmed(p, 1);   // sets *(p + 0x59) = 1
+        }
+        else
+        {
+            if (result == 2)
+                return result;
+            if (g_byte_1DBD9E1 != 0)
+                return result;
+
+            // Release the pause-debug instance (the one sub_67E460 installed).
+            int v9 = (int)(DWORD)LHAlloc(0x44);
+            int v10 = (v9 != 0) ? (int)(DWORD)PauseDebugCtor((void *)v9) : 0;
+            DWORD local[2];
+            PauseDebugThunk(local, v10);
+            int core2 = KoreGetVMCore();
+            int v13a = VMEntityOfCore(core2);
+            EntityInstanceTeardown((DWORD *)v13a, local);
+            PauseDebugThunkRelease(local);
+            g_byte_1DBD9E1 = 1;
+        }
+
+        // The pause sequence (shared by both paths).
+        int vc = KoreGetVMCore();
+        void *nm = j_GetNetManager_1((void *)vc);
+        // [STUB] the original reads *(nm + 0x10) unconditionally (the
+        // net manager is always installed in the original build); a null
+        // net manager here is possible pre-start, so guard the +0x10 read.
+        int v5 = (nm != 0) ? NetManagerSlot10(nm) : 0;
+        SendPauseGamePacket((void *)v5, 1, 1);
+        int vc2 = KoreGetVMCore();
+        void *nm2 = j_GetNetManager_1((void *)vc2);
+        int v8 = (nm2 != 0) ? NetManagerSlot10(nm2) : 0;
+        return SendPausedState((void *)v8);
+    }
+    return result;
+}
 static void  sub_619DE0(void) {}
 static void  sub_6199C0(void) {}
 static void  sub_619A70(void) {}
@@ -12832,11 +13181,12 @@ signedIn:
         void *hm = GetHeapManager();
         GetHeapManagerSlot1C(hm);
         SetSoundHWND((int)hwnd);
-        int c = (int)(DWORD)GetNetManager();
-        int d = sub_6A69A0(c);
-        sub_741E50(d);
+        // 0x61D487-0x61D48E: GetNetManager() -> CNetManagerGetVoiceManager
+        // (the +0x30 slot) -> CNetVoiceManagerInit (sub_741E50, the CNetVoice-
+        // Manager XNotify/XHV voice bring-up; implemented in netinit.cpp).
+        CNetVoiceManagerInit(CNetManagerGetVoiceManager(GetNetManager()));
 
-        sub_18F6C90(GetWorker(), (void *)sub_61A330);
+        sub_18F6C90(GetWorker(), (void *)PauseGameOnVMState);   // 0x61D493
         sub_18F6C80(GetWorker(), (void *)sub_619DE0);
         sub_18F6C70(GetWorker(), (void *)sub_6199C0);
         sub_18F6C60(GetWorker(), (void *)sub_619A70);
