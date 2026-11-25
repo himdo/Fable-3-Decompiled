@@ -34,6 +34,7 @@ typedef int (WINAPI *F3PreTranslateFn)(LPMSG msg);
 //    +4    critical section (24 bytes on x86)
 //    +156  event1   +288 event2   +420 event3   +552 event4  (auto-reset)
 //    +560  hInstance   +564 nShowCmd
+//    +604  pauseGameOnVMState (+0x25C)    +608  multiplayerPauseOnVMState (+0x260)    +612  armedPauseOnVMState (+0x264)    +620  onResetDevice (+0x26C)
 //    +656  timing (double, seconds since engine start)
 // ============================================================
 typedef struct CWorkerWin32
@@ -59,8 +60,11 @@ typedef struct CWorkerWin32
     int              windowFlags;   // +588 (0x24C) byte0 = fullscreen, byte1 (0x24D) = refresh byte
     int              f_0250;        // +592 (0x250) display-mode field (F3DisplayMode +36)
     void *           sharedBlock;   // +596 (0x254) refcounted shared block (window class name at +0)
-    F3CallbackFn     onCreateDevice; // +600 (0x258) on-create-device callback
-    char             _pad6b1[16];   // +604 .. +620
+    F3CallbackFn     onCreateDevice;     // +600 (0x258) on-create-device callback
+    F3CallbackFn     pauseGameOnVMState; // +604 (0x25C) pause-game VM-state callback (setter SetPauseGameOnVMState)
+    F3CallbackFn     multiplayerPauseOnVMState; // +608 (0x260) multi-player pause VM-state callback (setter SetMultiplayerPauseOnVMState)
+    F3CallbackFn     armedPauseOnVMState; // +612 (0x264) audio-armed / window-placement VM-state callback (setter SetArmedPauseOnVMState)
+    F3CallbackFn     netHeldCoopFailed; // +616 (0x268) net-held coop-failed callback (setter SetNetHeldCoopFailed)
     F3CallbackFn     onResetDevice; // +620 (0x26C) on-reset-device callback
     F3PreTranslateFn preTranslate;  // +624 (0x270) pre-translate hook (XLive; setter SetPreTranslate)
     char             _pad7a1[13];   // +628 .. +641
@@ -87,6 +91,10 @@ int InitEngineTime(void);
 // 0x18F6A40 - return the current worker (dword_20FC8F0). Used pervasively by
 // the engine to reach the current CWorkerWin32.
 void *GetWorker(void);
+
+// 0x18F0180 - clear the current-thread-id marker (dword_1E2ED70 / g_dword_1E2ED70)
+// to -1 (the "reset to -1 on shutdown" step).  __cdecl, no args, no return.
+void ClearCurrentThreadId(void);
 
 // 0x18CB6A0 - flush the pending device-operation object lists of the 64-byte
 // container (0x20FC988). Called from FlushRenderFrame (0x18F1F60).
@@ -119,6 +127,22 @@ void SetWorker(F3ObjReg *reg);
 // 0x18F6CA0 - set the worker's on-create-device callback [BYTE-IDENTICAL].
 // __thiscall + retn 4 hybrid: dispatch through F3ThiscallSetFn.
 F3CallbackFn SetOnCreateDevice(void *worker, F3CallbackFn cb);
+
+// 0x18F6C90 - set the worker's pause-game VM-state callback (the +0x25C slot)
+// [BYTE-IDENTICAL]. __thiscall + retn 4 hybrid: dispatch through F3ThiscallSetFn.
+F3CallbackFn SetPauseGameOnVMState(void *worker, F3CallbackFn cb);
+
+// 0x18F6C80 - set the worker's multi-player pause VM-state callback (the +0x260 slot)
+// [BYTE-IDENTICAL]. __thiscall + retn 4 hybrid: dispatch through F3ThiscallSetFn.
+F3CallbackFn SetMultiplayerPauseOnVMState(void *worker, F3CallbackFn cb);
+
+// 0x18F6C70 - set the worker's audio-armed VM-state callback (the +0x264 slot)
+// [BYTE-IDENTICAL]. __thiscall + retn 4 hybrid: dispatch through F3ThiscallSetFn.
+F3CallbackFn SetArmedPauseOnVMState(void *worker, F3CallbackFn cb);
+
+// 0x18F6C60 - set the worker's net-held coop-failed callback (the +0x268 slot)
+// [BYTE-IDENTICAL]. __thiscall + retn 4 hybrid: dispatch through F3ThiscallSetFn.
+F3CallbackFn SetNetHeldCoopFailed(void *worker, F3CallbackFn cb);
 
 // 0x18F8600 - one step of the worker's state machine, called on every
 // iteration of RunGame's main pump loop. See worker.cpp.

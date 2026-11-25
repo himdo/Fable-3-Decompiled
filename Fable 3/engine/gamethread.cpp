@@ -862,9 +862,15 @@ void CGameEngineCleanup(CGameEngine *obj)
 // sub_72F8E0 / sub_72F7E0 / sub_72F7D0 -- the CGameRenderer debug/log
 //   family: the 0x72F8E0 flag getter (impl+136 byte), the 0x72F7E0 flush
 //   (sub_72FC70 on the impl), and the 0x72F7D0 log flush (sub_19E1FA0).
-//   Remaining stubs: the renderer's 776-byte impl is not constructed in this
-//   build, so the flag is always 0 and the flushes are no-ops.
-static int   sub_72F8E0(void *obj) { (void)obj; return 0; }
+//   The flag getter reads the impl's +0x88 byte for real (the 776-byte impl
+//   is constructed by CGameRendererInnerCtor, so the getter is meaningful
+//   now); the flushes remain stubs (their flag stays 0 in this build and
+//   their targets -- sub_72FC70 / sub_19E1FA0 -- are unimplemented).
+static int   sub_72F8E0(void *obj)
+{
+    void *inner = *(void **)((char *)obj + 4);
+    return (inner != 0) ? (int)((BYTE *)inner + 136)[0] : 0;
+}
 static void  sub_72F7E0(void *obj) { (void)obj; }
 static void  sub_72F7D0(void *obj) { (void)obj; }
 
@@ -946,14 +952,15 @@ static void F3ReaderWriterLockCtor(void *lock)
     dw[1] = 0;
 }
 
-// sub_A1AA30 (0xA1AA30, 299 bytes) -- the packet-callback registration on
-// the net manager's packet manager (the CNetManager +0x04 sub-object):
-// validates the id (>= 0xFE) and the non-null handlers, allocates the entry,
-// copies the {callback obj, lock, receive, serialize} tuple, and registers it
-// in the packet manager's dispatch lists.
+// PauseDebugRegisterPacket (the original sub_A1AA30, 0xA1AA30, 299 bytes) -- the packet-
+// callback registration on the net manager's packet manager (the CNetManager +0x04
+// sub-object): validates the id (>= 0xFE) and the non-null handlers, allocates the
+// entry, copies the {callback obj, lock, receive, serialize} tuple, and registers
+// it in the packet manager's dispatch lists.
 // [STUB] The body is out of scope for CNetSaveGameCtor; in this build the
 // packet manager is 0 (CNetManagerGetPacketManager returns NULL) and no
-// packets are ever delivered, so a no-op preserves all observable behavior.
+// packets are ever delivered, so a no-op preserves all observable behavior
+// (the PauseDebug instance's registration is implemented in gamemain.cpp).
 static void NetRegisterPacketCallback(void *pm, int id, void *lock,
                                       void *cb, void *recv, void *ser)
 {
@@ -1692,7 +1699,7 @@ static void CGameEngineDestroy(CGameEngine *obj)
         F3ReleaseOne(obj->member0xB8);
     obj->member0xB8 = 0;
 
-    // 7. member0xB4: the 8-byte {value, SEH block} wrapper (sub_712430 shape).
+    // 7. member0xB4: the 8-byte {value, SEH block} wrapper (GameImplWrapperCtor, 0x712430).
     if (obj->member0xB4 != 0)
     {
         void *w     = obj->member0xB4;

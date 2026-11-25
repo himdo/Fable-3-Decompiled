@@ -9608,14 +9608,14 @@ static void EngineLuaNoop_615F30(void) { }
 // nullsub_4 (0x615DA0 - 0x615DA1) -- the SetFrontEndDemoMode no-op body.
 static void EngineLuaNoop_615DA0(void) { }
 
-// sub_673E80 + VM string ctor + sub_6477E0 (sub_646560): the VM-internal
+// VmCoreSlot1C (sub_673E80) + VM string ctor + sub_6477E0 (sub_646560): the VM-internal
 // string-object probe SetLevelNameStartsWithACS drives -- build the string
 // object for the arg text from the VM's string-ctor slot (*(vmcore+0xC)+0x1C)
 // and look it up in the VM global table.  No-op stub.
 static int KoreVmStringOp(const char *name) { (void)name; return 0; }
 // sub_6166C0 (0x6166C0 - 0x6166FB) -- SetLevelNameStartsWithACS: when the
 // Kore VM is live (g_dword_1DBDD4C, sub_673C50), build the string object
-// for the arg slot's text (sub_673E80 + the VM's string ctor slot) and
+// for the arg slot's text (VmCoreSlot1C + the VM's string ctor slot) and
 // probe it against the global table (sub_6477E0 / sub_646560); when the
 // probe fails (or there is no VM) copy the 0x1DBD0EC level-name slot over
 // the arg.  Also called from code: sub_677010 (0x677151).
@@ -9626,7 +9626,7 @@ static F3SharedBuffer **SetLevelNameStartsWithACS(F3SharedBuffer **slot)
     if (g_dword_1DBDD4C != 0)
     {
         const char *name = (slot[0] != 0) ? GetSlotString(slot) : "";   // Str1 = ""
-        if (KoreVmStringOp(name) != 0)   // sub_673E80 + VM string ctor + sub_6477E0 (stubs)
+        if (KoreVmStringOp(name) != 0)   // VmCoreSlot1C + VM string ctor + sub_6477E0 (stubs)
             return slot;                // the probe passed: keep the arg slot as-is
     }
     return CopySharedSlot(slot, &g_slot_1DBD0EC);

@@ -143569,7 +143569,7 @@
     },
     "0x00731b80": {
       "size": 25,
-      "name": "sub_731B80"
+      "name": "CFullScreenMoviePlayerCtor"
     },
     "0x00731ba0": {
       "size": 152,
@@ -641333,7 +641333,7 @@
     },
     "0x018e7180": {
       "size": 8,
-      "name": "sub_18E7180"
+      "name": "SetEngineStartedFlag"
     },
     "0x018e7190": {
       "size": 289,
@@ -641389,15 +641389,15 @@
     },
     "0x018e7fc0": {
       "size": 1184,
-      "name": "sub_18E7FC0"
+      "name": "TextureStreamerWork"
     },
     "0x018e8460": {
       "size": 95,
-      "name": "sub_18E8460"
+      "name": "TextureStreamerThread"
     },
     "0x018e84c0": {
       "size": 52,
-      "name": "sub_18E84C0"
+      "name": "StartTextureStreamer"
     },
     "0x018e8500": {
       "size": 498,
@@ -642585,15 +642585,15 @@
     },
     "0x018f6c70": {
       "size": 13,
-      "name": "sub_18F6C70"
+      "name": "SetArmedPauseOnVMState"
     },
     "0x018f6c80": {
       "size": 13,
-      "name": "sub_18F6C80"
+      "name": "SetMultiplayerPauseOnVMState"
     },
     "0x018f6c90": {
       "size": 13,
-      "name": "sub_18F6C90"
+      "name": "SetPauseGameOnVMState"
     },
     "0x018f6ca0": {
       "size": 13,

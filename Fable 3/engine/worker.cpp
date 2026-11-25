@@ -290,6 +290,15 @@ static unsigned char g_byte_2075DDB = 0;   // 0x2075DDB  device-active flag
 static long          g_dword_1E2ED70 = 0;  // 0x1E2ED70  reset to -1 on shutdown
 static long          g_dword_1E2ED6C = 0;  // 0x1E2ED6C  reset to -1 on shutdown
 
+//  ClearCurrentThreadId  (0x18F0180 - 0x18F018B)  -- clear the current-thread-id
+//  marker (dword_1E2ED70) to -1 (the "reset to -1 on shutdown" step).
+//  [NOT byte-identical] refs the high-VA global g_dword_1E2ED70 not placed at
+//  its original VA in this build, so it is implemented in C++ over a static.
+void ClearCurrentThreadId(void)
+{
+    g_dword_1E2ED70 = -1;
+}
+
 // 0x2075B28: the current parent/owner window for device creation (set by
 // SetHWndParent, 0x18F1AE0). High-VA global; lives here as a static.
 static HWND g_hWndParent = 0;
@@ -5281,6 +5290,96 @@ __declspec(naked) F3CallbackFn SetOnResetDevice(void *worker, F3CallbackFn cb)
     __asm {
         mov    eax, [esp+4]      ; eax = cb
         mov    [ecx+26Ch], eax   ; worker->onResetDevice = cb
+        ret    4                 ; return cb, clean up the stack arg
+    }
+}
+
+// ============================================================
+//  SetPauseGameOnVMState  (0x18F6C90 - 0x18F6C99)  -- set the worker's
+//  pause-game VM-state callback (the worker field at +0x25C)
+//
+//  [BYTE-IDENTICAL]  A __thiscall + retn 4 hybrid, the sibling of
+//  SetOnCreateDevice / SetOnResetDevice: the worker is in ECX and the
+//  callback is a stack arg the callee cleans (ret 4). It stores the
+//  callback in the worker's pauseGameOnVMState field and returns it.
+//  The caller must dispatch it as a __thiscall function (the F3ThiscallSetFn
+//  cast) so that the worker lands in ECX.
+//
+//  F3CallbackFn SetPauseGameOnVMState(CWorkerWin32 *worker, F3CallbackFn cb)
+// ============================================================
+__declspec(naked) F3CallbackFn SetPauseGameOnVMState(void *worker, F3CallbackFn cb)
+{
+    __asm {
+        mov    eax, [esp+4]      ; eax = cb
+        mov    [ecx+25Ch], eax   ; worker->pauseGameOnVMState = cb
+        ret    4                 ; return cb, clean up the stack arg
+    }
+}
+
+// ============================================================
+//  SetMultiplayerPauseOnVMState  (0x18F6C80 - 0x18F6C8D)  -- set the
+//  worker's multi-player pause VM-state callback (the worker field at +0x260)
+//
+//  [BYTE-IDENTICAL]  A __thiscall + retn 4 hybrid, the sibling of
+//  SetOnCreateDevice / SetOnResetDevice / SetPauseGameOnVMState: the
+//  worker is in ECX and the callback is a stack arg the callee cleans
+//  (ret 4). It stores the callback in the worker's multiplayerPauseOnVMState
+//  field and returns it. The caller must dispatch it as a __thiscall function
+//  (the F3ThiscallSetFn cast) so that the worker lands in ECX.
+//
+//  F3CallbackFn SetMultiplayerPauseOnVMState(CWorkerWin32 *worker, F3CallbackFn cb)
+// ============================================================
+__declspec(naked) F3CallbackFn SetMultiplayerPauseOnVMState(void *worker, F3CallbackFn cb)
+{
+    __asm {
+        mov    eax, [esp+4]      ; eax = cb
+        mov    [ecx+260h], eax   ; worker->multiplayerPauseOnVMState = cb
+        ret    4                 ; return cb, clean up the stack arg
+    }
+}
+
+// ============================================================
+//  SetArmedPauseOnVMState  (0x18F6C70 - 0x18F6C7D)  -- set the worker's
+//  audio-armed / window-placement VM-state callback (the worker field at +0x264)
+//
+//  [BYTE-IDENTICAL]  A __thiscall + retn 4 hybrid, the sibling of
+//  SetOnCreateDevice / SetOnResetDevice / SetPauseGameOnVMState /
+//  SetMultiplayerPauseOnVMState: the worker is in ECX and the callback is a
+//  stack arg the callee cleans (ret 4). It stores the callback in the worker's
+//  armedPauseOnVMState field and returns it. The caller must dispatch it as a
+//  __thiscall function (the F3ThiscallSetFn cast) so that the worker lands
+//  in ECX.
+//
+//  F3CallbackFn SetArmedPauseOnVMState(CWorkerWin32 *worker, F3CallbackFn cb)
+// ============================================================
+__declspec(naked) F3CallbackFn SetArmedPauseOnVMState(void *worker, F3CallbackFn cb)
+{
+    __asm {
+        mov    eax, [esp+4]      ; eax = cb
+        mov    [ecx+264h], eax   ; worker->armedPauseOnVMState = cb
+        ret    4                 ; return cb, clean up the stack arg
+    }
+}
+
+// ============================================================
+//  SetNetHeldCoopFailed  (0x18F6C60 - 0x18F6C6D)  -- set the worker's
+//  net-held coop-failed callback (the worker field at +0x268)
+//
+//  [BYTE-IDENTICAL]  A __thiscall + retn 4 hybrid, the sibling of
+//  SetOnCreateDevice / SetOnResetDevice / SetPauseGameOnVMState /
+//  SetMultiplayerPauseOnVMState / SetArmedPauseOnVMState: the worker
+//  is in ECX and the callback is a stack arg the callee cleans
+//  (ret 4). It stores the callback in the worker's netHeldCoopFailed
+//  field and returns it. The caller must dispatch it as a __thiscall
+//  function (the F3ThiscallSetFn cast) so that the worker lands in ECX.
+//
+//  F3CallbackFn SetNetHeldCoopFailed(CWorkerWin32 *worker, F3CallbackFn cb)
+// ============================================================
+__declspec(naked) F3CallbackFn SetNetHeldCoopFailed(void *worker, F3CallbackFn cb)
+{
+    __asm {
+        mov    eax, [esp+4]      ; eax = cb
+        mov    [ecx+268h], eax   ; worker->netHeldCoopFailed = cb
         ret    4                 ; return cb, clean up the stack arg
     }
 }

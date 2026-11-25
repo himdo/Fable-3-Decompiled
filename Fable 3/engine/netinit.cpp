@@ -435,7 +435,7 @@ static void NetLuaEventListCtor(void *obj)
 //  NetLuaEventListCtor at +0x08, the DNameNode base at +0x28 (vtable
 //  re-stored to CNetPacketCallback, +0x08 = 0), GetNetManager() +
 //  sub_6A6820 (registration -- remaining stub, no-op), the +0x30
-//  back-pointer, and a reader-writer-lock + sub_A1AA30(386, ...) global
+//  back-pointer, and a reader-writer-lock + PauseDebugRegisterPacket(386, ...) global
 //  registration (unimplemented registry -- skipped here). This build
 //  stores the placeholder vtable instead of the CNetLuaEventManager one.
 // ============================================================
@@ -456,7 +456,7 @@ static void *CNetLuaEventManagerCtor(void *obj)
 //  The real function is 0x333 bytes: it constructs the CNetManager's ~15
 //  sub-objects (LHAlloc + a per-class ctor into each +0x04..+0x5C slot,
 //  releasing the old one through its deleting destructor), wires the packet
-//  callback + reader-writer lock, and returns sub_A1AA30(535, ...).
+//  callback + reader-writer lock, and returns PauseDebugRegisterPacket(535, ...).
 //  This build constructs only the +0x1C sub-object (the 52-byte
 //  CNetLuaEventManager, sub_6AA3C0) -- the slot CNetLuaEventManagerListReset
 //  (sub_6AA2C0) reads -- and leaves the rest stubbed. Returns 0 (success).

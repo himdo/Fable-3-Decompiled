@@ -32,8 +32,8 @@ typedef struct F3AString
 // leaving d0 as-is): cap = 15, len = 0, buffer[0] = 0.
 void F3AStringReset(F3AString *s);
 
-// sub_402F00 (0x402F00 - 0x402F70) -- basic_string<char>::assign(src, len):
-// thiscall, returns the string.
+// F3AStringAssign (sub_402F00, 0x402F00 - 0x402F70) -- basic_string<char>::
+// assign(src, len): thiscall, returns the string.
 F3AString *F3AStringAssign(F3AString *s, const char *src, unsigned int len);
 
 // sub_50AD00 (the append variant of the F3AString family, the same

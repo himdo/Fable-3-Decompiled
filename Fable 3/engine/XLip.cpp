@@ -19,6 +19,7 @@
 #include <wchar.h>
 #include <stdarg.h>               // va_list / va_start / vswprintf_s (XLipDebugMessage)
 #include <wctype.h>               // iswspace (the XLipCultures line trim)
+#include <stdexcept>               // std::length_error / std::out_of_range / std::bad_alloc (F3AStringAssign throws)
 #include "common/common.h"        // LHAlloc / LHFree / InitSharedSlot / ReleaseSharedSlot
 #include "gamemain.h"             // CopySharedSlot (the shared-slot copy assign)
 #include "gameengine.h"           // GetGameEngine (sub_619A90)
@@ -122,23 +123,111 @@ void F3AStringReset(F3AString *s)
     s->u.buf[0] = 0;
 }
 
-// sub_402F00 (0x402F00 - 0x402F70) -- basic_string<char>::assign(src, len):
-// thiscall, returns the string.  "lip%u" is always short (< 16 chars) so the
-// SSO path is taken (no heap buffer); the general heap-growth path is
-// mirrored for completeness.
+//  F3AStringAssign  (sub_402F00, 0x402F00 - 0x402F70)  -- basic_string<char>::
+//  assign(src, len): thiscall, returns the string.
+//  [NOT byte-identical] placement-dependent (the LHAlloc / LHFree / _memcpy_s
+//  E8 calls, the length_error / out_of_range throw helpers and the high-VA
+//  heap table dword_2075B24), so C++ reimplementation.
+//
+//  Semantics (faithful to the original):
+//   - The self-overlap guard: if Source points into [buffer, buffer+len) the
+//     copy is sub_401BD0's erase/replace (the string becomes the segment
+//     [Source, Source+min(len-offset, SourceSize)); out_of_range when
+//     len < offset -- unreachable as reached, kept for fidelity).
+//   - Source == null: the overlap check is skipped; a len == 0 takes the
+//     len == 0 branch (len = 0, buffer[0] = 0, capacity kept). The original
+//     then proceeds with the Source == null source for len > 0 (a crash in
+//     debug / UB) -- the callers never do this, so the normal path is run.
+//   - SourceSize == 0xFFFFFFFF: throw std::length_error("string too long")
+//     (the original's sub_15196EA).
+//   - len == 0 with the capacity kept: len = 0, buffer[0] = 0 (the original's
+//     zero branch, inline or heap).
+//   - Heap growth (len > capacity) mirrors sub_402C00: new cap = len | 0xF
+//     (the "half-growth" rule: if cap/3 < cap>>1, the new cap is cap + (cap>>1)),
+//     LHAlloc(cap+1), the old heap buffer is freed, old content copied into
+//     the new buffer (the stale-copy the original does before the caller
+//     overwrites the buffer), cap / buffer / len updated, terminate.
+//  The SSO fast path (len <= 15, capacity kept) copies in place and
+//  null-terminates.
 F3AString *F3AStringAssign(F3AString *s, const char *src, unsigned int len)
 {
-    if (src == 0)
-        return s;                       // (Source == null path)
-    if (len > 15) {
-        s->u.ptr = (DWORD)LHAlloc(len + 1);
-        s->cap = len + 1;
-    } else
-        s->cap = 15;
-    char *dst = (s->cap < 16) ? s->u.buf : (char *)s->u.ptr;
-    for (unsigned int i = 0; i < len; i++)
-        dst[i] = src[i];
-    dst[len] = 0;
+    unsigned int cap = s->cap;
+    char *buf = (cap < 0x10) ? s->u.buf : (char *)s->u.ptr;
+
+    // The self-overlap guard: Source points into [buffer, buffer+len).
+    if (src != 0 &&
+        (unsigned int)src >= (unsigned int)buf &&
+        (unsigned int)src < (unsigned int)(buf + s->len))
+    {
+        unsigned int offset = (unsigned int)(src - buf);
+        if (s->len < offset)
+            throw std::out_of_range("invalid string position");
+        unsigned int newLen = len;
+        if (newLen > s->len - offset)
+            newLen = s->len - offset;
+        // erase the segment head [0, offset) and the tail [offset+newLen, len)
+        memmove(buf, src, newLen);
+        buf[newLen] = 0;
+        s->len = newLen;
+        if (cap >= newLen)
+            return s;
+        // the growth path (sub_402C00 semantics) for the erased segment
+        unsigned int v3 = newLen | 0xF;
+        if (v3 != 0xFFFFFFFFu)
+        {
+            unsigned int half = cap >> 1;
+            if (v3 / 3 < half && cap <= (unsigned int)(-2 - (int)half))
+                v3 = half + cap;
+        }
+        char *newBuf = (char *)LHAlloc(v3 + 1);
+        if (newBuf == 0)
+            throw std::bad_alloc();
+        memcpy(newBuf, buf, newLen);
+        if (cap >= 0x10)
+            LHFree((void *)s->u.ptr);
+        s->u.ptr = (DWORD)newBuf;
+        s->cap = v3;
+        s->len = newLen;
+        newBuf[newLen] = 0;
+        return s;
+    }
+
+    if (len == 0xFFFFFFFFu)
+        throw std::length_error("string too long");
+
+    if (cap >= len)
+    {
+        if (len == 0)
+        {
+            s->len = 0;
+            buf[0] = 0;
+            return s;
+        }
+        memcpy(buf, src, len);
+        buf[len] = 0;
+        s->len = len;
+        return s;
+    }
+
+    // heap growth (sub_402C00 semantics)
+    unsigned int v3 = len | 0xF;
+    if (v3 != 0xFFFFFFFFu)
+    {
+        unsigned int half = cap >> 1;
+        if (v3 / 3 < half && cap <= (unsigned int)(-2 - (int)half))
+            v3 = half + cap;
+    }
+    char *newBuf = (char *)LHAlloc(v3 + 1);
+    if (newBuf == 0)
+        throw std::bad_alloc();
+    if (s->len != 0)
+        memcpy(newBuf, buf, s->len);          // the stale-copy pre-fill
+    if (cap >= 0x10)
+        LHFree((void *)s->u.ptr);
+    s->u.ptr = (DWORD)newBuf;
+    s->cap = v3;
+    memcpy(newBuf, src, len);
+    newBuf[len] = 0;
     s->len = len;
     return s;
 }

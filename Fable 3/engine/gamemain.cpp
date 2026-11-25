@@ -40,6 +40,7 @@
 #include <math.h>                 // fabsf
 #include <float.h>                // _controlfp (the FPU round-toward-zero in KoreHeapInitGrow)
 #include <intrin.h>               // __rdtsc (the QPC span accounting in KoreHeapInitGrow)
+#include <time.h>                  // clock() / clock_t (the VfsQueryTableBuild timeout check)
 #include <direct.h>               // _chdir / _mkdir
 #include <stdexcept>              // std::length_error (F3ListSizeAdd overflow path)
 
@@ -70,6 +71,11 @@ static BYTE  g_byte_1DBD01F = 0;   // 0x1DBD01F
 static BYTE  g_byte_1DBD02A = 0;   // 0x1DBD02A: run-from-disk flag (data/streaming.bnk or FakeRunFromDVD)
 static F3SharedBuffer *g_unk_1DBDA78 = 0;   // 0x1DBDA78: build-version content slot
 static BYTE  g_byte_2075F07 = 0;   // 0x2075F07
+static BYTE  g_byte_2075F2B = 0;   // 0x2075F2B: engine-started flag
+static BYTE  g_byte_2075F38 = 0;   // 0x2075F38: Texture Streamer running flag
+static BYTE  g_byte_2075F39 = 0;   // 0x2075F39: Texture Streamer stop-arm flag
+static CRITICAL_SECTION g_cs_20FD1B4;   // 0x20FD1B4: the Texture Streamer critical section (zeroed)
+static int   g_cs_20FD1B4Init = 0;
 static BYTE  g_byte_2075F4E = 1;   // 0x2075F4E: path-normalize enable flag
 // Function-pointer slots published by the frontend (0x1D8C850 / 0x1D8C854).
 static void *g_off_1D8C850 = 0;    // 0x1D8C850
@@ -4667,7 +4673,7 @@ static DWORD WaitForWorkerClose(void *worker)
 // ============================================================
 //  SetFrontendEvent is defined below with its WaitForEvent sibling (the
 //  tail-jump target); declared here so the loop can call it.
-static void SetFrontendEvent(void *obj);
+static BOOL SetFrontendEvent(void *obj);
 
 // ============================================================
 //  RunGameLoop  (0x619D70 - 0x619DD3)  -- the frontend game/render loop.
@@ -7855,10 +7861,116 @@ static long __stdcall F3AudioNotifStateChanged(void *self, void *id, unsigned st
     ReleaseSharedSlotWide((F3SharedBuffer **)&id);
     return 0;
 }
-static long __stdcall F3AudioNotifRemoved(void *self, void *id) { return 0; }
-static long __stdcall F3AudioNotifDefaultFlow(void *self, unsigned a, unsigned b, void *c) { return 0; }
-static long __stdcall F3AudioNotifDefaultRole(void *self, unsigned a, unsigned b, void *c) { return 0; }
-static long __stdcall F3AudioNotifPropertyChanged(void *self, void *id, F3AudioPropKey key) { return 0; }
+// F3AudioNotifRemoved  (0x145DB20 - 0x145DB3E)  -- IMMNotificationClient "Removed" callback (vtable slot 5, 0x01B6F408).
+// stdcall, 2 stack args (self / id), retn 8.  The first argument (self) is the
+// notification object/client side; the original body never touches it (the
+// `int a1` in the pseudocode is deliberately ignored).  The second argument
+// (id) is the wide string carried in the removal event.  The body is the
+// sub_1A00310 wide-slot ctor followed immediately by the ReleaseSharedSlotWide
+// destructor -- the same 0x1E-byte body as F3AudioNotifAdded:
+//   1. the slot (the address of the second parameter) is nulled, and the wide
+//      live-slot counter is bumped (InterlockedIncrement on g_WideSlotCount);
+//   2. when the wide string is non-empty (non-NULL and not an empty string),
+//      a fresh 16-byte wide block is built from it via SharedBlockFromWide
+//      (the -1 auto-count case) and stored in the slot;
+//   3. the slot is destroyed on the spot by ReleaseSharedSlotWide -- the
+//      block's refcount (1) is dropped, on zero it is freed through the
+//      family's SharedBufferFree, and the slot is nulled -- so the build/tear-
+//      down nets to a no-op that returns 0 (the wide counter goes +1/-1).
+// The sub_1A00310 ctor's old-block-release branch (the `*this != 0` test
+// after the null-store) is dead at this point -- the slot is always 0 there --
+// so it is not reproduced.  [NOT byte-identical] placement-dependent (relative
+// E8 calls to the InterlockedIncrement IAT slot, SharedBlockFromWide and the
+// ReleaseSharedSlotWide/SharedBufferFree family -- the original 0x1E-byte body
+// is `mov eax,[esp+arg_4]` / `push 0xFFFFFFFFh` / `push eax` / `lea ecx,
+// [esp+8+arg_4]` / `call sub_1A00310` / `lea ecx,[esp+arg_4]` / `call
+// ReleaseSharedSlotWide` / `xor eax,eax` / `retn 8`).
+// NOTE on the arg convention: the IDA pseudocode is
+// `int __stdcall sub_145DB20(int a1, _WORD *a2)` -- the wide string is the
+// SECOND stack argument (and the client/notification side is the ignored
+// FIRST stack argument).  This is the faithful reading of the original body
+// (the identical 0x1E-byte shape as F3AudioNotifAdded, but with the same
+// _WORD * slot); in this build the callbacks never fire (neither Added nor
+// Removed is reachable from the engine test), so the distinction is latent.
+static long __stdcall F3AudioNotifRemoved(void *self, void *id)
+{
+    (void)self;
+    WCHAR *wide = (WCHAR *)id;   // the wide string carried in the second arg
+    id = 0;                       // ctor: *this = 0
+    InterlockedIncrement(&g_WideSlotCount);
+    if (wide != 0 && wide[0] != 0)
+        id = (void *)SharedBlockFromWide(wide, -1);
+    // (the ctor's old-block release branch is dead: the slot is 0 here)
+    ReleaseSharedSlotWide((F3SharedBuffer **)&id);
+    return 0;
+}
+// F3AudioNotifDefaultRole  (0x145DB40 - 0x145DB5F)  -- IMMNotificationClient
+// "DefaultRole" callback (vtable slot 7, 0x01B6F408).  thiscall, 7 stack args
+// (obj / a2 / wide-string / a4..a8), callee cleans the args (retn 0x1C).
+// This is the faithful reading of the original body (0x1F bytes: push ecx /
+// mov eax,[esp+0x0C] / push 0xFFFFFFFFh / push eax / lea ecx,[esp+8] / call
+// sub_1A00310 / lea ecx,[esp] / call ReleaseSharedSlotWide / xor eax,eax /
+// pop ecx / retn 0x1C) -- the same wide-slot ctor + destructor pattern as
+// F3AudioNotifAdded / F3AudioNotifRemoved (stdcall, 2 stack args), but thiscall
+// with 7 stack args instead.  The this pointer (ECX) is never used by the
+// body -- it is saved and restored (the saved-this cell is repurposed as the
+// 4-byte slot cell).  The wide string is the second stack arg; the other
+// stack args are ignored.  The body:
+//   1. the slot (the saved-this cell, nulled by the ctor) is built from the
+//      wide string passed in the second stack arg -- the slot is nulled, and
+//      the wide live-slot counter is bumped (InterlockedIncrement on
+//      g_WideSlotCount);
+//   2. when the wide string is non-empty (non-NULL and not an empty string),
+//      a fresh 16-byte wide block is built from it via SharedBlockFromWide
+//      (the -1 auto-count case) and stored in the slot;
+//   3. the slot is destroyed on the spot by ReleaseSharedSlotWide -- the
+//      block's refcount (1) is dropped, on zero it is freed through the
+//      family's SharedBufferFree, and the slot is nulled -- so the build/tear-
+//      down nets to a no-op that returns 0 (the wide counter goes +1/-1).
+// The sub_1A00310 ctor's old-block-release branch (the `*this != 0` test
+// after the null-store) is dead at this point -- the slot is always 0 there --
+// so it is not reproduced.  [NOT byte-identical] placement-dependent
+// (relative E8 calls to the InterlockedIncrement IAT slot, SharedBlockFromWide
+// and the ReleaseSharedSlotWide/SharedBufferFree family -- the original
+// 0x1F-byte body is the same wide-slot ctor + destructor sequence as
+// F3AudioNotifRemoved).
+static long F3AudioNotifDefaultRole(void *obj, unsigned a2, void *wide,
+                                   unsigned a4, unsigned a5, unsigned a6,
+                                   unsigned a7, unsigned a8)
+{
+    (void)obj; (void)a2; (void)a4; (void)a5; (void)a6; (void)a7; (void)a8;
+    WCHAR *w = (WCHAR *)wide;   // the wide string carried in the second stack arg
+    wide = 0;                   // ctor: slot = 0
+    InterlockedIncrement(&g_WideSlotCount);
+    if (w != 0 && w[0] != 0)
+        wide = (void *)SharedBlockFromWide(w, -1);
+    // (the ctor's old-block release branch is dead: the slot is 0 here)
+    ReleaseSharedSlotWide((F3SharedBuffer **)&wide);
+    return 0;
+}
+// F3AudioNotifPropertyChanged  -- IMMNotificationClient "OnPropertyValueChanged" callback (vtable slot 8, 0x01B6F408).
+// DESIGN NOTE -- there is no binary counterpart to decompile: the original
+// vtable at 0x01B6F408 has exactly 8 slots (0x145DB60/0x145DBC0/0x145E400/0x145E560/0x145DB00/0x145DB20/0x145E040/0x145DB40),
+// the 9th slot (0x1B6F428) is the ASCII string "Could not find specified document" (referenced by sub_145E440's
+// SetSaveGamePath, not a function), and the SDK's IMMNotificationClient
+// (IID 0x7991EEC9-7E89-4D85-8390-6C703CEC60C0) has exactly 8 slots -- slot 7 is OnPropertyValueChanged, implemented
+// in the binary as 0x145DB40 (F3AudioNotifDefaultRole) -- so this slot is a PHANTOM safety filler added by the
+// original C++ code, not an interface method.  The faithful behavior is therefore an empty no-op that returns 0
+// (S_OK): the caller's arity must clean the right number of stack bytes so any accidental vtable dispatch does
+// not corrupt the stack.  The full SDK signature is OnPropertyValueChanged(LPCWSTR pwstrDeviceId,
+// const PROPERTYKEY key) -- LPCWSTR (4 bytes) + a 20-byte PROPERTYKEY -- with `this` in ECX; the game passes the
+// notification client as the first stack arg (stdcall convention, like F3AudioNotifDefaultFlow / F3AudioNotifQI),
+// so the stub carries (self, id, key) with callee-clean args (retn 0x1C).  All three arguments are deliberately
+// ignored: the original implementation (slot 7 / 0x145DB40, F3AudioNotifDefaultRole) is itself the wide-slot
+// ctor + destructor no-op, and no slot 8 exists in the original binary at all.
+static long __stdcall F3AudioNotifPropertyChanged(void *self, void *id, F3AudioPropKey key)
+{
+    (void)self; (void)id; (void)key;
+    return 0;
+}
+static void F3AudioNotifInitXAudio2System(void);
+static void F3AudioNotifShutdownXAudio2System(void);
+static long __stdcall F3AudioNotifDefaultFlow(void *self, unsigned a, unsigned b, void *c);
 static const void *F3AudioNotifVtable[] = {
     (const void *)F3AudioNotifQI, (const void *)F3AudioNotifAddRef,
     (const void *)F3AudioNotifRelease, (const void *)F3AudioNotifStateChanged,
@@ -7988,12 +8100,21 @@ static const DWORD kCProcessDelegateThiscallVftable = 0x01B6FCC0;  // ??_7 CProc
 static const DWORD kCProcessDelegateStaticVftable   = 0x01B6F768;  // ??_7 CProcessDelegateStatic::`vftable'
 
 static F3SharedBuffer *g_dword_1DDC818 = 0;   // 0x1DDC818: the audio mastering-profile path slot
+static F3SharedBuffer *g_dword_1DDC81C = 0;   // 0x1DDC81C: the GAME path slot (the ApplyMasteringProfile path)
 static BYTE  g_byte_1DDC828 = 0;              // 0x1DDC828: InitVirtualFileSystem done flag
 static DWORD g_dword_1DDC820 = 0;             // 0x1DDC820: the CProcessDelegateThiscall object (16 bytes)
 static DWORD g_dword_1DDC824 = 0;             // 0x1DDC824: query-table mode (2 = drain)
-static BYTE  g_unk_1DDC830[28];               // 0x1DDC830: the main (80/4096) allocation-cache object
+static BYTE  g_unk_1DDC830[0x58];             // 0x1DDC830: the main (80/4096) allocation-cache object (0x58: the +0x18 init flag / +0x34 critical section / the +0x10/+0x14 fields)
 static DWORD g_off_1D6A80C[2] = { kCProcessDelegateStaticVftable, 0 };  // 0x1D6A80C: {vtable, VfsGetQueryTable}
 static DWORD g_off_1D6E9C8[2] = { kCProcessDelegateStaticVftable, 0 };  // 0x1D6E9C8: {vtable, AudioProcessDelegateTick}
+static BYTE  g_byte_1DDCF28 = 0;              // 0x1DDCF28: slot-1 callback registered flag
+static DWORD g_dword_1DDCF2C = 0;             // 0x1DDCF2C: slot-1 callback pair value
+static BYTE  g_unk_1DDCF30 = 0;               // 0x1DDCF30: slot-1 callback pair (address taken)
+static BYTE  g_byte_1DDCFB0 = 0;              // 0x1DDCFB0: slot-2 callback registered flag
+static DWORD g_dword_1DDCFB4 = 0;             // 0x1DDCFB4: slot-2 callback pair value
+static BYTE  g_unk_1DDCFB8 = 0;               // 0x1DDCFB8: slot-2 callback pair (address taken)
+static BYTE  g_unk_1DDCF00[0x20] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};  // 0x1DDCF00: the second 0x20-byte audio queue control block (all 0xFF = empty)
+static BYTE  g_unk_1DDCF88[0x20] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};  // 0x1DDCF88: the first 0x20-byte audio queue control block (all 0xFF = empty)
 
 // worker-pool / allocation-cache state (BSS, zero-initialised here)
 static BYTE  g_byte_1DDC9C0 = 0;              // 0x1DDC9C0: worker pool initialised
@@ -8008,6 +8129,11 @@ static DWORD g_dword_1DDCCD0 = 0;             // 0x1DDCCD0: the audio-engine obj
 static BYTE  g_unk_1DDCC40[72];               // 0x1DDCC40: provider query cache #1
 static BYTE  g_unk_1DDCC88[72];               // 0x1DDCC88: provider query cache #2
 static DWORD g_dword_1DDCD74 = 0;             // 0x1DDCD74: the concurrency reader-writer-lock object
+static DWORD g_dword_1DDCD34 = 0;             // 0x1DDCD34: the commit-command counter (incremented by CommitCommand)
+static BYTE  g_byte_1DDCCE0 = 0;              // 0x1DDCCE0: the SetProcessedCommitNumber gate flag
+static BYTE  g_unk_1DDCCE8[28];               // 0x1DDCCE8: the audio-comms command-wrapper allocation cache object (28 bytes)
+static const DWORD kCSetProcessedCommitNumberVftable = 0x01B71390;  // ??_7 CSetProcessedCommitNumber::`vftable'
+static const DWORD kCCommitCommandVftable     = 0x01B71450;  // ??_7 CCommitCommand::`vftable'
 
 // GetVfsDesc  (0x145DAF0 - 0x145DAF5)  -- return the global 80-byte VFS descriptor.
 static DWORD *GetVfsDesc(void) { return g_dword_1D6A720; }
@@ -8192,6 +8318,161 @@ static int VfsAllocCacheFinalize(void *cache)
     return r;
 }
 
+// F3AudioNotifInitXAudio2System  (0x1461BF0 - 0x1461C14)  -- the
+// InitializeXAudio2System ICommand thunk (CInitializeXAudio2System).
+// No-arg, stdcall, retn 0.  Stage a 1-slot allocation in the audio allocation
+// cache (unk_1DDC830, g_unk_1DDC830 -- the 28-byte cache object the
+// InitVirtualFileSystem path builds) via VfsAllocCacheAlloc (wait = 1) --
+// returns 0 when the cache is not initialised (+0x18 == 0, the only path live
+// in this build, where g_unk_1DDC830 is zero BSS because InitVirtualFileSystem
+// is never reached, the archive slot being null).  On success, install the
+// CInitializeXAudio2System vftable into the staged object, then finalize the
+// cache (VfsAllocCacheFinalize -- the staged object's ICommand slot 1 reports
+// its 4-byte size, which fits the element, so the slot is returned to the
+// pool and the critical section released).
+// [NOT byte-identical] placement-dependent (relative calls to the
+// VfsAllocCacheAlloc / VfsAllocCacheFinalize callees) and refs the high-VA
+// global g_unk_1DDC830 (0x01DDC830).
+static void *F3AudioNotifXAudio2SystemDtor(void *obj, int free)
+{
+    *(DWORD *)obj = 0x01B6F458;   // &NLHAudio::NThreading::ICommand::`vftable' (original VA)
+    if (free & 1)
+        LHFree(obj);
+    return obj;
+}
+static int F3AudioNotifXAudio2SystemSize() { return 4; }     // sub_1462740 / sub_1462120
+static void F3AudioNotifXAudio2SystemAtExitInit() { }        // sub_14601F0 -- [STUB] the atexit dtor
+static void F3AudioNotifXAudio2SystemAtExitShutdown() { }    // sub_1460200 -- [STUB] the atexit dtor
+static const void *kCInitializeXAudio2SystemVftable[] = {
+    (const void *)F3AudioNotifXAudio2SystemDtor,   // 0x1463450
+    (const void *)F3AudioNotifXAudio2SystemSize,   // 0x1462740
+    (const void *)F3AudioNotifXAudio2SystemAtExitInit,   // 0x14601F0
+    (const void *)0x534c4146                        // rdata entry (original VA; garbage marker)
+};
+static const void *kCShutdownXAudio2SystemVftable[] = {
+    (const void *)F3AudioNotifXAudio2SystemDtor,   // 0x1463470
+    (const void *)F3AudioNotifXAudio2SystemSize,   // 0x1462120
+    (const void *)F3AudioNotifXAudio2SystemAtExitShutdown,   // 0x1460200
+    (const void *)0x1C40F94                         // rdata entry, original VA
+};
+static void F3AudioNotifInitXAudio2System()
+{
+    DWORD *obj = (DWORD *)VfsAllocCacheAlloc(g_unk_1DDC830, 1);
+    if (obj != 0) {
+        obj[0] = (DWORD)kCInitializeXAudio2SystemVftable;
+        VfsAllocCacheFinalize(g_unk_1DDC830);
+    }
+}
+// F3AudioNotifShutdownXAudio2System  (0x14609E0 - 0x1460A04)  -- the
+// ShutdownXAudio2System ICommand thunk (CShutdownXAudio2System).  The
+// identical shape to F3AudioNotifInitXAudio2System, installing the
+// CShutdownXAudio2System vftable.
+static void F3AudioNotifShutdownXAudio2System()
+{
+    DWORD *obj = (DWORD *)VfsAllocCacheAlloc(g_unk_1DDC830, 1);
+    if (obj != 0) {
+        obj[0] = (DWORD)kCShutdownXAudio2SystemVftable;
+        VfsAllocCacheFinalize(g_unk_1DDC830);
+    }
+}
+// F3AudioNotifDefaultFlow  (0x145E040 - 0x145E21B)  -- IMMNotificationClient
+// "DefaultFlow" callback (vtable slot 6, 0x01B6F408).  stdcall, 4 stack args
+// (self / a / b / c), retn 0x10.  The first parameter is the notification
+// object (self); the second and third are flag words (a, b -- the walk only
+// happens when both are 0); the fourth is the wide string carried in the
+// notification event.  The body:
+//   1. sub_1A00310 (the wide-slot ctor, inlined): the c slot is nulled, the
+//      wide live-slot counter is bumped (InterlockedIncrement on
+//      g_WideSlotCount), and when the wide string is non-empty (non-NULL and
+//      not an empty string) a fresh 16-byte wide block is built from it via
+//      SharedBlockFromWide (the -1 auto-count case) and stored in the slot.
+//   2. When both flags are 0 and the wide string arg is non-NULL: the
+//      sub-struct at self+8 is walked -- [self+0x14] (start) is validated
+//      against [self+0x18] (end); each 8-byte slot is compared against the
+//      fresh id block (by block pointer, or by length + data contents via
+//      CompareWideStrings).  On a match, the slot's state word (second DWORD)
+//      is tested: 1 -> F3AudioNotifInitXAudio2System (the InitializeXAudio2System
+//      thunk), anything else -> F3AudioNotifShutdownXAudio2System (the
+//      ShutdownXAudio2System thunk); the self+0x20 word is set to the matched
+//      array element pointer; the fresh id block is released and the function
+//      returns 0.
+//   3. When both flags are 0 and the wide string arg is NULL (the v4 == 0
+//      case): F3AudioNotifShutdownXAudio2System is called and the self+0x20
+//      word is cleared.
+//   4. The fresh id block is released (ReleaseSharedSlotWide) and the
+//      function returns 0 (whether the walk matched, found nothing, or was
+//      skipped because a flag was set).
+// [NOT byte-identical] placement-dependent (relative E8 calls to the wide
+// slot ctor / SharedBlockFromWide / the ReleaseSharedSlotWide family, the
+// CompareWideStrings comparator, the VfsAllocCacheAlloc / Finalize pair, and
+// the InitializeXAudio2System / ShutdownXAudio2System thunks -- the original
+// body walks the slot array and dispatches through the pair).
+static long __stdcall F3AudioNotifDefaultFlow(void *self, unsigned a, unsigned b, void *c)
+{
+    WCHAR *wide = (WCHAR *)c;   // the wide string carried in the fourth arg
+    c = 0;                      // ctor: slot = 0
+    InterlockedIncrement(&g_WideSlotCount);
+    if (wide != 0 && wide[0] != 0)
+        c = (void *)SharedBlockFromWide(wide, -1);
+
+    if (a == 0 && b == 0)
+    {
+        if (wide != 0)
+        {
+            BYTE *start = *(BYTE **)((BYTE *)self + 0x14);
+            BYTE *end   = *(BYTE **)((BYTE *)self + 0x18);
+            BYTE *raw   = *(BYTE **)((BYTE *)self + 8);   // the notification object pointer
+            F3SharedBuffer *fresh = (F3SharedBuffer *)c;
+
+            if ((unsigned int)start > (unsigned int)end)
+                F3InvalidParam();
+            if ((unsigned int)(*(DWORD *)((BYTE *)self + 0x14)) > (unsigned int)end)
+                F3InvalidParam();
+
+            for (;;)
+            {
+                if (raw == 0)
+                    F3InvalidParam();
+                if (start == end)
+                    break;
+                if (raw != 0 && (unsigned int)start >= *(DWORD *)(*(BYTE **)raw + 0x10))
+                    F3InvalidParam();
+                F3SharedBuffer *slot = *(F3SharedBuffer **)start;
+                if (slot == fresh ||
+                    (slot != 0 && fresh != 0 &&
+                     ((DWORD *)slot)[1] == ((DWORD *)fresh)[1] &&
+                     CompareWideStrings((WCHAR *)((F3SharedBuffer *)slot)->data,
+                                        (WCHAR *)((F3SharedBuffer *)fresh)->data) == 0))
+                {
+                    // matched
+                    if (raw != 0 && (unsigned int)start >= *(DWORD *)(*(BYTE **)raw + 0x10))
+                        F3InvalidParam();
+                    if (((DWORD *)start)[1] == 1)
+                        F3AudioNotifInitXAudio2System();
+                    else
+                        F3AudioNotifShutdownXAudio2System();
+                    if (raw != 0 && (unsigned int)start >= *(DWORD *)(*(BYTE **)raw + 0x10))
+                        F3InvalidParam();
+                    *(DWORD *)((BYTE *)self + 0x20) = (DWORD)start;
+                    ReleaseSharedSlotWide((F3SharedBuffer **)&c);
+                    return 0;
+                }
+                if (raw != 0 && (unsigned int)start >= *(DWORD *)(*(BYTE **)raw + 0x10))
+                    F3InvalidParam();
+                start += 8;
+            }
+        }
+        else
+        {
+            F3AudioNotifShutdownXAudio2System();
+            *(DWORD *)((BYTE *)self + 0x20) = 0;
+        }
+    }
+
+    ReleaseSharedSlotWide((F3SharedBuffer **)&c);
+    return 0;
+}
+
 // VfsCacheQueryImpl  (0x14972C0 - 0x149731C)  -- one-time (g_dword_1DDCD74)
 //  concurrency init: the 8-byte Concurrency reader-writer lock + the 56-byte
 //  query state.  [STUB] the lock / state builders (sub_148D220 / sub_1496E90)
@@ -8211,12 +8492,92 @@ static int VfsCacheQueryImpl(void)
 //  VfsCacheQueryImpl (the (ECX) argument is unused).
 static int VfsCacheQueryInit(int unused) { (void)unused; return VfsCacheQueryImpl(); }
 
-// VfsProviderAlloc  (0x1477DA0)  -- [STUB] allocate the provider query buffer;
-//  returns a fresh block (non-null) so the query ctor takes its success path.
-static DWORD VfsProviderAlloc(int totalBytes, int count, int a3, int a4, int a5)
+// AudioNodeListInit  (sub_147D080 -> 0x147D080 - 0x147D0F2)  -- thiscall.  The
+//  32-byte provider/audio node-list block: +0x00 = a 4-byte wrapper holding
+//  the node pointer (0 on OOM); +0x18 = a 20-byte self-linked block whose
+//  [0]/[1]/[2] DWORDs all point back into itself, with bytes +0x10 and +0x11
+//  set to 1 (0 on OOM); +0x1C = 0.  Returns the node.  [NOT byte-identical]
+//  placement-dependent (the LHAlloc E8 call).
+static void *AudioNodeListInit(void *node)
 {
-    (void)count; (void)a3; (void)a4; (void)a5;
-    return (DWORD)LHAlloc(totalBytes > 0 ? (unsigned int)totalBytes : 1u);
+    DWORD *n = (DWORD *)node;
+
+    DWORD *wrapper = (DWORD *)LHAlloc(4);
+    if (wrapper != 0)
+        *wrapper = (DWORD)node;
+    else
+        wrapper = 0;
+    n[0] = (DWORD)wrapper;
+
+    DWORD *blk = (DWORD *)LHAlloc(20);
+    if (blk != 0)
+        blk[0] = 0;
+    if ((DWORD)blk != (DWORD)-4)
+        blk[1] = 0;
+    if ((DWORD)blk != (DWORD)-8)
+        blk[2] = 0;
+    if (blk != 0)
+    {
+        ((BYTE *)blk)[0x10] = 1;
+        n[6] = (DWORD)blk;
+        ((BYTE *)blk)[0x11] = 1;
+        blk[1] = (DWORD)blk;
+        blk[0] = (DWORD)blk;
+        blk[2] = (DWORD)blk;
+    }
+    n[7] = 0;
+    return node;
+}
+
+// VfsProviderAlloc  (0x1477DA0 - 0x1477E55)  -- thiscall.  Fill the caller-
+//  provided 32-byte provider-query block (the this in ECX): +0x00 = count,
+//  +0x04 = totalBytes, +0x08 = totalBytes / count, +0x0C = the data buffer
+//  (LHAlloc(totalBytes + (a6 ? (totalBytes / count) * a5 : 0))), +0x10 = 0,
+//  +0x14 = totalBytes / count, +0x18 (byte) = a6, +0x19 (byte) = a4,
+//  +0x1C = a5; then the buffer is filled (bound = totalBytes / count; for
+//  v9 = 0 .. bound-2: *(buffer + v9 * count + (a6 ? v9 * a5 : 0)) = v9 + 1)
+//  and -1 is written at buffer + (bound-1) * count + (a6 ? (bound-1) * a5 : 0).
+//  On allocation failure the original int 3 (debug break); this build returns
+//  the block with the data pointer zeroed (the original's OOM crash is not
+//  reproducible through the C++ heap path).  Returns the block.  [NOT
+//  byte-identical] placement-dependent (the LHAlloc call).
+static void *VfsProviderAlloc(void *obj, unsigned int totalBytes, unsigned int count, int a4, unsigned int a5, int a6)
+{
+    DWORD *blk = (DWORD *)obj;
+    DWORD bound = (count != 0) ? totalBytes / count : 0;
+
+    blk[0] = count;
+    blk[1] = totalBytes;
+    blk[2] = bound;
+    blk[4] = 0;
+    ((BYTE *)blk)[0x18] = (BYTE)a6;
+    ((BYTE *)blk)[0x19] = (BYTE)a4;
+    blk[7] = a5;
+    blk[5] = bound;
+
+    DWORD v7 = (a6 != 0) ? bound * a5 : 0;
+    unsigned int bytes = totalBytes + v7;
+    void *buf = (bytes != 0) ? LHAlloc(bytes) : 0;
+    blk[3] = (DWORD)buf;
+
+    if (buf != 0 && bound >= 1)
+    {
+        if (bound >= 2)
+        {
+            DWORD v9 = 0;
+            do
+            {
+                DWORD v10 = (a6 != 0) ? v9 * (DWORD)a5 : 0;
+                *(DWORD *)((char *)buf + (DWORD)v9 * count + v10) = v9 + 1;
+                v9++;
+            }
+            while (v9 + 1 < bound);
+        }
+        DWORD v12 = bound - 1;
+        DWORD v13 = (a6 != 0) ? v12 * (DWORD)a5 : 0;
+        *(DWORD *)((char *)buf + (DWORD)v12 * count + v13) = (DWORD)-1;
+    }
+    return obj;
 }
 
 // VfsProviderQueryCtor  (0x14778E0 - 0x147794A)  -- the 72-byte provider-
@@ -8232,7 +8593,8 @@ static int VfsProviderQueryCtor(void *obj, int a2, int a3)
     o[1] = a3;
     o[2] = a3;
     DWORD *v5 = GetVfsDesc();
-    void *p = LHAlloc(32) ? (void *)VfsProviderAlloc(a3 * a2, a2, 1, (int)((BYTE *)v5)[60], 0) : 0;
+    void *block = LHAlloc(32);
+    void *p = block ? (void *)VfsProviderAlloc(block, (unsigned int)(a3 * a2), (unsigned int)a2, 1, (unsigned int)((BYTE *)v5)[60], 0) : 0;
     o[0] = (DWORD)p;
     if (p == 0)
         return 0;
@@ -8443,9 +8805,29 @@ static void *AudioEngineFaderCtor(void *obj)
     return obj;
 }
 
-// ProcessDelegateDtor  (0x146DFA0 - 0x146DFA7)  -- the CProcessDelegateThiscall
-//  deleter (sub_14833E0, a remaining deep stub); returns 0.
-static int ProcessDelegateDtor(void *obj) { (void)obj; return 0; }
+//  sub_14833E0  (0x14833E0 - 0x1483612)  -- the CProcessDelegateThiscall engine
+//  destructor (thiscall): the 562-byte teardown.  Reads the +0x3C1 flag byte --
+//  if non-zero, returns it.  Otherwise runs the full teardown: the
+//  sub_146DA70(this+768/784/800, +0xCC) / sub_147F9C0 / sub_14806C0(this+756)
+//  calls, the +0xE0 block list free (sub_1480CD0, via the +0xD8 node chain),
+//  the +0xD8 node-list teardown (vtable slot 4 dispatch + vtable slot 2
+//  AddRef/Release + LHFree-style unlinking), the +0x338 object release
+//  (sub_1474830), the +0x18/+0x00-tag walk (sub_1482170 / sub_1480290 /
+//  sub_14860A0, __invalid_parameter_noinfo checks), the SetFrontendEvent(+0x33C)
+//  when +0x3C0 is set and +0xD8/+0x1C are empty, then the VfsDescDefaultCtor
+//  scratch block (+0x480 bytes on the stack) + sub_145DC90's release of the
+//  +0x338 slot.  Every callee above is an unimplemented deep stub in this
+//  build -- [remaining stub].  Returns 0.
+static int AudioEngineFaderDtor(void *obj) { (void)obj; return 0; }
+
+//  ProcessDelegateDtor  (0x146DFA0 - 0x146DFA7)  -- the CProcessDelegateThiscall
+//  deleter: load the +0x0C engine pointer and tail-jump into the engine
+//  destructor.  [NOT byte-identical] E9 jmp (placement-dependent).
+static int ProcessDelegateDtor(void *obj)
+{
+    DWORD child = *(DWORD *)((char *)obj + 0x0C);
+    return AudioEngineFaderDtor((void *)child);
+}
 
 // CProcessDelegateThiscallCtor  (0x146E220 - 0x146E275)  -- the 16-byte
 //  CProcessDelegateThiscall<CEngine> constructor (thiscall).  Installs its
@@ -8468,22 +8850,716 @@ static void *CProcessDelegateThiscallCtor(void *obj)
     return obj;
 }
 
-// AudioEngineCtor  (0x1479440)  -- [STUB] the 340-byte audio engine build (six
-//  node lists + the query ring); returns its (ECX) argument.
+// AudioEngineCtor  (0x1479440 - 0x14795A0)  -- thiscall.  The 340-byte
+//  (0x154) audio-engine build: nine 32-byte node-list blocks (at +0x00, the
+//  six loop blocks at +0x20..+0xC0, and +0xE0/+0x100), then the provider
+//  query buffer (the 32-byte block allocated at +0x120, filled by
+//  VfsProviderAlloc) and the a2/a3/a4 fields (+0x12C/+0x130/+0x140 etc.).
+//  Returns obj.  [NOT byte-identical] placement-dependent (the LHAlloc /
+//  VfsProviderAlloc / GetVfsDesc calls, the sub_147D080 helper's LHAlloc).
 static void *AudioEngineCtor(void *obj, int a2, int a3, int a4)
 {
-    (void)a2; (void)a3; (void)a4;
+    DWORD *o = (DWORD *)obj;
+
+    AudioNodeListInit(obj);                    // +0x00
+    char *node = (char *)obj + 0x20;
+    for (int i = 0; i < 6; ++i)
+    {
+        AudioNodeListInit(node);               // +0x20..+0xC0 (six blocks)
+        node += 0x20;
+    }
+    AudioNodeListInit((char *)obj + 0xE0);     // +0xE0
+    AudioNodeListInit((char *)obj + 0x100);    // +0x100
+
+    o[0x12C / 4] = (DWORD)a3;                   // +0x12C = a3
+    o[0x134 / 4] = (DWORD)a3;                   // +0x134 = a3
+    o[0x120 / 4] = 0;                           // +0x120 = 0 (then the provider block)
+    o[0x128 / 4] = 0;                           // +0x128 = 0
+    o[0x130 / 4] = (DWORD)a4;                   // +0x130 = a4
+    o[0x138 / 4] = (DWORD)a4;                   // +0x138 = a4
+    o[0x13C / 4] = 0;                           // +0x13C = 0
+    o[0x140 / 4] = (DWORD)a2;                   // +0x140 = a2
+
+    DWORD *v0 = GetVfsDesc();
+    DWORD v12 = v0[4] * v0[3];                  // VfsDesc[3] * VfsDesc[4]
+    o[0x124 / 4] = v12;                         // +0x124 = v12
+    DWORD v13 = v12 * (v0[6] + v0[7]);          // v12 * (VfsDesc[6] + VfsDesc[7])
+
+    void *block = LHAlloc(32);
+    if (block != 0)
+        block = VfsProviderAlloc(block, (unsigned int)v13, (unsigned int)v12, 1, 0x10000, 0);
+    else
+        block = 0;
+    o[0x120 / 4] = (DWORD)block;                // +0x120 = the provider block
+    o[0x148 / 4] = 0;                           // +0x148 = 0
+    o[0x14C / 4] = 0;                           // +0x14C = 0
+    o[0x150 / 4] = 0;                           // +0x150 = 0
+    *(WORD *)((char *)obj + 0x144) = 0;         // +0x144 (WORD) = 0
     return obj;
 }
 
-// AudioProcessDelegateTick  (0x147A740 - 0x147A74B)  -- the registered audio
-//  process tick (the deep sub_146D930/sub_1478F20/sub_1478820/... no-op chain).
-static int AudioProcessDelegateTick(void) { return 0; }
+// sub_1496FA0  (0x1496FA0 - 0x1497122)  -- the RWLock-guarded tick state-update
+//  chain (thiscall, obj in ECX) [STUB] (the CsGuardAcquire + CsGuardRelease
+//  chain through sub_148D350 is unimplemented; the ~370-byte state walk is
+//  out of scope).  Returns 0.
+static int sub_1496FA0(void *obj) { (void)obj; return 0; }
 
-// AudioFrameworkInit  (0x150D180)  -- one-time audio framework bring-up [STUB];
-//  the two VfsWorkerCallbackRegister registrations into slots 1/2 are no-ops in
-//  this build.
-static int AudioFrameworkInit(void) { return 1; }
+// AudioTickEnterStep  (0x146D930 - 0x146D93C)  -- the audio tick enter step:
+//  loads the concurrency reader-writer-lock object (g_dword_1DDCD74, via the
+//  sub_1495860 getter 0x1495860) and tail-calls sub_1496FA0(this=lock);
+//  returns sub_1496FA0's result.
+//  [NOT byte-identical] -- a relative E8 call + an E9 tail-jmp to sub_1496FA0
+//  (placement-dependent) plus the high-VA global; the deep callee chain
+//  (sub_1496FA0) is the documented no-op stub.
+static int AudioTickEnterStep(void)
+{
+    DWORD lock = g_dword_1DDCD74;   // sub_1495860 (0x1495860): the RWLock getter
+    return sub_1496FA0((void *)lock);   // 0x1496FA0 (thiscall) -- tail-call
+}
+
+//  AudioDelegateTickStep  (0x1478F20 - 0x1478FE1)  -- the audio delegate tick
+//  step (thiscall, obj in ECX; the audio-engine object).  [STUB] -- the deep
+//  vtable-dispatch + __invalid_parameter_noinfo chain through two unimplemented
+//  callees (AudioNodeConsumedWalk 0x147AF40 and sub_147CC80 0x147CC80); the tick is never
+//  dispatched in this build -- the worker pool is never spawned, so no tick
+//  caller is reached.  What it does, for reference:
+//
+//  Walks the element pointer-chain at the obj+0x100 header:
+//    v1  = **(_DWORD **)(obj + 0x118)   // the current element
+//    v2  = (_DWORD *)(obj + 0x100)      // the header
+//    v3  = *(_DWORD **)(obj + 0x100)    // the iterator pointer
+//    v10 = v1; v9 = v3;
+//  in a while (1) loop:
+//    v4 = v2[6];                         // = *(DWORD*)(obj + 0x118) -- sentinel
+//    if (v3 == nullptr || v3 != (_DWORD *)*v2) __invalid_parameter_noinfo();
+//    if (v1 == v4) break;
+//    v5 = (v3 != nullptr) ? *v3 : 0;     // (+ __invalid_parameter_noinfo in the null case)
+//    if (v1 == *(_DWORD *)(v5 + 24)) __invalid_parameter_noinfo();
+//    v6 = *(_DWORD *)(v1 + 12);
+//    if (*(_BYTE *)(v6 + 206) != 0 || (vtable dispatch via v6+0x10; v14 != v13)) {
+//        AudioNodeConsumedWalk(&v9);   // updates the saved v10 in place (v10 = consumed element)
+//        v1 = v10;
+//        v3 = v9;             // v9 itself is unchanged by the callee
+//    } else {
+//        v7 = sub_147CC80(&v11, v3, v1);  // returns a 2-DWORD buffer
+//        v3 = *(_DWORD **)v7;
+//        v1 = *(_DWORD *)(v7 + 4);
+//        v8 = vtable[18] via *(_DWORD *)v6;  // thiscall(v6, 1)
+//        v9 = v3; v10 = v1;
+//        v8(v6, 1);
+//    }
+//  [NOT byte-identical] placement-dependent (the relative E8 calls to
+//  __invalid_parameter_noinfo / AudioNodeConsumedWalk / sub_147CC80 + the indirect
+//  vtable dispatch through the v6+0x10 pointer and the v6 vtable); the deep
+//  callee chain is the documented no-op stub.
+static void AudioDelegateTickStep(void *obj) { (void)obj; }
+
+// sub_5BC1C0  (0x5BC1C0 - 0x5BC1D4)  -- the audio queue consumer (thiscall, obj
+//  in ECX, this = the queue control block; tail does _InterlockedCompareExchange64
+//  + _InterlockedDecrement + worker-callback (dword_2075B24 + 16) + the
+//  sub_18A6010/sub_18A5F20 chain) [STUB, NOT IMPLEMENTED].  Returns the popped
+//  item (non-zero) or 0 when the queue is drained.  Remaining stub: sub_18A6010 /
+//  sub_18A5F20 / dword_2075B24 are unimplemented.
+static int sub_5BC1C0(void *obj) { (void)obj; return 0; }
+
+// AudioQueuePoll  (0x150D380 - 0x150D399)  -- the audio queue poll: the sub_5BC1C0
+//  pair at the unk_1DDCF88 / unk_1DDCF00 slots; returns the first queue's popped
+//  item, or the second queue's when the first drains (0 = no pending item).
+//  [NOT byte-identical] placement-dependent (the relative E8 calls to
+//  sub_5BC1C0 + the high-VA globals g_unk_1DDCF88 / g_unk_1DDCF00); the deep
+//  callee sub_5BC1C0 is a documented remaining stub.
+static int AudioQueuePoll(void)
+{
+    int result = sub_5BC1C0((void *)&g_unk_1DDCF88);   // 0x150D380: call sub_5BC1C0(&unk_1DDCF88)
+    if (result != 0)
+        return result;                                // 0x150D398: retn
+    return sub_5BC1C0((void *)&g_unk_1DDCF00);         // 0x150D395: tail-call sub_5BC1C0(&unk_1DDCF00)
+}
+
+// AudioQueueBlockRelease  (0x147AA20 - 0x147AA86)  -- the audio queue block
+//  release helper (thiscall, slot in ECX = the +0x20 block slot, block on the
+//  stack): when the block's +8 back-pointer equals the slot, hand off / repoint
+//  the slot and null the block's three header DWORDs (+0/+4/+8).  The block's
+//  two optional out-pointers (+0 = a source object, +4 = a release target)
+//  follow a four-case contract:
+//    +0 == 0, +4 == 0  -- [slot] = 0, [slot + 4] = 0
+//    +0 != 0, +4 == 0  -- [slot] = +0 (repoint), [+0 + 4] = 0
+//    +0 == 0, +4 != 0  -- [slot + 4] = +4, [+4] = 0
+//    +0 != 0, +4 != 0  -- [+4] = +0 and [+0 + 4] = +4 (the two-way handoff)
+//  [NOT byte-identical] placement-dependent (the relative call site from
+//  AudioQueueItemProcess + the plain vtable-less body); declared as a plain
+//  free function (thiscall hybrid in the original).
+static void AudioQueueBlockRelease(char *slot, DWORD *v4)
+{
+    if (v4[2] != (DWORD)(DWORD)slot)
+        return;                    // [v4 + 8] != slot: nothing to release
+    DWORD v2 = v4[1];              // +0x04: the release-target object, if any
+    DWORD v3 = v4[0];              // +0x00: the source object, if any
+    if (v2 != 0)
+    {
+        if (v3 != 0)
+        {
+            *(DWORD *)v2 = v3;         // [v2] = v3
+            *(DWORD *)(v3 + 4) = v2;    // [v3 + 4] = v2
+        }
+        else
+        {
+            *(DWORD *)(slot + 4) = v2;  // [slot + 4] = v2
+            *(DWORD *)v2 = 0;
+        }
+        v4[1] = 0;
+        v4[0] = 0;
+        v4[2] = 0;
+    }
+    else
+    {
+        if (v3 != 0)
+        {
+            *(DWORD *)slot = v3;        // [slot] = v3
+            *(DWORD *)(v3 + 4) = 0;
+        }
+        else
+        {
+            *(DWORD *)slot = 0;         // [slot] = 0
+            *(DWORD *)(slot + 4) = 0;   // [slot + 4] = 0
+        }
+        v4[1] = 0;
+        v4[0] = 0;
+        v4[2] = 0;
+    }
+}
+
+// AudioQueueItemEmitFn  -- the object's vtable slot 11 (offset 0x2C): thiscall
+//  (this = +0x10 object, five stack words).  Used by AudioQueueItemProcess.
+typedef void (__thiscall *AudioQueueItemEmitFn)(DWORD self, DWORD a2, int a3,
+                                                DWORD a4, DWORD a5, char a6);
+
+// AudioQueueItemProcess  (0x1478820 - 0x1478977)  -- the audio queue item
+//  processor (thiscall, obj in ECX = the audio queue item object, a2 on the
+//  stack = the queue item; retn 4).  Zeroes the +0xCE flag, then, when the item
+//  byte at +0x2C is clear: accumulates the item's +0x1C/+0x20 counters into the
+//  heap block held at +0x20 (+0x14 sum / +0x18 difference), carries +0x1C into
+//  +0x88, subtracts (+0x1C, +0x20) from the 64-bit counter at +0x70 (signed),
+//  releases the block (AudioQueueBlockRelease + vtable[1] + LHFree, incrementing
+//  +0x80), then, when the outer condition holds, dispatches the object's
+//  vtable slot 11 (the audio-engine "emit" method) with the item's
+//  +0x10/+0x18/+0x24/+0x16 values and the release flag, accumulates +0x88 into
+//  the 64-bit counter at +0x78, and computes the ring cursor +0x84 as
+//  (+0x84 + 1) % (GetVfsDesc()[4] * ((+0x38 - +0x34) >> 2)).
+//  [NOT byte-identical] placement-dependent (the relative calls to
+//  AudioQueueBlockRelease / LHFree / GetVfsDesc, the indirect vtable
+//  dispatches, the high-VA globals and the retn 4 hybrid); declared as a plain
+//  free function.
+static void AudioQueueItemProcess(void *obj, int a2)
+{
+    char *o = (char *)obj;
+    DWORD *objd = (DWORD *)obj;
+    DWORD *a2d = (DWORD *)a2;
+
+    *(BYTE *)(o + 206) = 0;                // +0xCE = 0
+    if (*(BYTE *)((char *)a2 + 44) != 0)   // +0x2C != 0: the early-out
+        return;
+
+    DWORD *v4 = *(DWORD **)(o + 32);        // +0x20 -> the block
+    if (v4 == 0)
+        return;
+
+    v4[5] += a2d[7];                      // +0x14 += a2+0x1C
+    v4[5] += a2d[8];                      // +0x14 += a2+0x20
+    v4[6] -= a2d[7];                      // +0x18 -= a2+0x1C
+    int v13 = 0;
+    v4[6] -= a2d[8];                      // +0x18 -= a2+0x20
+    objd[136 / 4] += a2d[7];              // +0x88 += a2+0x1C
+
+    // the 64-bit counter at +0x70 -= (a2+0x1C) (unsigned) then -= sign-extended
+    // a2+0x20 (signed)
+    DWORD lo = objd[112 / 4];             // +0x70 (lo)
+    DWORD hi = objd[116 / 4];             // +0x74 (hi)
+    DWORD v5 = a2d[7];                    // a2+0x1C
+    DWORD borrow = (lo < v5) ? 1u : 0u;   // CF of `lo -= v5`
+    lo -= v5;
+    hi -= borrow;
+    int v12 = 0;
+    DWORD v8 = a2d[8];                    // a2+0x20
+    DWORD sext = ((signed int)v8 < 0) ? 0xFFFFFFFFu : 0u;
+    borrow = (lo < v8) ? 1u : 0u;         // CF of `lo -= v8`
+    lo -= v8;
+    hi -= sext + borrow;
+    objd[112 / 4] = lo;
+    objd[116 / 4] = hi;
+
+    DWORD v7 = v4[6];                     // +0x18
+    if (v7 == 0 || a2d[6] != 0)           // a2+0x18 != 0 (or the difference was 0)
+    {
+        if (*(WORD *)(o + 148) == 353 && v4[3] == 0)
+            v13 = 1;                      // +0x94 == 0x161 && +0x0C == 0
+        borrow = (lo < v7) ? 1u : 0u;     // CF of `lo -= v7`
+        lo -= v7;
+        hi -= borrow;
+        objd[112 / 4] = lo;
+        objd[116 / 4] = hi;
+        AudioQueueBlockRelease(o + 32, v4);   // 0x14788B8
+        DWORD v8b = v4[4];                 // +0x10
+        if (v8b != 0)
+            ((void (__thiscall *)(DWORD))(*(DWORD *)v8b + 4))(v8b);   // vtable[1]
+        v4[4] = 0;                        // +0x10 = 0
+        v4[3] = 0;                        // +0x0C = 0
+        LHFree(v4);                       // free the block
+        objd[128 / 4] -= 1;               // +0x80 -= 1
+        v12 = 1;
+    }
+
+    DWORD v9 = objd[136 / 4];             // +0x88
+    if (v9 == objd[140 / 4]               // v9 == +0x8C
+        || v13 != 0                       // the release flag
+        || *(WORD *)(o + 148) == 353      // +0x94 == 0x161
+        || objd[32 / 4] == 0)             // +0x20 == 0
+    {
+        // the object's vtable slot 11 (offset 0x2C): (this = +0x10,
+        // item+0x10, v9, item+0x28, item+0x24, v12)
+        DWORD p = *(DWORD *)(o + 16);     // +0x10 = the object
+        DWORD q = *(DWORD *)p;            // *p = its vtable
+        AudioQueueItemEmitFn fn = (AudioQueueItemEmitFn)(*(DWORD *)(q + 44));
+        fn(p, a2d[4], v9, a2d[10], a2d[9], (char)v12);
+
+        // the 64-bit add at +0x78 (unsigned), re-reading +0x88 after the dispatch
+        DWORD _lo = objd[120 / 4];        // +0x78
+        DWORD _hi = objd[124 / 4];        // +0x7C
+        DWORD _v9 = objd[136 / 4];        // +0x88 (re-read)
+        DWORD _carry = (_lo + _v9 < _lo) ? 1u : 0u;
+        objd[120 / 4] = _lo + _v9;
+        objd[124 / 4] = _hi + _carry;
+
+        DWORD diff = objd[56 / 4] - objd[52 / 4];   // +0x38 - +0x34
+        DWORD v10;
+        if ((diff & 0xFFFFFFFCu) != 0)
+            v10 = (DWORD)((int)(GetVfsDesc()[4]) * ((int)diff >> 2));   // sar 2
+        else
+            v10 = 0;
+        DWORD v11 = (objd[132 / 4] + 1u) % v10;      // +0x84 = (+0x84 + 1) % v10
+        objd[136 / 4] = 0;                           // +0x88 = 0
+        objd[132 / 4] = v11;                         // +0x84 = v11
+    }
+}
+
+// AudioTickFairnessPass  (0x1478B30 - 0x1478B9A)  -- the audio tick fairness /
+// fall-through pass (thiscall, obj in ECX).  Reads the counter pair at
+// +0x128 / +0x138 and the quota at +0x130; when the pair's sum is below the
+// quota, subtracts the sum from the quota, then walks the delegate chain with
+// the guard at +0x1C: when the guard is clear, the element holder at +0x18 is
+// dereferenced to the element pointer (b) and validated against *((*obj) + 0x18)
+// (the __invalid_parameter_noinfo check -- the null case and the equality case
+// both reproduce the original check, the null case calling the check-then-zero
+// path), the delegate object at (b + 0x0C) is then probed for its +0x38 function
+// pointer, and the delegate is invoked as a thiscall (self = the delegate
+// object, stack args (1, 0)); the word at +0x96 of the delegate object is
+// subtracted from the remaining quota and the walk repeats until the quota is
+// exhausted or the guard clears.  [NOT byte-identical] the body calls
+// __invalid_parameter_noinfo (reproduced here as the no-op F3InvalidParam) and
+// performs an indirect thiscall dispatch (the +0x38 slot) -- placement-dependent.
+static DWORD AudioTickFairnessPass(void *obj)
+{
+    BYTE *o = (BYTE *)obj;
+    DWORD v2 = *(DWORD *)(o + 0x138) + *(DWORD *)(o + 0x128);
+    DWORD result = *(DWORD *)(o + 0x130);
+    if ((unsigned int)v2 < result)
+    {
+        result -= v2;
+        DWORD remaining = result;
+        if ((int)remaining > 0)
+        {
+            for (;;)
+            {
+                if (*(DWORD *)(o + 0x1C) == 0)
+                    break;
+                BYTE *a = *(BYTE **)(o + 0x18);       // the element holder
+                BYTE *b = *(BYTE **)a;                 // the element pointer
+                BYTE *c = *(BYTE **)o;                 // *obj
+                BYTE *d;
+                if (c != 0)
+                    d = *(BYTE **)c;
+                else
+                {
+                    F3InvalidParam();                  // the null-obj debug check
+                    d = 0;
+                }
+                if (b == *(BYTE **)((BYTE *)d + 0x18))
+                    F3InvalidParam();                  // the equality debug check
+                BYTE *e = *(BYTE **)((BYTE *)b + 0x0C);  // the delegate object
+                BYTE *f = *(BYTE **)e;                 // the vtable holder
+                void *fn = *(void **)((BYTE *)f + 0x38); // the +0x38 slot
+                result = (DWORD)((int (__thiscall *)(void *, int, int))(void *)fn)(e, 1, 0);
+                WORD w = *(WORD *)((BYTE *)e + 0x96);
+                remaining -= w;
+                if ((int)remaining <= 0)
+                    break;
+            }
+        }
+    }
+    return result;
+}
+
+// sub_1479800  (0x1479800)  -- the audio delegate node-list per-node audio
+//  processing (thiscall, obj in ECX = the consumed node, a2 on the stack = the
+//  +0x140 slot value) [STUB] (the deep vtable dispatch chain -- the high-VA
+//  global reads / indirect vtable calls through +0x10 / +0x38 are not
+//  implemented in this build).
+static DWORD sub_1479800(void *obj, void *a2) { (void)obj; (void)a2; return 0; }
+
+// AudioNodeConsumedWalk  (0x147AF40)  -- the audio delegate node-list
+//  consume walk (thiscall, this in ECX = the &v3_current slot).  Reads the
+//  saved sentinel at the slot + 4 (the saved v2), chain-checks it (the +0x11
+//  byte checks at +0, +4, +8), and writes the updated sentinel back into the
+//  slot + 4 (the original returns void and writes *(this + 4) in place).  Two
+//  paths, selected by the +0x11 byte check at +8:
+//    branch A (byte at [v7 + 8] != 0) -- the chain walk: i = *(v7 + 4);
+//      while byte at [i + 17] == 0: if v7 != *(i + 8) break; v7 = i; i = *(i + 4);
+//      v7 = i (the last i).
+//    branch B (byte at [v7 + 8] == 0) -- the pointer walk: j = *(v7 + 8);
+//      while byte at [j + 17] == 0: v3 = j; j = *j;
+//      v7 = v3 (the last j).
+//  Called by AudioDelegateNodeListPass (0x1479A90).
+//  [NOT byte-identical] placement-dependent (the relative E8 call to
+//  __invalid_parameter_noinfo).
+static DWORD AudioNodeConsumedWalk(DWORD v3_current, DWORD v7)
+{
+    if (v3_current == 0)
+        F3InvalidParam();                     // original: __invalid_parameter_noinfo (no return)
+    if (*(BYTE *)(v7 + 17) != 0)
+    {
+        F3InvalidParam();                     // original: __invalid_parameter_noinfo (no return)
+        return v7;
+    }
+    DWORD v3 = *(DWORD *)(v7 + 8);
+    if (*(BYTE *)(v3 + 17) != 0)
+    {
+        // branch A -- the chain walk
+        DWORD i = *(DWORD *)(v7 + 4);
+        while (*(BYTE *)(i + 17) == 0)
+        {
+            if (v7 != *(DWORD *)(i + 8))
+                break;
+            v7 = i;
+            i = *(DWORD *)(i + 4);
+        }
+        v7 = i;
+    }
+    else
+    {
+        // branch B -- the pointer walk
+        DWORD v3_pseudo = v3;
+        for (DWORD j = *(DWORD *)v3_pseudo; *(BYTE *)(j + 17) == 0; j = *(DWORD *)j)
+            v3_pseudo = j;
+        v7 = v3_pseudo;
+    }
+    return v7;
+}
+
+// AudioDelegateNodeListPass  (0x1479A90)  -- the audio delegate node-list pass
+//  (thiscall, obj in ECX = the audio engine, a2 on the stack = the element
+//  holder).  Walks the node-list chain in a fixed-point loop: the saved
+//  sentinel (v2 = *(a2[6])) is updated by AudioNodeConsumedWalk each iteration
+//  and the loop breaks when the updated sentinel equals a2[6] (the sentinel
+//  pointer).  Per iteration: the invalid check (v3 == 0 or != a2[0]), the
+//  fixed-point break check, the chain dereference (v3 = *v3), the fixed-point
+//  invalid check (v2 == *(v3 + 0x18)), the capture of *(v2 + 0x0C), the node
+//  consume walk (AudioNodeConsumedWalk), and the per-node audio processing
+//  (sub_1479800 -- stub).  v2 (the sentinel) is the only loop-carried state;
+//  v3 (the iterator pointer) is unchanged across iterations.
+//  [NOT byte-identical] placement-dependent (the relative E8 calls to
+//  __invalid_parameter_noinfo / AudioNodeConsumedWalk / sub_1479800 + the high
+//  -VA obj +0x140 slot read).
+static void AudioDelegateNodeListPass(void *obj, void *a2)
+{
+    BYTE *obj_p = (BYTE *)obj;
+    DWORD v4 = *(DWORD *)((DWORD)a2 + 0x18);      // a2[6]: the sentinel pointer
+    DWORD v2 = *(DWORD *)v4;                      // v2 = *(a2[6]): the saved sentinel
+    DWORD v3_current = *(DWORD *)a2;              // v3 = a2[0]: the iterator pointer
+    DWORD v7 = v2;
+
+    for (;;)
+    {
+        // the head of the loop: the invalid check (v3 == 0 or != a2[0])
+        if (v3_current == 0 || v3_current != *(DWORD *)a2)
+            F3InvalidParam();                    // original: __invalid_parameter_noinfo (no return)
+
+        // the fixed-point break check
+        if (v2 == v4)
+            break;
+
+        // the chain dereference (v3 = *v3)
+        DWORD esi = v3_current;
+        if (esi != 0)
+            esi = *(DWORD *)esi;
+        else
+            F3InvalidParam();                    // original: __invalid_parameter_noinfo (no return)
+
+        // the fixed-point invalid check
+        if (v2 == *(DWORD *)(esi + 0x18))
+            F3InvalidParam();                    // original: __invalid_parameter_noinfo (no return)
+
+        // capture esi = *(v2 + 0x0C), then the node consume walk (updates v7)
+        DWORD new_v3 = *(DWORD *)(v2 + 0x0C);
+        v7 = AudioNodeConsumedWalk(v3_current, v7);
+
+        // the per-node audio processing (stub) -- edx re-read each iteration
+        DWORD edx = *(DWORD *)(obj_p + 0x140);    // edx = *(this + 0x140)
+        sub_1479800((void *)new_v3, (void *)edx);
+
+        // the loop-back: v2 = v7; v3_current unchanged
+        v2 = v7;
+    }
+}
+
+// AudioDelegateQueueDrain  (0x1478BA0 - 0x1478D16)  -- the audio delegate queue-drain
+//  pass (thiscall, obj in ECX = the audio-engine object) [IMPLEMENTED].  Two fixed-point
+//  passes over the element pointer chain, each seeded from a different slot of the
+//  object:
+//    pass 1 -- the obj+0 chain (this = obj): the saved iterator is *(obj + 0x00) and the
+//      saved sentinel value is **(obj + 0x18).  Loop head: the sentinel pointer is
+//      *(obj + 0x18) (re-read each iteration), the iterator invariant is
+//      iterator == *(obj + 0x00) (re-read each iteration), the loop breaks when the saved
+//      sentinel value equals the sentinel pointer.  Per iteration: the non-null/equality
+//      checks, the dereference (iterator = *iterator), the fixed-point invalid check
+//      (sentinel == *(dereferenced iterator + 0x18)), the capture of *(sentinel + 0x0C),
+//      the node consume walk (AudioNodeConsumedWalk -- rewrites the saved sentinel in
+//      place) and the per-node audio processing (vtable[14] dispatch thiscall(node, 1, 0))
+//      when the node's +0xCC byte is non-zero and the node's +0xC8 status word is 2
+//      (gate: +0xC0 >= 0xBB8) or 1 (gate: +0xC4 < 0x64) or anything else (no gate -- the
+//      dispatch runs unconditionally) and the gate condition holds.
+//    pass 2 -- the obj + 32*(word[obj+0x144] + 1) chain (the second node-list slot):
+//      the saved sentinel is seeded from **(obj + 32*(word+1) + 0x18) and the saved
+//      iterator from *(obj + 32*(word+1)).  Loop head: the tick counter is re-read each
+//      iteration (word[obj+0x144]), the sentinel pointer is
+//      *(obj + 32*(word+1) + 0x18), the iterator invariant is
+//      iterator == *(obj + 32*(word+1)), the loop breaks when the saved sentinel value
+//      equals the sentinel pointer.  Per iteration: the same checks and the capture of
+//      *(sentinel + 0x0C), the node consume walk, and the per-node audio processing
+//      (vtable[14] dispatch thiscall(node, 0, 1000)) when the node's +0xCC byte is zero
+//      -- the dispatch runs directly -- or the +0xC8 status word is 2 (gate: +0xC0 >=
+//      0xBB8) or 1 (gate: +0xC4 < 0x64) and the gate condition fails (the dispatch runs);
+//      a status neither 2 nor 1 skips the dispatch entirely.
+//  The +0x144 tick counter is READ but never written here (the tick increments it after
+//  this pass returns).
+//  [NOT byte-identical] placement-dependent (the relative E8 calls to
+//  __invalid_parameter_noinfo / AudioNodeConsumedWalk and the indirect vtable dispatch
+//  through the node's vtable[14]).
+static void AudioDelegateQueueDrain(void *obj)
+{
+    DWORD iterator;         // the saved iterator pointer (constant across iterations)
+    DWORD sentinel;         // the saved sentinel value (updated in place by the callee)
+
+    // ---------------- pass 1 -- the obj+0 chain ----------------
+    iterator = *(DWORD *)obj;                                   // *(obj + 0x00)
+    sentinel = *(DWORD *)*(DWORD *)((BYTE *)obj + 0x18);        // **(obj + 0x18)
+    for (;;)
+    {
+        DWORD sentinel_ptr = *(DWORD *)((BYTE *)obj + 0x18);    // the sentinel POINTER
+        DWORD obj_iterator = *(DWORD *)obj;                      // the obj+0 field
+        if (iterator == 0 || iterator != obj_iterator)
+            F3InvalidParam();                                   // original: __invalid_parameter_noinfo (no return)
+        if (sentinel == sentinel_ptr)
+            break;                                              // the fixed-point break
+
+        DWORD deref = iterator;                                 // the dereference
+        if (deref != 0)
+            deref = *(DWORD *)deref;
+        else
+            F3InvalidParam();                                   // original: __invalid_parameter_noinfo (no return)
+        if (sentinel == *(DWORD *)(deref + 0x18))
+            F3InvalidParam();                                   // original: __invalid_parameter_noinfo (no return)
+
+        DWORD node = *(DWORD *)(sentinel + 0x0C);               // the per-node audio processing node
+        sentinel = AudioNodeConsumedWalk(iterator, sentinel);    // rewrites the saved sentinel in place
+
+        if (*(BYTE *)(node + 0xCC) != 0)
+        {
+            DWORD status = *(DWORD *)(node + 0xC8);
+            DWORD gate = 1u;
+            if (status == 2)
+                gate = (*(DWORD *)(node + 0xC0) >= 0xBB8u) ? 1u : 0u;
+            else if (status == 1)
+                gate = (*(DWORD *)(node + 0xC4) < 0x64u) ? 1u : 0u;
+            // (status neither 2 nor 1): no gate -- the dispatch runs unconditionally
+            if (gate)
+            {
+                void **vt = (void **)*(void **)node;
+                ((void (__thiscall *)(void *, int, int))vt[14])((void *)node, 1, 0);
+            }
+        }
+        // loop-back: iterator stays constant (the callee never rewrites the iterator slot)
+    }
+
+    // ---------------- pass 2 -- the obj + 32*(word[obj+0x144] + 1) chain ----------------
+    DWORD offset0 = (DWORD)((unsigned int)(*(WORD *)((BYTE *)obj + 0x144)) + 1u) * 32u;
+    sentinel = *(DWORD *)*(DWORD *)((BYTE *)obj + offset0 + 0x18);   // **(obj + offset + 0x18)
+    iterator = *(DWORD *)((BYTE *)obj + offset0);                    // *(obj + offset)
+    for (;;)
+    {
+        DWORD tick = (unsigned int)(*(WORD *)((BYTE *)obj + 0x144));
+        DWORD offset = (tick + 1u) * 32u;
+        DWORD sentinel_ptr = *(DWORD *)((BYTE *)obj + offset + 0x18);
+        DWORD obj_iterator = *(DWORD *)((BYTE *)obj + offset);
+        if (iterator == 0 || iterator != obj_iterator)
+            F3InvalidParam();                                   // original: __invalid_parameter_noinfo (no return)
+        if (sentinel == sentinel_ptr)
+            break;                                              // the fixed-point break
+
+        DWORD deref = iterator;                                 // the dereference
+        if (deref != 0)
+            deref = *(DWORD *)deref;
+        else
+            F3InvalidParam();                                   // original: __invalid_parameter_noinfo (no return)
+        if (sentinel == *(DWORD *)(deref + 0x18))
+            F3InvalidParam();                                   // original: __invalid_parameter_noinfo (no return)
+
+        DWORD node = *(DWORD *)(sentinel + 0x0C);               // the per-node audio processing node
+        sentinel = AudioNodeConsumedWalk(iterator, sentinel);    // rewrites the saved sentinel in place
+
+        if (*(BYTE *)(node + 0xCC) == 0)
+        {
+            // byte == 0: the dispatch runs directly
+            void **vt = (void **)*(void **)node;
+            ((void (__thiscall *)(void *, int, int))vt[14])((void *)node, 0, 1000);
+            continue;
+        }
+
+        DWORD status = *(DWORD *)(node + 0xC8);
+        if (status == 2)
+        {
+            if (*(DWORD *)(node + 0xC0) >= 0xBB8u)
+                continue;   // gate true: skip the dispatch, loop back
+        }
+        else if (status == 1)
+        {
+            if (*(DWORD *)(node + 0xC4) < 0x64u)
+                continue;   // gate true: skip the dispatch, loop back
+        }
+        else
+        {
+            continue;       // status neither 2 nor 1: skip the dispatch, loop back
+        }
+
+        // gate false: the dispatch runs
+        void **vt = (void **)*(void **)node;
+        ((void (__thiscall *)(void *, int, int))vt[14])((void *)node, 0, 1000);
+    }
+}
+
+// SetProcessedCommitNumber  (0x148E290 - 0x148E2C0)  -- the CSetProcessedCommitNumber
+//  command-object wrapper (cdecl, 1 arg).  When the SetProcessedCommitNumber gate flag
+//  (g_byte_1DDCCE0) is set, stages a slot from the command-wrapper allocation cache
+//  (g_unk_1DDCCE8, 0x1DDCCE8, VfsAllocCacheAlloc wait = 1), stores the command's
+//  vtable (kCSetProcessedCommitNumberVftable, 0x01B71390) in the slot, and stores the
+//  commit number (the +4 payload); the staged object is finalized (VfsAllocCacheFinalize).
+//  Gated off in this build (g_byte_1DDCCE0 is zero BSS) and, when the cache is not
+//  initialised, the staged pointer is 0 -- the original would store the payload to
+//  address 4, which this implementation does not reproduce (the original's unconditional
+//  `v1[1] = a1` is dead on the 0-staged path and would fault; same null-guard convention
+//  as AudioProcessDelegateTick).  [NOT byte-identical] placement-dependent (relative
+//  E8 calls to the pool / slot callees) and refs the high-VA globals g_byte_1DDCCE0 /
+//  g_unk_1DDCCE8.
+static void SetProcessedCommitNumber(DWORD a1)
+{
+    if (g_byte_1DDCCE0 == 0)
+        return;
+    DWORD *v1 = (DWORD *)VfsAllocCacheAlloc(g_unk_1DDCCE8, 1);
+    if (v1 != 0) {
+        v1[0] = kCSetProcessedCommitNumberVftable;
+        v1[1] = a1;
+    }
+    VfsAllocCacheFinalize(g_unk_1DDCCE8);
+}
+
+// CommitCommand  (0x148E500 - 0x148E534)  -- the CCommitCommand command-object wrapper
+//  (cdecl, 0 args).  Stages a slot from the command-wrapper allocation cache
+//  (g_unk_1DDCCE8, 0x1DDCCE8), stores the command's vtable (kCCommitCommandVftable,
+//  0x01B71450) in the slot when one is staged, finalizes the stage (VfsAllocCacheFinalize)
+//  and returns the new commit counter: the InterlockedExchangeAdd(1) of the commit
+//  counter (g_dword_1DDCD34, 0x1DDCD34) -- the original's `lock xadd` + `inc eax`.
+//  [NOT byte-identical] placement-dependent (relative E8 calls to the pool / slot
+//  callees) and refs the high-VA globals g_unk_1DDCCE8 / g_dword_1DDCD34.
+static int CommitCommand(void)
+{
+    DWORD *v1 = (DWORD *)VfsAllocCacheAlloc(g_unk_1DDCCE8, 1);
+    if (v1 != 0)
+        v1[0] = kCCommitCommandVftable;
+    VfsAllocCacheFinalize(g_unk_1DDCCE8);
+    return (int)(InterlockedExchangeAdd((volatile LONG *)&g_dword_1DDCD34, 1) + 1);
+}
+
+// AudioTickExitStep  (0x146D9D0 - 0x146D9DC)  -- the audio tick exit step: the RWLock
+//  getter (g_dword_1DDCD74) + the SetProcessedCommitNumber / CommitCommand command
+//  pair + sub_1496FA0.  Loads the concurrency reader-writer-lock object (via the
+//  sub_1495860 getter 0x1495860), stages the commit number at [lock+0x1c] through
+//  SetProcessedCommitNumber (0x148E290, cdecl), increments the counter, stages the
+//  commit command (CommitCommand 0x148E500, cdecl -- result discarded) and tail-calls
+//  sub_1496FA0(this=lock); returns sub_1496FA0's result.
+//  [NOT byte-identical] placement-dependent (relative E8 calls + an E9 tail-jmp to
+//  sub_1496FA0) and refs the high-VA globals; the deep callee sub_1496FA0 is the
+//  documented no-op stub.
+static int AudioTickExitStep(void)
+{
+    DWORD lock = g_dword_1DDCD74;   // sub_1495860 (0x1495860): the RWLock getter
+    DWORD counter = *(DWORD *)(lock + 0x1c);
+    SetProcessedCommitNumber(counter);           // 0x148E290 (cdecl)
+    *(DWORD *)(lock + 0x1c) = counter + 1;       // ++[lock+0x1c]
+    CommitCommand();                             // 0x148E500 (cdecl) -- result discarded
+    return sub_1496FA0((void *)lock);            // 0x1496FA0 (thiscall) -- tail-call
+}
+
+// AudioProcessDelegateTick  (0x147A740 - 0x147A74B)  -- the registered audio
+//  process tick.  The stub loads ECX = the audio-engine object (dword_1DDCCD0)
+//  and tail-jumps into the real body at 0x147A210: enter (AudioTickEnterStep), the
+//  delegate step (AudioDelegateTickStep), the pending-queue item loop (AudioQueuePoll ->
+//  AudioQueueItemProcess), the fairness pass (AudioTickFairnessPass), the three node-list passes
+//  (AudioDelegateNodeListPass: this=v0 / v0 + 32*(word[v0+0x144] + 1) / v0 + 0xE0), the
+//  queue-drain pass (AudioDelegateQueueDrain), the +0x144 tick counter ((word + 1) % 6),
+//  then tail-calls the exit (AudioTickExitStep) and returns its result.
+//  [NOT byte-identical] placement-dependent (the relative E8 calls + the high-
+//  VA audio-engine global dword_1DDCCD0); the deep callee chain is stubbed.
+static int AudioProcessDelegateTick(void)
+{
+    DWORD v0 = g_dword_1DDCCD0;   // 0x1DDCCD0: the audio-engine object (340 bytes)
+    if (v0 == 0)
+        return 0;                // [guard] the original dereferences v0 unconditionally
+    AudioTickEnterStep();         // 0x146D930 -- unused result
+    AudioDelegateTickStep((void *)v0);   // 0x1478F20 (thiscall)
+    for (int i = AudioQueuePoll(); i != 0; i = AudioQueuePoll())
+        AudioQueueItemProcess((void *)*(DWORD *)i, i);   // 0x1478820 (thiscall + stack arg)
+    AudioTickFairnessPass((void *)v0);   // 0x1478B30 (thiscall, result unused)
+    AudioDelegateNodeListPass((void *)v0, (void *)v0);     // 0x1479A90 (this=v0, a2=v0)
+    AudioDelegateNodeListPass((void *)v0, (void *)(v0 + 32 * ((unsigned int)(*(WORD *)(v0 + 0x144) + 1))));
+    AudioDelegateNodeListPass((void *)v0, (void *)(v0 + 0xE0));   // 0x1479A90 (this=v0, a2=v0+0xE0)
+    AudioDelegateQueueDrain((void *)v0);   // 0x1478BA0 (thiscall)
+    *(WORD *)(v0 + 0x144) = (WORD)((unsigned int)(*(WORD *)(v0 + 0x144) + 1) % 6);
+    return AudioTickExitStep();      // 0x146D9D0 -- tail-call, result returned
+}
+
+// AudioFrameworkInit  (0x150D180 - 0x150D1D8)  -- one-time audio framework
+//  bring-up: register the two worker-callback pairs with VfsWorkerCallbackRegister
+//  -- slot 1: &unk_1DDCF30 with the pair value dword_1DDCF2C = 1, slot 2:
+//  &unk_1DDCFB8 with the pair value dword_1DDCFB4 = 2 -- each pair guarded by its
+//  own done-flag (byte_1DDCF28 / byte_1DDCFB0).  The pair value is stored BEFORE
+//  the call and the done-flag AFTER it.  Returns 1 when both pairs are freshly
+//  registered, 0 when the first flag is already set (or the second one is).
+//  [NOT byte-identical] two relative E8 calls to VfsWorkerCallbackRegister and
+//  the high-VA globals g_byte_1DDCF28 / g_dword_1DDCF2C / g_unk_1DDCF30 /
+//  g_byte_1DDCFB0 / g_dword_1DDCFB4 / g_unk_1DDCFB8.
+static int AudioFrameworkInit(void)
+{
+    if (g_byte_1DDCF28 != 0)
+        return 0;
+    g_dword_1DDCF2C = 1;                                     // 0x1DDCF2C
+    VfsWorkerCallbackRegister((void *)&g_unk_1DDCF30, 1);   // 0x150D19A
+    g_byte_1DDCF28 = 1;                                      // 0x1DDCF28
+    if (g_byte_1DDCFB0 != 0)
+        return 0;
+    g_dword_1DDCFB4 = 2;                                     // 0x1DDCFB4
+    VfsWorkerCallbackRegister((void *)&g_unk_1DDCFB8, 2);   // 0x150D1C3
+    g_byte_1DDCFB0 = 1;                                      // 0x1DDCFB0
+    return 1;
+}
 
 // AudioProcessDelegateInit  (0x147A750 - 0x147A7AC)  -- build the audio process
 //  delegate: AudioFrameworkInit, then LHAlloc(340) + AudioEngineCtor(desc[+0x04],
@@ -8501,13 +9577,83 @@ static int AudioProcessDelegateInit(void)
     return 0;
 }
 
-// VfsQueryTableBuild  (0x1473E70)  -- [STUB] build the query table (drain the
-//  pending ring into the cache under the +0x34 CS); void.
-static void VfsQueryTableBuild(void *obj, int timeout) { (void)obj; (void)timeout; }
+static int VfsQueryTableDrain(void *obj, int elem);   // defined below (0x1474320)
 
-// VfsQueryTableDrain  (0x1474320)  -- [STUB] drain one pending query (the ring
-//  index + the InterlockedExchangeAdd + SetFrontendEvent); returns 1.
-static int VfsQueryTableDrain(void *obj, int elem) { (void)obj; (void)elem; return 1; }
+//  VfsQueryTableBuild  (0x1473E70 - 0x1473F30)  -- build the query table:
+//  drain the pending ring into the cache under the +0x34 critical section.
+//  thiscall (obj in ECX, timeout on the stack, retn 4); void.  Under the CS
+//  (a 8-byte F3CsGuard over the cache object's +0x34), when the cache is
+//  initialised (+0x18 != 0): count = the ring's used counter (the control
+//  block's +0x10C word) / the element size (+0x14); when count > 0, loop,
+//  processing the slot at the ring cursor (+0x108): call its vtable[1] then
+//  vtable[0](slot, 0), drain one query (VfsQueryTableDrain), and break out
+//  once clock() - start > timeout (the unsigned comparison).  The timeout is
+//  the `a2` stack argument (the descriptor's +0x04 = the worker count).
+//  [NOT byte-identical] placement-dependent (the relative E8 calls to the
+//  clock / VfsQueryTableDrain / CsGuardAcquire / CsGuardRelease / the
+//  SetEvent IAT thunk, the high-VA cache global g_unk_1DDC830, and the
+//  control-block wrapper at o+4 -- an indirect dispatch through the slot's
+//  vtable, all of which relocate).
+static void VfsQueryTableBuild(void *obj, unsigned int timeout)
+{
+    BYTE *o = (BYTE *)obj;
+    F3CsGuard guard;
+    CsGuardAcquire(&guard, (CRITICAL_SECTION *)(o + 0x34), 0);
+    if (o[0x18] != 0)
+    {
+        BYTE *wrapper = *(BYTE **)(o + 4);           // o[1]: the block wrapper
+        BYTE *ring = *(BYTE **)wrapper;              // the ring base (v7[0])
+        DWORD used = *(DWORD *)(ring + 0x10C);       // the used counter
+        DWORD elem = *(DWORD *)(o + 0x14);           // the element size
+        unsigned int count = used / elem;            // the original divides unguarded
+        clock_t start = clock();
+        if ((int)count > 0)
+        {
+            for (unsigned int i = 0; i < count; ++i)
+            {
+                unsigned int cursor = *(DWORD *)(ring + 0x108);   // the ring cursor
+                BYTE *slot = ring + 0x110 + cursor;              // the ring-slot object
+                void **slotVtable = *(void ***)slot;
+                void (*slot1)(void *) = (void (*)(void *))slotVtable[1];
+                void (*slot0)(void *, unsigned int) = (void (*)(void *, unsigned int))slotVtable[0];
+                slot1(slot);                                     // vtable slot 1 (thiscall)
+                slot0(slot, 0);                                   // vtable slot 0 (thiscall + arg)
+                VfsQueryTableDrain((void *)wrapper, (int)elem);   // drain one query
+                DWORD elapsed = clock() - start;
+                if (elapsed > timeout)                           // unsigned compare
+                    break;
+            }
+        }
+    }
+    CsGuardRelease(&guard);
+}
+
+//  VfsQueryTableDrain  (0x1474320 - 0x147439F)  -- drain one pending query:
+//  advance the ring cursor by the element size (wrapping to 0 at the limit,
+//  __debugbreak on an overrun), decrement the used counter, and signal the
+//  frontend event; returns the SetEvent result.  thiscall (obj in ECX =
+//  the block wrapper, elemSize on the stack, retn 4).  The ring base is
+//  v7[0] (the wrapper's first word); the limit is at +0x100, the cursor at
+//  +0x108, the used counter at +0x10C, and the event handle is at wrapper
+//  +0x88 (the second of the two EventObjCtor event wrappers -- +0x80 within
+//  it, via SetFrontendEvent).
+//  [NOT byte-identical] placement-dependent (the relative calls to
+//  InterlockedExchangeAdd / SetFrontendEvent / clock IAT thunks, the high-
+//  VA wrapper global, and the vtable dispatch in the caller).
+static int VfsQueryTableDrain(void *obj, int elem)
+{
+    BYTE *wrapper = (BYTE *)obj;
+    BYTE *ring = *(BYTE **)wrapper;              // the ring base (v7[0])
+    DWORD limit = *(DWORD *)(ring + 0x100);
+    DWORD cursor = *(DWORD *)(ring + 0x108);
+    DWORD newCursor = cursor + (unsigned int)elem;
+    if (newCursor > limit)
+        __debugbreak();
+    newCursor = (newCursor == limit) ? 0u : newCursor;
+    *(DWORD *)(ring + 0x108) = newCursor;
+    InterlockedExchangeAdd((volatile LONG *)(ring + 0x10C), -(LONG)elem);
+    return (int)SetFrontendEvent((void *)(wrapper + 0x88));
+}
 
 // VfsGetQueryTable  (0x1460210 - 0x1474011)  -- the VFS query-table getter
 //  registered as the worker-slot-0 callback.  In drain mode (g_dword_1DDC824 ==
@@ -8518,12 +9664,12 @@ static int VfsQueryTableDrain(void *obj, int elem) { (void)obj; (void)elem; retu
 static DWORD *VfsGetQueryTable(void)
 {
     if (g_dword_1DDC824 == 2) {
-        void *cachePtr = *(void **)((char *)g_unk_1DDC830 + 4);   // 0x1DDC834
-        DWORD *cache = (DWORD *)cachePtr;                          // *(0x1DDC834)
-        DWORD *result = (DWORD *)((char *)cache + 0x10C);
-        while (cache != 0 &&
-               *(DWORD *)((char *)cache + 0x10C) > *(DWORD *)((char *)g_unk_1DDC830 + 0x14)) {
-            VfsQueryTableDrain(cachePtr, *(DWORD *)((char *)g_unk_1DDC830 + 0x14));
+        void *wrapper = *(void **)((char *)g_unk_1DDC830 + 4);   // 0x1DDC834: the block wrapper (o[1])
+        BYTE *ring = *(BYTE **)wrapper;                          // the ring base (v7[0])
+        DWORD *result = (ring != 0) ? (DWORD *)(ring + 0x10C) : 0;  // the used counter
+        while (ring != 0 &&
+               *(DWORD *)(ring + 0x10C) > *(DWORD *)((char *)g_unk_1DDC830 + 0x14)) {
+            VfsQueryTableDrain(wrapper, *(DWORD *)((char *)g_unk_1DDC830 + 0x14));
         }
         return result;
     }
@@ -8560,13 +9706,334 @@ static int InitVirtualFileSystem(void *descIn)
 }
 
 // RegisterVfsGroup1..4  (0x146F130 / 0x146F200 / 0x146F240 / 0x146F250)  --
-//  remaining stubs: register the per-provider VFS module groups (audio /
-//  video / input / table-lookup providers) after a successful init.  Not
-//  implemented in this build (reached only on the success path).
-static int RegisterVfsGroup1(void) { return 0; }
-static int RegisterVfsGroup2(DWORD a) { (void)a; return 0; }
-static int RegisterVfsGroup3(void) { return 0; }
-static int RegisterVfsGroup4(void) { return 0; }
+//  register the per-provider VFS module groups (audio / video / input /
+//  codec-registration providers) after a successful init.
+//
+//  RegisterVfsGroup1/2/3/4 are implemented (below).
+//
+//  The 15 VFS source-program component vftables, the 4 effect-program component
+//  vftables and the CRegisteredComponent/CRegisteredEffectProgramComponent block
+//  layout (original high-VA addresses kept in comments).  Each component is a
+//  bare vftable holder built by LHAlloc; the 40-byte registration block is built
+//  by the registration helper (VfsRegisterSourceComponent /
+//  VfsRegisterEffectProgramComponent).  Group 4's three audio codec components
+//  (PCM / XWMA / Crescendo) are bare 4-byte vftable holders built by LHAlloc;
+//  the 20-byte CRegisteredCodec block is built by VfsRegisterCodecComponent.
+static const DWORD kVfsNAtmosComponentVftable         = 0x01B73B34;  // 0x1B73B34: ??_7CComponent@NAtmos@NSourcePrograms@NFramework@NLHAudio@@6B@
+static const DWORD kVfsNCrescendoComponentVftable     = 0x01B73A38;  // 0x1B73A38: ??_7CComponent@NCrescendo@NSourcePrograms@NFramework@NLHAudio@@6B@
+static const DWORD kVfsNMapSolverComponentVftable     = 0x01B738D8;  // 0x1B738D8: ??_7CComponent@NMapSolver@NSourcePrograms@NFramework@NLHAudio@@6B@
+static const DWORD kVfsNMusicSolverComponentVftable   = 0x01B73730;  // 0x1B73730: ??_7CComponent@NMusicSolver@NSourcePrograms@NFramework@NLHAudio@@6B@
+static const DWORD kVfsNChannelMachinesComponentVftable = 0x01B73500;  // 0x1B73500: ??_7CComponent@NChannelMachines@NSourcePrograms@NFramework@NLHAudio@@6B@
+static const DWORD kVfsMusicalNotesComponentVftable   = 0x01B73368;  // 0x1B73368: ??_7CComponent@MusicalNotes@NSourcePrograms@NFramework@NLHAudio@@6B@
+static const DWORD kVfsQueuedSequenceComponentVftable = 0x01B73150;  // 0x1B73150: ??_7CComponent@QueuedSequence@NSourcePrograms@NFramework@NLHAudio@@6B@
+static const DWORD kVfsQueuePopperComponentVftable    = 0x01B72FE4;  // 0x1B72FE4: ??_7CComponent@QueuePopper@NSourcePrograms@NFramework@NLHAudio@@6B@
+static const DWORD kVfsSequenceComponentVftable       = 0x01B72E20;  // 0x1B72E20: ??_7CComponent@Sequence@NSourcePrograms@NFramework@NLHAudio@@6B@
+static const DWORD kVfsNSVComponentVftable            = 0x01B72D24;  // 0x1B72D24: ??_7CComponent@NSV@NSourcePrograms@NFramework@NLHAudio@@6B@
+static const DWORD kVfsSmartVariationsComponentVftable = 0x01B72B50;  // 0x1B72B50: ??_7CComponent@SmartVariations@NSourcePrograms@NFramework@NLHAudio@@6B@
+static const DWORD kVfsNSourceBlenderComponentVftable = 0x01B72954;  // 0x1B72954: ??_7CComponent@NSourceBlender@NSourcePrograms@NFramework@NLHAudio@@6B@
+static const DWORD kVfsSplittersComponentVftable      = 0x01B72704;  // 0x1B72704: ??_7CComponent@Splitters@NSourcePrograms@NFramework@NLHAudio@@6B@
+static const DWORD kVfsCWaveformsComponentVftable     = 0x01B72558;  // 0x1B72558: ??_7CWaveforms@NSourcePrograms@NFramework@NLHAudio@@6B@
+static const DWORD kVfsCSpeechWaveformsComponentVftable = 0x01B72450;  // 0x1B72450: ??_7CSpeechWaveforms@NSourcePrograms@NFramework@NLHAudio@@6B@
+
+static const DWORD kCRegisteredSourceProgramComponentVftable = 0x01B72414;  // 0x1B72414: ??_7CRegisteredSourceProgramComponent@NFramework@NLHAudio@@6B@
+static const DWORD kCMapTableLookupVftable = 0x01B723D0;  // 0x1B723D0: ??_7?$CMap@VCTableLookupEntry@NFramework@NLHAudio@@...$0BM@@Intrusive@Containers@NSupport@@6B@
+static const DWORD kVfsCRegisteredEffectProgramComponentVftable = 0x01B72408;  // 0x1B72408: ??_7CRegisteredEffectProgramComponent@NFramework@NLHAudio@@6B@
+static const DWORD kVfsNFaderDuckerComponentVftable   = 0x01B74104;  // 0x1B74104: ??_7CComponent@NFaderDucker@NEffectPrograms@NFramework@NLHAudio@@6B@
+static const DWORD kVfsNFaderPitchDuckerComponentVftable = 0x01B73F70;  // 0x1B73F70: ??_7CComponent@NFaderPitchDucker@NEffectPrograms@NFramework@NLHAudio@@6B@
+static const DWORD kVfsNLinkToFaderComponentVftable   = 0x01B73E60;  // 0x1B73E60: ??_7CComponent@NLinkToFader@NEffectPrograms@NFramework@NLHAudio@@6B@
+static const DWORD kVfsNRandomLevelModulatorComponentVftable = 0x01B73C98;  // 0x1B73C98: ??_7CComponent@NRandomLevelModulator@NEffectPrograms@NFramework@NLHAudio@@6B@
+static const DWORD kCTestFilterFactoryVftable = 0x01B7422C;  // 0x1B7422C: ??_7CTestFilterFactory@NTestFilter@NAudioFilter@NLHAudio@@6B@
+
+// ---- group 4: the three audio-codec components (PCM / XWMA / Crescendo) and
+//  the 20-byte codec registration block (original high-VA addresses kept in
+//  comments; group 1/2's component vftables are the source/effect-program ones).
+static const DWORD kVfsCodecPcmVftable            = 0x01B743B4;  // 0x1B743B4: ??_7CodecPCM@NCodecPCM@NCodec@NLHAudio@@6B@
+static const DWORD kVfsCodecXwmaVftable           = 0x01B7433C;  // 0x1B7433C: ??_7CodecXWMA@NCodecXWMA@NCodec@NLHAudio@@6B@
+static const DWORD kVfsCodecCrescendoVftable      = 0x01B742C0;  // 0x1B742C0: ??_7CodecCrescendo@NCodecCrescendo@NCodec@NLHAudio@@6B@
+static const DWORD kVfsCodecCBaseVftable          = 0x01B70744;  // 0x1B70744: ??_7?$CBase@VICodec@NCodec@NLHAudio@@...@@Allocated@Containers@NSupport@@6B@
+static const DWORD kVfsCodecIntrusiveCBaseVftable = 0x01B70700;  // 0x1B70700: ??_7?$CBase@V?$CIterator@VICodec@NCodec@NLHAudio@@...@@Intrusive@Containers@NSupport@@6B@
+static const DWORD kVfsCodecAllocatedCMapVftable  = 0x01B7074C;  // 0x1B7074C: ??_7?$CMap@VICodec@NCodec@NLHAudio@@...@@Allocated@Containers@NSupport@@6B@
+
+static DWORD g_dword_1DDCCD4 = 0;               // 0x1DDCCD4: the 20-byte codec registration block (lazy init, shared across the three calls)
+static DWORD g_dword_1DDCE7C = 0;               // 0x1DDCE7C: the XWMA worker-callback registration count (refcount)
+static BYTE  g_byte_1DDCE78 = 0;                // 0x1DDCE78: the XWMA worker-callback registered flag
+static DWORD g_dword_1D80B70 = 0;               // 0x1D80B70: the XWMA worker callback pointer (sub_150B110 -- stubbed)
+static DWORD g_off_1D80B6C[2] = { kCProcessDelegateStaticVftable, 0 };  // 0x1D80B6C: the {vtable, type_info} pair (vtable slot real, fn slot high-VA stubbed)
+
+//  VfsAllocSourceProgramComponent  -- the shared body of the 15 per-provider
+//  allocation subs (sub_14F8BC0 / sub_14F1570 / ... / sub_14B3870): LHAlloc(4)
+//  a bare 4-byte vftable holder; nullptr on allocation failure.
+static void *VfsAllocSourceProgramComponent(DWORD vftable)
+{
+    void *p = LHAlloc(4);
+    if (p != 0)
+        *(DWORD *)p = vftable;
+    return p;
+}
+
+//  VfsRegisterSourceComponent  (0x146DF00 + 0x14B2740)  -- the thiscall
+//  registration helper: build the 40-byte CRegisteredSourceProgramComponent
+//  block over the 4-byte component and register it into the VFS refcount wrapper.
+//  The block: [0] CRegisteredSourceProgramComponent vtable (the temp
+//  CRegisteredComponent slot is overwritten), [4] CMap vtable (the temp CBase
+//  vtable is overwritten), [8..28] the two-node intrusive CMap base via
+//  CMapBaseCtor (0x150C5A0), [16..24]/[32] words 0-2-4-8 zeroed, [36] the
+//  component.  The deep leaves are documented stubs in this build: the 48-byte
+//  wrapper-list node build (sub_14B2350) and the intrusive CMap insert
+//  (sub_150C060, itself with its sub_150BAF0 / sub_150BA10 chain).  The original
+//  stores the component at block[9] unconditionally, which would crash on
+//  allocation failure; this build skips the registration (returns 0) on OOM.
+static int VfsRegisterSourceComponent(void *wrapper, void *component)
+{
+    DWORD block = (DWORD)LHAlloc(40);   // 40-byte CRegisteredSourceProgramComponent
+    (void)wrapper;
+    if (block != 0) {
+        DWORD *b = (DWORD *)block;
+        b[0] = kCRegisteredSourceProgramComponentVftable;
+        b[1] = kCMapTableLookupVftable;
+        CMapBaseCtor((void *)(block + 8));                 // 0x150C5A0
+        b[4] = 0; b[5] = 0; b[6] = 0; b[8] = 0;            // sub_150C560: words 0-2-4
+        b[9] = (DWORD)component;                          // [block+36] = component
+    }
+    // (sub_14B2350(this=block, arg=wrapper+0x18) and sub_150C060(this=wrapper+4,
+    //  args={block, wrapper}) are the documented no-op stubs here; the original
+    //  registers the component into the wrapper's 48-byte component map through
+    //  them.  No observable effect in this build.)
+    return 0;
+}
+
+//  RegisterVfsGroup1  (0x146F130 - 0x146F1FA)  -- allocate the fifteen
+//  VFS source-program components (NAtmos .. CSpeechWaveforms) and register each
+//  into the refcount wrapper passed in (the 4-byte VfsRefCountCtor object at
+//  dword_1DDC7E4, cdecl, one stack DWORD) through VfsRegisterSourceComponent.
+//  Returns the result of the final registration (the original returns the last
+//  sub_146DF00's result).  [NOT byte-identical] placement-dependent (the 15
+//  relative E8 alloc calls plus the thiscall registration call) and refs the
+//  original high-VA component vftables.
+static int RegisterVfsGroup1(DWORD wrapper)
+{
+    int result;
+    result = VfsRegisterSourceComponent((void *)wrapper, VfsAllocSourceProgramComponent(kVfsNAtmosComponentVftable));
+    result = VfsRegisterSourceComponent((void *)wrapper, VfsAllocSourceProgramComponent(kVfsNCrescendoComponentVftable));
+    result = VfsRegisterSourceComponent((void *)wrapper, VfsAllocSourceProgramComponent(kVfsNMapSolverComponentVftable));
+    result = VfsRegisterSourceComponent((void *)wrapper, VfsAllocSourceProgramComponent(kVfsNMusicSolverComponentVftable));
+    result = VfsRegisterSourceComponent((void *)wrapper, VfsAllocSourceProgramComponent(kVfsNChannelMachinesComponentVftable));
+    result = VfsRegisterSourceComponent((void *)wrapper, VfsAllocSourceProgramComponent(kVfsMusicalNotesComponentVftable));
+    result = VfsRegisterSourceComponent((void *)wrapper, VfsAllocSourceProgramComponent(kVfsQueuedSequenceComponentVftable));
+    result = VfsRegisterSourceComponent((void *)wrapper, VfsAllocSourceProgramComponent(kVfsQueuePopperComponentVftable));
+    result = VfsRegisterSourceComponent((void *)wrapper, VfsAllocSourceProgramComponent(kVfsSequenceComponentVftable));
+    result = VfsRegisterSourceComponent((void *)wrapper, VfsAllocSourceProgramComponent(kVfsNSVComponentVftable));
+    result = VfsRegisterSourceComponent((void *)wrapper, VfsAllocSourceProgramComponent(kVfsSmartVariationsComponentVftable));
+    result = VfsRegisterSourceComponent((void *)wrapper, VfsAllocSourceProgramComponent(kVfsNSourceBlenderComponentVftable));
+    result = VfsRegisterSourceComponent((void *)wrapper, VfsAllocSourceProgramComponent(kVfsSplittersComponentVftable));
+    result = VfsRegisterSourceComponent((void *)wrapper, VfsAllocSourceProgramComponent(kVfsCWaveformsComponentVftable));
+    result = VfsRegisterSourceComponent((void *)wrapper, VfsAllocSourceProgramComponent(kVfsCSpeechWaveformsComponentVftable));
+    return result;
+}
+
+//  VfsAllocEffectProgramComponent4  -- the shared body of the three 4-byte
+//  effect-program component alloc subs (sub_15046B0 / sub_15022B0 / sub_1500100):
+//  LHAlloc(4), store the class's vftable; nullptr on allocation failure.
+static void *VfsAllocEffectProgramComponent4(DWORD vftable)
+{
+    void *p = LHAlloc(4);
+    if (p != 0)
+        *(DWORD *)p = vftable;
+    return p;
+}
+
+//  VfsAllocEffectProgramComponent36  -- the sub_1505770 body (NFaderDucker):
+//  LHAlloc(36), store the class's vftable; nullptr on allocation failure.  The
+//  original additionally builds a throwaway stack-local 32-byte scratch block
+//  (two heap objects, never referenced or returned -- the net effect on the
+//  returned component is just the allocation + the vftable store), so it is not
+//  reproduced here.
+static void *VfsAllocEffectProgramComponent36(DWORD vftable)
+{
+    void *p = LHAlloc(36);
+    if (p != 0)
+        *(DWORD *)p = vftable;
+    return p;
+}
+
+//  VfsRegisterEffectProgramComponent  (0x146DEF0 + 0x14B27F0)  -- the thiscall
+//  registration helper for the effect-program components: build the 40-byte
+//  CRegisteredEffectProgramComponent block over the component and register it
+//  into the VFS refcount wrapper.  The block: [0] CRegisteredEffectProgram
+//  Component vtable (the temp CRegisteredComponent slot is overwritten), [4] CMap
+//  vtable (the temp CBase vtable is overwritten), [8..28] the two-node intrusive
+//  CMap base via CMapBaseCtor (0x150C5A0), [16..24]/[32] words 0-2-4-8 zeroed
+//  (sub_150C560), [36] the component.  The deep leaves are documented stubs in
+//  this build: the 48-byte wrapper-list node build (sub_14B2350, called as
+//  sub_14B2350(this=block, a2=componentMap+0x24)) and the intrusive CMap insert
+//  (sub_150C060, this=componentMap+0x10 / a2=componentMap+0x0C / a3=block), both
+//  whose deep bodies are out of scope; here componentMap is the first DWORD of
+//  the 4-byte wrapper (*wrapper, the 48-byte component-map block built by
+//  VfsComponentMapCtor).  The original stores the component at block[9]
+//  unconditionally, which would crash on allocation failure; this build skips
+//  the registration (returns 0) on OOM.
+static int VfsRegisterEffectProgramComponent(void *wrapper, void *component)
+{
+    DWORD block = (DWORD)LHAlloc(40);   // 40-byte CRegisteredEffectProgramComponent
+    (void)wrapper;
+    if (block != 0) {
+        DWORD *b = (DWORD *)block;
+        b[0] = kVfsCRegisteredEffectProgramComponentVftable;
+        b[1] = kCMapTableLookupVftable;
+        CMapBaseCtor((void *)(block + 8));                 // 0x150C5A0
+        b[4] = 0; b[5] = 0; b[6] = 0; b[8] = 0;            // sub_150C560: words 0-2-4
+        b[9] = (DWORD)component;                          // [block+36] = component
+    }
+    // (sub_14B2350(this=block, a2=componentMap+0x24) and sub_150C060(this=
+    //  componentMap+0x10, a2=componentMap+0x0C, a3=block) are the documented
+    //  no-op stubs here; the original registers the component into the wrapper's
+    //  48-byte component map through them.  No observable effect in this build.)
+    return 0;
+}
+
+//  RegisterVfsGroup2  (0x146F200 - 0x146F23B)  -- allocate the four
+//  VFS effect-program components (NEffectPrograms: NFaderDucker /
+//  NFaderPitchDucker / NLinkToFader / NRandomLevelModulator) and register each
+//  into the refcount wrapper passed in (the 4-byte VfsRefCountCtor object at
+//  dword_1DDC7E4, cdecl, one stack DWORD) through
+//  VfsRegisterEffectProgramComponent.  Returns the result of the final
+//  registration (the original returns the last sub_146DEF0's result).  [NOT
+//  byte-identical] placement-dependent (the four relative E8 alloc calls plus
+//  the thiscall registration call) and refs the original high-VA component
+//  vftables.
+static int RegisterVfsGroup2(DWORD wrapper)
+{
+    int result;
+    result = VfsRegisterEffectProgramComponent((void *)wrapper, VfsAllocEffectProgramComponent36(kVfsNFaderDuckerComponentVftable));
+    result = VfsRegisterEffectProgramComponent((void *)wrapper, VfsAllocEffectProgramComponent4(kVfsNFaderPitchDuckerComponentVftable));
+    result = VfsRegisterEffectProgramComponent((void *)wrapper, VfsAllocEffectProgramComponent4(kVfsNLinkToFaderComponentVftable));
+    result = VfsRegisterEffectProgramComponent((void *)wrapper, VfsAllocEffectProgramComponent4(kVfsNRandomLevelModulatorComponentVftable));
+    return result;
+}
+
+//  VfsAllocTestFilterComponent  (0x15091F0 - 0x1509207)  -- the sub_15091F0
+//  body: LHAlloc(4) a bare 4-byte CTestFilterFactory vftable holder; nullptr
+//  on allocation failure.
+static void *VfsAllocTestFilterComponent(void)
+{
+    void *p = LHAlloc(4);
+    if (p != 0)
+        *(DWORD *)p = kCTestFilterFactoryVftable;
+    return p;
+}
+
+//  RegisterVfsGroup3  (0x146F240 - 0x146F24D)  -- allocate the
+//  CTestFilterFactory component (sub_15091F0) and hand it to the registration
+//  stub sub_15090C0, which ignores its argument and always returns 0.  The
+//  original pushes the component, calls the stub, discards it (pop ecx) and
+//  returns 0 -- the component allocation is not freed (leaked) and never
+//  referenced again, exactly as in the original.  [NOT byte-identical]
+//  placement-dependent (the relative E8 calls) and refs the original high-VA
+//  vftable.
+static int RegisterVfsGroup3(void)
+{
+    void *component = VfsAllocTestFilterComponent();
+    (void)component;   // the sub_15090C0 stub ignores its argument
+    return 0;
+}
+
+//  VfsAllocCodecComponent  -- the shared body of the PCM / Crescendo
+//  allocation subs (sub_150B6B0 / sub_15094F0): LHAlloc(4), store the class's
+//  vftable; nullptr on allocation failure.
+static void *VfsAllocCodecComponent(DWORD vftable)
+{
+    void *p = LHAlloc(4);
+    if (p != 0)
+        *(DWORD *)p = vftable;
+    return p;
+}
+
+//  VfsAllocCodecXwmaComponent  (0x150AFF0)  -- the sub_150AFF0 body: LHAlloc(4),
+//  store the XWMA class's vftable; nullptr on allocation failure.  On the first
+//  call (the refcount at dword_1DDCE7C == 0 and the flag at byte_1DDCE78 == 0)
+//  the XWMA worker callback is registered as well: the sub_150B110 callback
+//  pointer is stored at dword_1D80B70 and the static {vtable, type_info} pair
+//  at off_1D80B6C is handed to VfsWorkerCallbackRegister(pair, 6); the refcount
+//  is then bumped and the flag set.  On a repeat call only the refcount is
+//  bumped.
+static void *VfsAllocCodecXwmaComponent(void)
+{
+    void *p = LHAlloc(4);
+    if (p == 0)
+        return 0;
+    *(DWORD *)p = kVfsCodecXwmaVftable;
+    if (g_dword_1DDCE7C == 0 && g_byte_1DDCE78 == 0) {
+        g_dword_1D80B70 = 0;                          // the sub_150B110 callback pointer (0 -- stubbed)
+        VfsWorkerCallbackRegister(g_off_1D80B6C, 6);  // 0x1476D00
+        g_dword_1DDCE7C += 1;
+        g_byte_1DDCE78 = 1;
+    } else {
+        g_dword_1DDCE7C += 1;
+    }
+    return p;
+}
+
+//  VfsRegisterCodecComponent  (0x147E880)  -- the thiscall registration helper:
+//  build the 20-byte codec registration block (only once -- the lazy init in
+//  dword_1DDCCD4) and, for a non-null component, register it into the block.
+//  The block: [0] the CBase<ICodec,...> vftable (overwritten with the CMap
+//  vftable below), [8] the Intrusive::CBase vftable, [12..20] the two-node
+//  intrusive CMap base via CMapBaseCtor (0x150C5A0), [0] overwritten with the
+//  Allocated::CMap vftable, and the block stored in dword_1DDCCD4.  [NOT
+//  byte-identical] placement-dependent (the relative LHAlloc call and the
+//  thiscall registration call) and refs the original high-VA codec vftables.
+//  The deep leaves -- the component's vtable[0] virtual dispatch (the original
+//  high-VA codec vftable), the sub_150BD30 intrusive-map search (its
+//  sub_150C560/sub_150C060 chain) and the sub_147EEF0 node registration
+//  (LHAlloc(0x18) + set [node+0x14] = component + the sub_150C060 insert) --
+//  are documented no-op stubs in this build, exactly like the deep leaves of
+//  RegisterVfsGroup1/2.  This build returns 0 for a null component; the PCM /
+//  XWMA / Crescendo results of the first two calls are discarded by the
+//  caller, so its observable effect is the 20-byte block + the XWMA
+//  callback-registration side effects.
+static int VfsRegisterCodecComponent(void *component)
+{
+    if (g_dword_1DDCCD4 == 0) {
+        DWORD block = (DWORD)LHAlloc(20);   // 20-byte codec registration block
+        if (block != 0) {
+            DWORD *b = (DWORD *)block;
+            b[0] = kVfsCodecCBaseVftable;
+            b[1] = 0;                              // [+4]: never written in the original; zeroed here
+            b[2] = kVfsCodecIntrusiveCBaseVftable;
+            CMapBaseCtor((void *)(block + 12));    // 0x150C5A0
+            b[0] = kVfsCodecAllocatedCMapVftable;  // overwrite the temp CBase vftable
+            g_dword_1DDCCD4 = block;
+        } else {
+            g_dword_1DDCCD4 = 0;
+        }
+    }
+    (void)g_dword_1DDCCD4;
+    if (component == 0)
+        return 0;
+    // deep leaves stubbed (see the header comment): the PCM/XWMA/Crescendo
+    // components are never actually spliced into the map and the component is
+    // never registered -- the original returns 1 after the deep leaves.
+    return 1;
+}
+
+//  RegisterVfsGroup4  (0x146F250 - 0x146F279)  -- allocate the three audio
+//  codec components (PCM / XWMA / Crescendo) and register each into the VFS
+//  codec registration block through VfsRegisterCodecComponent.  cdecl, no
+//  args, returning the last registration's result (the original returns the
+//  final sub_147E880's result).  [NOT byte-identical] placement-dependent (the
+//  three relative E8 alloc calls and the thiscall registration call) and refs
+//  the original high-VA component vftables.
+static int RegisterVfsGroup4(void)
+{
+    int result;
+    void *pcm = VfsAllocCodecComponent(kVfsCodecPcmVftable);        // 0x150B6B0
+    VfsRegisterCodecComponent(pcm);                                 // 0x147E880
+    void *xwma = VfsAllocCodecXwmaComponent();                      // 0x150AFF0
+    VfsRegisterCodecComponent(xwma);                                // 0x147E880
+    void *crescendo = VfsAllocCodecComponent(kVfsCodecCrescendoVftable);  // 0x15094F0
+    result = VfsRegisterCodecComponent(crescendo);                  // 0x147E880
+    return result;
+}
 
 
 // CreateVirtualFilesystem  (0x145DD80 - 0x145DECE)  -- see the header above.
@@ -8602,7 +10069,7 @@ static int CreateVirtualFilesystem(void *descIn)
             void *mem = LHAlloc(4);
             DWORD obj = (mem != 0) ? (DWORD)VfsRefCountCtor(mem) : 0;
             g_dword_1DDC7E4 = obj;
-            RegisterVfsGroup1();
+            RegisterVfsGroup1(g_dword_1DDC7E4);
             RegisterVfsGroup2(g_dword_1DDC7E4);
             RegisterVfsGroup3();
             RegisterVfsGroup4();
@@ -9327,16 +10794,17 @@ void CSortedMapDtor(void *obj)
 
 // Placeholder vtables for the frontend's stub-constructed engine members.
 // The original constructors store real vtables (NUI::CLoadingScreen, 0x7330F0;
-// CGameRenderer, 0x72FB30; NUI::CFullScreenMoviePlayer, 0x731B80; 0x767360:
-// CPackageManager); those tables are unimplemented in this build, but slot 0
-// (the `vt[0](obj, 1)` release dispatch used by RunFrontEnd's old-value frees
-// and by CGameEngineDestroy) must be a callable no-op so the teardown does not
-// dispatch through unconstructed memory.
+// CHeroUniqueID, 0xC1E6A0; CGameRenderer, 0x72FB30; NUI::CFullScreenMoviePlayer,
+// 0x731B80; 0x767360: CPackageManager); those tables are unimplemented in this
+// build, but slot 0 (the `vt[0](obj, 1)` release dispatch used by RunFrontEnd's
+// old-value frees and by CGameEngineDestroy) must be a callable no-op so the
+// teardown does not dispatch through unconstructed memory.
 static void F3StubRelease(void *obj, int freeIt) { (void)obj; (void)freeIt; }
 static void *g_CLoadingScreenVtable[2]         = { (void *)F3StubRelease, 0 };
 static void *g_CGameRendererVtable[2]          = { (void *)F3StubRelease, 0 };
 static void *g_CFullScreenMoviePlayerVtable[2] = { (void *)F3StubRelease, 0 };
 static void *g_CPackageManagerVtable[2]        = { (void *)F3StubRelease, 0 };
+static void *g_CHeroUniqueIDVtable[2]         = { (void *)F3StubRelease, 0 };
 
 // 0x18984D0 -- the NTools::CBaseClassNonCopyable base ctor (also implemented
 // as a static in gamethread.cpp): store the base vtable, return obj.
@@ -11713,9 +13181,147 @@ static int LoadAudioMasteringProfiles(void)
 {
     return LoadMasteringProfiles("audio/profiles.amp");
 }
+
+// ============================================================
+//  CApplyMasteringProfile / StageApplyMasteringProfile / ApplyMasteringProfile /
+//  LoadApplyMasteringProfile  (0x18FB930 - 0x18FB9AC frontend, 0x145D890 stdcall
+//  wrapper, 0x14611F0 staging, 0x1473AB0 slot-string hash, 0x1B6F8E0 vftable)
+//
+//  The CApplyMasteringProfile lambda class is the sibling of the CLoadMasteringProfiles
+//  one (0x14611B0): the NLHAudio::NFramework::NComms::ApplyMasteringProfile
+//  (char const *) lambda builds an 8-byte ICommand {vtable, 4-byte payload} instead
+//  of the 8-byte {vtable, path slot} of CLoadMasteringProfiles.  The payload is the
+//  FNV hash (seed 0x811C9DC5, prime 0x01000193) of the source string -- computed in
+//  this build as the seed only, because the compiler-generated identity
+//  copy-then-release dance inside the hash helper nulls the temp slot before the
+//  hash loop (the slot is nulled and re-released on the empty string), so the
+//  loop is dead and the seed is the only value the function can return.
+static void *CApplyMasteringProfileDtor(void *obj, int free)
+{
+    *(DWORD *)obj = 0x01B6F458;   // &NLHAudio::NThreading::ICommand::`vftable' (original VA)
+    if (free & 1)
+        LHFree(obj);
+    return obj;
+}
+static int CApplyMasteringProfileSize(void) { return 8; }      // sub_14623E0
+static int CApplyMasteringProfileExec(void *path)              // sub_1460520 (stub)
+{ (void)path; return 0; }
+static const void *kCApplyMasteringProfileVftable[] = {
+    (const void *)CApplyMasteringProfileDtor,   // 0x1463760
+    (const void *)CApplyMasteringProfileSize,   // 0x14623E0
+    (const void *)CApplyMasteringProfileExec,   // 0x1460520
+    (const void *)0x01C41674                     // rdata entry, original VA
+};
+
+//  HashSlotContent  (0x1473AB0 - 0x1473AF3)  -- the slot-string FNV hash
+//  [NOT byte-identical] placement-dependent (relative calls to the identity
+//  RefSharedSlot / GetSlotString / ReleaseSharedSlot callees).
+//
+//  int HashSlotContent(F3SharedBuffer **slot)   -- this: the slot to hash
+//
+//  The compiler-generated identity copy-then-release dance nulls the temp
+//  slot and takes a live-slot reference; the toupper pass and the hash loop
+//  are dead (the temp slot holds no block), so the function always returns
+//  the FNV seed (0x811C9DC5).  The temp slot is released afterwards (the
+//  live-slot count is dropped), balancing the +1 above.
+// ============================================================
+static int HashSlotContent(F3SharedBuffer **slot)
+{
+    F3SharedBuffer *v5 = (F3SharedBuffer *)slot;   // v5 = this: the slot pointer
+    RefSharedSlot(&v5, &v5);                        // identity copy: null the temp slot, +1 g_Addend
+    int hash = (int)0x811C9DC5u;                    // the loop is dead (the slot holds no block)
+    (void)GetSlotString(&v5);                       // the dead-path empty-string read
+    ReleaseSharedSlot(&v5);                         // drop the counter (the slot is null, no free)
+    return hash;
+}
+
+//  StageApplyMasteringProfile  (0x14611F0 - 0x146122F)  -- stage the 8-byte
+//  CApplyMasteringProfile ICommand into the main (80/4096) allocation cache
+//  (g_unk_1DDC830, built by InitVirtualFileSystem, never reached here).
+//
+//  void StageApplyMasteringProfile(const char *source)   -- cdecl
+//
+//  On success, install the CApplyMasteringProfile vtable, assign the source
+//  into a temp slot, store the slot-string hash as the +4 payload, release the
+//  temp slot and finalize the cache.
+//  [NOT byte-identical] placement-dependent (relative calls to the pool / slot
+//  callees) and refs the high-VA global g_unk_1DDC830 (0x01DDC830) and the
+//  CApplyMasteringProfile vtable at its original VA (0x01B6F8E0).
+static void StageApplyMasteringProfile(const char *source)
+{
+    F3SharedBuffer *v2 = 0;
+    DWORD *obj = (DWORD *)VfsAllocCacheAlloc(g_unk_1DDC830, 1);
+    if (obj != 0) {
+        obj[0] = (DWORD)kCApplyMasteringProfileVftable;
+        SetSharedSlot(&v2, source, -1);
+        obj[1] = (DWORD)HashSlotContent(&v2);
+        ReleaseSharedSlot(&v2);
+        VfsAllocCacheFinalize(g_unk_1DDC830);
+    }
+}
+
+//  ApplyMasteringProfile  (0x145D890 - 0x145D8C9)  -- the NLHAudio::
+//  NFramework::NComms::ApplyMasteringProfile(char const*) stdcall wrapper
+//  (the ECX the caller stages is ignored):
+//
+//  void ApplyMasteringProfile(F3SharedBuffer **dstSlot, const char *source, int a3)
+//
+//  Register the global GAME-path slot's block into the caller's temp slot
+//  (RefSharedSlot, 0x1A012C0), stage the ApplyMasteringProfile command
+//  (StageApplyMasteringProfile, 0x14611F0), and -- when a3 != 0 -- publish the
+//  source path into the global slot (dword_1DDC81C) via SetSaveGamePath
+//  (0x1A019B0).  Sole caller: LoadApplyMasteringProfile (sub_18FB930).
+//  [NOT byte-identical] placement-dependent (relative calls to the slot / pool
+//  / SetSaveGamePath callees) and refs the high-VA global g_dword_1DDC81C
+//  (0x01DDC81C).
+static void ApplyMasteringProfile(F3SharedBuffer **dstSlot, const char *source, int a3)
+{
+    RefSharedSlot(dstSlot, &g_dword_1DDC81C);
+    StageApplyMasteringProfile(source);
+    if (a3 != 0)
+        SetSaveGamePath(&g_dword_1DDC81C, source);
+}
+
+// ============================================================
+//  LoadApplyMasteringProfile  (0x18FB930 - 0x18FB9AC)  -- load the GAME
+//  mastering profile from "GAME"
+//
+//  int LoadApplyMasteringProfile(void)   -- cdecl (plain retn)
+//
+//  The compiler-generated empty local (the identity ctor sub_145D7C0 + the nullsub_124
+//  `retn` dtor on a 1-byte stack object) is side-effect free and omitted, as is the
+//  __security_cookie frame check.  Copies the global GAME-path slot's block into a
+//  local slot (RefSharedSlot), stages the CApplyMasteringProfile ICommand into the
+//  audio-comms allocation pool (ApplyMasteringProfile, sub_145D890), with the literal
+//  "GAME" (0x01BD35B0), then sets the global slot (dword_1DDC81C) to the new path and
+//  releases the copied block: decrements its refcount and frees it on zero.  Returns
+//  the live-slot count after the final g_Addend decrement (the original returns the
+//  InterlockedDecrement result through the nullsub_124 `retn` dtor).
+//  Callers: RunFrontEnd (0x61D701 -- right after the nullsub_29 atexit pair) and the
+//  vtable thunk 0x619B10 (both discard the value); replaces the sub_18FB930 no-op
+//  stub in RunFrontEnd.
+//  [NOT byte-identical] placement-dependent (relative calls to the slot / pool
+//  callees + the __security_check_cookie IAT slot) and refs the high-VA "GAME"
+//  string (0x01BD35B0) at its original address and the GAME path slot dword_1DDC81C.
+// ============================================================
+static int LoadApplyMasteringProfile(void)
+{
+    F3SharedBuffer *v1 = 0;
+
+    ApplyMasteringProfile(&v1, "GAME", 1);
+
+    if (v1 != 0)
+    {
+        if (InterlockedDecrement(&v1->refcount) <= 0 && v1 != 0)
+            SharedBufferFree(v1);
+        v1 = 0;
+    }
+    return (int)InterlockedDecrement(&g_Addend);
+}
 //  0x619990 (the Havok aligned-allocate thunk) and 0x6199A0 (the aligned-
 //  free thunk) are now the real JmpLHAllocAligned / JmpLHFreeAligned in
 //  common/common.cpp.
+
 //  WaitForEvent  (0x18C4560 - 0x18C45B3)  -- block on the event stored in
 //  the frontend object (handle at obj+0x80; sibling SetFrontendEvent does
 //  SetEvent on the same slot, sub_18C45E0 does CloseHandle). Wraps
@@ -11749,9 +13355,9 @@ static int WaitForEvent(void *obj, int dwMilliseconds, int bAlertable)
 //  here with the frontend object (dword_1DBD9E8) in ECX.  [NOT byte-
 //  identical] the original calls the SetEvent IAT slot at its original high
 //  VA (call ds:__imp_SetEvent, 0x01AD5xxx).
-static void SetFrontendEvent(void *obj)
+static BOOL SetFrontendEvent(void *obj)
 {
-    SetEvent(*(HANDLE *)((char *)obj + 0x80));
+    return SetEvent(*(HANDLE *)((char *)obj + 0x80));
 }
 // 0x18FA3E0 / 0x18FA3D0: the heap-manager getters. The original sub_18FA3E0
 // takes no argument (callers push a value on the stack for a later stdcall
@@ -11788,7 +13394,7 @@ static int __stdcall SetSoundHWND(int hwnd)
 // in the worker at +0x25C/+0x260/+0x264/+0x268 by the sub_18F6Cxx setters).
 // PauseGameOnVMState  (0x61A330 - 0x61A407)
 // -- the VM-state-driven worker callback (registered by RunFrontEnd on the
-// worker at +0x25C via sub_18F6C90).  Reads the VM core's state byte (0x674320);
+// worker at +0x25C via SetPauseGameOnVMState).  Reads the VM core's state byte (0x674320);
 // while the VM reports something active, dispatches the entity's vtable[1] step.
 // On the pause-worthy result (10) — or, when the result is not 2 and the
 // one-shot release flag is clear, releases the previous pause-debug instance
@@ -11797,8 +13403,9 @@ static int __stdcall SetSoundHWND(int hwnd)
 // twice, sends the pause packet through sub_687D90(v, 1, 1) and tail-calls
 // sub_685520 with the +0x10 sub-object.  Returns the send's result; returns
 // the raw state byte when the VM reports nothing.  Calls that are no-ops in
-// this build (the worker callback is never invoked: sub_18F6C90 is a no-op)
-// are left as documented stubs.
+// this build (the worker callback is stored at +0x25C via SetPauseGameOnVMState
+// but never invoked: the worker's pump loop does not read the slot).  Calls
+// that are no-ops in this build are left as documented stubs.
 //   [NOT byte-identical] refs the high-VA globals g_dword_1DBDD4C (via
 // KoreGetVMCore) + byte_1DBD9E1 (0x1DBD9E1, kept static here) and ~13
 // unimplemented engine callees (marked [STUB] below); placement-dependent
@@ -11862,7 +13469,7 @@ static int EntitySubObject(void *obj)
 //  (unk_1DBE300, 0x1DBE300..0x1DBE3A8).  [NOT byte-identical] refs the
 //  high-VA globals (unk_1DBE300 / dword_1DBE3A8) and the relative E8 calls
 //  (InitSharedSlot / InitSharedSlotWide / LHAlloc / the CRT
-//  InitializeCriticalSection / GetNetManager / NetRegisterPacketCallback).
+//  InitializeCriticalSection / GetNetManager / PauseDebugRegisterPacket).
 //
 //  The pause-debug instance is a 0xA8-byte object, built on first use by
 //  GetPauseDebugInstance (sub_67E460): two -1 owner words, the shared slot
@@ -11896,36 +13503,711 @@ static void PauseDebugLockCtor(void *lock)
     dw[1] = 0;
 }
 
-// sub_A1AA30 (0xA1AA30) -- the packet-callback registration on the net
-// manager's packet manager.  [STUB] the body is out of scope (the net
-// manager's packet manager is 0 in this build, so no packets are ever
-// delivered); the registration is a no-op, preserving all observable behavior
-// (the ids / locks / handlers / callback pointers are identical in shape).
-static void PauseDebugRegisterPacket(void *pm, int id, void *lock,
-                                     void *callback, void *recv, void *ser)
-{
-    (void)pm; (void)id; (void)lock; (void)callback; (void)recv; (void)ser;
-}
+// ===============================================================
+//  The CNetPacketCallback registration cluster (PauseDebugRegisterPacket + helpers)
+// ===============================================================
 
-// The two packet registrations of the pause-debug instance (the receive /
-// serialize handler pairs 519 and 520).  [STUB] each body is out of scope;
-// the packet manager is 0 and no packets are ever delivered, so the handlers
-// are never called (only their addresses are registered).
-static void PauseDebugRecv519(void *pkt, void *obj) { (void)pkt; (void)obj; }
-static void PauseDebugSer519(void *out, void *in)  { (void)out; (void)in; }
-static void PauseDebugRecv520(void *pkt, void *obj) { (void)pkt; (void)obj; }
-static void PauseDebugSer520(void *out, void *in)  { (void)out; (void)in; }
-
-// Placeholder vtable for the CNetPacketCallback DNameNode base at +0x88:
-// nothing dispatches through it in this build (CNetPacketCallbackDtor does
+// Placeholder vtable for the CNetPacketCallback DNameNode base at +0x88 and
+// the derived vftable the registration cluster stores into the {vftable, node}
+// slots (the helpers below and the +0x88 base at PauseDebugInstanceCtor).
+// Nothing dispatches through it in this build (CNetPacketCallbackDtor does
 // not virtual-call), so the zeroed 8-slot placeholder preserves the
 // observable behavior (the netinit.cpp g_CNetPacketCallbackVtable pattern).
 static void *g_PauseDebugPacketCallbackVtable[8] = { 0 };   // NPacketCallback::CNetPacketCallback::`vftable'
 
+// Placeholder for the base CBaseTrackingPointer vftable (the base vftable the
+// DNameNode base ctor (PauseDebugDNameNodeCtor) stores into a freshly constructed object
+// before the derived CNetPacketCallback vftable overwrite).  Zeroed, like
+// the other placeholder vtables in this build.
+static void *g_BaseTrackingPointerVtable[1] = { 0 };   // NTools::CBaseTrackingPointer::`vftable'
+
+// Placeholder for the CNetPlayFMVPacket vftable (slot 0 = the packet-filling
+// callee sub_680160, out of scope in this build) and the CApplicationPacket
+// vftable (the reset-of-vftable thunk sub_9EDB40 writes back after the packet
+// is serialized, also not dispatched in this build).  Zeroed, like the other
+// placeholder vtables in this build.
+static void *g_CNetPlayFMVPacketVtable[6] = { 0 };   // NTools::CNetPlayFMVPacket::`vftable'
+static void *g_CNetStopFMVPacketVtable[6] = { 0 };   // NTools::CNetStopFMVPacket::`vftable' (0x1AEF740)
+static void *g_CApplicationPacketVtable[6] = { 0 };   // NTools::CApplicationPacket::`vftable'
+
+// PauseDebugDNameNodeCtor (0x1898300 - 0x189830F) -- DNameNode::DNameNode
+// the 8-byte base ctor: store the base CBaseTrackingPointer vftable, zero the
+// node word.  [NOT byte-identical] placement-dependent (references the base
+// vftable at a high VA).
+static void PauseDebugDNameNodeCtor(DWORD *obj)
+{
+    obj[0] = (DWORD)g_BaseTrackingPointerVtable;
+    obj[1] = 0;
+}
+
+// PauseDebugSharedNodeFinalize (0x1898350 - 0x1898395) -- the shared-object node finalizer:
+// store the base CBaseTrackingPointer vftable, decrement the node's refcount
+// (freeing the block when it hits zero and the stored value is null), zero
+// the node word, and return the old node.
+static DWORD PauseDebugSharedNodeFinalize(DWORD *obj)
+{
+    DWORD result = obj[1];
+    obj[0] = (DWORD)g_BaseTrackingPointerVtable;
+    if (result != 0)
+    {
+        InterlockedDecrement((volatile long *)((char *)result + 4));
+        result = obj[1];
+        if (*(DWORD *)((char *)result + 4) == 0 && *(DWORD *)result == 0)
+            LHFree((void *)result);
+        obj[1] = 0;
+    }
+    obj[1] = 0;
+    return result;
+}
+
+// PauseDebugSharedNodeRelease (0x1898310 - 0x1898348) -- the shared-object node release:
+// decrement the node's refcount (freeing the block when it hits zero and the
+// stored value is null), zero the node word, and return the old node.
+static DWORD PauseDebugSharedNodeRelease(DWORD *obj)
+{
+    DWORD result = obj[1];
+    if (result != 0)
+    {
+        InterlockedDecrement((volatile long *)((char *)result + 4));
+        result = obj[1];
+        if (*(DWORD *)((char *)result + 4) == 0 && *(DWORD *)result == 0)
+            LHFree((void *)result);
+        obj[1] = 0;
+    }
+    return result;
+}
+
+// PauseDebugSharedNodeRef (0x18983A0 - 0x1898427) -- the shared-object add/release helper
+// (the 2-word {vftable, node} shared-object slot a DNameNode points at).
+// Releases the old node (refcount drop + optional free) and, when a handler
+// is non-null, shares its existing shared-object (refcount increment) or
+// builds a fresh 8-byte {handler, refcount} block.  Returns the new refcount
+// (InterlockedIncrement) or the old node value.
+//
+// this = the DNameNode object (2 words), a2 = the handler (the callback).
+static DWORD PauseDebugSharedNodeRef(DWORD *obj, DWORD a2)
+{
+    DWORD result = obj[1];
+    if (result != 0)
+    {
+        if (*(DWORD *)result == a2 && a2 != 0)
+            return result;
+        InterlockedDecrement((volatile long *)((char *)result + 4));
+        result = obj[1];
+        if (*(DWORD *)((char *)result + 4) == 0 && *(DWORD *)result == 0)
+            LHFree((void *)result);
+        obj[1] = 0;
+    }
+    if (a2 != 0)
+    {
+        DWORD v4 = *(DWORD *)((char *)a2 + 4);
+        if (v4 != 0)
+        {
+            obj[1] = v4;
+            return (DWORD)InterlockedIncrement((volatile long *)((char *)v4 + 4));
+        }
+        DWORD *v5 = (DWORD *)LHAlloc(8);
+        obj[1] = (DWORD)v5;
+        if (v5 != 0)
+        {
+            *v5 = a2;
+            *(DWORD *)((char *)v5 + 4) = 1;
+        }
+        result = obj[1];
+        *(DWORD *)((char *)a2 + 4) = result;
+    }
+    return result;
+}
+
+// PauseDebugCompare (0x77DD10 - 0x77DD2C) -- the 2-word compare: the manager's
+// +0x58 object must equal the lock's 2-word shape (both words) for the
+// fast-path branch to fall through.
+static BOOL PauseDebugCompare(const DWORD *a, const DWORD *b)
+{
+    return *a == *b && a[1] == b[1];
+}
+
+// PauseDebugRegisterCopy (0xA1D080 - 0xA1D0E1) -- the registration copy: build the
+// holder object ({lock[0], lock[1], id, DNameNode{vftable, node}, ser, recv})
+// from the lock and the registration object, sharing the callback's
+// shared-object.  [NOT byte-identical] placement-dependent.
+//
+// this = the 7-word holder (7 dwords), a2 = the lock, a3 = the id,
+// a4 = the registration object (the 1st DNameNode).
+static DWORD *PauseDebugRegisterCopy(DWORD *holder, DWORD *lock, DWORD id, DWORD *obj1)
+{
+    holder[0] = lock[0];
+    holder[1] = lock[1];
+    holder[2] = id;
+
+    // The DNameNode base ctor at holder+3, then the derived overwrite.
+    PauseDebugDNameNodeCtor(&holder[3]);
+    holder[3] = (DWORD)g_PauseDebugPacketCallbackVtable;   // derived vftable overwrite
+
+    // The shared-object node for the callback: release the old slot, then
+    // share the existing shared-object (or build a fresh one).
+    DWORD v6 = obj1[1];
+    DWORD v7 = 0;
+    if (v6 != 0)
+    {
+        if (*(DWORD *)v6 != 0)
+            v7 = *(DWORD *)v6;                              // the callback
+        else
+        {
+            PauseDebugSharedNodeRelease(obj1);              // PauseDebugSharedNodeRelease(&obj1)
+        }
+    }
+    PauseDebugSharedNodeRef(&holder[3], v7);
+
+    holder[5] = obj1[2];   // the ser handler
+    holder[6] = obj1[3];   // the recv handler
+    return holder;
+}
+
+// PauseDebugA1FE30 (0xA1FE30) -- [STUB] the packet-table-entry shift callee
+// (depends on sub_A1FB40 / sub_A1CA90 -- both unimplemented).  Out of scope
+// for this build (the packet manager is 0, so the +0x44 table is never
+// reached); the arguments are accepted and ignored, matching the observable
+// behavior (the original would route through a dead slot).
+static DWORD PauseDebugA1FE30(DWORD *pm, DWORD holder)
+{
+    (void)pm; (void)holder;
+    return 0;
+}
+
+// PauseDebugA1A530 (0xA1A530) -- [STUB] the one-shot (fast-path) registration
+// (depends on ~8 unimplemented VM-ish callees: sub_A1D9A0 / sub_A1F330 /
+// sub_A1E140 / sub_A20E50 / sub_A1C720 / sub_A1FED0 / sub_A1DA40 /
+// sub_A20700 -- all out of scope).  Out of scope for this build (the packet
+// manager is 0, so no packets are ever delivered); the arguments are
+// accepted and ignored, preserving the observable behavior.
+static void PauseDebugA1A530(void *pm, unsigned int id, DWORD *lock, DWORD *obj1)
+{
+    (void)pm; (void)id; (void)lock; (void)obj1;
+}
+
+// PauseDebugRegisterPacket (0xA1AA30 - 0xA1AB5B) -- the packet-callback registration on the
+// net manager's packet manager.  [NOT byte-identical] placement-dependent
+// (relative E8 calls / high-VA globals / the relative E8 chain through the
+// shared-object helpers).
+//
+// thiscall in the original (the packet manager in ECX); the obj is passed
+// explicitly.  Faithful port of the original control flow: the id/callback
+// guard, the 1st DNameNode (the registration object) + the {ser, recv}
+// handler-pair area, the 2nd DNameNode + the shared-object add-ref on the
+// callback (PauseDebugSharedNodeRef), the +0x60 fast-path / +0x58 compare gate, the
+// PauseDebugRegisterCopy + PauseDebugA1FE30 + release sequence (normal path) or the
+// PauseDebugA1A530 one-shot (fast path), then the two finalizers (PauseDebugSharedNodeFinalize)
+// whose return value is the function's result.
+//
+// [NOT byte-identical] and not byte-identical: refs the high-VA vtables and
+// the relative E8 calls.  The NULL packet manager carrying NULL through is a
+// documented safe deviation: the original reads [esi+60h] unconditionally
+// (the original game always has a live packet manager), so this build guards
+// it (the packet manager is 0, so no packets are ever delivered).
+static DWORD PauseDebugRegisterPacket(void *pm, int id, void *lock,
+                                      void *callback, void *recv, void *ser)
+{
+    DWORD result = (DWORD)lock;
+    if ((unsigned short)id < 0xFE || callback == 0)
+        return result;
+
+    // The packet manager is 0 in this build (the net manager's +0x04 slot is
+    // never constructed), so the original's unconditional [esi+60h] flag read
+    // would dereference a null pointer.  Carry the NULL through (the project's
+    // established null-net-manager idiom).
+    if (pm == 0)
+        return result;
+
+    BYTE *pmbyte = (BYTE *)pm;
+
+    // The 1st DNameNode (the registration object): the base ctor + derived
+    // overwrite.  16 bytes: {vftable, node, ser, recv}.
+    DWORD obj1[4];
+    PauseDebugDNameNodeCtor(obj1);
+    obj1[0] = (DWORD)g_PauseDebugPacketCallbackVtable;
+
+    // The 2nd DNameNode (the shared-object holder): the base ctor + derived
+    // overwrite, then the shared-object add/release on the callback.
+    DWORD obj2[2];
+    PauseDebugDNameNodeCtor(obj2);
+    obj2[0] = (DWORD)g_PauseDebugPacketCallbackVtable;
+
+    // PauseDebugSharedNodeRef(&obj2, callback) -- the shared-object add/release.
+    PauseDebugSharedNodeRef(obj2, (DWORD)callback);
+
+    // eax = obj2[1] (the shared-object node); branch the same way the
+    // original does (release the node when its stored value is null, else
+    // share the pointed-to object).
+    DWORD eax = obj2[1];
+    if (eax != 0)
+    {
+        if (*(DWORD *)eax == 0)
+        {
+            PauseDebugSharedNodeRelease(obj2);
+            eax = 0;
+        }
+        else
+        {
+            eax = *(DWORD *)eax;
+        }
+    }
+    else
+    {
+        eax = 0;
+    }
+
+    // PauseDebugSharedNodeRef(&obj1, eax) -- the registration object's shared-object.
+    PauseDebugSharedNodeRef(obj1, eax);
+
+    // The _ReaderWriterLock ctor zeroes the {ser, recv} handler-pair area
+    // (the original zeroes the lock area first, then writes the handlers in).
+    // The original packs the pair via sub_11CAD00; the observable effect is
+    // the same as writing the two handlers into the registration object.
+    obj1[2] = (DWORD)ser;
+    obj1[3] = (DWORD)recv;
+
+    // The +0x60 fast-path / +0x58 compare gate.
+    if (pmbyte[0x60] == 0 ||
+        !PauseDebugCompare((DWORD *)((char *)pm + 0x58), (DWORD *)lock))
+    {
+        // The PauseDebugA1A530 one-shot registration (out of scope -- stubbed).
+        PauseDebugA1A530(pm, (unsigned int)id, (DWORD *)lock, obj1);
+    }
+    else
+    {
+        // The PauseDebugRegisterCopy registration copy, then the +0x44 table write, then
+        // the v12 finalizer.
+        DWORD holder38[7];
+        PauseDebugRegisterCopy(holder38, (DWORD *)lock, (DWORD)id, obj1);
+        PauseDebugA1FE30((DWORD *)((char *)pm + 0x44), (DWORD)holder38);
+
+        // PauseDebugSharedNodeFinalize(&v12) -- the 16-byte v12 buffer finalizer (zeroed: the
+        // original reads the uninitialized stack slot free; zeroing is the
+        // safe equivalent).
+        DWORD v12[4];
+        memset(v12, 0, sizeof(v12));
+        PauseDebugSharedNodeFinalize(v12);
+    }
+
+    // The two finalizers (the return value of the second is the function's
+    // result).
+    PauseDebugSharedNodeFinalize(obj2);
+    return PauseDebugSharedNodeFinalize(obj1);
+}
+
+// The receive / serialize handler pairs 519 and 520 of the pause-debug
+// instance.  519: receive (wrapper + documented [STUB] state loader) +
+// serialize (implemented).  520: both implemented (the receive handler is a
+// tail-jump into the implemented stop-FMV state machine; the serialize
+// handler is a faithful port of the original outer control flow).
+
+// sub_67E030 (0x67E030 - 0x67E2CE) -- the FMV packet state loader behind the
+// 519 receive handler.  [STUB] out of scope for this build — the body is a
+// 682-byte (0x2A6) thiscall (the pause-debug instance in ECX; 7 stack args)
+// that resolves the FMV "videos" settings slot path through the shared-slot
+// machinery (CopySharedSlot / InitSharedSlot / SetSharedSlot /
+// ResolveLipComponentSlotPath / MakeSettingsFilePath / SharedSlotConcat /
+// ReleaseSharedSlot), checks the settings file exists (SharedFileExists),
+// reads the FMV state into the instance (+0x14/+0x18), applies the sub-
+// title/video gate (sub_7D4650 / sub_67DAF0 / the LHAlloc + DWORD-pool chain
+// sub_42CE40 / sub_67F100 / sub_C0E130 / sub_452E70 / sub_18EAAF0) and writes
+// the flags (+0x10/+0x54-+0x58, and the +0x98/+0xA0 double/byte).  The body
+// depends on ~20 unimplemented callees (sub_6A8760 / GetEngineTime /
+// sub_18FB460 / sub_18F02C0 / sub_18F1120 / sub_7D4650 / sub_67DAF0 /
+// unknown_libname_2583 / sub_42CE40 / sub_67F100 / sub_C0E130 / sub_452E70 /
+// sub_18EAAF0 / PauseDebugSetStopState — all out of scope, so the body is NOT
+// reimplemented here.  Faithful port of the wrapper (PauseDebugRecv519) only;
+// the callee is an explicit stub carried the same way as PauseDebugA1A530 /
+// PauseDebugA1FE30.
+static int FmvPacketStateLoad(void *obj, void *stateObj, unsigned char a3,
+                              unsigned char a4, unsigned char a5,
+                              unsigned char a6, DWORD a7, int a8)
+{
+    (void)obj; (void)stateObj; (void)a3; (void)a4; (void)a5; (void)a6;
+    (void)a7; (void)a8;
+    return 0;
+}
+
+// PauseDebugRecv519  (0x6805B0 - 0x6805DC)  -- the receive handler for the
+// pause-debug FMV packet (519): unpack the packet and delegate to the FMV
+// state loader.
+//
+// This is a thin wrapper in the original (44 bytes, no frame): it reads the
+// incoming packet (arg_0 = pkt) at +8..+11 (four bytes, movzx) and +12 (a
+// DWORD), adds 4 to the packet pointer (the state object handed to the
+// loader) and sets ECX to the pause-debug instance (arg_1 = obj) before
+// calling sub_67E030 with seven stack args (pkt+4, *(pkt+8), *(pkt+9),
+// *(pkt+10), *(pkt+11), *(pkt+12), 1).  The return value is the loader's
+// result.  [NOT byte-identical] the body has relative E8 calls and references
+// the (unimplemented) state loader, so it is a C++ reimplementation.  The
+// callee is an explicit [STUB] carried as FmvPacketStateLoad above; the
+// observable behavior in this build is unchanged (the packet manager is 0, so
+// the handler is never called and only its address is registered).
+static int PauseDebugRecv519(void *pkt, void *obj)
+{
+    BYTE *bytes = (BYTE *)pkt;
+    return FmvPacketStateLoad(obj,
+                              (char *)pkt + 4,
+                              bytes[8],
+                              bytes[9],
+                              bytes[10],
+                              bytes[11],
+                              *(DWORD *)(bytes + 12),
+                              1);
+}
+
+// PauseDebugSer519LowerSearch (sub_651F70, 0x651F70 - 0x651FC3) -- the "lower-bound"
+// half of the two-call sorted-entry binary search the 519/520 serialize handlers
+// run over the packet-state entry list (the sorted 20-byte entry list at the
+// packet state's +8 (start) .. +0xC (end)).  Faithful port of the original
+// binary search: starting at the list start, the probe entry is advanced by
+// 20*(count/2); if the probe's first word is >= the target, the search advances
+// to the next entry and recomputes the count (v4 += -1 - v4 / 2); otherwise
+// the count is halved (the target is in the first half).  [NOT byte-identical]
+// placement-dependent (the inline division-by-20 magic + the relative E8 calls).
+static int PauseDebugSer519LowerSearch(DWORD *obj, int *a2, unsigned short *a3)
+{
+    int v3 = *(obj + 2);                       // the list start (+8)
+    int v4 = (*(obj + 3) - v3) / 20;           // the entry count
+    *a2 = 0;
+    a2[1] = v3;
+    while (v4 > 0)
+    {
+        int v5 = *a2;
+        int v6 = a2[1] + 20 * (v4 / 2);
+        if (*a3 < *(unsigned short *)v6)
+        {
+            v4 /= 2;
+        }
+        else
+        {
+            a2[1] = v6 + 20;
+            *a2 = v5;
+            v4 += -1 - v4 / 2;
+        }
+    }
+    return (int)a2;
+}
+
+// PauseDebugSer519UpperSearch (sub_651F00, 0x651F00 - 0x651F6E) -- the "upper-bound"
+// half of the two-call sorted-entry binary search the serialize handlers run
+// over the packet-state entry list.  Faithful port of the original: starting at
+// the list start, the probe entry is advanced by 20*(count/2); if the probe's
+// first word >= the target, the search backs out to the original entry and
+// halves the count; otherwise the search advances to the next entry and
+// recomputes the count (v4 += -1 - (v4 >> 1)).  [NOT byte-identical]
+// placement-dependent (the inline division-by-20 magic + the relative E8 calls).
+static int PauseDebugSer519UpperSearch(DWORD *obj, int *a2, unsigned short *a3)
+{
+    int v3 = *(obj + 2);                       // the list start (+8)
+    int v4 = (*(obj + 3) - v3) / 20;           // the entry count
+    *a2 = 0;
+    a2[1] = v3;
+    while (v4 > 0)
+    {
+        int v5 = 20 * (v4 >> 1);
+        int oldEntry = a2[1];
+        a2[1] += v5;
+        unsigned short *v6 = (unsigned short *)a2[1];
+        if (*v6 >= *a3)
+        {
+            a2[1] = oldEntry;
+            v4 >>= 1;
+        }
+        else
+        {
+            a2[1] += 20;
+            v4 += -1 - (v4 >> 1);
+        }
+    }
+    return (int)a2;
+}
+
+// PauseDebugSer519  (0x67F940 - 0x67FA4B)  -- the serialize handler for the
+// pause-debug FMV packet (519): build the CNetPlayFMVPacket from the
+// packet-state object, then iterate the sorted 20-byte entry list for the
+// 519 id.  [NOT byte-identical] placement-dependent (relative E8 calls to
+// sub_651F70 / sub_651F00 / ReleaseSharedSlot / sub_9EDB40 / the packet vftable
+// call, plus the high-VA CNetPlayFMVPacket vftable).
+//
+// this = a4 = the packet-state object (the sorted 20-byte entry list at +8..+0xC
+// with the entry's first WORD holding the packet id; the +0xAC byte read at the
+// loop tail gates the "keep looping" condition); a1 = unused (the placeholder
+// leading arg); a2 = the outer object handed to the packet-constructor thunk
+// (the CNetPlayFMVPacket vftable[0] call, out of scope in this build); a3 = the
+// object whose +0xAC byte gates the loop.
+static int PauseDebugSer519(int a1, int a2, int a3, DWORD *a4)
+{
+    (void)a1;
+    BYTE packet[16];
+    memset(packet, 0, sizeof(packet));
+
+    // The packet (the v11 local): the first word is the CNetPlayFMVPacket vftable.
+    // (The original sub_9EDBB0 thunk originally writes &CApplicationPacket::vftable;
+    // the write is immediately overwritten with the PlayFMV vftable, so only the
+    // PlayFMV vftable matters.)
+    *(DWORD *)(packet + 0) = (DWORD)g_CNetPlayFMVPacketVtable;
+
+    // +0x04: the shared slot (the original InitSharedSlot call; a documented
+    // [STUB]-adjacent helper, implemented in this build).
+    InitSharedSlot((F3SharedBuffer **)(packet + 4));
+
+    // The packet fields: the +0x0A/+0x0B byte pair (1, 1) and the +0x0C dword
+    // (1) are written before the vftable[0] call in the original, as is the
+    // +0x08/+0x09 byte pair (0, 0) (v13 / v14).
+    packet[10] = 1;                     // +0x0A (v15)
+    packet[11] = 1;                     // +0x0B (v16)
+    *(DWORD *)(packet + 12) = 1;        // +0x0C (v17)
+    packet[8] = 0;                      // +0x08 (v13)
+    packet[9] = 0;                      // +0x09 (v14)
+
+    // The packet-filling callee (the CNetPlayFMVPacket vftable[0] call,
+    // sub_680160) -- out of scope for this build.  It writes the packet's
+    // +0x08..+0x11 byte fields and the +0x0C dword through the outer object's
+    // vftable slots [16] / [10] (0x40 / 0x28), plus calls sub_67FFC0 (the
+    // 519-packet builder, which depends on a deep set of unimplemented callees
+    // -- SetSaveGamePath / LHAlloc / sub_67FD50 / the LHFree finalizer).  The
+    // handler is never called in this build (the packet manager is 0) -- only
+    // its address is registered -- so the observable behavior is unchanged.
+    // [STUB] -- documented no-op, mirroring FmvPacketStateLoad / PauseDebugA1FE30.
+    (void)a2;
+
+    // The two binary searches for the 519 id (sub_651F70 lower-bound +
+    // sub_651F00 upper-bound -- together bracketed over the sorted entry list).
+    DWORD lowerSearch[2];
+    DWORD upperSearch[2];
+    unsigned short target = 519;
+    PauseDebugSer519LowerSearch(a4, (int *)lowerSearch, &target);
+    PauseDebugSer519UpperSearch(a4, (int *)upperSearch, &target);
+
+    // Iterate the entries from the found entry to the end of the list.
+    // (The original reads an uninitialized "end" local from the loop's
+    // comparison -- no store for it exists anywhere in the body; in the
+    // original the loop would iterate against garbage.  The honest
+    // interpretation is the search object's +0xC field (the list end, the
+    // same pointer the binary searches read), so the loop runs from the
+    // found entry to the actual list end.)
+    DWORD foundEntry = upperSearch[1];
+    DWORD endEntry = *(DWORD *)((char *)a4 + 12);
+    if (foundEntry != endEntry)
+    {
+        DWORD v6 = foundEntry + 8;
+        do
+        {
+            DWORD *holder = (DWORD *)*(DWORD **)v6;
+            if (*(DWORD *)v6 != 0)
+            {
+                if (holder != 0 && *holder != 0)
+                {
+                    int v8 = *holder;
+                    if (v8 != 0)
+                    {
+                        (*(void (__cdecl **)(char **, DWORD))(v6 + 8))(
+                            (char **)packet, *(DWORD *)(v8 + 8));
+                    }
+                }
+                else
+                {
+                    PauseDebugSharedNodeRelease((DWORD *)(v6 - 4));
+                }
+            }
+            if (a3 != 0 && (*(unsigned char *)((char *)a3 + 172) & 2) == 0)
+                break;
+            foundEntry += 20;
+            v6 += 20;
+        } while (foundEntry != endEntry);
+    }
+
+    // The shared-slot destructor (the return value is the function's result,
+    // as the original leaves EAX with ReleaseSharedSlot's result).
+    long result = ReleaseSharedSlot((F3SharedBuffer **)(packet + 4));
+
+    // The packet vftable reset (sub_9EDB40: the first word back to the
+    // CApplicationPacket vftable).
+    *(DWORD *)(packet + 0) = (DWORD)g_CApplicationPacketVtable;
+
+    (void)packet;
+    return (int)result;
+}
+
+//  PauseDebugSetStopState  (sub_67CF30, 0x67CF30 - 0x67CF72) -- set the
+//  FMV stop-state word (+0x30) under the instance's +0x34 critical section.
+//  [NOT byte-identical] placement-dependent (the Enter/Leave critical-section
+//  IAT slots).  The original is thiscall (obj in ECX; the state word on the
+//  stack), so the obj is passed explicitly.
+static void PauseDebugSetStopState(void *obj, int state)
+{
+    F3CsGuard guard;
+    CsGuardAcquire(&guard, (CRITICAL_SECTION *)((char *)obj + 52), 0);
+    *(DWORD *)((char *)obj + 48) = (DWORD)state;
+    CsGuardRelease(&guard);
+}
+
+//  PauseDebugGetStopState  (sub_67CF80, 0x67CF80 - 0x67CFBE) -- read the
+//  FMV stop-state word (+0x30) under the instance's +0x34 critical section.
+//  [NOT byte-identical] placement-dependent (the Enter/Leave critical-section
+//  IAT slots).  The original is thiscall (obj in ECX), so the obj is passed
+//  explicitly.
+static int PauseDebugGetStopState(void *obj)
+{
+    F3CsGuard guard;
+    CsGuardAcquire(&guard, (CRITICAL_SECTION *)((char *)obj + 52), 0);
+    int v2 = *(DWORD *)((char *)obj + 48);
+    CsGuardRelease(&guard);
+    return v2;
+}
+
+//  PauseDebugStopFmvReceive  (sub_67D310, 0x67D310 - 0x67D3A9) -- the
+//  pause-debug instance's stop-FMV state machine.  [NOT byte-identical]
+//  placement-dependent (the Enter/Leave critical-section IAT slots + the
+//  tail-call structure).  The original is thiscall (obj in ECX); a C call
+//  cannot stage ECX, so the obj is passed explicitly.
+//
+//  Faithful port of the original: acquire the +0x34 critical section, read
+//  the +0x30 state word, release and re-acquire it, then:
+//    state == 3  ->  state = 4
+//    state == 1  ->  set state = 5
+//    state == 2  ->  set state = 0
+//  (the else branch re-reads the state word under the re-acquired section
+//  before deciding; only the state == 2 path calls the getter, exactly as
+//  the original does).
+static void PauseDebugStopFmvReceive(void *obj)
+{
+    F3CsGuard guard;
+    CsGuardAcquire(&guard, (CRITICAL_SECTION *)((char *)obj + 52), 0);
+    DWORD v3 = *(DWORD *)((char *)obj + 48);
+    CsGuardRelease(&guard);
+    CsGuardAcquire(&guard, (CRITICAL_SECTION *)((char *)obj + 52), 0);
+    if (v3 == 3)
+    {
+        *(DWORD *)((char *)obj + 48) = 4;
+        CsGuardRelease(&guard);
+        return;
+    }
+    DWORD v4 = *(DWORD *)((char *)obj + 48);
+    CsGuardRelease(&guard);
+    if (v4 == 1)
+    {
+        PauseDebugSetStopState(obj, 5);
+    }
+    else if (PauseDebugGetStopState(obj) == 2)
+    {
+        PauseDebugSetStopState(obj, 0);
+    }
+}
+
+//  PauseDebugRecv520  (sub_67F4B0, 0x67F4B0 - 0x67F4B9) -- the receive handler
+//  for the pause-debug FMV stop packet (520): tail-jump into the stop-FMV
+//  state machine with the pause-debug instance in ECX.
+//
+//  This is a 9-byte (no-frame) wrapper in the original: `mov ecx,
+//  [esp+arg_4]; jmp sub_67D310` -- the second argument (obj) becomes the
+//  thiscall's ECX and the state machine runs with it.  [NOT byte-identical]
+//  the body is a tail-jmp (the original's absolute target is not
+//  reproducible); the callee is the implemented PauseDebugStopFmvReceive
+//  above.  The original returns the void state machine's result (undefined
+//  EAX -- the callee leaves no defined return value), so 0 is returned.
+static int PauseDebugRecv520(void *pkt, void *obj)
+{
+    (void)pkt;
+    PauseDebugStopFmvReceive(obj);
+    return 0;
+}
+
+//  PauseDebugSer520  (sub_67FA50, 0x67FA50 - 0x67FB27) -- the serialize handler
+//  for the pause-debug FMV stop packet (520): build the CNetStopFMVPacket
+//  from the packet-state object, then iterate the sorted 20-byte entry list
+//  for the 520 id.  [NOT byte-identical] placement-dependent (relative E8
+//  calls to PauseDebugSer519LowerSearch / PauseDebugSer519UpperSearch /
+//  PauseDebugSharedNodeRelease / sub_9EDB40 / the packet-ctor call, and the
+//  high-VA CNetStopFMVPacket vftable).
+//
+//  this = a4 = the packet-state object (the sorted 20-byte entry list at
+//  +8..+0xC with the entry's first WORD holding the packet id; the +0xAC byte
+//  read at the loop tail gates the "keep looping" condition); a1 = unused
+//  (the placeholder leading arg); a2 = the outer object handed to the packet-
+//  ctor thunk (the CNetStopFMVPacket vftable[0] call, out of scope in this
+//  build); a3 = the object whose +0xAC byte gates the loop.
+static void PauseDebugSer520(int a1, int a2, int a3, DWORD *a4)
+{
+    (void)a1;
+    BYTE packet[16];
+    memset(packet, 0, sizeof(packet));
+
+    // The packet (the v10 local): the first word is the CNetStopFMVPacket
+    // vftable.  (The original sub_9EDBB0 thunk originally writes
+    // &CApplicationPacket::vftable; the write is immediately overwritten
+    // with the StopFMV vftable, so only the StopFMV vftable matters.)
+    *(DWORD *)(packet + 0) = (DWORD)g_CNetStopFMVPacketVtable;
+
+    // The packet-filling callee (the CNetStopFMVPacket vftable[0] call,
+    // nullsub_19) -- out of scope for this build.  It writes the packet
+    // through the outer object's vftable slots (the CNetStopFMVPacket ctor
+    // thunk); the handler is never called in this build (the packet manager
+    // is 0) -- only its address is registered -- so the observable behavior
+    // is unchanged.  [STUB] -- documented no-op, mirroring the 519 handler's
+    // packet-filling callee.
+    (void)a2;
+
+    // The two binary searches for the 520 id (PauseDebugSer519LowerSearch --
+    // the sub_651F70 lower-bound search, and PauseDebugSer519UpperSearch --
+    // the sub_651F00 upper-bound search; the two helpers are packet-id-
+    // agnostic and are shared with the 519 serialize handler).
+    DWORD lowerSearch[2];
+    DWORD upperSearch[2];
+    unsigned short target = 520;
+    PauseDebugSer519LowerSearch(a4, (int *)lowerSearch, &target);
+    PauseDebugSer519UpperSearch(a4, (int *)upperSearch, &target);
+
+    // Iterate the entries from the found entry (the upper-bound search's final
+    // entry -- the first entry whose first word >= 520) to the first entry
+    // strictly above the 520 id (the lower-bound search's final entry).  This
+    // is exactly the range the original's two search calls bracket, so the
+    // walk covers the entries whose first word == 520 -- the two-search-
+    // bounds walk, not the +0xC list-end walk the (divergent) 519 handler
+    // uses.
+    DWORD foundEntry = upperSearch[1];
+    DWORD endEntry = lowerSearch[1];
+    if (foundEntry != endEntry)
+    {
+        DWORD v7 = foundEntry + 8;
+        do
+        {
+            DWORD *holder = (DWORD *)*(DWORD **)v7;
+            if (*(DWORD *)v7 != 0)
+            {
+                if (holder != 0 && *holder != 0)
+                {
+                    int v8 = *holder;
+                    if (v8 != 0)
+                    {
+                        (*(void (__cdecl **)(char **, DWORD))(v7 + 8))(
+                            (char **)packet, *(DWORD *)(v8 + 8));
+                    }
+                }
+                else
+                {
+                    PauseDebugSharedNodeRelease((DWORD *)(v7 - 4));
+                }
+            }
+            if (a3 != 0 && (*(unsigned char *)((char *)a3 + 172) & 2) == 0)
+                break;
+            foundEntry += 20;
+            v7 += 20;
+        } while (foundEntry != endEntry);
+    }
+
+    // The packet vftable reset (sub_9EDB40: the first word back to the
+    // CApplicationPacket vftable).
+    *(DWORD *)(packet + 0) = (DWORD)g_CApplicationPacketVtable;
+    (void)packet;
+}
+
 // PauseDebugInstanceCtor  (0x67E310 - 0x67E45C) -- construct the pause-debug
 // instance in place.  [NOT byte-identical] placement-dependent (relative E8
 // calls / the CRT InitializeCriticalSection / GetNetManager / the packet-
-// manager helpers / the two NetRegisterPacketCallback calls).
+// manager helpers / the two PauseDebugRegisterPacket calls).
 //
 // thiscall in the original (obj in ECX); a C call cannot stage ECX, so the
 // obj is passed explicitly.  Faithful port of the original control flow:
@@ -12128,13 +14410,27 @@ static void *PauseDebugCtor(void *obj)
     return obj;
 }
 
-// sub_61E040 (0x61E040 - 0x61E050) -- the thunk's release fn: vftable[0](obj, 1).
-static void PauseDebugRelease(DWORD ctx)
+// [BYTE-IDENTICAL]  PauseDebugRelease  (0x61E040 - 0x61E051)  -- the thunk's
+// release fn: when the SEH block's arg is non-null, dispatch the object's
+// deleting destructor (vtable[0](obj, 1)).
+//
+// The pause-debug thunk-record writer (PauseDebugThunk) registers this as the
+// SEH block's handler; the block is released by PauseDebugThunkRelease. The
+// original is a cdecl 1-arg function with no absolute refs or relative calls,
+// so it emits the original 17 bytes exactly.
+static __declspec(naked) int PauseDebugRelease(int)
 {
-    if (ctx == 0)
-        return;
-    // [STUB] the CGameModePauseDebug deleting dtor is not modelled; the
-    // original would dispatch vtable[0](ctx, 1).
+    __asm {
+        mov    ecx, [esp+4]
+        test   ecx, ecx
+        jz     short f3_pd_done
+        mov    eax, [ecx]
+        mov    edx, [eax]
+        push   1
+        call   edx
+    f3_pd_done:
+        retn
+    }
 }
 
 // sub_61FEC0 (0x61FEC0 - 0x61FF0B) -- the 12-byte thunk-record writer:
@@ -12153,7 +14449,7 @@ static DWORD *PauseDebugThunk(DWORD *obj, int a2)
     {
         DWORD v4 = *obj;
         v3[0] = 1;
-        v3[1] = (DWORD)(void (*)(DWORD))PauseDebugRelease;  // sub_61E040 (cdecl: 1 stack arg)
+        v3[1] = (DWORD)(int (*)(int))PauseDebugRelease;  // PauseDebugRelease: cdecl, 1 stack arg
         v3[2] = v4;
         obj[1] = (DWORD)v3;
     }
@@ -12295,7 +14591,7 @@ static DWORD PauseDebugThunkRelease(DWORD *obj)
         if (result == 0)
         {
             DWORD *block = (DWORD *)obj[1];
-            ((void (*)(DWORD))block[1])(block[2]);   // sub_61E040(context): vtable[0](context, 1)
+            ((int (*)(int))block[1])(block[2]);   // PauseDebugRelease(context): vtable[0](context, 1)
             LHFree(block);   // [STUB] LHFree is void in this build; the original returns its result
         }
     }
@@ -12306,6 +14602,345 @@ static DWORD PauseDebugThunkRelease(DWORD *obj)
 
 // j_GetNetManager_1 (0x673C30 - 0x673C38) -- thiscall thunk: returns GetNetManager().
 static void *j_GetNetManager_1(void *obj) { (void)obj; return GetNetManager(); }
+
+// ===========================================================================
+//  Multi-player pause worker-callback cluster (the SECOND VM-state-driven
+//  worker callback, registered on the worker at +0x260 via SetMultiplayerPauseOnVMState).
+//
+//  SubObjSlot4 (sub_658E40) / VmCoreSlot1C (sub_673E80) / VmCoreSlot40
+//  (sub_673F80) are the 7-byte thiscall slot getters the multi-player pause
+//  flow drives; SubObjSlotGetRelease (sub_6BCB80) / ListEntryGetRelease
+//  (sub_BBE910) are the shared-node resolve/release helpers (both release
+//  the slot's shared node via PauseDebugSharedNodeRelease when the stored
+//  value is null); SubObjListMatch (sub_6B6EC0) walks the 12-byte entry list
+//  and returns the first word of the entry whose resolved view matches;
+//  NetHeldGate (sub_683770) is the net-manager held gate; NetManagerHeld
+//  (sub_6A87A0) is its thunk; NetManagerTeardown (sub_6A66D0) is the
+//  net-manager teardown/cleanup step; EntityInstanceRelease (sub_6E2F20) is
+//  the entity-instance release thunk (the entity-instance chain, documented
+//  no-op); NetOtherPlayerUIPause (sub_684710) is the "other player looking
+//  at UI" pause-send handler; NetClientWaitForPause (sub_6AEE30) is the
+//  multi-player pause wait handler (both documented no-op stubs).
+// ===========================================================================
+
+// sub_673E80 (0x673E80 - 0x673E87) -- the +0x1C slot of the VM core's +0x0C
+// sub-object (thiscall): *(*(this + 0x0C) + 0x1C).  Plain C++ (the same
+// 7-byte thiscall shape as VMEntityOfCore / NetManagerSlot10 elsewhere in
+// this file).
+static int VmCoreSlot1C(int core)
+{
+    return (int)*(DWORD *)(*(DWORD *)(core + 0x0C) + 0x1C);
+}
+
+// sub_658E40 (0x658E40 - 0x658E47) -- the +4 slot of the object at (this + 4)
+// (thiscall): *(*(this + 4) + 4).
+static int SubObjSlot4(int obj)
+{
+    return (int)*(DWORD *)(*(DWORD *)(obj + 4) + 4);
+}
+
+// sub_673F80 (0x673F80 - 0x673F87) -- the +0x40 slot of the VM core's +0x0C
+// sub-object (thiscall): *(*(this + 0x0C) + 0x40).
+static int VmCoreSlot40(int core)
+{
+    return (int)*(DWORD *)(*(DWORD *)(core + 0x0C) + 0x40);
+}
+
+// sub_683770 (0x683770 - 0x68378E) -- the net-manager held gate (thiscall):
+// 1 when (byte at +0x3C set AND byte at +0x3E set) OR (dword at +0x94 set),
+// 0 otherwise.  [NOT byte-identical] C++ reimplementation (the original's
+// three-branch CMP/JZ/JNZ byte layout is not reproduced); the project's
+// established convention for this shape.
+static int NetHeldGate(int obj)
+{
+    BYTE *b = (BYTE *)obj;
+    if (b[0x3C] != 0 && b[0x3E] != 0)
+        return 1;
+    if (*(DWORD *)(b + 0x94) != 0)
+        return 1;
+    return 0;
+}
+
+// sub_6A87A0 (0x6A87A0 - 0x6A87B3) -- the net-manager held gate thunk:
+// GetNetManager() -> NetManagerSlot10 -> sub_683770 (the held gate).
+// [NOT byte-identical] placement-dependent (relative E8 calls throughout).
+static int NetManagerHeld(void)
+{
+    void *nm = GetNetManager();
+    if (nm == 0)
+        return 0;
+    return NetHeldGate(NetManagerSlot10(nm));
+}
+
+// sub_6A66D0 (0x6A66D0 - 0x6A67B2) -- the net-manager teardown/cleanup step
+// (thiscall): the one-time teardown install (the unk_1DBE470 cluster + the
+// CNetLiveSystem one-time ctor + atexit thunk -- both documented no-op
+// stubs in this build), the net-manager's ~19 sub-object releases (all
+// documented no-op stubs), then the *(this + 0x4C) &= sub_6A87A0() AND-mask
+// and the gate result.  [NOT byte-identical] placement-dependent
+// (relative E8 calls throughout) -- C++ reimplementation.
+static int NetManagerTeardown(void *obj)
+{
+    int v = NetManagerHeld();
+    if (obj != 0)
+    {
+        unsigned char *p = (unsigned char *)((char *)obj + 0x4C);
+        *p = (unsigned char)(*p & (unsigned char)v);
+    }
+    return v;
+}
+
+// sub_6E2F20 (0x6E2F20 - 0x6E2F28) -- the entity-instance release thunk
+// (thiscall): the +4 slot of the entity (the sub-object) + the caller's
+// flag arg.  [STUB] the entity-instance chain behind it (sub_6E2DE0's ~8
+// unimplemented callees: EntityInstanceSubPtr (implemented), sub_6E41B0 /
+// sub_6E4030 / the vtable dispatches) is out of scope -- the arguments are
+// accepted and ignored, matching the observable behavior of the no-op stub
+// it replaces (the pause release is never exercised in this build).
+static void EntityInstanceRelease(void *obj, int a2)
+{
+    (void)obj; (void)a2;
+}
+
+// sub_6BCB80 (0x6BCB80 - 0x6BCBA0) -- the +0xEC slot resolve/release
+// (thiscall): v1 = *(this + 0xEC); if v1 != 0, return *v1 when the
+// pointed-to block is live, else release the shared node at this + 0xE8 and
+// return 0.  [NOT byte-identical] placement-dependent (the relative E8 call
+// to PauseDebugSharedNodeRelease).
+static int SubObjSlotGetRelease(int obj)
+{
+    DWORD v1 = *(DWORD *)(obj + 0xEC);
+    if (v1 != 0)
+    {
+        if (*(DWORD *)v1 != 0)
+            return *(DWORD *)v1;
+        PauseDebugSharedNodeRelease((DWORD *)(obj + 0xE8));
+    }
+    return 0;
+}
+
+// sub_BBE910 (0xBBE910 - 0xBBE92A) -- the +0x10 slot resolve/release
+// (thiscall): the same shape with the +0x10 / +0x0C pair.  [NOT
+// byte-identical] placement-dependent (the relative E8 call to
+// PauseDebugSharedNodeRelease).
+static int ListEntryGetRelease(int obj)
+{
+    DWORD v1 = *(DWORD *)(obj + 0x10);
+    if (v1 != 0)
+    {
+        if (*(DWORD *)v1 != 0)
+            return *(DWORD *)v1;
+        PauseDebugSharedNodeRelease((DWORD *)(obj + 0x0C));
+    }
+    return 0;
+}
+
+// sub_6B6EC0 (0x6B6EC0 - 0x6B6F5A) -- the shared-node list match step
+// (thiscall): walk the 12-byte entries in the {*(this + 0x0C) .. *(this + 0x10)}
+// list; for each entry whose resolved shared-node view (via sub_BBE910) is
+// non-null, carries the +0xAC flag bit 1, and matches the compare object's
+// +0x18 shape (PauseDebugCompare), write the entry's first word to *out and
+// return 1.  Otherwise return 0.  [NOT byte-identical] placement-dependent
+// (relative E8 calls to sub_BBE910 / PauseDebugCompare).
+static int SubObjListMatch(int obj, DWORD compareObj, DWORD *out)
+{
+    DWORD start = *(DWORD *)(obj + 0x0C);
+    DWORD end = *(DWORD *)(obj + 0x10);
+    int count = (int)((end - start) / 12);
+    if (count == 0)
+        return 0;
+    int v4 = 0;
+    int i = 0;
+    for (;;)
+    {
+        DWORD v6 = ListEntryGetRelease(*(DWORD *)(start + i + 4));
+        if (v6 != 0 && (*(unsigned char *)(v6 + 172) & 2) != 0 &&
+            PauseDebugCompare((const DWORD *)(v6 + 24), (const DWORD *)(compareObj + 24)))
+        {
+            *out = *(DWORD *)(start + 12 * v4);
+            return 1;
+        }
+        if (++v4 >= count)
+            return 0;
+        i += 12;
+    }
+}
+
+// sub_684710 (0x684710 - 0x68499E) -- the "other player looking at UI"
+// pause-send handler (thiscall + retn 4): set *(this + 0x98) = 1 and clear
+// *(this + 0x16A); when the +0x11C counter is clear, run the 654-byte
+// shared-string build + pause teardown, then increment the counter.
+// [STUB] the teardown body (the PauseDebugThunk / sub_9EDDB0 / sub_C2B4E0 /
+// sub_C2B090 shared-string build + the CNetLiveSystem install + ~20
+// unimplemented helpers) is out of scope -- the observable byte writes and
+// the counter increment are preserved; the body is a documented no-op.
+// Returns 0 (the original is void; the result is discarded by this build's
+// caller).
+static int NetOtherPlayerUIPause(int obj, int a2)
+{
+    (void)a2;
+    BYTE *o = (BYTE *)obj;
+    if (o == 0)
+        return 0;
+    o[0x98] = 1;
+    o[0x16A] = 0;
+    DWORD count = *(DWORD *)(o + 0x11C);
+    if (count != 0)
+    {
+        *(DWORD *)(o + 0x11C) = count + 1;
+        return 0;
+    }
+    // [STUB] the big teardown body -- no-op
+    ++*(DWORD *)(o + 0x11C);
+    return 0;
+}
+
+// sub_6AEE30 (0x6AEE30 - 0x6AF266) -- the multi-player pause wait handler
+// (thiscall + retn 8): the 1078-byte "other player looking at UI / paused"
+// handler.  [STUB] ~30 unimplemented VM-internal callees (sub_7D4660 /
+// sub_6AE490 / sub_BBD6E0 / sub_673E80 / sub_659200 / sub_6A8760 /
+// sub_674450 / sub_6AE420 / sub_BBD360 / sub_6AC780 / sub_BBE8D0 /
+// sub_BBD860 / sub_BB0FA0 / sub_BB2000 ...) -- the arguments are accepted
+// and ignored.  Returns 0 (the original returns the handler's result, which
+// is a documented no-op here).
+static int NetClientWaitForPause(void *obj, DWORD out, int a3)
+{
+    (void)obj; (void)out; (void)a3;
+    return 0;
+}
+
+// sub_619DE0 (0x619DE0 - 0x619FF1) -- the VM-state-driven multi-player pause
+// worker callback (registered on the worker at +0x260 via SetMultiplayerPauseOnVMState).
+// [NOT byte-identical] placement-dependent (relative E8 calls throughout)
+// and refs the high-VA globals g_GameEngine (via GetGameEngine) +
+// byte_1DBD9E1 (0x1DBD9E1, kept static here) + ~13 unimplemented engine
+// callees (marked [STUB] below); it is only registered (never invoked) in
+// this build, so it is dead code here -- exercised only when a multi-player
+// pause event occurs with the worker pump live.
+//
+// The flow (the two pause callbacks PauseGameOnVMState (the +0x25C slot)
+// and this one share the VM-state gate + the pause-packet / paused-state
+// send path, but this one dispatches the entity sub-object step and also
+// handles the multi-player pause states):
+//   1. VMStateByte() != 0 gate (returns 0 otherwise).
+//   2. KoreGetVMCore() -> VMEntityOfCore() -> EntitySubObject() -> the
+//      entity sub-object step (vtable[1]); esi = the step result (v5).
+//   3. KoreGetVMCore() -> j_GetNetManager_1() -> NetManagerTeardown()
+//      (sub_6A66D0; the net-manager sub-object release pass).
+//   4. result == 10: GetPauseDebugInstance() + TurnOnPauseArmed(p, 0);
+//      re-read the net manager twice, SendPauseGamePacket(slot10#1, 0, 1)
+//      + SendPausedState(slot10#2); return the paused-state result.
+//   5. result == 2 && byte_1DBD9E1 != 0: release the previous pause-debug
+//      instance (KoreGetVMCore() -> VMEntityOfCore() ->
+//      EntityInstanceRelease -- the documented no-op thunk), clear the
+//      flag, SendPauseGamePacket(slot10#1, 0, 1) + SendPausedState(slot10#2).
+//   6. VM core slot6 dispatch (the [edx+0x18] thiscall call); if its result
+//      is non-zero, return it.
+//   7. The entity sub-object step again; if the result is 1/2/8, return it.
+//   8. Net manager slot10 + 362 flag: if set, run NetOtherPlayerUIPause
+//      (the multi-player "other player looking at UI" handler) and return.
+//   9. Otherwise VmCoreSlot1C() -> SubObjSlot4() -> SubObjSlotGetRelease();
+//      if the resolved object non-null AND its +0xAC byte carries flag bit 1,
+//      VmCoreSlot40() -> SubObjListMatch() -> NetClientWaitForPause();
+//      return the handler's result.
+//  The fall-through (all paths) returns the raw result.
+static int MultiplayerPauseOnVMState(void)
+{
+    int result = VMStateByte();
+    if (result == 0)
+        return result;
+
+    int core = KoreGetVMCore();
+    int entity = VMEntityOfCore(core);
+    int sub = EntitySubObject((void *)entity);
+    int stepResult = (sub != 0)
+        ? ((int (__thiscall *)(DWORD))(*(DWORD *)sub + 4))(sub) : 0;   // vtable[1]
+
+    core = KoreGetVMCore();
+    void *nm = j_GetNetManager_1((void *)core);
+    NetManagerTeardown(nm);
+
+    if (stepResult == 10)
+    {
+        // The pause-armed(0) + pause-packet + paused-state path.
+        void *p = GetPauseDebugInstance();
+        TurnOnPauseArmed(p, 0);   // sets *(p + 0x59) = 0
+        core = KoreGetVMCore();
+        nm = j_GetNetManager_1((void *)core);
+        int v1 = (nm != 0) ? NetManagerSlot10(nm) : 0;
+        SendPauseGamePacket((void *)v1, 0, 1);
+        core = KoreGetVMCore();
+        nm = j_GetNetManager_1((void *)core);
+        int v2 = (nm != 0) ? NetManagerSlot10(nm) : 0;
+        return SendPausedState((void *)v2);
+    }
+
+    if (stepResult == 2 && g_byte_1DBD9E1 != 0)
+    {
+        // Release the previous pause-debug instance + the pause-packet path.
+        core = KoreGetVMCore();
+        entity = VMEntityOfCore(core);
+        EntityInstanceRelease((void *)entity, stepResult);   // the documented no-op thunk
+        g_byte_1DBD9E1 = 0;
+        core = KoreGetVMCore();
+        nm = j_GetNetManager_1((void *)core);
+        int v1 = (nm != 0) ? NetManagerSlot10(nm) : 0;
+        SendPauseGamePacket((void *)v1, 0, 1);
+        core = KoreGetVMCore();
+        nm = j_GetNetManager_1((void *)core);
+        int v2 = (nm != 0) ? NetManagerSlot10(nm) : 0;
+        SendPausedState((void *)v2);
+    }
+
+    // The VM core slot6 dispatch.
+    core = KoreGetVMCore();
+    result = (core != 0)
+        ? ((int (__thiscall *)(DWORD))(*(DWORD *)core + 24))(core) : 0;   // vtable[6]
+    if (result != 0)
+        return result;
+
+    // The entity sub-object step again.
+    core = KoreGetVMCore();
+    entity = VMEntityOfCore(core);
+    sub = EntitySubObject((void *)entity);
+    result = (sub != 0)
+        ? ((int (__thiscall *)(DWORD))(*(DWORD *)sub + 4))(sub) : 0;   // vtable[1]
+
+    if (result == 1 || result == 2 || result == 8)
+        return result;
+
+    core = KoreGetVMCore();
+    nm = j_GetNetManager_1((void *)core);
+    if (nm != 0 && *(unsigned char *)((char *)NetManagerSlot10(nm) + 362) != 0)
+    {
+        core = KoreGetVMCore();
+        nm = j_GetNetManager_1((void *)core);
+        int v1 = (nm != 0) ? NetManagerSlot10(nm) : 0;
+        return NetOtherPlayerUIPause(v1, 0);
+    }
+
+    core = KoreGetVMCore();
+    int obj1 = VmCoreSlot1C(core);
+    int obj2 = SubObjSlot4(obj1);
+    int result2 = SubObjSlotGetRelease(obj2);
+
+    if (result2 != 0 && (*(unsigned char *)(result2 + 172) & 2) != 0)
+    {
+        DWORD out = 0;
+        core = KoreGetVMCore();
+        int obj3 = VmCoreSlot40(core);
+        int r2 = SubObjListMatch(obj3, (DWORD)result2, &out);
+        if (r2 != 0)
+        {
+            void *engine = GetGameEngine();
+            void *gui = (engine != 0) ? *(void **)((char *)engine + 0xB8) : 0;
+            return NetClientWaitForPause(gui, out, 1);
+        }
+    }
+
+    return result2;
+}
+
 
 static int PauseGameOnVMState(void)
 {
@@ -12362,54 +14997,1344 @@ static int PauseGameOnVMState(void)
     }
     return result;
 }
-static void  sub_619DE0(void) {}
-static void  sub_6199C0(void) {}
-static void  sub_619A70(void) {}
+// sub_18FAC40 (0x18FAC40 - 0x18FACB9) -- the heap manager's audio-mixer
+// "armed" level setter (thiscall, retn 4: the heap manager in ECX, the flag
+// byte on the stack).  Under the manager critical section (stru_20FC8AC),
+// when the byte at +0x79 differs from the flag: store it, recompute the
+// mixer level (0.0f while the flag is set, the saved float at +0x7C otherwise)
+// and stage the CSetGlobalMixer audio-comms command through the
+// VfsAllocCacheAlloc / VfsAllocCacheFinalize pair (the CSetGlobalMixer vftable
+// is the original VA 0x1B6F890, an opaque marker like the other rdata vtables;
+// the staged object is a no-op in this build: g_unk_1DDC830 is zero BSS because
+// InitVirtualFileSystem is never reached, exactly like the audio-comms
+// wrappers above).  The identity ctor sub_145D7C0 and the null dtor nullsub_124
+// are side-effect free and omitted.
+// [NOT byte-identical] placement-dependent (relative E8 calls to the IAT slots)
+// and refs the high-VA globals g_unk_1DDC830 (via the VfsAllocCacheAlloc /
+// VfsAllocCacheFinalize pair) and g_dword_2075ED8 (via GetHeapManager).
+static void HeapManagerSetArmed(void *hm, int a2)
+{
+    if (hm == 0)
+        return;   // [STUB-guard] the original would null-deref pre-start
+    EnterCriticalSection(MgrCs());
+    if (*(BYTE *)((char *)hm + 0x79) != (BYTE)a2)
+    {
+        *(BYTE *)((char *)hm + 0x79) = (BYTE)a2;
+        float level;
+        if (a2 != 0)
+            level = 0.0f;
+        else
+            level = *(float *)((char *)hm + 0x7C);
+        DWORD levelBits;
+        memcpy(&levelBits, &level, sizeof(levelBits));
+        // sub_145D7F0 (stdcall forwarder) -> sub_14610B0: stage the
+        // CSetGlobalMixer command (the +4 float slot, the +8 1000 slot, the
+        // vftable at +0).
+        DWORD *obj = (DWORD *)VfsAllocCacheAlloc(g_unk_1DDC830, 1);
+        if (obj != 0) {
+            obj[0] = 0x1B6F890;   // [STUB] the CSetGlobalMixer vftable (original VA)
+            obj[1] = levelBits;
+            obj[2] = 1000;
+            VfsAllocCacheFinalize(g_unk_1DDC830);
+        }
+    }
+    LeaveCriticalSection(MgrCs());
+}
+
+// sub_674660 (0x674660 - 0x674764) -- the VM-state pause step: resolve the
+// VM core's sub-object release (SubObjSlot4 over *(*(core + 0x0C) + 0x1C),
+// SubObjSlotGetRelease over the resolved object), test its +0xAC flag bit 1
+// and +0x2C 0x20 mask, then -- on the pass -- read the +0xA8 dword (or
+// binary-search the +0x50 list via sub_640AC0), resolve the VM core's +0x1C
+// / +0x40 slots (sub_659200 over *(*(dword_1DBDD4C + 0x0C) + 0x1C)), run the
+// sub_AADAB0 / sub_91A200 / sub_9134F0(28) / sub_9134F0(7) gate chain,
+// dispatch sub_BFC490(v4), tail-call sub_9155A0(v6, a2) and return
+// sub_914610(1).  [STUB] the ~8 unimplemented VM-internal callees
+// (sub_640AC0 / sub_659200 / sub_AADAB0 / sub_91A200 -- the recursive
+// sub-object walk -- sub_9134F0 / sub_BFC490 / sub_9155A0 / sub_914610) are
+// not implemented in this build, so the whole step -- the 2 implemented
+// slot-read/release primitives (SubObjSlot4 / SubObjSlotGetRelease) included
+// -- is documented as a no-op here (it is also only reached through a state
+// that never occurs in this build, the VM being uncreated).  The result is
+// discarded by ArmedPauseOnVMState, the only caller.  The argument is accepted
+// and ignored.
+static int VMPauseCoreStep(int core)
+{
+    (void)core;
+    return 0;
+}
+
+// sub_67D090 (0x67D090 - 0x67D097) -- thiscall: sets *(this + 0x5A) = a2 and
+// returns a2.  The +0x5A-byte sibling of TurnOnPauseArmed (sub_67D070, +0x59),
+// installed on the pause-debug instance by ArmedPauseOnVMState.
+static int PauseDebugArmedSet(void *obj, int a2)
+{
+    *(BYTE *)((char *)obj + 0x5A) = (BYTE)a2;
+    return a2;
+}
+
+// sub_6199C0 (0x6199C0 - 0x619A61) -- the third VM-state-driven worker callback
+// (registered on the worker at +0x264 via SetArmedPauseOnVMState).  The audio-armed /
+// window-placement sibling of the two pause callbacks above: when the worker
+// callback runs with a1 == 0, first arm the heap manager's audio-mixer level
+// (silenced, via HeapManagerSetArmed) and -- while the VM reports something
+// active -- run the VM-state pause step (VMPauseCoreStep, result discarded);
+// then read the main window's placement (GetWindowPlacement over the manager
+// vtable[8] GetWindow).  When the window is not maximized (showCmd != 2) or
+// the "arm" flag is clear, install the one-time pause-debug instance and set
+// its +0x5A flag to the arm flag (PauseDebugArmedSet) and return it; otherwise
+// return the GetWindowPlacement result.
+// [NOT byte-identical] placement-dependent (relative E8 calls throughout) and
+// refs the high-VA globals g_dword_2075ED8 (via GetHeapManager), g_unk_1DDC830
+// (via the VfsAllocCacheAlloc / VfsAllocCacheFinalize pair in
+// HeapManagerSetArmed), the pause-debug instance (GetPauseDebugInstance) and
+// the manager vtable[8] dispatch -- C++ reimplementation.
+static int ArmedPauseOnVMState(int a1)
+{
+    void *hm = GetHeapManager();
+    HeapManagerSetArmed(hm, a1 == 0);   // sub_18FAC40
+
+    if (a1 == 0 && VMStateByte() != 0)
+    {
+        int core = KoreGetVMCore();
+        VMPauseCoreStep(core);   // sub_674660 -- [STUB]
+    }
+
+    WINDOWPLACEMENT wndpl;
+    memset(&wndpl, 0, sizeof(wndpl));
+    wndpl.length = 44;
+
+    void *mgr   = GetManager();
+    void **vt   = (void **)*(void ***)mgr;
+    HWND hwnd   = (HWND)((int (*)(void *))vt[8])(mgr);
+    BOOL result = GetWindowPlacement(hwnd, &wndpl);
+
+    if (wndpl.showCmd != 2 || a1 == 0)
+    {
+        // sub_67E460 + sub_67D090: install the pause-debug instance and set
+        // its +0x5A flag to the arm flag.
+        PauseDebugArmedSet(GetPauseDebugInstance(), a1 == 0);
+        return a1 == 0;
+    }
+    return result;
+}
+// sub_6904F0 (0x6904F0 - 0x690817) -- the "GUI_SCREEN_COOP_FAILED" screen step
+// (thiscall + retn 4): the coop-failed screen dispatch body hung off the
+// net-held worker callback -- the gate's +0x3C/+0x3E/+0x94 branch (the
+// STRICT path: KoreGetVMCore -> sub_673BB0 -> unknown_libname_451 ->
+// sub_720310 -> AssignSharedSlotWide -> ReleaseSharedSlotWide -> sub_1A00310
+// -> sub_5C1740 -> sub_1A00810 -> ReleaseSharedSlotWide/ sub_1A00310 ->
+// sub_675CA0 -> sub_B73360 -> SharedSlotToWide -> sub_1A00810 ->
+// ReleaseSharedSlotWide/ ReleaseSharedSlot/ ReleaseSharedSlotWide), then the
+// slot-136/140 guard + sub_68F700, then the coop-failed branch (the one-time
+// CNetLiveSystem install + SetSharedSlot("GUI_SCREEN_COOP_FAILED") + the
+// Slot24 / sub_C1A150 / SetSaveGamePath chain + the VMStateByte / sub_6743D0 /
+// sub_71C410 / sub_7D6E60 / sub_7D4090 / sub_B80A00 / sub_6743A0 screen
+// dispatch + the CGameVersionCtor / GetGameEngine / sub_761110 / sub_68F6B0 /
+// sub_623280 tail + the final one-time CNetLiveSystem install).  [STUB] the
+// ~35 unimplemented VM-internal callees (sub_687050, KoreGetVMCore,
+// sub_673BB0, unknown_libname_451, sub_720310, AssignSharedSlotWide,
+// ReleaseSharedSlotWide, sub_1A00310, sub_5C1740, sub_1A00810, sub_675CA0,
+// sub_B73360, SharedSlotToWide, ReleaseSharedSlot, sub_68F700,
+// CNetLiveSystemCtor, CNetLiveSystemAtExit, SetSharedSlot,
+// CNetManagerGetSlot24, sub_C1A150, SetSaveGamePath, VMStateByte,
+// sub_6743D0, sub_71C410, sub_7D6E60, sub_7D4090, sub_B80A00, sub_6743A0,
+// CGameVersionCtor, GetGameEngine, GetGameEngineVersionTable, sub_761110,
+// sub_68F6B0, sub_623280, ReleaseSharedSlot, _invalid_parameter_noinfo) are
+// not implemented in this build -- the whole body is documented as a no-op
+// here.  The arguments are accepted and ignored; the only caller
+// (NetHeldCoopFailed, below) is itself a worker callback that is never
+// invoked in this build.
+static void NetCoopFailedScreen(int obj, int a2)
+{
+    (void)obj; (void)a2;
+}
+
+// sub_619A70 (0x619A70 - 0x619A8F) -- the net-held-gate worker callback
+// (registered on the worker at +0x268 via SetNetHeldCoopFailed): when the net-manager
+// held gate (NetManagerHeld -- the +0x10 slot's +0x3C/+0x3E/+0x94 gate) fires,
+// resolve the net manager's +0x10 slot (NetManagerSlot10, the same object the
+// gate checks) and kick the coop-failed screen step (NetCoopFailedScreen,
+// sub_6904F0 -- [STUB], see its comment) with a2 = 0.  The original's
+// stack-arg idiom (push 0 before the GetNetManager call; sub_6904F0 returns
+// via retn 4, popping the pushed 0) is simply the a2 = 0 stack argument.
+// [NOT byte-identical] placement-dependent (relative E8 calls throughout) --
+// C++ reimplementation; the gate thunk above already carries the same shape.
+static int NetHeldCoopFailed(void)
+{
+    int result = NetManagerHeld();
+    if (result != 0)
+    {
+        void *nm = GetNetManager();
+        NetCoopFailedScreen(NetManagerSlot10(nm), 0);
+    }
+    return result;
+}
 
 // Worker callback setters (thiscall, worker in ECX + one function pointer).
-// The originals store the pointer at worker +0x25C/+0x260/+0x264/+0x268; the
-// worker object in this build is smaller, so they are stubbed as no-ops.
-static void  sub_18F6C90(void *worker, void *fn) { (void)worker; (void)fn; }
-static void  sub_18F6C80(void *worker, void *fn) { (void)worker; (void)fn; }
-static void  sub_18F6C70(void *worker, void *fn) { (void)worker; (void)fn; }
-static void  sub_18F6C60(void *worker, void *fn) { (void)worker; (void)fn; }
+// The +0x25C setter is the byte-identical SetPauseGameOnVMState, the +0x260
+// setter is the byte-identical SetMultiplayerPauseOnVMState, the +0x264
+// setter is the byte-identical SetArmedPauseOnVMState and the +0x268 setter is
+// the byte-identical SetNetHeldCoopFailed (worker.cpp).
 
-static void  sub_402F00(void *obj, const char *name, int size)
-{ (void)obj; (void)name; (void)size; }
-static int   g_sub18013B0Word = 0;
-static void *sub_18013B0(void *obj, void *a, void *b)
-{ (void)obj; (void)a; (void)b; return &g_sub18013B0Word; }
-static void  sub_18E8CD0(void) {}
-static int   sub_18E8960(int a, int b) { (void)a; (void)b; return 0; }
-static void  sub_18E8D50(void *obj, int a) { (void)obj; (void)a; }
-static void  sub_18E7180(void) {}
-static void  sub_18E84C0(void) {}
-// sub_7330F0 -- NUI::CLoadingScreen ctor (0x58 bytes): stub stores the
-// placeholder vtable and zeroes +4 (the CS slot).
-static void *sub_7330F0(void *obj)
-{ *(void **)obj = g_CLoadingScreenVtable; *(void **)((char *)obj + 4) = 0; return obj; }
-// sub_72FB30 -- CGameRenderer ctor (8 bytes): stub stores the placeholder
-// vtable and zeroes +4 (the impl slot).
-static void *sub_72FB30(void *obj)
-{ *(void **)obj = g_CGameRendererVtable; *(void **)((char *)obj + 4) = 0; return obj; }
-static void  sub_72FB10(void *obj, void *argList, void *a, void *b)
-{ (void)obj; (void)argList; (void)a; (void)b; }
-static void  sub_18F0180(void) {}
-static void  sub_72FAE0(void *obj) { (void)obj; }
+//  FinalizeModelHeaders  (0x18013B0 - 0x18013C6)  -- forwards the 28-byte
+//  "globals_model_headers" SSO string to the file-subsystem validation chain
+//  (sub_1811F50 / sub_1819080 / sub_181B6E0) and returns the string.
+//  [NOT byte-identical] placement-dependent (the E8 call to sub_1811F50).
+//
+//  Faithful call sequence (the original's bytes at 0x18013B0 - 0x18013C6):
+//    eax = param2 (&string); esi = param2; push eax; push esi;
+//    call sub_1811F50 (this=ecx, param1=param2=&string); eax = esi; return esi.
+//  The callee chain (sub_1819080 / sub_181B6E0 / sub_181AF00 / sub_724E10 /
+//  sub_6F9AE0 / __invalid_parameter_noinfo) is NOT implemented in this project.
+//  Established from the callee's bytes (0x1811F50 - 0x1811F81 + 0x1819080):
+//  in the normal case (vtable set + the string's len != 0) sub_1819080 always
+//  returns 0, so sub_1811F50 takes its else branch and WRITES the string's
+//  first dword to 0 before returning it.  That side effect is reproduced here;
+//  the caller then stores the zeroed first dword into the engine's +0x7C slot.
+//  The a1 (out-holder) parameter is ignored, exactly as the original does.
+static void *FinalizeModelHeaders(void *obj, void *a, void *b)
+{
+    (void)obj;       // the file-subsystem object (this, passed through)
+    (void)b;         // the out-holder (a1) -- ignored by the callee
+    *(void **)a = 0; // sub_1811F50's else branch (the normal case)
+    return a;
+}
+// 0x18E8CD0 - 0x18E8D31 -- SetEngineService
+// [NOT byte-identical] placement-dependent (relative calls to the impl
+// builder / pair teardown and the LHAlloc / InterlockedDecrement /
+// InitializeCriticalSection IAT slots).
+//
+// Installs the engine-service object + SEH cleanup pair (dword_20FD1AC /
+// dword_20FD1B0):
+//   12-byte object { vtable (&off_1BE7424), impl, sehBlock } built by
+//   BuildEngineServiceObject (sub_18E8C60): the 136-byte impl object via
+//   EngineServiceInitImpl (sub_57AEC0 + sub_57E260), and the impl's own
+//   12-byte SEH block { refcount = 1, handler = DisposeEngineServiceImpl
+//   (sub_57CC30), arg = the impl }.
+//   The pair block is 12 bytes { refcount = 1, handler = DisposeEngineService
+//   (sub_57CC50), arg = the object }.
+//
+// The old pair is released first (ReleaseEngineServicePair -- sub_57FDF0:
+// decrement the old block's refcount; on zero dispatch the old handler with
+// the old arg, then LHFree the block; both globals are cleared). The new
+// object is stored in g_engineServiceObject, and -- when non-null and the SEH
+// block allocation succeeds -- the fresh block is stored in
+// g_engineServiceSehBlock. The return value is the sub_57FDF0 result (or the
+// fresh block pointer) -- both callers discard it, exactly as the original.
+static void *g_engineServiceObject = 0;    // dword_20FD1AC
+static void *g_engineServiceSehBlock = 0;  // dword_20FD1B0
+static void *g_engineServiceVtable[2] = { (void *)F3StubRelease, 0 };
+
+// The 136-byte engine-service impl object (sub_57AEC0 / sub_57E260).
+// [NOT byte-identical] placement-dependent (relative calls to LHAlloc and
+// InitializeCriticalSection); documented deviations: the 48-byte head's zero
+// stores are unconditional when the allocation succeeds (the original's
+// lea-vs-zero guards are only reachable when v1 == 0, where the original
+// would crash on the [v1+2C] store -- it is treated as a fatal alloc failure
+// here and the head is simply left 0), and no fields other than the
+// documented ones are zeroed.
+static void *EngineServiceInitImpl(void *impl)
+{
+    char *p = (char *)impl;
+    p[0] = 0;
+    *(DWORD *)(p + 0x30) = 0;
+    *(DWORD *)(p + 0x34) = 0;
+    *(DWORD *)(p + 0x38) = 0;
+    *(DWORD *)(p + 0x44) = 0;
+    *(DWORD *)(p + 0x48) = 0;
+    *(DWORD *)(p + 0x4C) = 0;
+    // the self-linked 48-byte list head (sub_57E260): [0]/[4]/[8] = head,
+    // byte 0x2C = 1 (0x2D = 1 follows in the original's TailCall idiom)
+    void *head = LHAlloc(48);
+    if (head != 0)
+    {
+        *(DWORD *)((char *)head + 0x00) = (DWORD)head;
+        *(DWORD *)((char *)head + 0x04) = (DWORD)head;
+        *(DWORD *)((char *)head + 0x08) = (DWORD)head;
+        ((BYTE *)head)[0x2C] = 1;
+        ((BYTE *)head)[0x2D] = 1;
+    }
+    *(void **)(p + 0x18) = head;
+    *(DWORD *)(p + 0x1C) = 0;
+    // the +0x50 4-byte back-pointer block (the original allocates it even
+    // on failure; the back-pointer content is only written on success)
+    void *block = LHAlloc(4);
+    if (block != 0)
+        *(void **)block = (void *)(p + 0x50);
+    *(void **)(p + 0x50) = block;
+    InitializeCriticalSection((LPCRITICAL_SECTION)(p + 112));
+    return impl;
+}
+
+// The impl-object destructor (sub_57CC30): the deep impl teardown (sub_57DAF0,
+// the +0x44/+0x48 and +0x30/+0x34 sub-pair lists + the sub_57C3F0 / sub_580DA0
+// release chain) is a documented no-op here -- the lists are empty in this
+// build and the impl is never released (the service-stop step is a stub), so
+// nothing observable runs beyond the critical-section release.
+static int DisposeEngineServiceImpl(int arg)
+{
+    if (arg == 0)
+        return 0;
+    DeleteCriticalSection((LPCRITICAL_SECTION)((char *)arg + 112));
+    LHFree((void *)arg);
+    return 0;
+}
+
+// The deleting-destructor dispatcher for the 12-byte object (sub_57CC50):
+// obj->vtable[0](obj, 1).
+static int DisposeEngineService(int arg)
+{
+    if (arg == 0)
+        return 0;
+    void **vt = *(void ***)(void *)arg;
+    return ((int (*)(void *, int))vt[0])((void *)arg, 1);
+}
+
+// The 12-byte object builder (sub_18E8C60) -- returns the (new) 12-byte object.
+static void *BuildEngineServiceObject(void *obj)
+{
+    *(void **)obj = g_engineServiceVtable;
+    void *impl = LHAlloc(136);
+    if (impl != 0)
+        impl = EngineServiceInitImpl(impl);
+    *(void **)((char *)obj + 4) = impl;
+    if (impl != 0)
+    {
+        void *block = LHAlloc(12);
+        if (block != 0)
+        {
+            *(DWORD *)block = 1;                              // refcount
+            *(void **)((char *)block + 4) = (void *)DisposeEngineServiceImpl;
+            *(DWORD *)((char *)block + 8) = (DWORD)impl;
+            *(void **)((char *)obj + 8) = block;
+        }
+        else
+        {
+            *(void **)((char *)obj + 8) = 0;
+        }
+    }
+    else
+    {
+        *(void **)((char *)obj + 8) = 0;
+    }
+    return obj;
+}
+
+// The pair teardown (sub_57FDF0) -- decrement the old block's refcount; on
+// zero dispatch its handler with its arg, then LHFree the block. Both globals
+// are cleared. Returns the decrement result (0 when there is no block or the
+// refcount reached zero -- the original returns the heap-free return value in
+// the zero case, which no caller reads).
+static int ReleaseEngineServicePair(void)
+{
+    void *block = g_engineServiceSehBlock;
+    int result = 0;
+    if (block != 0)
+    {
+        result = InterlockedDecrement((volatile LONG *)block);
+        if (result == 0)
+        {
+            ((int (*)(int))*(void **)((char *)block + 4))((int)*(DWORD *)((char *)block + 8));
+            LHFree(block);
+        }
+    }
+    g_engineServiceObject = 0;
+    g_engineServiceSehBlock = 0;
+    return result;
+}
+
+// The pair installer (sub_18E8CD0).
+static int SetEngineService(void)
+{
+    void *obj = LHAlloc(12);
+    if (obj != 0)
+        obj = BuildEngineServiceObject(obj);
+    else
+        obj = 0;
+    int result = ReleaseEngineServicePair();
+    g_engineServiceObject = obj;
+    if (obj != 0)
+    {
+        void *block = LHAlloc(12);
+        if (block != 0)
+        {
+            *(DWORD *)block = 1;                              // refcount
+            *(void **)((char *)block + 4) = (void *)DisposeEngineService;
+            *(DWORD *)((char *)block + 8) = (DWORD)obj;
+            g_engineServiceSehBlock = block;
+            return (int)block;
+        }
+        g_engineServiceSehBlock = 0;
+        return 0;
+    }
+    return result;
+}
+//  GetEngineService  (0x18E8960 - 0x18E8966)  -- return the current engine-service object
+//  [NOT byte-identical] placement-independent but references the high-VA
+//  global dword_20FD1AC (0x020FD1AC) not present in this build.
+//  A tiny getter (mov eax, dword_20FD1AC; retn) used pervasively by the
+//  engine to reach the current engine-service object.
+static void *GetEngineService(void)
+{
+    return g_engineServiceObject;
+}
+//  sub_57B160  (0x57B160 - 0x57B255)  -- the engine-service impl worker
+//  [STUB] still unimplemented: a 245-byte __thiscall body (the impl's
+//  +0x70 critical section, the +0x28 sub-object build (sub_57CEC0), the
+//  +0x34 pointer check, the +0x28 teardown (sub_57CE70) and its
+//  sub_57EDF0 / sub_57CF60 / sub_5807D0 callees) is not reimplemented here.
+//  ForwardEngineServiceImpl (the tail-call thunk below) forwards the impl
+//  here, exactly as the original's E9 jmp does.
+static void sub_57B160(void *impl)
+{
+    (void)impl;
+}
+//  ForwardEngineServiceImpl  (0x18E8D50 - 0x18E8D58)  -- engine-service object
+//  tail-call thunk: load the +4 impl and tail-jump to the impl worker
+//  (sub_57B160). [NOT byte-identical] the original is an 8-byte tail-call
+//  (mov ecx, [ecx+4]; jmp sub_57B160) whose E9 displacement is
+//  placement-dependent, so it is implemented in C++ with a direct call
+//  instead of the inline tail jump.
+static void ForwardEngineServiceImpl(void *obj)
+{
+    // mov ecx, [ecx+4]
+    void *impl = *(void **)((char *)obj + 4);
+    sub_57B160(impl);      // tail call: forward the impl to the worker
+}
+//  SetEngineStartedFlag  (0x18E7180 - 0x18E7188)  -- 8-byte thunk: set the
+//  engine-started flag (byte_2075F2B) to 1.  [NOT byte-identical] the original
+//  stores to the high-VA global 0x2075F2B not present in this build, so it is
+//  implemented in C++ over a static global.
+static void SetEngineStartedFlag(void) { g_byte_2075F2B = 1; }
+//  TextureStreamerCs  -- lazy-init the Texture Streamer critical section
+//  (stru_20FD1B4).  The original relies on stru_20FD1B4 being initialized at
+//  startup; here we InitializeCriticalSection on first use (the same
+//  lazy-init pattern as MgrCs above).
+static CRITICAL_SECTION *TextureStreamerCs(void)
+{
+    if (!g_cs_20FD1B4Init) { InitializeCriticalSection(&g_cs_20FD1B4); g_cs_20FD1B4Init = 1; }
+    return &g_cs_20FD1B4;
+}
+//  TextureStreamerWork  (0x18E7FC0 - 0x18E8460)  -- the streamer work loop
+//  body (0x1184 bytes) is NOT implemented in this build.  [STUB] reports no
+//  pending work (0), so the thread's while loop exits immediately.
+static int TextureStreamerWork(void) { return 0; }
+//  TextureStreamerThread  (0x18E8460 - 0x18E84BF)  -- the "Texture Streamer"
+//  thread entry (started by StartTextureStreamer with no argument):
+//  announce the thread name, mark the streamer running under the critical
+//  section, then spin while the streamer has pending work, sleeping 1 ms per
+//  pass; on exit, clear the stop-arm flag and the running flag.
+//  [NOT byte-identical] refs the high-VA globals stru_20FD1B4 / byte_2075F38 /
+//  byte_2075F39 and the SetThreadName / Enter / LeaveCriticalSection / Sleep
+//  IAT slots.
+static void TextureStreamerThread(void *arg)
+{
+    (void)arg;
+    SetThreadName("Texture Streamer");
+    CRITICAL_SECTION *cs = TextureStreamerCs();
+    EnterCriticalSection(cs);
+    g_byte_2075F38 = 1;
+    LeaveCriticalSection(cs);
+    while (TextureStreamerWork() != 0)
+        Sleep(1u);
+    g_byte_2075F39 = 0;
+    g_byte_2075F38 = 0;
+}
+//  StartTextureStreamer  (0x18E84C0 - 0x18E84F4)  -- the guarded thread
+//  spawner: under the Texture Streamer critical section, read the running
+//  flag; when it is 0, spawn the "Texture Streamer" thread
+//  (TextureStreamerThread) with no argument.
+//  [NOT byte-identical] refs the high-VA globals stru_20FD1B4 /
+//  byte_2075F38 and the Enter / LeaveCriticalSection / _beginthread IAT
+//  slots.
+static void StartTextureStreamer(void)
+{
+    CRITICAL_SECTION *cs = TextureStreamerCs();
+    EnterCriticalSection(cs);
+    BYTE running = g_byte_2075F38;
+    LeaveCriticalSection(cs);
+    if (running == 0)
+        _beginthread(TextureStreamerThread, 0u, NULL);
+}
+//  CHeroUniqueIDCtor  (0xC1E6A0 - 0xC1E6CB)  -- the CHeroUniqueID member ctor
+//  [NOT byte-identical] placement-dependent (relative E8 calls to
+//  InitSharedSlotWide).
+//
+//  void *CHeroUniqueIDCtor(void *obj)
+//
+//  Construct the CHeroUniqueID sub-object embedded at CLoadingScreen +0x18
+//  (this = the member base): store the (placeholder) vtable, zero the four
+//  dwords at +8 / +0xC / +0x10 / +0x14, zero the 8-byte quad word at +0x18
+//  (the original xorps'd xmm0 over [esi+18h]), and run InitSharedSlotWide
+//  on the wide-string slot at +0x20 (the wide-shared-slot null-ctor). The
+//  original is thiscall (obj in ECX, plain retn); declared here as a plain
+//  free function per the project convention.
+static void *CHeroUniqueIDCtor(void *obj)
+{
+    DWORD *m = (DWORD *)obj;
+    *(void **)obj = g_CHeroUniqueIDVtable;
+    m[2] = 0;
+    m[3] = 0;
+    m[4] = 0;
+    m[5] = 0;
+    m[6] = 0;
+    m[7] = 0;
+    InitSharedSlotWide((F3SharedBuffer **)((char *)obj + 0x20));
+    return obj;
+}
+//  CLoadingScreenCtor  (0x7330F0 - 0x733158)  -- the NUI::CLoadingScreen ctor
+//  [NOT byte-identical] placement-dependent (relative E8 calls to
+//  CBaseClassNonCopyableCtor / LHAlloc / InitializeCriticalSection /
+//  InitSharedSlot / CHeroUniqueIDCtor / sub_18A88B0 / srand).
+//
+//  void *CLoadingScreenCtor(void *obj)
+//
+//  Construct the 88-byte NUI::CLoadingScreen object: run the
+//  CBaseClassNonCopyableCtor (base vtable, overwritten below), store the
+//  (placeholder) vtable, zero +4, allocate a 24-byte critical section via
+//  LHAlloc(24) and InitializeCriticalSection it in place (stored at +8;
+//  NULL on allocation failure), zero the +0xC flag byte, InitSharedSlot the
+//  +0x10 shared slot, zero +0x14, run the CHeroUniqueID member ctor at
+//  +0x18, zero +0x40..+0x50, and seed the RNG from the low word of the
+//  QueryPerformanceCounter (the original pushes EAX -- the LowPart -- as
+//  srand's Seed). Then return obj. The original is thiscall (obj in ECX,
+//  plain retn); declared here as a plain free function per the project
+//  convention.
+static void *CLoadingScreenCtor(void *obj)
+{
+    F3BaseClassNonCopyableCtor(obj);
+    *(void **)obj = g_CLoadingScreenVtable;
+    *(void **)((char *)obj + 4) = 0;
+    CRITICAL_SECTION *cs = (CRITICAL_SECTION *)LHAlloc(24u);
+    if (cs != 0)
+        InitializeCriticalSection(cs);
+    *(void **)((char *)obj + 8) = cs;
+    *(unsigned char *)((char *)obj + 12) = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 16));
+    *(void **)((char *)obj + 20) = 0;
+    CHeroUniqueIDCtor((char *)obj + 24);
+    *(void **)((char *)obj + 64) = 0;
+    *(void **)((char *)obj + 68) = 0;
+    *(void **)((char *)obj + 72) = 0;
+    *(void **)((char *)obj + 76) = 0;
+    *(void **)((char *)obj + 80) = 0;
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    srand((int)q.LowPart);
+    return obj;
+}
+//  CGameRendererInnerCtor  (sub_731330, 0x731330 - 0x731484)  -- the 776-byte
+//  CGameRenderer inner-state constructor.
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  InitializeCriticalSection / EventObjCtor / LHAlloc / InitIntOptionMap /
+//  InitFloatOptionMap / InitDetailOptionMap / InitVideoOptionsDefaults).
+//
+//  void *CGameRendererInnerCtor(void *obj)
+//
+//  Constructs the 776-byte inner state of a CGameRenderer (passed by the
+//  CGameRendererCtor at CGameEngine +0x9C):
+//    +0x00 / +0x18 / +0x30  the three 24-byte critical sections
+//    +0x48 / +0x50 / +0x60 / +0x68  the 8-byte zeroed qword quad
+//    +0x58  the DWORD zero
+//    +0x70 .. +0x80  the five -1 (0xFFFFFFFF) DWORDs
+//    +0x84  the DWORD zero
+//    +0x88  the 0 flag byte (the flag the 0x72F8E0 getter reads)
+//    +0x8C  the DWORD zero
+//    +0x90  the 0 flag byte (the byte the 0x72F7E0 flush writes 1 to)
+//    +0x98 / +0xA0 / +0xB0  the 8-byte zeroed qword triple
+//    +0xA8  the 1 flag byte
+//    +0xB8  the DWORD zero
+//    +0xBC / +0xBD  the two 0 flag bytes
+//    +0xC0 / +0x144 / +0x1C8  the three 0x84-byte Win32-event wrappers
+//    +0x24C  the DWORD zero
+//    +0x250  the -1.0f float
+//    +0x254  the 0 flag byte
+//    +0x258  the DWORD zero
+//    +0x25C  a self-referencing 4-byte heap block (LHAlloc(4)): the block
+//           contains the address of +0x25C itself, and +0x25C holds the block
+//           pointer
+//    +0x268 / +0x26C / +0x270  the three DWORD zeros
+//    +0x274 / +0x294 / +0x2B4  the three 32-byte option maps (Int / Float /
+//           Detail)
+//    +0x2D4  the 52-byte video-options record (1280x720 defaults)
+//  Returns obj.
+static void *CGameRendererInnerCtor(void *obj)
+{
+    char *b = (char *)obj;
+    memset(b, 0, 776u);
+    InitializeCriticalSection((CRITICAL_SECTION *)b + 0x00);
+    InitializeCriticalSection((CRITICAL_SECTION *)b + 0x18);
+    InitializeCriticalSection((CRITICAL_SECTION *)b + 0x30);
+    *(DWORD *)(b + 0x58) = 0;
+    *(DWORD *)(b + 0x70) = 0xFFFFFFFFu;
+    *(DWORD *)(b + 0x74) = 0xFFFFFFFFu;
+    *(DWORD *)(b + 0x78) = 0xFFFFFFFFu;
+    *(DWORD *)(b + 0x7C) = 0xFFFFFFFFu;
+    *(DWORD *)(b + 0x80) = 0xFFFFFFFFu;
+    *(DWORD *)(b + 0x84) = 0;
+    *(BYTE *)(b + 0x88) = 0;
+    *(DWORD *)(b + 0x8C) = 0;
+    *(BYTE *)(b + 0x90) = 0;
+    *(BYTE *)(b + 0xA8) = 1;
+    *(DWORD *)(b + 0xB8) = 0;
+    *(BYTE *)(b + 0xBC) = 0;
+    *(BYTE *)(b + 0xBD) = 0;
+    EventObjCtor(b + 0xC0, 0, 0);            // 0x18C46E0
+    EventObjCtor(b + 0x144, 0, 0);           // 0x18C46E0
+    EventObjCtor(b + 0x1C8, 0, 0);           // 0x18C46E0
+    *(DWORD *)(b + 0x24C) = 0;
+    *(float *)(b + 0x250) = -1.0f;
+    *(BYTE *)(b + 0x254) = 0;
+    *(DWORD *)(b + 0x258) = 0;
+    void **wrapper = (void **)LHAlloc(4u);
+    if (wrapper != 0)
+        *wrapper = (void *)(b + 0x25C);
+    *(void **)(b + 0x25C) = wrapper;
+    *(DWORD *)(b + 0x268) = 0;
+    *(DWORD *)(b + 0x26C) = 0;
+    *(DWORD *)(b + 0x270) = 0;
+    InitIntOptionMap((F3OptionMap *)(b + 0x274), 0, 0);      // sub_40E6D0
+    InitFloatOptionMap((F3OptionMap *)(b + 0x294), 0, 0);   // sub_40E780
+    InitDetailOptionMap((F3OptionMap *)(b + 0x2B4), 0, 0);  // sub_40E830
+    InitVideoOptionsDefaults((F3VideoOptions *)(b + 0x2D4));   // sub_19E1380
+    return obj;
+}
+
+//  CGameRendererCtor  (sub_72FB30, 0x72FB30 - 0x72FB85)  -- the CGameRenderer
+//  ctor (the CGameEngine +0x9C object, RunFrontEnd's +0x9C slot).
+//  [NOT byte-identical] placement-dependent (relative E8 calls to
+//  CBaseClassNonCopyableCtor / LHAlloc / CGameRendererInnerCtor).
+//
+//  void *CGameRendererCtor(void *obj)
+//
+//  Constructs the CGameRenderer object RunFrontEnd allocates at CGameEngine
+//  +0x9C (stored as the +0x9C slot after the old object's vtable-slot-0
+//  release): run the base ctor, overwrite the vtable with the placeholder
+//  one, clear the +4 impl slot, allocate the 776-byte inner state via
+//  LHAlloc(776) and construct it (CGameRendererInnerCtor), then store the
+//  new inner pointer at +4 and return obj. The original reads the +4 slot
+//  after allocating and, when it was non-zero, would delete the old inner
+//  state through the inner destructor (sub_7312A0) + LHFree -- [obj+4] is
+//  always 0 at that point (the slot was just assigned 0 and is not reassigned
+//  before the check), so that branch is dead for every input and the inner
+//  destructor is not invoked in this build.
+static void *CGameRendererCtor(void *obj)
+{
+    F3BaseClassNonCopyableCtor(obj);
+    *(void **)obj = g_CGameRendererVtable;
+    *(void **)((char *)obj + 4) = 0;
+    void *inner = LHAlloc(776u);
+    void *v3 = 0;
+    if (inner != 0)
+        v3 = CGameRendererInnerCtor(inner);
+    // Dead branch: the original reads [obj+4] here and, when non-zero,
+    // deletes the old inner state (sub_7312A0 + LHFree). [obj+4] is always 0
+    // here, so this branch is never taken.
+    if (*(void **)((char *)obj + 4) != 0)
+    {
+        /* sub_7312A0(old inner state) + LHFree -- never taken */
+    }
+    *(void **)((char *)obj + 4) = v3;
+    return obj;
+}
+//  sub_731490  (0x731490 - 0x731634)  -- the CGameRenderer impl worker that the
+//  tail-call thunk below forwards to.
+//  [STUB] not reimplemented in this build -- the 420-byte body (the +0x24C
+//  renderer-object slot, the +0x84 engine-service pointer via sub_61A220, the
+//  52-byte saved-options record copy into this+0xB5, the option-map finalizer
+//  (sub_487050), the thumbnail / asset-path setup via SetSaveGamePath for the
+//  Shaders / TextureThumbnails / AlphaTextureThumbnails / SourceAssets slots,
+//  the CopySharedSlot / LHAlloc(4) particle-callback alloc and the
+//  sub_731200 finalizer) is not reimplemented here.
+static int sub_731490(void *obj, int a2, void *a3, int a4, const void *a5)
+{
+    (void)obj; (void)a2; (void)a3; (void)a4; (void)a5;
+    return 0;
+}
+//  CGameRendererApplySavedOptions  (sub_72FB10, 0x72FB10 - 0x72FB2B)  -- the
+//  CGameRenderer tail-call thunk: push the renderer's +4 impl pointer as the
+//  impl's `this`, pass the outer renderer / engine / video-options records
+//  along as the impl's arguments, and tail-call the impl worker (sub_731490).
+//  [NOT byte-identical] placement-dependent (the single relative E8 call into
+//  sub_731490).
+//
+//  int CGameRendererApplySavedOptions(void *obj, void *argList, void *a, void *b)
+static int CGameRendererApplySavedOptions(void *obj, void *argList, void *a, void *b)
+{
+    void *inner = *(void **)((char *)obj + 4);      // mov ecx, [ecx+4]
+    return sub_731490(inner, (int)(DWORD)obj, argList, (int)(DWORD)a, b);
+}
+//  sub_7306A0  (0x7306A0 - 0x730706)  -- the worker-thread starter behind the
+//  thunk: under the renderer inner state's critical section, when the +0x88
+//  (136) "thread already started" flag is still 0, spawn the "3D Engine"
+//  thread (CreateThread: StartAddress, 0x20000 stack, lpParameter = the
+//  critical section), set the flag, and run the thread-registration
+//  notification (sub_19E2100).
+//  [STUB] not reimplemented in this build: the faithful body needs its two
+//  callees -- StartAddress (0x7303B0, the 294-byte engine worker loop whose
+//  own callees (sub_1A22440 / sub_1A22420 / sub_72FDE0 / sub_18F1990 /
+//  sub_18F0170 / SetThreadName / WaitForEvent / GetManager / ...) are
+//  unimplemented -- and sub_19E2100 (0x19E2100, the thread-registration
+//  notification pair: dword_1E2E7CC store + sub_19D0DC0, both unimplemented).
+//  Spawning the real thread in this build would run the full engine worker
+//  loop against a dead consumer, so the flag-check + CreateThread step stays
+//  a documented no-op here (the flag is also never set, so the renderer's
+//  +0x88 flag byte -- which sub_72F8E0 reads -- stays 0 as well).
+static void sub_7306A0(void *cs) { (void)cs; }
+
+//  StartWorkerThread  (0x72FAE0 - 0x72FAE8)  -- the
+//  CGameRenderer / context-proxy tail-call thunk: load the object's +4
+//  inner-state (critical-section-bearing) pointer and tail-call the
+//  worker-thread starter (sub_7306A0) with it.  [NOT byte-identical]
+//  placement-dependent (the E9 tail call into sub_7306A0).
+//
+//  void StartWorkerThread(void *obj)
+static void StartWorkerThread(void *obj)
+{
+    void *inner = *(void **)((char *)obj + 4);      // mov ecx, [ecx+4]
+    sub_7306A0(inner);                                // jmp sub_7306A0 (tail call)
+}
 // MountVideoFile (0x61BFE0, the video-slot mount over the +0x30 sub-object)
 // is now implemented above (the MountPermanentBanks block).
-static void  sub_61A5E0(void *obj) { (void)obj; }
-// sub_731B80 -- NUI::CFullScreenMoviePlayer ctor (8 bytes): stub stores the
-// placeholder vtable and zeroes +4.
-static void *sub_731B80(void *obj)
-{ *(void **)obj = g_CFullScreenMoviePlayerVtable; *(void **)((char *)obj + 4) = 0; return obj; }
-// sub_712430 -- the 8-byte {value, SEH block} wrapper ctor: zeroes both words
-// (the original then allocates the 96-byte impl and registers it via
-// sub_7172D0, which the stub skips; the SEH slot stays 0).
-static void *sub_712430(void *obj)
-{ *(void **)obj = 0; *(void **)((char *)obj + 4) = 0; return obj; }
+//  ===============================================================
+//  InitParticleSystem  (sub_61A5E0, 0x61A5E0 - 0x61A7B6)
+//  [NOT byte-identical] placement-dependent (relative E8 calls to LHAlloc /
+//  LHFree / InterlockedIncrement / InterlockedDecrement and the high-VA
+//  factory / global slots).
+//
+//  This is the engine's particle-system front-end initializer:
+//    1. builds the three 4-byte light-primitive vftable-holder blocks
+//       (CFable2SpotLightPrimitiveFactory / CFable2PointLightPrimitiveFactory /
+//       CFable2RenderPrimitiveFactory) and feeds them to the factory
+//       registration chain (sub_1926130 -- a documented stub, see below);
+//    2. constructs the 52-byte CFable2MeshVolumeQuery object at [obj+0x88]
+//       together with a fresh 12-byte refcount block {1, ReleaseVtableSlot0,
+//       meshQuery} and stashes the (value, block) pair into the persistent
+//       engine-wide slot (dword_20FC2D0 / dword_20FC2D4), releasing the old
+//       slot pair;
+//    3. constructs the CHeightFieldCollider (4 bytes) at [obj+0x90] together
+//       with a fresh 12-byte refcount block {1, ReleaseVtableSlot0, collider},
+//       swapping the pair in via the sub_61FD20 pair-swap and stashing the
+//       (value, block) pair into the persistent slot (dword_20FC294 /
+//       dword_20FC298), releasing the old slot pair;
+//    4. attempts the particle-thread spawn (sub_1926160: CreateThread over
+//       sub_1921430) -- NOT performed in this build (the worker loop is dead),
+//       so the thread globals stay 0 and the return value is 0.
+//  The factory registration's globals (dword_1E2ED48/-4C/-3C/-40/-44/-2C/-30/-34/
+//  -38/-B0/-EC0) live in the dead registration chain and are not reproduced.
+// ===============================================================
+
+//  the persistent particle-system slot globals (the original's high-VA slots)
+static DWORD g_dword_20FC2D0 = 0;   // 0x20FC2D0  the mesh volume query pair -- the value
+static DWORD g_dword_20FC2D4 = 0;   // 0x20FC2D4  the mesh volume query pair -- the block
+static DWORD g_dword_20FC294 = 0;   // 0x20FC294  the heightfield pair -- the value
+static DWORD g_dword_20FC298 = 0;   // 0x20FC298  the heightfield pair -- the block
+static DWORD g_dword_1E2ED58 = 0;   // 0x1E2ED58  the a2 (worker-parameter) global
+static DWORD g_dword_1E2ED54 = 0;   // 0x1E2ED54  the a3 (worker-parameter) global
+static DWORD g_dword_2075EC4 = 0;   // 0x2075EC4  the particle-thread handle
+
+//  the vftable placeholders (the release dispatcher never fires in this build
+//  -- the pair stays stashed in the global -- but the slot-0 entry is a real
+//  int-returning stub so the vftable is callable).
+static int F3Slot0Release(DWORD obj, int freeIt) { (void)obj; (void)freeIt; return 0; }
+static void *g_CFable2SpotLightPrimitiveFactoryVtable[1]   = { 0 };
+static void *g_CFable2PointLightPrimitiveFactoryVtable[1]  = { 0 };
+static void *g_CFable2RenderPrimitiveFactoryVtable[1]      = { 0 };
+static void *g_CFable2MeshVolumeQueryVtable[1]             = { (void *)F3Slot0Release };
+static void *g_NAbstractParticleSystemTypesIMeshVolumeQueryVtable[1] = { 0 };
+static void *g_CHeightFieldColliderVtable[1]               = { (void *)F3Slot0Release };
+static void *g_NAbstractParticleSystemTypesICollisionQueryVtable[1] = { 0 };
+
+//  the 12-byte refcount block layout: {DWORD refcount; void *releaseFn; DWORD arg}
+//  (the same idiom the engine uses for the +0x70 SEH block / the service pair).
+static void *MkRefBlock(void *releaseFn, DWORD arg)
+{
+    void *p = LHAlloc(12u);
+    if (p == 0)
+        return 0;
+    *(DWORD *)p = 1;
+    *(void **)((char *)p + 4) = releaseFn;
+    *(DWORD *)((char *)p + 8) = arg;
+    return p;
+}
+
+//  ReleaseVtableSlot0  (sub_61E2A0 / sub_61DE40) -- the release dispatcher for
+//  the 12-byte block: a no-op when the arg is null, else call the object's
+//  vftable slot 0 with (this = arg, 1).  The original uses the identical body
+//  for both blocks, so a single helper serves both.
+static int ReleaseVtableSlot0(DWORD arg)
+{
+    if (arg == 0)
+        return 0;
+    void *vt = *(void **)(char *)(DWORD)arg;         // the vftable pointer stored at [arg]
+    return ((int (*)(DWORD, int))((void **)vt)[0])(arg, 1);
+}
+
+//  GlobalPairRelease  (sub_50DD80 / sub_50DD30) -- release the (value, block)
+//  pair stored in the pair at (valueSlot, blockSlot): decrement the block's
+//  refcount, on zero dispatch the block's release callback with its arg and
+//  free the block, and clear both slots.
+static long GlobalPairRelease(DWORD *valueSlot, DWORD *blockSlot)
+{
+    DWORD block = *blockSlot;
+    long result = (long)block;
+    if (result != 0)
+    {
+        result = InterlockedDecrement((volatile LONG *)(void *)result);
+        if (result == 0)
+        {
+            ((void (*)(DWORD))*(void **)((char *)block + 4))(*(DWORD *)((char *)block + 8));
+            LHFree((void *)block);
+        }
+    }
+    *valueSlot = 0;
+    *blockSlot = 0;
+    return result;
+}
+
+//  GlobalPairStash  (sub_1925160 / sub_1925120) -- stash the (value, block)
+//  pair into the persistent global slot: release the old pair (clearing the
+//  global slots) when the block differs, store the new value + block and
+//  increment the new block's refcount.  The discarded return value is 0.
+static long GlobalPairStash(DWORD *valueGlobal, DWORD *blockGlobal, DWORD value, DWORD block)
+{
+    if (*blockGlobal != block)
+    {
+        GlobalPairRelease(valueGlobal, blockGlobal);
+        *valueGlobal = value;
+        *blockGlobal = block;
+        if (block != 0)
+            return InterlockedIncrement((volatile LONG *)(void *)block);
+    }
+    return 0;
+}
+
+//  MeshVolumeQueryPairSet  (sub_620210) -- the engine-slot pair setter for the
+//  mesh volume query: release the old pair's refcount block (callback + free
+//  at zero), store the new value, build the fresh 12-byte block {1,
+//  ReleaseVtableSlot0, value} (or null when the value is null) and store it.
+//  Returns the fresh block (or 0).
+static void *MeshVolumeQueryPairSet(void *slot, void *meshQuery)
+{
+    void *oldBlock = *(void **)((char *)slot + 4);
+    if (oldBlock != 0 && InterlockedDecrement((volatile LONG *)oldBlock) == 0)
+    {
+        ((void (*)(DWORD))*(void **)((char *)oldBlock + 4))(*(DWORD *)((char *)oldBlock + 8));
+        LHFree(oldBlock);
+    }
+    *(void **)slot = meshQuery;
+    *(void **)((char *)slot + 4) = 0;
+    void *newBlock = 0;
+    if (meshQuery != 0)
+    {
+        newBlock = MkRefBlock((void *)ReleaseVtableSlot0, (DWORD)meshQuery);
+        if (newBlock != 0)
+        {
+            *(void **)((char *)slot + 4) = newBlock;
+        }
+        else
+        {
+            *(void **)((char *)slot + 4) = 0;
+            return 0;
+        }
+    }
+    return newBlock;
+}
+
+//  HeightfieldPairSwap  (sub_61FD20) -- the heightfield slot pair swap: when
+//  the slot's old block differs from the new block, release the old block
+//  (callback + free at zero), store the new pair, and increment the new
+//  block's refcount.
+static void HeightfieldPairSwap(void *slot, void *value, void *block)
+{
+    void *oldBlock = *(void **)((char *)slot + 4);
+    if (oldBlock != block)
+    {
+        if (oldBlock != 0 && InterlockedDecrement((volatile LONG *)oldBlock) == 0)
+        {
+            ((void (*)(DWORD))*(void **)((char *)oldBlock + 4))(*(DWORD *)((char *)oldBlock + 8));
+            LHFree(oldBlock);
+        }
+        *(void **)slot = value;
+        *(void **)((char *)slot + 4) = block;
+        if (block != 0)
+            InterlockedIncrement((volatile LONG *)block);
+    }
+}
+
+//  IMeshVolumeQueryStore  (sub_19FCF40) -- the IMeshVolumeQuery vftable store
+//  (overwritten by the CFable2 vftable in the same function).
+static void *IMeshVolumeQueryStore(void *obj)
+{
+    *(void **)obj = g_NAbstractParticleSystemTypesIMeshVolumeQueryVtable;
+    return obj;
+}
+
+//  ICollisionQueryStore  (sub_19FCF60) -- the ICollisionQuery vftable store
+//  (overwritten by the CHeightFieldCollider vftable in the same function).
+static void *ICollisionQueryStore(void *obj)
+{
+    *(void **)obj = g_NAbstractParticleSystemTypesICollisionQueryVtable;
+    return obj;
+}
+
+//  Zero3Words  (unknown_libname_2582, 0x18A5F10) -- zero *this, *(this+1),
+//  *(this+2).
+static void *Zero3Words(void *obj)
+{
+    *(DWORD *)obj = 0;
+    *(DWORD *)((char *)obj + 4) = 0;
+    *(DWORD *)((char *)obj + 8) = 0;
+    return obj;
+}
+
+//  MeshVolumeQueryInner  (sub_710650) -- the 28-byte self-linked state block
+//  build (the mesh volume query's inner structure): a 4-byte wrapper
+//  {this+8}, then a 28-byte block {[0] = [4] = [8] = block, byte 0x18 = 1,
+//  byte 0x19 = 1} with the zero stores guarded exactly as the original.
+static void *MeshVolumeQueryInner(void *obj)
+{
+    void *wrapper = LHAlloc(4u);
+    if (wrapper != 0)
+        *(void **)wrapper = obj;
+    else
+        wrapper = 0;
+    *(void **)obj = wrapper;
+
+    void *v5 = (void *)LHAlloc(28u);
+    if (v5 != 0)
+        *(DWORD *)v5 = 0;
+    if ((int)v5 != -4)
+        *(DWORD *)((char *)v5 + 4) = 0;
+    if ((int)v5 != -8)
+        *(DWORD *)((char *)v5 + 8) = 0;
+    *(BYTE *)((char *)v5 + 25) = 0;
+    *(BYTE *)((char *)v5 + 24) = 1;
+    *(void **)((char *)obj + 0x18) = v5;
+    *(BYTE *)((char *)v5 + 25) = 1;
+    *(DWORD *)((char *)v5 + 4) = (DWORD)v5;
+    *(DWORD *)v5 = (DWORD)v5;
+    *(DWORD *)((char *)v5 + 8) = (DWORD)v5;
+    *(DWORD *)((char *)obj + 0x1C) = 0;
+    return obj;
+}
+
+//  MeshVolumeQueryCtor  (sub_70F430) -- the CFable2MeshVolumeQuery ctor (52
+//  bytes): the IMeshVolumeQuery vftable store (overwritten by the CFable2
+//  vftable), +4 = 1, the inner block build (MeshVolumeQueryInner) at [obj+8],
+//  then +0x28/+0x2C/+0x30 zeroed.
+static void *MeshVolumeQueryCtor(void *obj)
+{
+    IMeshVolumeQueryStore(obj);                                  // sub_19FCF40
+    *(void **)obj = g_CFable2MeshVolumeQueryVtable;              // the overwrite
+    *(DWORD *)((char *)obj + 4) = 1;
+    MeshVolumeQueryInner((char *)obj + 8);                       // sub_710650
+    Zero3Words((char *)obj + 0x28);                              // unknown_libname_2582
+    return obj;
+}
+
+//  sub_1926130 -- the particle-system factory registration chain
+//  [STUB] not reimplemented in this build: the callee chain sub_19224D0 ->
+//  sub_5CEA80 / sub_5CEBC0 / sub_5CED00 / sub_1912BB0 / sub_1924FC0 (the light
+//  primitive factory registration + the particle-system globals) is not
+//  reimplemented here.  The three vftable-holder blocks are still allocated
+//  and populated exactly as the original does.
+static int sub_1926130(void *renderFactory, void *pointFactory, void *spotFactory, int callback, float radius, int a2)
+{
+    (void)renderFactory; (void)pointFactory; (void)spotFactory;
+    (void)callback; (void)radius; (void)a2;
+    return 0;
+}
+
+//  sub_1926160 -- the particle-thread spawn  (0x1926160 - 0x192618C)
+//  [NOT byte-identical].  The original stores the two worker-parameter globals
+//  (dword_1E2ED58 = a2, dword_1E2ED54 = a3), creates the "Particle Thread"
+//  (CreateThread: sub_1921430, 0x10000 stack, lpParameter = a1) and stores the
+//  handle in dword_2075EC4; the return value is the handle (the caller
+//  discards it).  NOT performed in this build: the worker loop
+//  (sub_1921430 -- the particle-thread spin over dword_20FC36x / byte_1D9E1ED)
+//  is a documented stub, so no thread is created and the globals stay 0; the
+//  return value is 0.
+static int sub_1926160(int lpParameter, int a2, int a3)
+{
+    (void)lpParameter; (void)a2; (void)a3;
+    g_dword_1E2ED58 = 0;
+    g_dword_1E2ED54 = 0;
+    g_dword_2075EC4 = 0;
+    return 0;
+}
+
+//  InitParticleSystem  (sub_61A5E0, 0x61A5E0 - 0x61A7B6)  -- the engine's
+//  particle-system front-end initializer.
+static int InitParticleSystem(void *obj)
+{
+    // 1. the three 4-byte light-primitive vftable-holder blocks
+    DWORD *spotBlock = (DWORD *)LHAlloc(4u);
+    if (spotBlock != 0)
+        *spotBlock = (DWORD)g_CFable2SpotLightPrimitiveFactoryVtable;
+    DWORD *pointBlock = (DWORD *)LHAlloc(4u);
+    if (pointBlock != 0)
+        *pointBlock = (DWORD)g_CFable2PointLightPrimitiveFactoryVtable;
+    DWORD *renderBlock = (DWORD *)LHAlloc(4u);
+    if (renderBlock != 0)
+        *renderBlock = (DWORD)g_CFable2RenderPrimitiveFactoryVtable;
+
+    // 2. the factory registration chain (documented stub -- the allocations
+    //    are real, exactly as the original)
+    sub_1926130(renderBlock, pointBlock, spotBlock, 0, 15.0f, 2);
+
+    // 3. the mesh volume query + its persistent slot
+    DWORD *meshRaw = (DWORD *)LHAlloc(52u);
+    void *meshQuery = 0;
+    if (meshRaw != 0)
+        meshQuery = MeshVolumeQueryCtor(meshRaw);
+    MeshVolumeQueryPairSet((char *)obj + 0x88, meshQuery);
+
+    DWORD meshValue = *(DWORD *)((char *)obj + 0x88);
+    DWORD meshBlock = *(DWORD *)((char *)obj + 0x8C);
+    if (meshBlock != 0)
+        InterlockedIncrement((volatile LONG *)(void *)meshBlock);
+    GlobalPairStash(&g_dword_20FC2D0, &g_dword_20FC2D4, meshValue, meshBlock);
+    if (meshBlock != 0 && InterlockedDecrement((volatile LONG *)(void *)meshBlock) == 0)
+    {
+        ((void (*)(DWORD))*(void **)((char *)meshBlock + 4))(*(DWORD *)((char *)meshBlock + 8));
+        LHFree((void *)meshBlock);
+    }
+
+    // 4. the heightfield collider + its persistent slot
+    DWORD *collider = (DWORD *)LHAlloc(4u);
+    if (collider != 0)
+    {
+        ICollisionQueryStore(collider);                            // sub_19FCF60
+        *collider = (DWORD)g_CHeightFieldColliderVtable;           // the overwrite
+    }
+    if (collider != 0)
+    {
+        void *heightBlock = MkRefBlock((void *)ReleaseVtableSlot0, (DWORD)collider);
+        HeightfieldPairSwap((char *)obj + 0x90, collider, heightBlock);
+    }
+
+    DWORD heightValue = *(DWORD *)((char *)obj + 0x90);
+    DWORD heightBlockPtr = *(DWORD *)((char *)obj + 0x94);
+    if (heightBlockPtr != 0)
+        InterlockedIncrement((volatile LONG *)(void *)heightBlockPtr);
+    GlobalPairStash(&g_dword_20FC294, &g_dword_20FC298, heightValue, heightBlockPtr);
+    if (heightBlockPtr != 0 && InterlockedDecrement((volatile LONG *)(void *)heightBlockPtr) == 0)
+    {
+        ((void (*)(DWORD))*(void **)((char *)heightBlockPtr + 4))(*(DWORD *)((char *)heightBlockPtr + 8));
+        LHFree((void *)heightBlockPtr);
+    }
+
+    // 5. the particle-thread spawn (documented no-op)
+    return sub_1926160(0, 0, 0);
+}
+//  CFullScreenMoviePlayerCtor  (sub_731B80, 0x731B80 - 0x731B99)  -- the
+//  NUI::CFullScreenMoviePlayer ctor (8-byte object).
+//  [NOT byte-identical] placement-dependent (relative E8 call to the
+//  CBaseClassNonCopyableCtor and the high-VA vftable
+//  (??_7CFullScreenMoviePlayer@NUI@@6B@, 0x01AF5178)).
+//
+//  void *CFullScreenMoviePlayerCtor(void *obj)
+//
+//  Construct the 8-byte NUI::CFullScreenMoviePlayer object (engine member
+//  0xB4, built over LHAlloc(8) in RunFrontEnd): run the
+//  CBaseClassNonCopyableCtor (base vtable, overwritten below), store the
+//  (placeholder) vtable (slot 0 = F3StubRelease, see the placeholder-vtable
+//  block above), zero +4, and return obj. The original is thiscall (obj in
+//  ECX, plain retn); declared here as a plain free function per the project
+//  convention.
+static void *CFullScreenMoviePlayerCtor(void *obj)
+{
+    F3BaseClassNonCopyableCtor(obj);
+    *(void **)obj = g_CFullScreenMoviePlayerVtable;
+    *(void **)((char *)obj + 4) = 0;
+    return obj;
+}
+//  0x1DC269C -- the live 96-byte game-impl pointer (dword_1DC269C).  Written by
+//  GameImplCtor (sub_712120); cleared by GameImplTeardown (sub_711DD0).
+static int *g_dword_1DC269C = 0;   // 0x1DC269C: the live 96-byte game-impl
+
+//  JmpLHFree2  (0x712AE0 - 0x712AE5)  -- the 5-byte tail-jump thunk `jmp LHFree`
+//  that the 20-byte float block's SEH handler dispatches to.  [NOT byte-identical]
+//  plain C++ equivalent of the tail-jump (frees its arg).
+static void JmpLHFree2(int arg) { if (arg != 0) LHFree((void *)arg); }
+
+//  ReleaseListNode28 / ReleaseListNode32  (sub_715810 / sub_714C40) -- the
+//  recursive in-node finalizers shared by ResetSubList28 / ResetSubList32.
+//  Their fast path dispatches the flag-set check (the block's flag byte at
+//  +0x19 / +0x1D is 1, so the original returns immediately).  Only flag-set
+//  blocks are ever constructed here, so the recursive release path (flag
+//  clear) is never hit and the fast path is implemented as the faithful no-op.
+static void ReleaseListNode28(void *node) { (void)node; }
+static void ReleaseListNode32(void *node) { (void)node; }
+
+//  F3SubListCtor28 / F3SubListCtor32  (sub_7158A0 / sub_715920) -- the 4-byte
+//  self-referencing "sub-list" ctor.  Builds:
+//   - a 4-byte v4 block holding the object pointer (*v4 = obj), stored at +0
+//   - a blockSize-byte v5 block (28 bytes for the impl+0x10 sub-list, 32 for
+//     the impl+0x30 sub-list): word 0 / word 1 / word 2 all = v5 (self-refs);
+//     flag byte at +blockSize-4 (+0x18 / +0x1C) = 1 and flag byte at
+//     +blockSize-3 (+0x19 / +0x1D) = 1; stored at word 6 (+0x18)
+//   - word 7 (+0x1C) = 0 (the flag-clear word)
+//  The original's word-0 guard ("if (v5 != 0)") is the real guard; the "!= -4"
+//  / "!= -8" decompiler guards are artifacts of the lea/test/jz pattern and are
+//  always true for a successful LHAlloc.
+static void *F3SubListCtor28(void *obj)
+{
+    int *this_ = (int *)obj;
+    int *v4 = (int *)LHAlloc(4);
+    if (v4 != 0)
+        *v4 = (int)obj;
+    this_[0] = (v4 != 0) ? (int)v4 : 0;
+    char *v5 = (char *)LHAlloc(28);
+    if (v5 != 0)
+    {
+        *(DWORD *)(v5 + 0) = 0;
+        *(DWORD *)(v5 + 4) = 0;
+        *(DWORD *)(v5 + 8) = 0;
+        v5[25] = 0;
+        v5[24] = 1;
+        this_[6] = (int)v5;
+        v5[25] = 1;
+        *(DWORD *)(v5 + 4) = (DWORD)v5;
+        *(DWORD *)(v5 + 0) = (DWORD)v5;
+        *(DWORD *)(v5 + 8) = (DWORD)v5;
+    }
+    else
+        this_[6] = 0;
+    this_[7] = 0;
+    return obj;
+}
+static void *F3SubListCtor32(void *obj)
+{
+    int *this_ = (int *)obj;
+    int *v4 = (int *)LHAlloc(4);
+    if (v4 != 0)
+        *v4 = (int)obj;
+    this_[0] = (v4 != 0) ? (int)v4 : 0;
+    char *v5 = (char *)LHAlloc(32);
+    if (v5 != 0)
+    {
+        *(DWORD *)(v5 + 0) = 0;
+        *(DWORD *)(v5 + 4) = 0;
+        *(DWORD *)(v5 + 8) = 0;
+        v5[29] = 0;
+        v5[28] = 1;
+        this_[6] = (int)v5;
+        v5[29] = 1;
+        *(DWORD *)(v5 + 4) = (DWORD)v5;
+        *(DWORD *)(v5 + 0) = (DWORD)v5;
+        *(DWORD *)(v5 + 8) = (DWORD)v5;
+    }
+    else
+        this_[6] = 0;
+    this_[7] = 0;
+    return obj;
+}
+
+//  ResetSubList28 / ResetSubList32  (sub_716670 / sub_716760) -- the sub-list
+//  reset called from GameImplTeardown.  On a constructed block the flag byte
+//  is always set, so the original's recursive release finalizer (ReleaseListNode*)
+//  dispatches the no-op fast path; the remaining writes are redundant self-
+//  references plus the flag-clear word.  The 8-byte out-buffer the original
+//  builds is discarded by the caller, so this is faithfully: clear word 7.
+static void ResetSubList28(int *this_)
+{
+    void *v5 = (void *)this_[6];
+    if (v5 != 0)
+        *(DWORD *)((char *)v5 + 4) = (DWORD)v5;
+    this_[7] = 0;
+}
+static void ResetSubList32(int *this_)
+{
+    void *v5 = (void *)this_[6];
+    if (v5 != 0)
+        *(DWORD *)((char *)v5 + 4) = (DWORD)v5;
+    this_[7] = 0;
+}
+
+//  GameImplTeardown  (sub_711DD0, 0x711DD0 - 0x711EAF)  -- release the impl's
+//  +0x5C / +0x54 SEH blocks, zero the +0x58/+0x5C / +0x50/+0x54 slots, then
+//  the two sub-list slots (+0x48/+0x4C and +0x28/+0x2C) and free the 4-byte
+//  / 28-byte / 32-byte blocks.  [NOT byte-identical] placement-dependent (the
+//  relative E8 calls into LHFree / InterlockedDecrement).
+static void GameImplTeardown(void *obj)
+{
+    int *this_ = (int *)obj;
+
+    g_dword_1DC269C = 0;
+
+    if (this_[23] != 0 && InterlockedDecrement((volatile LONG *)this_[23]) == 0)
+    {
+        void **b = (void **)this_[23];
+        ((void (*)(void *))b[1])(b[2]);
+        LHFree(b);
+    }
+    this_[22] = 0;   // +0x58
+    this_[23] = 0;   // +0x5C
+
+    if (this_[21] != 0 && InterlockedDecrement((volatile LONG *)this_[21]) == 0)
+    {
+        void **b = (void **)this_[21];
+        ((void (*)(void *))b[1])(b[2]);
+        LHFree(b);
+    }
+    this_[20] = 0;   // +0x50
+    this_[21] = 0;   // +0x54
+
+    ResetSubList32(this_ + 12);   // +0x30's sub-list
+    LHFree((void *)this_[18]);    // +0x48: the 32-byte block
+    LHFree((void *)this_[12]);    // +0x30: the 4-byte block
+    this_[18] = 0;   // +0x48
+    this_[19] = 0;   // +0x4C
+
+    ResetSubList28(this_ + 4);    // +0x10's sub-list
+    LHFree((void *)this_[10]);    // +0x28: the 28-byte block
+    LHFree((void *)this_[4]);     // +0x10: the 4-byte block
+    this_[10] = 0;   // +0x28
+    this_[11] = 0;   // +0x2C
+}
+
+//  ReleaseGameImpl  (sub_7172B0, 0x7172B0 - 0x7172CB)  -- the SEH handler for
+//  the wrapper's 12-byte block: tear down the 96-byte impl and free it.  [NOT
+//  byte-identical] placement-dependent (the relative E8 calls into
+//  GameImplTeardown / LHFree).
+static int ReleaseGameImpl(int arg)
+{
+    if (arg != 0)
+    {
+        GameImplTeardown((void *)arg);
+        LHFree((void *)arg);
+    }
+    return 0;
+}
+
+//  RegisterFloatBlockSeh  (sub_7136D0, 0x7136D0 - 0x71374A)  -- the SEH
+//  installer for the 20-byte float block at impl+0x50: release the old SEH
+//  block at this+4, store the value, and build a 12-byte SEH block
+//  {refcount=1, handler=JmpLHFree2, arg=value}.  [NOT byte-identical]
+//  placement-dependent (the relative E8 calls into LHAlloc / LHFree /
+//  InterlockedDecrement / JmpLHFree2).
+static void *RegisterFloatBlockSeh(void *obj, void *value)
+{
+    int *this_ = (int *)obj;
+    int oldBlock = this_[1];
+    if (oldBlock != 0 && InterlockedDecrement((volatile LONG *)oldBlock) == 0)
+    {
+        void **b = (void **)oldBlock;
+        ((void (*)(void *))b[1])(b[2]);
+        LHFree((void *)oldBlock);
+    }
+    this_[1] = 0;
+    this_[0] = (int)value;
+    if (value != 0)
+    {
+        int *block = (int *)LHAlloc(12);
+        if (block == 0)
+        {
+            this_[1] = 0;
+            return 0;
+        }
+        block[0] = 1;                 // refcount
+        block[1] = (int)JmpLHFree2;   // handler: free the float block on release
+        block[2] = (int)value;
+        this_[1] = (int)block;
+        return block;
+    }
+    return value;   // a2 == 0: the original returns a2 (= 0)
+}
+
+//  RegisterWrapperSeh  (sub_7172D0, 0x7172D0 - 0x717343)  -- the 8-byte
+//  {value, SEH block} wrapper installer: release the old SEH block at obj+4,
+//  store the value, and build a 12-byte SEH block {refcount=1,
+//  handler=ReleaseGameImpl, arg=value}.  [NOT byte-identical] placement-
+//  dependent (the relative E8 calls into LHAlloc / LHFree / InterlockedDecrement
+//  / ReleaseGameImpl).
+static void *RegisterWrapperSeh(void *obj, void *value)
+{
+    int *this_ = (int *)obj;
+    int oldBlock = this_[1];
+    if (oldBlock != 0 && InterlockedDecrement((volatile LONG *)oldBlock) == 0)
+    {
+        void **b = (void **)oldBlock;
+        ((void (*)(void *))b[1])(b[2]);
+        LHFree((void *)oldBlock);
+    }
+    this_[1] = 0;
+    this_[0] = (int)value;
+    if (value != 0)
+    {
+        int *block = (int *)LHAlloc(12);
+        if (block == 0)
+        {
+            this_[1] = 0;
+            return 0;
+        }
+        block[0] = 1;                     // refcount
+        block[1] = (int)ReleaseGameImpl;  // handler
+        block[2] = (int)value;
+        this_[1] = (int)block;
+        return block;
+    }
+    return value;   // a2 == 0: the original returns a2 (= 0)
+}
+
+//  GameImplCtor  (sub_712120, 0x712120 - 0x7121DA)  -- the 96-byte game-impl
+//  ctor: the 1-word / 4-byte flag pattern, the two 4-byte + 28/32-byte
+//  self-referencing sub-lists (impl+0x10 and impl+0x30), the 20-byte float
+//  block ({1.5707964f, 1.5707964f, 0.5f, 0.5f, 0.5f}, dword_1BD15FC = 3.1415927f
+//  and dword_1AEA1E0 = 0.5f) and its SEH block.  [NOT byte-identical]
+//  placement-dependent (relative E8 calls to F3SubListCtor28/32 /
+//  RegisterFloatBlockSeh and the high-VA global dword_1DC269C).
+static void *GameImplCtor(void *obj)
+{
+    int *this_ = (int *)obj;
+    char *b = (char *)obj;
+
+    this_[0] = 1;
+    b[9] = 1; b[10] = 1; b[11] = 1; b[12] = 1;   // bytes +9..+12 = 1
+    b[4] = 0; b[5] = 0; b[6] = 0; b[7] = 0; b[8] = 0;  // bytes +4..+8 = 0
+
+    F3SubListCtor28((void *)(this_ + 4));   // +0x10
+    F3SubListCtor32((void *)(this_ + 12));  // +0x30
+
+    this_[20] = 0;                            // +0x50
+    this_[21] = 0;                            // +0x54
+    this_[22] = 0;                            // +0x58
+    this_[23] = 0;                            // +0x5C
+    g_dword_1DC269C = this_;
+
+    float *block = (float *)LHAlloc(20);
+    if (block != 0)
+    {
+        block[0] = 3.1415927f * 0.5f;     // dword_1BD15FC * dword_1AEA1E0
+        block[1] = 3.1415927f * 0.5f;
+        block[2] = 0.5f;                    // dword_1AEA1E0
+        block[3] = 0.5f;
+        block[4] = 0.5f;
+    }
+    RegisterFloatBlockSeh((void *)(this_ + 20), block);
+    return obj;
+}
+
+//  GameImplWrapperCtor  (sub_712430, 0x712430 - 0x71246F)  -- the 8-byte
+//  {value, SEH block} wrapper ctor: zero both words, allocate the 96-byte game
+//  impl and register it via RegisterWrapperSeh (the SEH slot stored at +4).
+//  [NOT byte-identical] placement-dependent (the relative E8 calls into
+//  GameImplCtor / RegisterWrapperSeh / LHAlloc).
+static void *GameImplWrapperCtor(void *obj)
+{
+    void **this_ = (void **)obj;
+    this_[0] = 0;
+    this_[1] = 0;
+    int *impl = (int *)LHAlloc(96);
+    if (impl != 0)
+        GameImplCtor((void *)impl);
+    RegisterWrapperSeh(obj, impl);
+    return obj;
+}
 static void  nullsub_29(void) {}
-static void  sub_18FB930(void) {}
 
 // The 36-byte F3WString wide-path struct now lives in gamemain.h (it is
 // shared with the CLuaManager serialise-script path in engine/luavm.cpp).
@@ -14199,11 +18124,10 @@ char RunFrontEnd(void *obj, int arg)
     int             v72;                    // var_16D (game ran)
     int             v71;                    // var_16E (sign-in wait flag)
     int             v164;                   // sub_1801C20 result
-    void           *v168 = 0;              // sub_18013B0 out-pointer
+    void           *v168 = 0;              // FinalizeModelHeaders out-holder
     F3WString       vfsCfg;                 // the 36-byte "startup.vfsconfig" string (sub_4358A0)
     int             vfs[4];                 // the 16-byte vfs config word block
-    DWORD           modelHdr;               // "globals_model_headers" string
-    int             v140, v154;             // sub_402F00 model-headers word block
+    F3AString       modelHdr;               // the 28-byte "globals_model_headers" string (F3AStringAssign / sub_402F00)
     F3SharedBuffer *v160slot = 0;          // microsoft_logo.bik string slot
     char            result = 0;             // default: cancel / failure -> 0
 
@@ -14544,16 +18468,15 @@ signedIn:
         // Manager XNotify/XHV voice bring-up; implemented in netinit.cpp).
         CNetVoiceManagerInit(CNetManagerGetVoiceManager(GetNetManager()));
 
-        sub_18F6C90(GetWorker(), (void *)PauseGameOnVMState);   // 0x61D493
-        sub_18F6C80(GetWorker(), (void *)sub_619DE0);
-        sub_18F6C70(GetWorker(), (void *)sub_6199C0);
-        sub_18F6C60(GetWorker(), (void *)sub_619A70);
+        ((F3ThiscallSetFn)SetPauseGameOnVMState)(GetWorker(), (F3CallbackFn)PauseGameOnVMState);   // 0x61D493
+        ((F3ThiscallSetFn)SetMultiplayerPauseOnVMState)(GetWorker(), (F3CallbackFn)MultiplayerPauseOnVMState);   // 0x61D4B0
+        ((F3ThiscallSetFn)SetArmedPauseOnVMState)(GetWorker(), (F3CallbackFn)ArmedPauseOnVMState);   // 0x61D4C1
+        ((F3ThiscallSetFn)SetNetHeldCoopFailed)(GetWorker(), (F3CallbackFn)NetHeldCoopFailed);   // 0x61D4D0
 
         g_byte_2075F07 = 0;
-        v140 = 0xF;
-        v154 = 0;
-        sub_402F00(&modelHdr, "globals_model_headers", 0x15);
-        void *v52 = sub_18013B0((void *)v164, &modelHdr, &v168);
+        F3AStringReset(&modelHdr);                  // the default SSO ctor (cap = 15, len = 0, buf[0] = 0)
+        F3AStringAssign(&modelHdr, "globals_model_headers", 0x15);   // sub_402F00
+        void *v52 = FinalizeModelHeaders((void *)v164, &modelHdr, &v168);
         void *v52obj = *(void **)v52;
         if (v52obj != 0)
             ((void (*)(void *))F3_VT(v52obj)[1])(v52obj);
@@ -14563,52 +18486,52 @@ signedIn:
         dw[0x7C / 4] = (DWORD)v52obj;
         if (v168 != 0)
             ((void (*)(void *))F3_VT(v168)[2])(v168);
-        if (v140 >= 0x10)
-            LHFree((void *)v154);
+        if (modelHdr.cap >= 0x10)
+            LHFree((void *)modelHdr.u.ptr);
 
-        sub_18E8CD0();
-        int e = sub_18E8960(0, 0);
-        sub_18E8D50((void *)e, 0);
-        sub_18E7180();
-        sub_18E84C0();
+        SetEngineService();
+        void *e = GetEngineService();
+        ForwardEngineServiceImpl(e);
+        SetEngineStartedFlag();   // 0x61D56D
+        StartTextureStreamer();
 
         void *p88 = LHAlloc(0x58);
-        int   v55 = (p88 != 0) ? (int)sub_7330F0(p88) : 0;
+        int   v55 = (p88 != 0) ? (int)CLoadingScreenCtor(p88) : 0;
         void *v56 = (void *)dw[0x28 / 4];
         if (v56 != 0)
             ((void (*)(void *, int))F3_VT(v56)[0])(v56, 1);
         dw[0x28 / 4] = (DWORD)v55;
 
         void *p8 = LHAlloc(8);
-        int   v58 = (p8 != 0) ? (int)sub_72FB30(p8) : 0;
+        int   v58 = (p8 != 0) ? (int)CGameRendererCtor(p8) : 0;
         void *v59 = (void *)dw[0x9C / 4];
         if (v59 != 0)
             ((void (*)(void *, int))F3_VT(v59)[0])(v59, 1);
         dw[0x9C / 4] = (DWORD)v58;
-        sub_72FB10((void *)v58, obj, v108, str103);
+        CGameRendererApplySavedOptions((void *)v58, obj, v108, str103);
 
         ResetEngineTest((int)dw[0xBC / 4]);
         RegisterEngineTest((int)dw[0xBC / 4]);
-        sub_18F0180();
-        sub_72FAE0((void *)dw[0x9C / 4]);
+        ClearCurrentThreadId();
+        StartWorkerThread((void *)dw[0x9C / 4]);
 
         F3SharedBuffer **fileId = SetSharedSlot(&v160slot, "data\\art\\videos\\microsoft_logo.bik", -1);
         MountVideoFile(obj, fileId);
         ReleaseSharedSlot(&v160slot);
-        sub_61A5E0(obj);
+        InitParticleSystem(obj);
 
         base[0x84] = 0;
         dw[0x80 / 4] = (DWORD)_beginthread(MountPermanentBanks, 0x40000u, obj);
 
         void *p8b = LHAlloc(8);
-        int   v62 = (p8b != 0) ? (int)sub_731B80(p8b) : 0;
+        int   v62 = (p8b != 0) ? (int)CFullScreenMoviePlayerCtor(p8b) : 0;
         void *v63 = (void *)dw[0x2C / 4];
         if (v63 != 0)
             ((void (*)(void *, int))F3_VT(v63)[0])(v63, 1);
         dw[0x2C / 4] = (DWORD)v62;
 
         void *p8c = LHAlloc(8);
-        int   v64 = (p8c != 0) ? (int)sub_712430(p8c) : 0;
+        int   v64 = (p8c != 0) ? (int)GameImplWrapperCtor(p8c) : 0;
         volatile LONG **v65 = (volatile LONG **)(void *)dw[0xB4 / 4];
         if (v65 != 0)
         {
@@ -14625,7 +18548,7 @@ signedIn:
 
         if (g_byte_1DBD03E != 0)
             nullsub_29();
-        sub_18FB930();
+        LoadApplyMasteringProfile();
     }
 
     // Success: the frontend ran and the device / threads were started.
