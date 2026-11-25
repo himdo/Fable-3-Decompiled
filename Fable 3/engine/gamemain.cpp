@@ -7100,15 +7100,368 @@ static char SpeechBankPrefixTest(const char **nameSlotAddr, const char *a2)
     return (char)(strcmp(a2, "") != 0);
 }
 
-// SpeechBankMount (0x61ACA0, formerly sub_61ACA0) -- the file-subsystem mount callback for the
-// speech-bank table pass.  Deep dependency chain (SharedSlotConcat /
-// sub_18AED30 / sub_18C4AE0 / RefSharedSlot / SubstringSharedSlot /
-// SharedSlotToWide / GetLocalizedString / sub_5AF180 / ReleaseSharedSlotWide /
-// the vtable dispatches / LHAlloc / sub_616660) -- out of scope.  Stub.
-// [remaining stub]
+//  0x1DBE2B4 / 0x1DBDA70: the two shared slots SpeechBankMount concats
+//  into the speech-bank mount path (SharedSlotConcat, 0x1A02260).  .bss;
+//  both null in this build (the original's static initializers do not
+//  run here).
+static F3SharedBuffer *g_dword_1DBE2B4 = 0;   // 0x1DBE2B4
+static F3SharedBuffer *g_dword_1DBDA70 = 0;   // 0x1DBDA70
+
+//  forward decl for a file-local helper defined below this point.
+static F3SharedBuffer **SharedSlotAppendSlot(F3SharedBuffer **dst, F3SharedBuffer **src);
+
+//  TruncateSharedBlockTo  (sub_403A70, 0x403A70 - 0x403AE6)  -- truncate a
+//  counted block to a shorter payload in place.  The original: when the new
+//  length is smaller than the block's current length, allocate a fresh
+//  aligned payload ((len + 4) & ~3), memcpy_s the first newLength bytes,
+//  null-terminate, free the old payload through the heap-table free slot
+//  (dword_2075B24+0x10), flip the capacity flag pair ((old & 0x80000000) |
+//  (new & 0x7FFFFFFF)), then re-terminate and zero the tail padding
+//  (memset(new + newLen + 1, 0, aligned - (newLen + 1))).  [NOT byte-identical]
+//  placement-dependent (relative calls to LHAlloc / memcpy_s / memset / LHFree).
+static void TruncateSharedBlockTo(unsigned int newLen, F3SharedBuffer *blk)
+{
+    if (newLen >= blk->length)
+        return;
+
+    unsigned int aligned = (newLen + 4u) & ~3u;
+    char *newData = (char *)LHAlloc(aligned);
+    memcpy_s(newData, newLen, blk->data, newLen);
+    newData[newLen] = 0;
+
+    if (blk->data != 0)
+    {
+        LHFree(blk->data);               // the heap-table free slot (dword_2075B24+0x10)
+        blk->data = 0;
+    }
+
+    blk->capacity ^= (aligned ^ blk->capacity) & 0x7FFFFFFFu;
+    blk->data   = newData;
+    blk->length = newLen;
+    newData[newLen] = 0;
+    unsigned int pad = aligned - (newLen + 1u);
+    if (pad != 0)
+        memset(newData + newLen + 1, 0, pad);
+}
+
+//  DetachToUpperSharedSlot  (sub_1A01B80, 0x1A01B80 - 0x1A01BD7)  -- the
+//  ANSI shared-slot "private copy + upcase": RefSharedSlot into out,
+//  DetachSharedSlot (a private copy), then toupper (0x80) the payload in
+//  place.  Returns the out slot.  Used by NormalizeSpeechPath to build the
+//  uppercase hash suffixes.  [NOT byte-identical] placement-dependent
+//  (relative calls to RefSharedSlot / DetachSharedSlot / toupper).
+static F3SharedBuffer **DetachToUpperSharedSlot(F3SharedBuffer **src,
+                                                F3SharedBuffer **out)
+{
+    RefSharedSlot(out, src);
+    DetachSharedSlot(out);
+    F3SharedBuffer *b = *out;
+    if (b == 0)
+        return out;
+    for (unsigned int i = 0; i < b->length; i++)
+        if ((unsigned char)b->data[i] < 0x80u)
+            b->data[i] = (char)toupper((unsigned char)b->data[i]);
+    return out;
+}
+
+//  NormalizeSpeechPath  (sub_18C4AE0, 0x18C4AE0 - 0x18C4F1E)  -- the
+//  speech-bank mount path normalizer: split the lowercased source slot into
+//  the three parts of the final mount path -- the prefix (the drive +
+//  "data\" root, or just "data\" for a data-rooted path), the directory
+//  (everything up to and including the last backslash) and the filename
+//  (everything after it) -- and concat them into the destination slot.
+//  a1 = the destination slot, a2 = the source slot.  When the filename is
+//  longer than 40 chars it is truncated to 32 and an uppercase 8-hex-digit
+//  FNV-32 hash of the whole (lowercased) source string is appended to it.
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  SubstringSharedSlot / CopySharedSlot / ReleaseSharedSlot /
+//  SetSaveGamePath / AppendSharedSlot / DetachSharedSlot /
+//  SharedSlotAppendSlot / sprintf_s + the Interlocked IAT slots).
+static F3SharedBuffer **NormalizeSpeechPath(F3SharedBuffer **a1,
+                                            F3SharedBuffer **a2)
+{
+    F3SharedBuffer *slot36 = 0;   // v36: the lowercased source (private copy)
+    DetachToLowerSharedSlot(a2, &slot36);
+
+    F3SharedBuffer *slot39 = 0;   // v39: the prefix slot
+    SetSharedSlot(&slot39, "", -1);
+
+    const char *v3 = (slot36 != 0) ? slot36->data : "";
+
+    if (strncmp(v3, "data\\", 5u) == 0)
+    {
+        // the data-rooted case: strip the "data\" prefix
+        unsigned int len = (slot36 != 0) ? slot36->length : 0;
+        F3SharedBuffer *slot33 = 0;
+        SubstringSharedSlot(&slot36, &slot33, 5, (int)len);
+        CopySharedSlot(&slot36, &slot33);
+        if (slot33 != 0)
+        {
+            if (InterlockedDecrement(&slot33->refcount) <= 0 && slot33 != 0)
+                SharedBufferFree(slot33);
+            slot33 = 0;
+        }
+        InterlockedDecrement(&g_Addend);
+        SetSaveGamePath(&slot39, "data\\");
+    }
+    else
+    {
+        const char *v6 = v3;   // the whole (lowercased) string
+        const char *v7 = strchr(v6, ':');
+        if (v7 != 0)
+        {
+            int v8 = (int)(v7 - v6);   // the drive offset
+            F3SharedBuffer *slot34 = 0;
+            if (strstr(v7, ":\\data\\") != 0)
+            {
+                int v9 = v8 + 7;
+                SubstringSharedSlot(&slot36, &slot34, 0, v9);
+                CopySharedSlot(&slot39, &slot34);
+                ReleaseSharedSlot(&slot34);
+                unsigned int len = (slot36 != 0) ? slot36->length : 0;
+                SubstringSharedSlot(&slot36, &slot34, v9, (int)len);
+            }
+            else
+            {
+                int v12 = v8 + 2;
+                SubstringSharedSlot(&slot36, &slot34, 0, v12);
+                CopySharedSlot(&slot39, &slot34);
+                ReleaseSharedSlot(&slot34);
+                unsigned int len = (slot36 != 0) ? slot36->length : 0;
+                SubstringSharedSlot(&slot36, &slot34, v12, (int)len);
+            }
+            CopySharedSlot(&slot36, &slot34);
+            ReleaseSharedSlot(&slot34);
+        }
+    }
+
+    // the strrchr section -- the dir / filename split
+    const char *v15 = (slot36 != 0) ? slot36->data : "";
+    const char *v16 = strrchr(v15, '\\');
+
+    F3SharedBuffer *slot37 = 0;   // v37: the dir slot
+    SetSharedSlot(&slot37, "", -1);
+
+    F3SharedBuffer *slot38 = 0;   // v38: the filename slot
+    RefSharedSlot(&slot38, &slot36);
+
+    if (v16 != 0)
+    {
+        int v17 = (int)(v16 - v15);   // the dir offset (the backslash position)
+
+        CopySharedSlot(&slot37, &slot36);
+        unsigned int v18len = (slot37 != 0) ? slot37->length : 0;
+        if ((int)v18len > v17)
+        {
+            if (v17 != 0)
+            {
+                DetachSharedSlot(&slot37);
+                TruncateSharedBlockTo((unsigned int)v17, slot37);
+            }
+            else
+            {
+                SetSaveGamePath(&slot37, "");
+            }
+        }
+        AppendSharedSlot(&slot37, "\\");
+        SetSaveGamePath(&slot38, &v15[v17 + 1]);
+    }
+
+    F3SharedBuffer *v19 = slot38;
+    if (slot38 != 0 && slot38->length > 0x28u)
+    {
+        // the long-filename case: truncate to 32, hash the source string
+        if (slot38->length > 32u)
+        {
+            DetachSharedSlot(&slot38);
+            TruncateSharedBlockTo(32u, slot38);
+        }
+        const char *src = (slot36 != 0) ? slot36->data : "";
+        DWORD hash = 0x811C9DC5u;
+        while (*src != 0)
+        {
+            hash = (hash * 16777619u) ^ (DWORD)(unsigned char)*src;
+            ++src;
+        }
+        char buf[12];
+        sprintf_s(buf, sizeof(buf), "%08x", hash);
+        F3SharedBuffer *slot34 = 0;
+        SetSharedSlot(&slot34, buf, -1);
+        F3SharedBuffer *slot33 = 0;   // v33: the uppercase hash slot
+        DetachToUpperSharedSlot(&slot34, &slot33);
+        SharedSlotAppendSlot(&slot38, &slot33);
+        if (slot33 != 0)
+        {
+            if (InterlockedDecrement(&slot33->refcount) <= 0 && slot33 != 0)
+                SharedBufferFree(slot33);
+            slot33 = 0;
+        }
+        InterlockedDecrement(&g_Addend);
+        if (slot34 != 0)
+        {
+            if (InterlockedDecrement(&slot34->refcount) <= 0 && slot34 != 0)
+                SharedBufferFree(slot34);
+            slot34 = 0;
+        }
+        InterlockedDecrement(&g_Addend);
+        v19 = slot38;
+    }
+
+    // the final (prefix + dir + filename) assembly
+    F3SharedBuffer *slot33 = 0;   // v33: the concat slot
+    InterlockedIncrement(&g_Addend);
+    CopySharedSlot(&slot33, &slot39);
+    SharedSlotAppendSlot(&slot33, &slot37);
+    *a1 = 0;
+    InterlockedIncrement(&g_Addend);
+    CopySharedSlot(a1, &slot33);
+    SharedSlotAppendSlot(a1, &slot38);
+
+    if (slot33 != 0)
+    {
+        if (InterlockedDecrement(&slot33->refcount) <= 0 && slot33 != 0)
+            SharedBufferFree(slot33);
+        slot33 = 0;
+    }
+    InterlockedDecrement(&g_Addend);
+    if (v19 != 0)
+    {
+        if (InterlockedDecrement(&v19->refcount) <= 0 && v19 != 0)
+            SharedBufferFree(v19);
+        v19 = 0;
+    }
+    InterlockedDecrement(&g_Addend);
+    if (slot37 != 0)
+    {
+        if (InterlockedDecrement(&slot37->refcount) <= 0 && slot37 != 0)
+            SharedBufferFree(slot37);
+        slot37 = 0;
+    }
+    InterlockedDecrement(&g_Addend);
+    if (slot39 != 0)
+    {
+        if (InterlockedDecrement(&slot39->refcount) <= 0 && slot39 != 0)
+            SharedBufferFree(slot39);
+        slot39 = 0;
+    }
+    InterlockedDecrement(&g_Addend);
+    if (slot36 != 0)
+    {
+        if (InterlockedDecrement(&slot36->refcount) <= 0 && slot36 != 0)
+            SharedBufferFree(slot36);
+        slot36 = 0;
+    }
+    InterlockedDecrement(&g_Addend);
+
+    return a1;
+}
+
+//  sub_616660  (0x616660 - 0x616699)  -- the speech-bank mount error report:
+//  builds the "Lua DLC startup script has an error in it" slot, dispatches the
+//  Lua-module error report (sub_6281C0 -- the deep Lua VM chain:
+//  KoreFormatValue / KoreValueEq / KoreHashTableInsert / sub_18AFB90 /
+//  sub_604CF0), and releases the slot.  Deep dependency chain --
+//  out of scope.  Stub.  [remaining stub]
+static long SpeechBankMountReportError(size_t Size, int a2, int a3, F3SharedBuffer **a4)
+{
+    (void)Size; (void)a2; (void)a3; (void)a4;
+    return 0;
+}
+
+//  SpeechBankMount  (0x61ACA0 - 0x61AE6B)  -- the file-subsystem mount callback for the
+//  speech-bank table pass: concat the two speech-bank path slots (SharedSlotConcat),
+//  normalize the combined path through NormalizedCopySlot (sub_18AED30) +
+//  NormalizeSpeechPath (sub_18C4AE0), RefSharedSlot it, then -- for a
+//  "data\"-rooted path -- strip the prefix.  The path is converted to wide
+//  (SharedSlotToWide + GetLocalizedString + sub_5AF180) and dispatched through
+//  the entry's vtable slot 4 (the mount); when the mount wrote an entry,
+//  the entry's slot 7 (thiscall) reads the write size, the entry's slot 3
+//  (thiscall) writes the mount buffer (LHAlloc'd), the entry's slot 2
+//  (stdcall) releases it.  Returns 1 unconditionally.
+//  [NOT byte-identical] placement-dependent (E8 calls + the __security_cookie
+//  prologue + the vtable dispatches).
 static unsigned char SpeechBankMount(int entry, int data)
 {
-    (void)entry; (void)data;
+    if (entry != 0)
+    {
+        // the path slot: concat the two speech-bank slots
+        F3SharedBuffer *slotConcat = 0;   // v15
+        SharedSlotConcat(&slotConcat, &g_dword_1DBE2B4, &g_dword_1DBDA70);
+
+        // normalize the combined path (sub_18AED30 + sub_18C4AE0)
+        F3SharedBuffer *slotNorm = 0;     // v14
+        NormalizedCopySlot(&slotNorm, &slotConcat);
+
+        F3SharedBuffer *slotPath = 0;     // v12
+        NormalizeSpeechPath(&slotPath, &slotNorm);
+
+        F3SharedBuffer *slotPath10 = 0;   // v10
+        RefSharedSlot(&slotPath10, &slotPath);
+
+        const char *v2 = GetSlotString(&slotPath10);
+
+        if (strncmp(v2, "data\\", 5u) == 0)
+        {
+            unsigned int len = (slotPath10 != 0) ? slotPath10->length : 0;
+            F3SharedBuffer *slot13 = 0;
+            SubstringSharedSlot(&slotPath10, &slot13, 5, (int)len);
+            CopySharedSlot(&slotPath10, &slot13);
+            ReleaseSharedSlot(&slot13);
+        }
+
+        // build the wide path string (SharedSlotToWide + GetLocalizedString + sub_5AF180)
+        F3SharedBuffer *wideSlot = 0;
+        SharedSlotToWide(&slotPath10, &wideSlot);
+        const WCHAR *localized = GetLocalizedString((const WCHAR ***)&wideSlot);
+        F3WString wstr;
+        F3WStringReset(&wstr);
+        F3WStringAssign(&wstr, localized, (unsigned int)wcslen(localized));
+        F3WStringNormalizeSeparators(&wstr);
+        ReleaseSharedSlotWide(&wideSlot);
+
+        // the mount dispatch: the entry's vtable slot 4 (thiscall)
+        typedef void (__thiscall *EntryMountFn)(int self, int **outSlot, F3WString *wide, int flag);
+        int v11 = 0;
+        ((EntryMountFn)F3_VT((void *)entry)[4])(entry, (int **)&v11, &wstr, 1);
+
+        if (v11 != 0)
+        {
+            // the entry's slot 7 (thiscall): the write size
+            typedef int (__thiscall *EntrySizeFn)(int self);
+            int v7 = ((EntrySizeFn)F3_VT((void *)v11)[7])(v11);
+
+            if (v7 > 0)
+            {
+                // heap the mount buffer (v7 + 1) bytes
+                void *v8 = LHAlloc((unsigned int)(v7 + 1));
+                DWORD blockPair[2];
+                blockPair[0] = (DWORD)v8;
+                blockPair[1] = 0;
+
+                // the entry's slot 3 (thiscall): the write
+                typedef int (__thiscall *EntryWriteFn)(int self, DWORD **block, DWORD, DWORD, int, DWORD);
+                if ((int)((EntryWriteFn)F3_VT((void *)v11)[3])(v11, (DWORD **)blockPair, 0, 0, v7, 0) == 0)
+                    SpeechBankMountReportError((size_t)data, (int)v8, v7, (F3SharedBuffer **)&slotPath);
+                LHFree(v8);
+            }
+
+            if (v11 != 0)
+            {
+                // the entry's slot 2 (stdcall): release
+                typedef void (__stdcall *EntryReleaseFn)(int self);
+                ((EntryReleaseFn)F3_VT((void *)v11)[2])(v11);
+            }
+        }
+
+        // the wide-string cleanup: the free idiom + the reset idiom
+        if (wstr.cap >= 8)
+            LHFree((void *)wstr.u.ptr);
+        F3WStringReset(&wstr);
+        ReleaseSharedSlot(&slotPath10);
+        ReleaseSharedSlot(&slotPath);
+        ReleaseSharedSlot(&slotNorm);
+        ReleaseSharedSlot(&slotConcat);
+    }
     return 1;
 }
 
@@ -8129,6 +8482,7 @@ static DWORD g_dword_1DDCCD0 = 0;             // 0x1DDCCD0: the audio-engine obj
 static BYTE  g_unk_1DDCC40[72];               // 0x1DDCC40: provider query cache #1
 static BYTE  g_unk_1DDCC88[72];               // 0x1DDCC88: provider query cache #2
 static DWORD g_dword_1DDCD74 = 0;             // 0x1DDCD74: the concurrency reader-writer-lock object
+static DWORD g_dword_1DDCCD8 = 0xffffffff;   // 0x1DDCCD8: the concurrency RW-lock critical-section source object (initialized at startup; 0xffffffff placeholder in the file image)
 static DWORD g_dword_1DDCD34 = 0;             // 0x1DDCD34: the commit-command counter (incremented by CommitCommand)
 static BYTE  g_byte_1DDCCE0 = 0;              // 0x1DDCCE0: the SetProcessedCommitNumber gate flag
 static BYTE  g_unk_1DDCCE8[28];               // 0x1DDCCE8: the audio-comms command-wrapper allocation cache object (28 bytes)
@@ -8898,23 +9252,137 @@ static void *AudioEngineCtor(void *obj, int a2, int a3, int a4)
     return obj;
 }
 
-// sub_1496FA0  (0x1496FA0 - 0x1497122)  -- the RWLock-guarded tick state-update
-//  chain (thiscall, obj in ECX) [STUB] (the CsGuardAcquire + CsGuardRelease
-//  chain through sub_148D350 is unimplemented; the ~370-byte state walk is
-//  out of scope).  Returns 0.
-static int sub_1496FA0(void *obj) { (void)obj; return 0; }
+//  GetRwLockCriticalSection  (0x148D350 - 0x148D35C)  -- extract the critical
+//  section of the concurrency RW-lock object: load dword_1DDCCD8, call vtable[1]
+//  (thiscall, offset 0x4 -- the +0x4 / vtable[1] thiscall slot), and return its
+//  result (the CRITICAL_SECTION pointer as an int).
+//  [NOT byte-identical] refs the high-VA global dword_1DDCCD8.
+static int GetRwLockCriticalSection(void)
+{
+    DWORD obj = g_dword_1DDCCD8;   // 0x1DDCCD8 -- dword_1DDCCD8
+    return ((int (*)(DWORD))(*(DWORD *)obj + 4))(obj);
+}
+
+//  SyncLockedStateChains  (0x1496FA0 - 0x1497122)  -- the RWLock-guarded tick
+//  state-update (thiscall, obj in ECX).  Acquires the RW-lock critical section
+//  (GetRwLockCriticalSection above), commits *(obj + 8) = the value at *(obj +
+//  0x28), then syncs two element chains:
+//    chain 1: obj[4] (the obj+0x10 pointer) followed while the node's +0x1C is
+//      the marker (obj+0x10); each node (v5) copies the float at v7 = *(v5 +
+//      0x60) into v5+0x30, overwrites the int at v5+0x38 with *(v7 + 4) when the
+//      committed value is >= v5+0x3C, copies the float at v7+8 into v5+0x40, and
+//      overwrites the int at v5+0x48 with *(v7 + 12) when the committed value
+//      is >= v5+0x4C, then advances through +0x14 while the node's +0x1C is the
+//      marker (a node with a non-marker +0x1C ends the walk; a null +0x14 also
+//      ends it).
+//    chain 2: obj[1] (the obj+0x04 pointer) followed while the node's +0x10 is
+//      the marker (obj+0x04); each node (v13) copies the float at v15 = *(v13
+//      + 0x48) into v13+0x20, overwrites the int at v13+0x28 with *(v15 + 4)
+//      when the committed value is >= v13+0x2C, walks the nested inner chain
+//      (the node at v13+0x30, marker v13+0x30, each step copying the float at
+//      v19 = *(v17+0x38) into v17+0x20 and the int at v17+0x28 with *(v19+4)
+//      when the committed value is >= v17+0x2C), then copies the six float
+//      slots (v15+0x0C/+0x08/+0x10 -> v13+0x88/+0x84/+0x8C), the int slots
+//      (v15+0x18/+0x20/+0x24/+0x28/+0x2C/+0x30 -> v13+0x94/+0xA0/+0xA4/+0xA8/
+//      +0xAC/+0xB8) and the byte flags (v15+0x1C/+0x1D/+0x1E/+0x1F ->
+//      v13+0xF2/+0xF3/+0xF5/+0xF7), then advances through +0x08 while the
+//      node's +0x10 is the marker (a node with a non-marker +0x10 ends the
+//      walk; a null +0x08 also ends it).
+//  [NOT byte-identical] relative E8 calls to GetRwLockCriticalSection /
+//  CsGuardAcquire / CsGuardRelease plus the x87 float semantics (fld/fstp).
+static void SyncLockedStateChains(void *obj)
+{
+    F3CsGuard guard;
+    DWORD cs = GetRwLockCriticalSection();
+    CsGuardAcquire(&guard, (CRITICAL_SECTION *)cs, 0);
+    DWORD *o = (DWORD *)obj;
+    o[2] = *(DWORD *)o[10];      // *(this + 8) = the committed value at *(this + 0x28)
+    DWORD marker1 = (DWORD)(o + 4);   // this + 0x10
+    DWORD *v5 = (DWORD *)o[4];        // the obj+0x10 pointer
+    while (v5 != 0)
+    {
+        DWORD v7 = *(DWORD *)((char *)v5 + 0x60);
+        if (v7 != 0)
+        {
+            *(float *)((char *)v5 + 0x30) = *(float *)v7;
+            if (o[2] >= *(DWORD *)((char *)v5 + 0x3C))
+                *(DWORD *)((char *)v5 + 0x38) = *(DWORD *)(v7 + 4);
+            *(float *)((char *)v5 + 0x40) = *(float *)(v7 + 8);
+            if (o[2] >= *(DWORD *)((char *)v5 + 0x4C))
+                *(DWORD *)((char *)v5 + 0x48) = *(DWORD *)(v7 + 12);
+        }
+        if (*(DWORD *)((char *)v5 + 0x1C) == marker1)
+        {
+            v5 = (DWORD *)*(DWORD *)((char *)v5 + 0x14);
+            if (v5 == 0)
+                break;
+            if (*(DWORD *)((char *)v5 + 0x1C) == marker1)
+                continue;
+        }
+        v5 = 0;
+    }
+    DWORD marker2 = (DWORD)(o + 1);   // this + 0x04
+    DWORD *v13 = (DWORD *)o[1];       // the obj+0x04 pointer
+    while (v13 != 0)
+    {
+        DWORD v15 = *(DWORD *)((char *)v13 + 0x48);
+        *(float *)((char *)v13 + 0x20) = *(float *)v15;
+        if (o[2] >= *(DWORD *)((char *)v13 + 0x2C))
+            *(DWORD *)((char *)v13 + 0x28) = *(DWORD *)(v15 + 4);
+        DWORD v17 = *(DWORD *)((char *)v13 + 0x30);
+        if (v17 != 0)
+        {
+            DWORD marker3 = (DWORD)((char *)v13 + 0x30);
+            do
+            {
+                DWORD v19 = *(DWORD *)((char *)v17 + 0x38);
+                *(float *)((char *)v17 + 0x20) = *(float *)v19;
+                if (o[2] >= *(DWORD *)((char *)v17 + 0x2C))
+                    *(DWORD *)((char *)v17 + 0x28) = *(DWORD *)(v19 + 4);
+                if (*(DWORD *)((char *)v17 + 0x1C) != marker3)
+                    break;
+                v17 = *(DWORD *)((char *)v17 + 0x14);
+                if (v17 == 0)
+                    break;
+            } while (*(DWORD *)((char *)v17 + 0x1C) == marker3);
+        }
+        *(float *)((char *)v13 + 0x84) = *(float *)(v15 + 8);
+        *(float *)((char *)v13 + 0x88) = *(float *)(v15 + 12);
+        *(float *)((char *)v13 + 0x8C) = *(float *)(v15 + 16);
+        *(DWORD *)((char *)v13 + 0x94) = *(DWORD *)(v15 + 24);
+        *(BYTE *)((char *)v13 + 0xF2) = *(BYTE *)(v15 + 28);
+        *(BYTE *)((char *)v13 + 0xF3) = *(BYTE *)(v15 + 29);
+        *(DWORD *)((char *)v13 + 0xA0) = *(DWORD *)(v15 + 32);
+        *(DWORD *)((char *)v13 + 0xA4) = *(DWORD *)(v15 + 36);
+        *(DWORD *)((char *)v13 + 0xA8) = *(DWORD *)(v15 + 40);
+        *(DWORD *)((char *)v13 + 0xAC) = *(DWORD *)(v15 + 44);
+        *(DWORD *)((char *)v13 + 0xB8) = *(DWORD *)(v15 + 48);
+        *(BYTE *)((char *)v13 + 0xF5) = *(BYTE *)(v15 + 30);
+        *(BYTE *)((char *)v13 + 0xF7) = *(BYTE *)(v15 + 31);
+        if (*(DWORD *)((char *)v13 + 0x10) == marker2)
+        {
+            v13 = (DWORD *)*(DWORD *)((char *)v13 + 0x08);
+            if (v13 == 0)
+                break;
+            if (*(DWORD *)((char *)v13 + 0x10) == marker2)
+                continue;
+        }
+        v13 = 0;
+    }
+    CsGuardRelease(&guard);
+}
 
 // AudioTickEnterStep  (0x146D930 - 0x146D93C)  -- the audio tick enter step:
 //  loads the concurrency reader-writer-lock object (g_dword_1DDCD74, via the
-//  sub_1495860 getter 0x1495860) and tail-calls sub_1496FA0(this=lock);
-//  returns sub_1496FA0's result.
-//  [NOT byte-identical] -- a relative E8 call + an E9 tail-jmp to sub_1496FA0
-//  (placement-dependent) plus the high-VA global; the deep callee chain
-//  (sub_1496FA0) is the documented no-op stub.
+//  sub_1495860 getter 0x1495860) and tail-calls SyncLockedStateChains(this=lock)
+//  (0x1496FA0).
+//  [NOT byte-identical] -- a relative E8 call + an E9 tail-jmp to
+//  SyncLockedStateChains (placement-dependent) plus the high-VA global.
 static int AudioTickEnterStep(void)
 {
     DWORD lock = g_dword_1DDCD74;   // sub_1495860 (0x1495860): the RWLock getter
-    return sub_1496FA0((void *)lock);   // 0x1496FA0 (thiscall) -- tail-call
+    SyncLockedStateChains((void *)lock);   // 0x1496FA0 (thiscall) -- tail-call
+    return 0;
 }
 
 //  AudioDelegateTickStep  (0x1478F20 - 0x1478FE1)  -- the audio delegate tick
@@ -9199,12 +9667,241 @@ static DWORD AudioTickFairnessPass(void *obj)
     return result;
 }
 
-// sub_1479800  (0x1479800)  -- the audio delegate node-list per-node audio
-//  processing (thiscall, obj in ECX = the consumed node, a2 on the stack = the
-//  +0x140 slot value) [STUB] (the deep vtable dispatch chain -- the high-VA
-//  global reads / indirect vtable calls through +0x10 / +0x38 are not
-//  implemented in this build).
-static DWORD sub_1479800(void *obj, void *a2) { (void)obj; (void)a2; return 0; }
+//  AudioDelegateNodeAudioStep  (0x1478600 - 0x1478680)  -- the per-node audio
+//  step (thiscall, this in ECX = the consumed node, a2 on the stack = the
+//  +0x140 slot value).  The vtable[13] dispatch through the node's vtable holder
+//  (+0x10, slot 13 = byte +0x34) with the float scratch slot on the stack;
+//  when the slot float is >= 0.003 (dword_1BD1618) the +0xC0 counter is bumped
+//  (clamped to 0xBB9) and the +0xC4 counter is cleared, otherwise the +0xC4
+//  counter is bumped (clamped to 0x65) and the +0xC0 counter is cleared.
+//  Returns the vtable[13] call's result.
+static int AudioDelegateNodeAudioStep(void *node, DWORD a2)
+{
+    DWORD node_addr = (DWORD)node;
+    DWORD holder = *(DWORD *)(node_addr + 0x10);
+    typedef int (__thiscall *VTabCall13)(DWORD holder, float *v);
+    float v = 0.0f;
+    int result = ((VTabCall13)((DWORD *)(*(DWORD *)holder))[13])(holder, &v);
+    if (v >= 0.003000000026077032f)
+    {
+        *(DWORD *)(node_addr + 0xC0) += (DWORD)a2;
+        if (*(DWORD *)(node_addr + 0xC0) > 0xBB8u)
+            *(DWORD *)(node_addr + 0xC0) = 0xBB9u;
+        *(DWORD *)(node_addr + 0xC4) = 0;
+    }
+    else
+    {
+        *(DWORD *)(node_addr + 0xC4) += (DWORD)a2;
+        if (*(DWORD *)(node_addr + 0xC4) > 0x64u)
+            *(DWORD *)(node_addr + 0xC4) = 0x65u;
+        *(DWORD *)(node_addr + 0xC0) = 0;
+    }
+    return result;
+}
+
+//  AudioEngineChainSelect  (0x1478260 - 0x14782A0)  -- the per-status chain
+//  selector (thiscall, this in ECX = the audio-engine object, a2 on the stack =
+//  the status byte).  Switches the status: 1 -> the tick-counter chain
+//  (this + (word[this+0x144] + 1) * 32), 2 -> this, 3 -> this + 0xE0,
+//  4 -> this + 0x100, anything else -> 0.
+static DWORD AudioEngineChainSelect(DWORD obj, int a2)
+{
+    switch (a2)
+    {
+    case 1: return obj + (DWORD)(((DWORD)(unsigned int)(*(WORD *)(obj + 0x144)) + 1u) * 32u);
+    case 2: return obj;
+    case 3: return obj + 0xE0;
+    case 4: return obj + 0x100;
+    default: return 0;
+    }
+}
+
+//  GetProcessDelegate  (0x14601D0 - 0x14601D2)  -- the CProcessDelegateThiscall
+//  object getter (returns dword_1DDC820).
+static int GetProcessDelegate(void) { return (int)g_dword_1DDC820; }
+
+//  sub_14796A0  -- [STUB] the node-consume destroy path (the full node-list
+//  teardown: the (v9 != 4) / (v9 == 2) / AudioEngineChainSelect / sub_147DF10 / sub_147DDE0
+//  / sub_1483D70 chain).  Deep dependency chain -- out of scope.
+static DWORD sub_14796A0(void *obj) { (void)obj; return 0; }
+
+//  sub_1478D20  -- [STUB] the audio-queue insertion (the per-node audio-queue
+//  builder: the +0x130 / +0x138 fields + the sub_1477EA0 block check + the
+//  sub_147C9B0 insertion).  Deep dependency chain -- out of scope.
+static DWORD sub_1478D20(DWORD obj, DWORD a2, DWORD a3) { (void)obj; (void)a2; (void)a3; return 0; }
+
+//  sub_147DF10  -- [STUB] the path builder (the stack-slot-backed path setter:
+//  the sub_147C530 / sub_147C2B0 / sub_147D100 chain).  Deep dependency chain --
+//  out of scope.
+static DWORD sub_147DF10(DWORD *a1, DWORD a2) { (void)a1; (void)a2; return 0; }
+
+//  sub_147DDE0  -- [STUB] the node-list walk / chain update (the self-linked
+//  block walk + the sub_1477F10 node-release / sub_147D1E0 pair).  Deep
+//  dependency chain -- out of scope.
+static DWORD sub_147DDE0(DWORD obj, DWORD *a2) { (void)obj; (void)a2; return 0; }
+
+//  sub_1483D70  -- [STUB] the delegate invoke (the sub_1488800 / sub_14815E0
+//  batch-release chain).  Deep dependency chain -- out of scope.
+static DWORD sub_1483D70(DWORD obj, DWORD a2, DWORD a3) { (void)obj; (void)a2; (void)a3; return 0; }
+
+//  sub_1478980  -- [STUB] the +0x34-slot full-drain step (the GetVfsDesc /
+//  AudioQueueBlockRelease / LHFree chain).  Deep dependency chain -- out of
+//  scope.
+static DWORD sub_1478980(void *obj) { (void)obj; return 0; }
+
+//  sub_1478500  -- [STUB] the +0x34-slot incremental-drain step (the
+//  sub_147A800 / sub_150D320 chain).  Deep dependency chain -- out of scope.
+static DWORD sub_1478500(void *obj) { (void)obj; return 0; }
+
+//  AudioDelegateNodeProcess  (0x1479800 - 0x1479A57)  -- the audio delegate
+//  node-list per-node audio processing (thiscall, obj in ECX = the consumed
+//  node, a2 on the stack = the +0x140 slot value).  The per-node audio step:
+//  (1) the +0xDC gate: when the byte at +0xDC is clear, the vtable[9] dispatch
+//      (slot 9 = byte +0x24) + the vtable[14] dispatch (slot 14 = byte +0x38;
+//      the +0xD0 / +0xD4 accumulate / reset at +0xD8 / +0xDC);
+//  (2) the always-called audio step (AudioDelegateNodeAudioStep: the node's
+//      +0xC0 / +0xC4 counter updates driven by the vtable[13] dispatch);
+//  (3) the +0xCE / +0xCF byte dispatches (+0x6C arm / sub_14796A0 teardown);
+//  (4) the tail block (the vtable[7] dispatch at slot 7 = byte +0x1C; the
+//      node-node vtable[2] call at the +0x0C node; the audio-queue insertion
+//      via sub_1478D20; the +0xC8 status / decrement chain over the audio-
+//      engine +0x148 status table; the audio-chain selector via
+//      AudioEngineChainSelect; the +0x128 fader-counter subtraction; the
+//      status = 1 write; the tick-counter advance + sub_147DDE0; the +0xEC
+//      delegate invoke (GetProcessDelegate + sub_1483D70); the +0xEC reset);
+//  (5) the final +0x20 / +0x00-[0x34] dispatch chain (sub_1478980 / sub_1478500).
+//  The deep callees (sub_14796A0 / sub_1478D20 / sub_147DF10 / sub_147DDE0 /
+//  sub_1483D70 / sub_1478980 / sub_1478500) are remaining no-op stubs;
+//  AudioDelegateNodeAudioStep / AudioEngineChainSelect / GetProcessDelegate are implemented.
+//  [NOT byte-identical] placement-dependent (the E8 calls + the indirect
+//  vtable dispatches + the high-VA audio-engine global dword_1DDCCD0).
+static DWORD AudioDelegateNodeProcess(void *obj, DWORD a2)
+{
+    DWORD node = (DWORD)obj;
+    DWORD result;
+
+    // ---- (1) the +0xDC gate + the vtable[9] / vtable[14] dispatch chain
+    if (*(BYTE *)(node + 0xDC) == 0)
+    {
+        if (*(BYTE *)(node + 0xCD) != 0 || *(DWORD *)(node + 0xC8) == 3u)
+        {
+            DWORD holder = *(DWORD *)(node + 0x10);
+            typedef unsigned char (__thiscall *VTabCall9)(DWORD holder);
+            if ((unsigned char)((VTabCall9)((DWORD *)(*(DWORD *)holder))[9])(holder) == 0)
+            {
+                int v14 = 0, v15 = 0;
+                typedef void (__thiscall *VTabCall14)(DWORD holder, int *slot);
+                ((VTabCall14)((DWORD *)(*(DWORD *)holder))[14])(holder, &v14);
+                if (*(DWORD *)(node + 0xD0) == (DWORD)v14 && *(DWORD *)(node + 0xD4) == (DWORD)v15)
+                {
+                    *(DWORD *)(node + 0xD8) += (DWORD)a2;
+                    if (*(DWORD *)(node + 0xD8) > (*(WORD *)(node + 0x94) != 353u ? 7000u : 12000u))
+                        *(BYTE *)(node + 0xDC) = 1;
+                }
+                else
+                {
+                    *(DWORD *)(node + 0xD0) = (DWORD)v14;
+                    *(DWORD *)(node + 0xD4) = (DWORD)v15;
+                    *(DWORD *)(node + 0xD8) = 0;
+                    *(BYTE *)(node + 0xDC) = 0;
+                }
+            }
+        }
+    }
+
+    // ---- (2) the always-called audio step
+    result = (DWORD)AudioDelegateNodeAudioStep((void *)node, a2);
+
+    // ---- (3) the +0xCE / +0xCF byte dispatches
+    if (*(BYTE *)(node + 0xCE) != 0)
+    {
+        if (*(BYTE *)(node + 0xDC) != 0)
+            *(BYTE *)(node + 0x6C) = 1;
+        return result;
+    }
+    if (*(BYTE *)(node + 0xCF) != 0)
+        return sub_14796A0((void *)node);
+
+    // ---- (4) the tail block
+    DWORD node_holder = *(DWORD *)(node + 0x10);
+    typedef unsigned char (__thiscall *VTabCall7)(DWORD holder);
+    result = (DWORD)(unsigned char)((VTabCall7)((DWORD *)(*(DWORD *)node_holder))[7])(node_holder);
+    if (*(DWORD *)(node + 0xC8) == 3u && (result & 0xFFu) != 0u)
+    {
+        // the node-node call (the vtable[2] on the +0x0C node)
+        DWORD v6 = *(DWORD *)(node + 0x20);
+        if (v6 != 0)
+        {
+            DWORD v7 = *(DWORD *)(v6 + 0x0C);
+            if (v7 != 0)
+            {
+                DWORD vt7 = *(DWORD *)v7;
+                typedef void (__thiscall *VTabCall2)(DWORD v7);
+                ((VTabCall2)((DWORD *)vt7)[2])(v7);
+            }
+        }
+        // the audio-queue insertion (the +0x96 word + the &(node + 0x28) arg)
+        result = sub_1478D20(g_dword_1DDCCD0, (DWORD)(unsigned int)(*(WORD *)(node + 0x96)), node + 0x28);
+        DWORD v8 = *(DWORD *)(node + 0xC8);
+        if (v8 != 1u)
+        {
+            DWORD v9 = g_dword_1DDCCD0;
+            if (v8 == 2u)
+            {
+                DWORD v10 = *(DWORD *)(node + 0xBC);
+                DWORD v11 = 0;
+                if ((int)v10 > 1)
+                    v11 = (v10 - 2u > 0x3E5u) ? 2u : 1u;
+                DWORD *slot = (DWORD *)(v9 + 4u * v11 + 328u);
+                if (*slot != 0)
+                    *slot = *slot - 1u;
+            }
+            result = AudioEngineChainSelect(v9, (int)v8);
+            if (result != 0)
+            {
+                DWORD slot2 = node;
+                result = sub_147DF10(&slot2, result);
+            }
+            if (v8 == 3u)
+            {
+                DWORD target = v9 + 0x128u;
+                if (target != 0)
+                {
+                    *(DWORD *)target -= (DWORD)(unsigned int)(*(WORD *)(node + 0x96));
+                }
+                result = target;
+            }
+            *(DWORD *)(node + 0xC8) = 1u;
+            DWORD tick_addr = v9 + (DWORD)((unsigned int)(*(WORD *)(v9 + 0x144)) + 1u) * 32u;
+            if (tick_addr != 0)
+            {
+                DWORD slot3 = node;
+                result = sub_147DDE0(tick_addr, &slot3);
+            }
+            if (*(BYTE *)(node + 0xEC) != 0)
+            {
+                DWORD dlg = (DWORD)GetProcessDelegate();
+                DWORD vE0 = *(DWORD *)(node + 0xE0);
+                DWORD vE4 = *(DWORD *)(node + 0xE4);
+                result = sub_1483D70(*(DWORD *)(dlg + 0x0C), vE0, vE4);
+            }
+            *(BYTE *)(node + 0xEC) = 0;
+        }
+    }
+
+    // ---- (5) the +0x20 check + the [node + 0x00] +0x34 dispatch
+    if (*(DWORD *)(node + 0x20) != 0)
+    {
+        DWORD v = *(DWORD *)node;
+        DWORD fn = *(DWORD *)(v + 0x34);
+        typedef unsigned char (__thiscall *NodeFn)(DWORD node);
+        if ((unsigned char)((NodeFn)fn)(node) != 0)
+            return sub_1478980((void *)node);
+        return sub_1478500((void *)node);
+    }
+    return result;
+}
+
 
 // AudioNodeConsumedWalk  (0x147AF40)  -- the audio delegate node-list
 //  consume walk (thiscall, this in ECX = the &v3_current slot).  Reads the
@@ -9264,10 +9961,10 @@ static DWORD AudioNodeConsumedWalk(DWORD v3_current, DWORD v7)
 //  fixed-point break check, the chain dereference (v3 = *v3), the fixed-point
 //  invalid check (v2 == *(v3 + 0x18)), the capture of *(v2 + 0x0C), the node
 //  consume walk (AudioNodeConsumedWalk), and the per-node audio processing
-//  (sub_1479800 -- stub).  v2 (the sentinel) is the only loop-carried state;
+//  (AudioDelegateNodeProcess).  v2 (the sentinel) is the only loop-carried state;
 //  v3 (the iterator pointer) is unchanged across iterations.
 //  [NOT byte-identical] placement-dependent (the relative E8 calls to
-//  __invalid_parameter_noinfo / AudioNodeConsumedWalk / sub_1479800 + the high
+//  __invalid_parameter_noinfo / AudioNodeConsumedWalk / AudioDelegateNodeProcess + the high
 //  -VA obj +0x140 slot read).
 static void AudioDelegateNodeListPass(void *obj, void *a2)
 {
@@ -9302,9 +9999,9 @@ static void AudioDelegateNodeListPass(void *obj, void *a2)
         DWORD new_v3 = *(DWORD *)(v2 + 0x0C);
         v7 = AudioNodeConsumedWalk(v3_current, v7);
 
-        // the per-node audio processing (stub) -- edx re-read each iteration
+        // the per-node audio processing (AudioDelegateNodeProcess) -- edx re-read each iteration
         DWORD edx = *(DWORD *)(obj_p + 0x140);    // edx = *(this + 0x140)
-        sub_1479800((void *)new_v3, (void *)edx);
+        AudioDelegateNodeProcess((void *)new_v3, (DWORD)edx);
 
         // the loop-back: v2 = v7; v3_current unchanged
         v2 = v7;
@@ -9490,14 +10187,13 @@ static int CommitCommand(void)
 
 // AudioTickExitStep  (0x146D9D0 - 0x146D9DC)  -- the audio tick exit step: the RWLock
 //  getter (g_dword_1DDCD74) + the SetProcessedCommitNumber / CommitCommand command
-//  pair + sub_1496FA0.  Loads the concurrency reader-writer-lock object (via the
+//  pair + SyncLockedStateChains.  Loads the concurrency reader-writer-lock object (via the
 //  sub_1495860 getter 0x1495860), stages the commit number at [lock+0x1c] through
 //  SetProcessedCommitNumber (0x148E290, cdecl), increments the counter, stages the
 //  commit command (CommitCommand 0x148E500, cdecl -- result discarded) and tail-calls
-//  sub_1496FA0(this=lock); returns sub_1496FA0's result.
+//  SyncLockedStateChains(this=lock).
 //  [NOT byte-identical] placement-dependent (relative E8 calls + an E9 tail-jmp to
-//  sub_1496FA0) and refs the high-VA globals; the deep callee sub_1496FA0 is the
-//  documented no-op stub.
+//  SyncLockedStateChains) and refs the high-VA globals.
 static int AudioTickExitStep(void)
 {
     DWORD lock = g_dword_1DDCD74;   // sub_1495860 (0x1495860): the RWLock getter
@@ -9505,7 +10201,8 @@ static int AudioTickExitStep(void)
     SetProcessedCommitNumber(counter);           // 0x148E290 (cdecl)
     *(DWORD *)(lock + 0x1c) = counter + 1;       // ++[lock+0x1c]
     CommitCommand();                             // 0x148E500 (cdecl) -- result discarded
-    return sub_1496FA0((void *)lock);            // 0x1496FA0 (thiscall) -- tail-call
+    SyncLockedStateChains((void *)lock);            // 0x1496FA0 (thiscall) -- tail-call
+    return 0;
 }
 
 // AudioProcessDelegateTick  (0x147A740 - 0x147A74B)  -- the registered audio

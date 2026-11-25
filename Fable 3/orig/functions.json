@@ -96,21 +96,51 @@
 "source": "gamemain"
 },
 {
-"name": "?sub_1496FA0@@YAHPAX@Z",
-"rva": 17395616,
-"size": 386,
-"source": "gamemain"
-},
-{
 "name": "?sub_5BC1C0@@YAHPAX@Z",
 "rva": 1819072,
 "size": 396,
 "source": "gamemain"
 },
 {
-"name": "?sub_1479800@@YAKPAX0@Z",
-"rva": 17274880,
-"size": 599,
+"name": "?sub_14796A0@@YAKPAX@Z",
+"rva": 17274528,
+"size": 346,
+"source": "gamemain"
+},
+{
+"name": "?sub_1478D20@@YAKKKK@Z",
+"rva": 17272096,
+"size": 259,
+"source": "gamemain"
+},
+{
+"name": "?sub_147DF10@@YAKPAKK@Z",
+"rva": 17293072,
+"size": 106,
+"source": "gamemain"
+},
+{
+"name": "?sub_147DDE0@@YAKKPAK@Z",
+"rva": 17292768,
+"size": 295,
+"source": "gamemain"
+},
+{
+"name": "?sub_1483D70@@YAKKKK@Z",
+"rva": 17317232,
+"size": 131,
+"source": "gamemain"
+},
+{
+"name": "?sub_1478980@@YAKPAX@Z",
+"rva": 17271168,
+"size": 223,
+"source": "gamemain"
+},
+{
+"name": "?sub_1478500@@YAKPAX@Z",
+"rva": 17270016,
+"size": 250,
 "source": "gamemain"
 },
 {

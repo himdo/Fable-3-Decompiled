@@ -129,7 +129,7 @@ echo === link, x86 ===
 rem .lib order: bundled third-party / DirectX import libs, then the standard
 rem Windows DLLs the original imports (kernel32 is pulled by the default CRT).
 set "IMPORT_LIBS=xlive.lib d3d9.lib dinput8.lib dsound.lib xinput1_3.lib x3daudio1_7.lib d3dx9_42.lib binkw32.lib steam_api.lib user32.lib gdi32.lib shell32.lib ole32.lib rpcrt4.lib oleaut32.lib ws2_32.lib"
-link %LNKFLAGS% /out:Fable3.exe /pdb:Fable3.pdb main.obj framework.obj common.obj engine.obj worker.obj manager.obj object_registry.obj xlo_device.obj gameengine.obj gamethread.obj gamemain.obj luavm.obj luavm_asm.obj XLip.obj netinit.obj thread.obj banktree.obj namemap.obj save.obj %IMPORT_LIBS% %RRES%
+link %LNKFLAGS% /out:Fable3.exe /pdb:Fable3.pdb main.obj framework.obj common.obj engine.obj worker.obj manager.obj object_registry.obj xlo_device.obj gameengine.obj gamethread.obj gamemain.obj luavm.obj luavm_asm.obj XLip.obj netinit.obj thread.obj banktree.obj namemap.obj subnode.obj save.obj %IMPORT_LIBS% %RRES%
 if errorlevel 1 (echo LINK FAILED & popd & popd & exit /b 1)
 
 rem The exe now really imports from the bundled third-party DLLs; copy the
