@@ -102181,7 +102181,7 @@
     },
     "0x006240f0": {
       "size": 99,
-      "name": "sub_6240F0"
+      "name": "OutBlockDtor"
     },
     "0x006241f0": {
       "size": 192,
@@ -102301,7 +102301,7 @@
     },
     "0x00625d10": {
       "size": 114,
-      "name": "sub_625D10"
+      "name": "OutBlockInit"
     },
     "0x00625de0": {
       "size": 62,
@@ -636677,7 +636677,7 @@
     },
     "0x018917a0": {
       "size": 97,
-      "name": "sub_18917A0"
+      "name": "FileDataInputStreamDtor"
     },
     "0x01891840": {
       "size": 55,
@@ -645849,7 +645849,7 @@
     },
     "0x01922280": {
       "size": 370,
-      "name": "sub_1922280"
+      "name": "WideLoadStream"
     },
     "0x01922420": {
       "size": 170,

@@ -77,6 +77,7 @@ static BYTE  g_byte_2075F39 = 0;   // 0x2075F39: Texture Streamer stop-arm flag
 static CRITICAL_SECTION g_cs_20FD1B4;   // 0x20FD1B4: the Texture Streamer critical section (zeroed)
 static int   g_cs_20FD1B4Init = 0;
 static BYTE  g_byte_2075F4E = 1;   // 0x2075F4E: path-normalize enable flag
+static BYTE  g_byte_2075F28 = 0;   // 0x2075F28: one-shot global-init flag
 // Function-pointer slots published by the frontend (0x1D8C850 / 0x1D8C854).
 static void *g_off_1D8C850 = 0;    // 0x1D8C850
 static void *g_off_1D8C854 = 0;    // 0x1D8C854
@@ -5689,7 +5690,7 @@ static void F3WStringClear(F3WString *s);
 // (sub_17FDC60 / sub_17FDC80 / sub_17FDCD0 / sub_17FDD20 / sub_17FDD30 /
 // sub_17FD6F0 / sub_17FDD50 / sub_17FDD60 / sub_17FD700 -- remaining
 // stubs; the stub build never dispatches through them).
-static void LegacyMemoryFileStubMethod(void *obj) { (void)obj; }
+static int LegacyMemoryFileStubMethod(void *obj) { (void)obj; return 0; }
 static void *CLegacyMemoryFileDtorAddress(void);
 static int CLegacyMemoryFileOpen(void *obj, F3SharedBuffer **slot, int mode, int a4);
 
@@ -6693,50 +6694,380 @@ static int RegisterBankContainer(int impl)
 // base (g_unk_1DBE2CC).
 static F3SharedBuffer *g_dword_20FD138 = 0;
 
-// 0x1DBD0E8 (unk_1DBD0E8): the 4-byte global the sub_18ED640 registration
-// reads (a char* the registration function dereferences).  Deep dependency
-// chain -- stubbed.
-static char *g_unk_1DBD0E8 = 0;
+// 0x1DBD0E8 (unk_1DBD0E8): the 4-byte global the GlobalVfsRegistration
+// thunk reads -- the original types it as char ** (the slot stores a pointer
+// to the ANSI string the registration converts).  Left null in this build
+// (the caller never sets it), so the registration always takes its default
+// (empty) string path.
+static char **g_unk_1DBD0E8 = 0;
 
-//  sub_61B730 -- the per-entry "fable2_anims.bnk" mount callback: takes the
-//  file-entry handle, resolves the archive slot, registers the entry against
+//  the forward declarations for the deep leaves (declared later in the file)
+//  sub_56FB30 (0x56FB30 - 0x56FBA8) -- the record-array append helper: takes
+//  the 64-byte record at +0x28 of the out block (the 4-byte self-ref wrapper),
+//  and the out slot for the record's new value (&v10).  Writes the record
+//  through the array, releasing the old value's vtable slot 1 (AddRef) on the
+//  overflow path (sub_571B10).  Deep dependency chain (sub_571B10 -- the
+//  archive-manager reload step) -- out of scope.  Stub.  [remaining stub]
+static DWORD RecordArrayAppend(DWORD *rec, DWORD *outSlot)
+{
+    (void)rec; (void)outSlot;
+    return 0;
+}
+
+static void *GetVfsArchiveCollection(void);
+static void *VfsEntryLoad(void *collection, void **out, int a2, F3WString *path);
+static void *LookupBnk(void *out, void *cwdSlot, void *nameBuf, int flags);
+static F3SharedBuffer **GetArchiveSlot(F3SharedBuffer **out);
+
+//  sub_61B730 (0x61B730 - 0x61B851) -- AnimsBankMount: the per-entry
+//  "fable2_anims.bnk" mount callback: takes the file-entry handle and the
+//  64-byte out block, resolves the archive slot, registers the entry against
 //  the wide outblock (the GetVfsArchiveCollection / sub_180D3F0 / sub_1806060
-//  / GetArchiveSlot / LHFree / vtable dispatch chain).  Deep dependency chain
-//  -- out of scope.  Stub.  [remaining stub]
-static unsigned char AnimsBankMount(int entry, int out) { (void)entry; (void)out; return 1; }
+//  / GetArchiveSlot / LHFree / vtable-dispatch chain), and writes the
+//  wide-outblock record over the caller's 64-byte out block.  The deep leaves
+//  (sub_180D3F0 / sub_1806060 / sub_56FB30 -- the VFS load / bank lookup /
+//  record-array append) are [remaining stubs]; in this build the archive slot
+//  is null and the bank handle is 0, so the whole slot-10 dispatch block is
+//  dormant (identical to the no-op tail the original falls through to).
+//  [NOT byte-identical] placement-dependent (the E8 calls to
+//  GetVfsArchiveCollection / GetArchiveSlot / LHFree / the stubbed leaves +
+//  the __security_cookie prologue).
+//  IDA renamed sub_61B730 -> AnimsBankMount.
+static unsigned char AnimsBankMount(int entry, int out)
+{
+    //  the 64-byte dest block the per-entry load builds (the wide outblock)
+    BYTE dest[64];
+    memset(dest, 0, sizeof(dest));
 
-//  sub_625D10 -- the wide-string build over the 36-byte F3WString, folding it
-//  into the 64-byte out block (this: this + 4..60 -- the +0x14/+0x18 layout,
-//  the LHAlloc(4) self-ref wrapper, the sub_435B20 string-assign core).
-//  Deep dependency chain (sub_435B20) -- out of scope.  Stub.  [remaining stub]
-static int sub_625D10(void *obj, void *str, int a3) { (void)obj; (void)str; (void)a3; return 0; }
+    GetVfsArchiveCollection();                                     // the collection
 
-//  sub_18EBEB0 -- the one-shot global init thunk: reads byte_2075F28, runs the
-//  sub_18E3860 global-zero-init (the 0x200000-byte memset + globals) once, then
-//  sets byte_2075F28 = 1.  Deep dependency chain -- out of scope.  Stub.
-//  [remaining stub]
-static int sub_18EBEB0(void) { return 0; }
+    //  the per-entry VFS load: hash the path, look the entry up in the
+    //  collection, and (when it matches a data entry) write the resolved
+    //  64-byte block over the dest.  Stub -- the deep chain is out of scope.
+    VfsEntryLoad(GetVfsArchiveCollection(), (void **)&dest, entry, (F3WString *)dest);   // sub_180D3F0 [remaining stub]
 
-//  sub_18ED640 -- the global registration thunk (the 0x84-byte VFS object ctor
-//  / the wide-string / FileSubsysMountCollection / vtable release chain) over
-//  unk_1DBD0E8.  Deep dependency chain -- out of scope.  Stub.  [remaining stub]
-static int sub_18ED640(void *arg) { (void)arg; return 0; }
+    DWORD slotOut = 0;
+    DWORD v2 = (DWORD)LookupBnk((void *)&slotOut, (void *)(DWORD)entry, (void *)dest,
+                                (DWORD)((DWORD *)out)[0x24 / 4]);   // sub_1806060 [remaining stub]
+    DWORD v10 = v2;
 
-//  sub_6240F0 -- the 64-byte out-block destructor (the sub_573390 release +
-//  LHFree idioms, the +0x14/+0x18 reset).  Deep dependency chain -- out of
-//  scope.  Stub.  [remaining stub]
-static int sub_6240F0(void *obj) { (void)obj; return 0; }
+    if (v2 != 0)
+        ((void (WINAPI *)(void *))F3_VT((void *)v2)[1])((void *)v2);   // the bank handle's slot 1 (AddRef)
+    if (slotOut != 0)
+        ((void (WINAPI *)(void *))F3_VT((void *)slotOut)[2])((void *)slotOut);   // the slot's slot 2 (Release)
+
+    if (v2 != 0)
+    {
+        DWORD v3 = (DWORD)(*GetArchiveSlot((F3SharedBuffer **)&slotOut));   // sub_180AC90
+
+        //  the wide-string name block (v6): pre-seed the empty SSO layout
+        //  (cap 7 / len 0 / SSO word 0).
+        BYTE nameBlock[36];
+        memset(nameBlock, 0, sizeof(nameBlock));
+        *(WORD *)(nameBlock + 0x04) = 0;
+        ((DWORD *)nameBlock)[0x14 / 4] = 0;                            // len = 0
+        ((DWORD *)nameBlock)[0x18 / 4] = 7;                            // cap = 7
+
+        //  the slot-10 ("add archive") thiscall dispatch on the archive
+        //  manager -- dead in this build (the archive slot is null, the
+        //  success path is never reached).  Faithful reproduction.
+        typedef void (__thiscall *F3ArchiveAddArchiveFn)(void *this_, DWORD handle,
+                                                         F3WString *name, int f1, int f2);
+        F3ArchiveAddArchiveFn fn = (F3ArchiveAddArchiveFn)F3_VT((void *)(DWORD)v3)[10];
+        fn((void *)(DWORD)v3, v2, (F3WString *)nameBlock, 2, 1);
+
+        if (((DWORD *)nameBlock)[0x18 / 4] >= 8)
+            LHFree((void *)((DWORD *)nameBlock)[0x04 / 4]);
+
+        //  reset to the empty SSO layout
+        ((DWORD *)nameBlock)[0x14 / 4] = 0;
+        ((DWORD *)nameBlock)[0x18 / 4] = 7;
+        *(WORD *)(nameBlock + 0x04) = 0;
+
+        if (slotOut != 0)
+            ((void (WINAPI *)(void *))F3_VT((void *)slotOut)[2])((void *)slotOut);   // the slot's slot 2 (Release)
+
+        RecordArrayAppend((DWORD *)((BYTE *)out + 0x28), &v10);              // sub_56FB30 [remaining stub]
+        if (v10 != 0)
+            ((void (WINAPI *)(void *))F3_VT((void *)v10)[2])((void *)v10);   // the record's slot 2 (Release)
+    }
+
+    //  the tail: the original reads the 64-byte dest block's cap field
+    //  (+0x18) and frees the block's +0x04 pointer when it is >= 8 -- the
+    //  same idiom as OutBlockDtor.  In this build the dest is zero-filled
+    //  (the stubs never allocate), so the cap is 0 and the LHFree is never
+    //  taken.
+    if (((DWORD *)dest)[0x18 / 4] >= 8)
+        LHFree((void *)((DWORD *)dest)[0x04 / 4]);
+
+    return 1;
+}
+
+
+//  SpeechBankWideAssign (sub_435B20) is defined later in the file; forward
+//  declare it for the out-block init and the record build below.
+static F3WString *SpeechBankWideAssign(F3WString *dst, const F3WString *src,
+                                       unsigned int offset, unsigned int count);
+
+//  OutBlockInit  (0x625D10 - 0x625D82)  -- the 64-byte out-block init: the
+//  36-byte F3WString wide-string build folded into the out block.  Pre-seeds
+//  the +0x14 (len) / +0x18 (cap) / +0x04 (SSO buf word) fields, assigns the
+//  source wide string into the block (SpeechBankWideAssign, the string-assign
+//  core -- the original's thiscall this=ctx, src/offset/count on the stack),
+//  then copies the source's e1/e2 words (+0x1C / +0x20), stores the third
+//  stack arg (a3) at +0x24, builds the 4-byte self-ref wrapper block at +0x28
+//  (LHAlloc(4): the wrapper holds &block.selfRef, the block's selfRef = the
+//  wrapper; NULL -> selfRef = 0), zeroes +0x34 / +0x38 / +0x3C, and returns
+//  the block.  [NOT byte-identical] placement-dependent (the E8 calls to
+//  SpeechBankWideAssign / LHAlloc).
+static F3WString *OutBlockInit(F3WString *obj, const F3WString *src, int a3)
+{
+    DWORD *this_ = (DWORD *)obj;
+    this_[0x18 / 4] = 7;                            // +0x18 = 7 (cap pre-seed)
+    this_[0x14 / 4] = 0;                            // +0x14 = 0 (len pre-seed)
+    *(WORD *)((BYTE *)this_ + 0x04) = 0;            // +0x04 = 0 (word, SSO buf)
+
+    SpeechBankWideAssign(obj, src, 0, 0xFFFFFFFFu);
+
+    this_[0x1C / 4] = src->e1;                      // +0x1C = the source's e1
+    this_[0x20 / 4] = src->e2;                      // +0x20 = the source's e2
+    this_[0x24 / 4] = a3;                           // +0x24 = a3
+
+    BYTE *selfRefBlock = (BYTE *)obj + 0x28;
+    void *blk = LHAlloc(4);
+    if (blk != 0)
+    {
+        *(void **)blk = selfRefBlock;               // the wrapper holds &obj.selfRef
+        *(void **)selfRefBlock = blk;               // the block's selfRef = blk
+    }
+    else
+    {
+        *(void **)selfRefBlock = 0;
+    }
+
+    this_[0x34 / 4] = 0;                             // +0x34 = 0
+    this_[0x38 / 4] = 0;                             // +0x38 = 0
+    this_[0x3C / 4] = 0;                             // +0x3C = 0
+    return obj;
+}
+
+//  GlobalZeroInit  (0x18E3860 - 0x18E3BF5)  -- the global-zero-init: memsets the
+//  0x200000-byte region at dword_1E63030, sets dword_1E2F028 = &dword_1E63030,
+//  dword_1E63030/34 = 0, dword_1E63038 = 0x200000, memsets 0x4000 at dword_1E3F030
+//  and 0x20000 at unk_1E43030, links the self-referential 8-byte pointers from
+//  &unk_1E4304C up to &dword_1E6302C (*result = result + 1, step 8), sets
+//  dword_1E2F024 = &unk_1E43030, and returns the final result pointer.
+//  Deep dependency chain (the 2MB/2-MB high-VA regions + the self-referencing
+//  link writes) -- out of scope.  Stub.  [remaining stub]
+static int GlobalZeroInit(void) { return 0; }
+
+//  InitGlobalsOnce  (0x18EBEB0 - 0x18EBEC6)  -- the one-shot global-init thunk:
+//  reads byte_2075F28; when it is clear, runs the sub_18E3860 global-zero-init
+//  (GlobalZeroInit, stubbed) once, then sets byte_2075F28 = 1.  The return value
+//  is the init's result (0 while the callee is stubbed -- the caller ignores it).
+//  [NOT byte-identical] placement-dependent (the E8 call to the init callee +
+//  the absolute store/load of the high-VA flag byte g_byte_2075F28).
+static int InitGlobalsOnce(void)
+{
+    int result = 0;
+    if (g_byte_2075F28 == 0)
+        result = GlobalZeroInit();
+    g_byte_2075F28 = 1;
+    return result;
+}
+
+//  GlobalVfsRegistration  (0x18ED640 - 0x18EDA79)  -- the global VFS
+//  registration thunk: LHAlloc(84) + VirtualFileSystemCtor (the 84-byte VFS
+//  object), publish it in the 0x20FD080 slot (the previous holder's release is
+//  dormant here -- the fresh VFS carries a placeholder vtable), build the
+//  ANSI string from the caller's slot (defaulting to an empty string), build
+//  the 68-byte record (sub_56E2A0, implemented below), free the source
+//  wide-string buffer (the cap >= 8 LHFree idiom), mount the file-subsystem
+//  collection over the record (FileSubsysMountCollection with the
+//  sub_18EC4D0 callback -- stubbed), and release the record's heap buffer.
+//  The vt[6] collection-iterator loop and the vt[4] per-entry dispatch are
+//  dormant in this build (the fresh VFS carries a placeholder vtable, so
+//  they cannot be safely performed), as is the per-entry refcount chain
+//  (sub_18A8C30 / sub_18DD8A0 / sub_18DC400 / sub_575680 / sub_570D30 /
+//  sub_56E380) and the mount callback itself (sub_18EC4D0).
+//  [NOT byte-identical] placement-dependent (the E8 calls to LHAlloc /
+//  VirtualFileSystemCtor / F3WStringFromAnsi / FileSubsysMountCollection /
+//  LHFree + the __security_cookie prologue).
+static void *VirtualFileSystemCtor(void *obj);
+
+static DWORD g_dword_20FD080 = 0;   // 0x20FD080 -- the published VFS object
+static BYTE  g_byte_2122F24 = 0;     // 0x2122F24 -- the legacy-streaming flag
+static DWORD g_dword_2122F20 = 0;    // 0x2122F20 -- the per-entry counter
+static DWORD g_dword_20FD164 = 0;    // 0x20FD164 -- the collection range begin
+static DWORD g_dword_20FD168 = 0;    // 0x20FD168 -- the collection range end
+
+//  sub_56E2A0 (0x56E2A0 - 0x56E323) -- the 68-byte record builder: the wide
+//  string is copied into the record (as an F3WString at +0x00), the e1/e2
+//  words ride along (+0x1C / +0x20), +0x24 = 1, +0x28 = the VFS object, a
+//  4-byte self-ref wrapper block is allocated at +0x2C, and the +0x38 / +0x3C
+//  / +0x40 words are zeroed.  The original's vt[1] dispatch on the VFS object
+//  is dormant in this build (the fresh VFS carries a placeholder vtable).
+static void SpeechBankRecordBuild(F3WString *src, BYTE *rec, DWORD vfsObj)
+{
+    DWORD *r = (DWORD *)rec;
+    r[0x18 / 4] = 7;                               // +0x18 = 7 (the cap word pre-seed)
+    r[0x14 / 4] = 0;                               // +0x14 = 0
+    *(WORD *)((BYTE *)rec + 0x04) = 0;             // +0x04 = 0 (word)
+    SpeechBankWideAssign((F3WString *)rec, src, 0, 0xFFFFFFFFu);
+    r[0x1C / 4] = src->e1;                         // +0x1C = the source's e1
+    r[0x20 / 4] = src->e2;                         // +0x20 = the source's e2
+    r[0x24 / 4] = 1;                               // +0x24 = 1
+    r[0x28 / 4] = vfsObj;                          // +0x28 = the VFS object
+    // (the original's vt[1] dispatch on vfsObj -- dormant here: placeholder vtable)
+    BYTE *selfRefBlock = (BYTE *)rec + 0x2C;
+    void *blk = LHAlloc(4);
+    if (blk != 0)
+    {
+        *(void **)blk = selfRefBlock;              // the wrapper holds &rec.selfRef
+        *(void **)selfRefBlock = blk;              // the record's selfRef = blk
+    }
+    else
+    {
+        *(void **)selfRefBlock = 0;
+    }
+    r[0x38 / 4] = 0;                               // +0x38 = 0
+    r[0x3C / 4] = 0;                               // +0x3C = 0
+    r[0x40 / 4] = 0;                               // +0x40 = 0
+}
+
+//  sub_18EC4D0 -- the per-entry mount callback (the GetVfsArchiveCollection /
+//  sub_180D3F0 / sub_1806060 / sub_56FB30 chain).  Deep dependency chain --
+//  out of scope.  Stub.  [remaining stub]
+static unsigned char SpeechBankMountCallback(int entry, int record)
+{
+    (void)entry; (void)record; return 1;
+}
+
+//  sub_575FD0 -- the tail tree-walk over the 0x20FD164/0x20FD168 collection
+//  range.  Deep dependency chain -- out of scope.  Stub.  [remaining stub]
+static int Sub_575FD0(int a1, int a2, int a3, int a4, int a5, int a6)
+{
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return 0;
+}
+
+static int GlobalVfsRegistration(char ***a1)
+{
+    // 1. the 0x84-byte VFS object ctor
+    char *v1 = (char *)LHAlloc(84);                       // 0x84 = 84
+    void *v2 = 0;
+    if (v1 != 0)
+    {
+        v2 = VirtualFileSystemCtor(v1);
+        // (The two vt[1] dispatches on the fresh VFS -- the AddRef pair --
+        //  are dormant in this build: the fresh VFS carries a placeholder
+        //  vtable, so they are not performed.)
+    }
+
+    // 2. release the previous holder -- dormant (placeholder vtable)
+    if (g_dword_20FD080 != 0)
+    {
+        // (the original dispatches the previous holder's vtable slot 2 --
+        //  dormant: placeholder vtable in this build)
+    }
+    g_dword_20FD080 = (DWORD)v2;
+    // (the vt[2] dispatch on the fresh VFS -- dormant here)
+
+    // 3. the ANSI string (the slot is always null in this build -> default)
+    char **slot = (char **)*a1;                           // *a1 = the slot content (char **)
+    const char *src = (slot != 0) ? *slot : "";             // **a1 = the ANSI string
+    F3WString str;
+    F3WStringFromAnsi(&str, src);
+
+    // 4. the 68-byte record build (sub_56E2A0)
+    BYTE rec[68];
+    memset(rec, 0, sizeof(rec));
+    SpeechBankRecordBuild(&str, rec, g_dword_20FD080);
+
+    // 5. the source wide-string buffer (the cap >= 8 LHFree idiom)
+    if (str.cap >= 8)
+        LHFree((void *)str.u.ptr);
+
+    // 6. the file-subsystem mount collection (sub_18EC4D0 -- stubbed)
+    void *fs = GetFileSubsystem(0);                       // sub_1801C20
+    void *entry = 0;
+    FileSubsysMountCollection(fs, &entry,
+                              (unsigned char (__cdecl *)(int, int))SpeechBankMountCallback,
+                              (int)rec);                  // sub_1801620
+    if (entry != 0)
+        ((void (WINAPI *)(void *))F3_VT(entry)[2])(entry);   // the entry's vtable slot 2 (stdcall)
+
+    // 7. the vt[6] collection-iterator loop -- dormant in this build: the
+    //    fresh VFS carries a placeholder vtable, so the original's vt[6]
+    //    dispatch (the collection iterator) cannot be performed safely.  The
+    //    per-entry vt[4] walk, the per-entry refcount chain, and the sub_18EC4D0
+    //    mount callback are all dormant for the same reason.
+
+    // 8. the tail tree-walk (sub_575FD0) over the empty collection range
+    Sub_575FD0((g_dword_20FD168 - g_dword_20FD164) >> 3, 0, 0,
+               g_dword_20FD164, 0, g_dword_20FD168);
+
+    // 9. the collection release -- skipped (the collection is unavailable)
+
+    // 10. release the record's heap buffer (the cap >= 8 LHFree idiom)
+    DWORD recCap = ((DWORD *)rec)[0x18 / 4];               // +0x18 = the record's cap
+    if (recCap >= 8)
+        LHFree((void *)((DWORD *)rec)[0x04 / 4]);          // +0x04 = the record's data ptr
+
+    return 0;                                              // the LHFree result (opaque)
+}
+
+//  BankCacheRangeRelease (0x573390) is defined below this block (the
+//  bank-cache slot helper cluster); forward-declare it for the release idiom.
+static void BankCacheRangeRelease(DWORD *start, DWORD *end);
+
+//  OutBlockDtor  (0x6240F0 - 0x624153)  -- the 64-byte out-block destructor:
+//  releases the bank-cache range at +0x34 (BankCacheRangeRelease over
+//  [+0x34, +0x38)) and frees the range pointer, frees the 4-byte self-ref
+//  wrapper block at +0x28, zeroes +0x34/+0x38/+0x3C, frees the +0x04 field
+//  when +0x18 is >= 8, then resets +0x14=0 / +0x18=7 / +0x04=0 (word).
+//  The original is a thiscall function -- ECX = obj, returns eax (the last
+//  LHFree call result, opaque; kept as 0 here).
+//  [NOT byte-identical] placement-dependent (the relative E8 calls to
+//  BankCacheRangeRelease / LHFree).
+static int OutBlockDtor(void *obj)
+{
+    DWORD *this_ = (DWORD *)obj;
+    DWORD v2 = this_[0x34 / 4];                 // [this+0x34]
+    if (v2 != 0)
+    {
+        BankCacheRangeRelease((DWORD *)v2, (DWORD *)this_[0x38 / 4]);
+        LHFree((void *)this_[0x34 / 4]);        // re-read [this+0x34] after the release
+    }
+
+    DWORD selfRefBlock = this_[0x28 / 4];       // [this+0x28] (the 4-byte self-ref wrapper)
+    this_[0x34 / 4] = 0;
+    this_[0x38 / 4] = 0;
+    this_[0x3C / 4] = 0;
+    LHFree((void *)selfRefBlock);
+
+    if (this_[0x18 / 4] >= 8)
+    {
+        DWORD w = this_[0x04 / 4];              // the disasm loads a full dword at +0x04
+        LHFree((void *)w);
+    }
+
+    this_[0x14 / 4] = 0;
+    this_[0x18 / 4] = 7;
+    *(WORD *)((BYTE *)this_ + 0x04) = 0;         // the word store (mov [edi+4], dx)
+
+    return 0;                                    // the LHFree result (opaque)
+}
 
 //  MountAnimsBank  (0x61B860 - 0x61B91A)  -- mount the "fable2_anims.bnk" bank
 //  and register the "data\\" archive over the engine: the wide-string build
-//  (sub_625D10), the file-subsystem FileSubsysMountCollection (0x1801620)
-//  mount with the sub_61B730 (AnimsBankMount) callback, the entry vtable slot
-//  2 dispatch, the one-shot sub_18EBEB0 registration, the "data\\" shared-slot
+//  (OutBlockInit), the file-subsystem FileSubsysMountCollection (0x1801620)
+//  mount with the AnimsBankMount callback, the entry vtable slot
+//  2 dispatch, the one-shot InitGlobalsOnce registration, the "data\\" shared-slot
 //  publish into dword_20FD138 (SetSharedSlot / CopySharedSlot /
-//  ReleaseSharedSlot), the sub_18ED640 registration, and the out-block dtor
-//  (sub_6240F0).  [NOT byte-identical] placement-dependent (the E8 calls to the
-//  wide-string build / FileSubsysMountCollection / sub_18EBEB0 / SetSharedSlot /
-//  CopySharedSlot / ReleaseSharedSlot / sub_18ED640 / sub_6240F0 + the
+//  ReleaseSharedSlot), the GlobalVfsRegistration registration, and the out-block dtor
+//  (OutBlockDtor).  [NOT byte-identical] placement-dependent (the E8 calls to the
+//  wide-string build / FileSubsysMountCollection / InitGlobalsOnce / SetSharedSlot /
+//  CopySharedSlot / ReleaseSharedSlot / GlobalVfsRegistration / OutBlockDtor + the
 //  __security_cookie prologue).
 static int MountAnimsBank(void *obj)
 {
@@ -6746,7 +7077,7 @@ static int MountAnimsBank(void *obj)
     F3WStringFromAnsi(&ws, "fable2_anims.bnk");                 // sub_5AF180 + sub_4357C0
 
     char outblock[64];                                           // the 64-byte out block (v6)
-    sub_625D10(outblock, &ws, 0);                                 // sub_625D10 [remaining stub]
+    OutBlockInit((F3WString *)outblock, &ws, 0);                  // 0x625D10 -> OutBlockInit
 
     if (ws.cap >= 8)                                              // the cap >= 8 LHFree idiom
         LHFree((void *)ws.u.ptr);
@@ -6759,16 +7090,16 @@ static int MountAnimsBank(void *obj)
     if (entry != 0)
         ((void (WINAPI *)(void *))F3_VT(entry)[2])(entry);        // the entry's vtable slot 2 (stdcall)
 
-    sub_18EBEB0();                                                 // sub_18EBEB0 [remaining stub]
+    InitGlobalsOnce();                                             // InitGlobalsOnce
 
     F3SharedBuffer *slot = 0;
     SetSharedSlot(&slot, "data\\", -1);                          // sub_1A01CC0
     CopySharedSlot(&g_dword_20FD138, &slot);                       // sub_1A01270
     ReleaseSharedSlot(&slot);                                      // sub_1A01320
 
-    sub_18ED640(&g_unk_1DBD0E8);                                    // sub_18ED640 [remaining stub]
+    GlobalVfsRegistration(&g_unk_1DBD0E8);                          // sub_18ED640 -> GlobalVfsRegistration
 
-    return sub_6240F0(outblock);                                   // sub_6240F0 [remaining stub]
+    return OutBlockDtor(outblock);
 }
 
 // sub_17FDE20 (0x17FDE20 - 0x17FDE5D) -- release the legacy-file object:
@@ -6791,23 +7122,251 @@ static LONG ReleaseLegacyMemoryFile(void *obj)
     return r;
 }
 
-// sub_1892420 (0x1892420 - 0x1892496)  [remaining stub] -- the 0x8000-byte
-// read-buffer ctor over the 40-byte NFile::CFileDataInputStream object (the
-// buffer alloc + the vt[9] / vt[7] dispatches over the legacy-file object
-// are the deep chain -- not implemented in this build).
-static void *sub_1892420(void *stream, void *legacyFile, int size)
-{ (void)stream; (void)legacyFile; (void)size; return stream; }
+// 0x20FC310 (dword_20FC310): the wide-load state slot -- a 4-byte length word
+// at +4 (the wide-load block: NULL pre-init, a F3SharedBuffer * in this build).
+static F3SharedBuffer *g_dword_20FC310 = 0;
+// 0x1DB1114 (dword_1DB1114): the 4-byte element published by WideLoadStream
+// (the byte-swapped stream word).
+static DWORD g_dword_1DB1114 = 0;
+// 0x1DB113C (dword_1DB113C): the owner-list container -- self-referencing:
+// +0 = &container, +4 = the head node (cleared to the container itself after
+// the sub_5493E0 pass), +8 = &container.
+static DWORD g_dword_1DB113C[3] = { 0 };
+// 0x1DB1140 (dword_1DB1140): the wide-load flag -- 0 while the container is
+// armed, written 0 by WideLoadStream.
+static DWORD g_dword_1DB1140 = 0;
 
-// sub_1922280 (0x1922280 - 0x19223F1)  [remaining stub] -- the wide-load step
-// (the dword_20FC310 state read + the sub_1893EB0 block build + SharedBufferBlocksEqual
-// + sub_1891540 + the 9 sub-dispatch chain over the 40-byte stream object).
-static void sub_1922280(void *stream)
-{ (void)stream; }
+// 0x403AF0 (SharedBufferBlocksEqual) -- the counted-buffer equality helper
+// (sub_403AF0): the +4 lengths are equal and the data strings compare equal
+// (the generic _strcmp byte-wise C string compare).  Replicated here (the
+// original's call target) because the XLip module's copy is static to it.
+static int BlocksEqual(F3SharedBuffer *a, F3SharedBuffer *b)
+{
+    return (a->length == b->length) && (strcmp(a->data, b->data) == 0);
+}
 
-// sub_18917A0 (0x18917A0 - 0x1891800)  [remaining stub] -- the stream-object
-// finalize step (buffer free + vtable dispatches + the field nulls).
-static int sub_18917A0(void *stream)
-{ (void)stream; return 0; }
+// sub_1893EB0 (0x1893EB0 - 0x1893EB0)  [remaining stub] -- the wide-load block
+// build over the wide-load state slot (the SetSharedSlot / vftable dispatch /
+// heap-table free chain is out of scope).  Writes 0 into the out slot.
+static void sub_1893EB0(F3SharedBuffer **out, int a2)
+{ (void)a2; *out = 0; }
+
+// sub_1891540 (0x1891540 - 0x1891540)  [remaining stub] -- the 4-byte element
+// load over the 40-byte stream object (the memcpy / vtable dispatch chain is
+// out of scope).  Writes 0 into the out slot.
+static int sub_1891540(void *this_, DWORD *out, int a3)
+{ (void)this_; (void)a3; *out = 0; return 0; }
+
+// sub_19230E0 / sub_1913F40 / sub_1913690 / sub_1912E10 / sub_19124C0 (the
+// wide-load dispatch chain over the stream object)  [remaining stubs] -- the
+// per-family owner-list destroys + the +0x14/+0x0C/+0x04 4-byte consumption.
+// Out of scope; no observable effect.
+static void sub_19230E0(void *this_) { (void)this_; }
+static void sub_1913F40(void *this_) { (void)this_; }
+static void sub_1913690(void *this_) { (void)this_; }
+static void sub_1912E10(void *this_) { (void)this_; }
+static void sub_19124C0(void *this_) { (void)this_; }
+
+// sub_5493E0 (0x5493E0 - 0x5493F1)  [remaining stub] -- the owner-list
+// destroyer: walks the head node (the stack arg) and its +8 children, freeing
+// the counted blocks at +0x14 and the node itself through the heap table.
+// Out of scope -- the node model is not implemented in this build.
+static void sub_5493E0(void *head) { (void)head; }
+
+//  WideLoadStreamWork  -- the work path of WideLoadStream (the part reached
+//  when the freshly-built block still equals the stored one): the 4-byte
+//  element consumption (the +0x14 count / +0x0C data pointer / +0x04 counter),
+//  the +0x18 flag byte-swap, the dword_1DB1114 publish, the five-dispatch
+//  chain, the owner-list cleanup, and the freshly-built block's refcount drop.
+static void WideLoadStreamWork(DWORD *o, F3SharedBuffer *v3)
+{
+    DWORD v4 = o[5];                                             // +0x14: the 4-byte element count
+    DWORD element;
+    if (v4 < 4)
+    {
+        element = 0;
+        sub_1891540(o, &element, 4);                             // sub_1891540 [remaining stub]
+    }
+    else
+    {
+        element = *(DWORD *)o[3];                                // +0x0C: the first element (a 4-byte word)
+        o[1] += 4;                                               // +0x04: the element counter
+        o[3] = (DWORD)((BYTE *)o[3] + 4);                        // +0x0C: the data pointer + 4
+        o[5] = v4 - 4;                                           // +0x14: the count
+    }
+
+    LONG v8 = (LONG)element;
+    if (*(BYTE *)((BYTE *)o + 24) != 0)
+    {
+        BYTE e0 = (BYTE)element;
+        BYTE e1 = (BYTE)(element >> 8);
+        BYTE e2 = (BYTE)(element >> 16);
+        BYTE e3 = (BYTE)(element >> 24);
+        v8 = (LONG)(e3 | (e2 << 8) | (e1 << 16) | ((DWORD)e0 << 24));
+    }
+    g_dword_1DB1114 = (DWORD)v8;
+
+    sub_19230E0(o);                                              // sub_19230E0 [remaining stub]
+    sub_1913F40(o);                                              // sub_1913F40 [remaining stub]
+    sub_1913690(o);                                              // sub_1913690 [remaining stub]
+    sub_1912E10(o);                                              // sub_1912E10 [remaining stub]
+    sub_19124C0(o);                                              // sub_19124C0 [remaining stub]
+
+    sub_5493E0((void *)g_dword_1DB113C[1]);                      // sub_5493E0 [remaining stub]
+    g_dword_1DB113C[1] = (DWORD)g_dword_1DB113C;                 // +4 = &container
+    g_dword_1DB1140 = 0;
+    g_dword_1DB113C[0] = (DWORD)g_dword_1DB113C;                 // +0 = &container
+    g_dword_1DB113C[2] = (DWORD)g_dword_1DB113C;                 // +8 = &container
+
+    if (v3 != 0 && InterlockedDecrement((volatile LONG *)((BYTE *)v3 + 12)) <= 0)
+        SharedBufferFree(v3);
+}
+
+//  WideLoadStream  (0x1922280 - 0x19223F2)  -- the wide-load step over the
+//  40-byte NFile::CFileDataInputStream object (the dword_20FC310 state read
+//  + the sub_1893EB0 block build + SharedBufferBlocksEqual + the 4-byte
+//  element consumption (sub_1891540) + the byte-swap on the +0x18 flag + the
+//  five sub-dispatch chain (sub_19230E0 / sub_1913F40 / sub_1913690 / sub_1912E10 /
+//  sub_19124C0) + the sub_5493E0 owner-list cleanup over dword_1DB113C + the
+//  freshly-built block's refcount drop).  The original is __thiscall + retn 0
+//  (this in ECX, no stack args, result in EAX) and uses the __security_cookie
+//  prologue.  The deep dispatch chain is [remaining stub]s in this build, so
+//  the function reduces to: read the wide-load state, build the block (stub
+//  -> null), take the null-return path (or, when the freshly-built block still
+//  equals the stored one, the field-consuming path with a dormant swizzle),
+//  and drop the live-slot counter.  [NOT byte-identical] placement-dependent
+//  (the E8 calls to sub_1893EB0 / sub_1891540 / the dispatch chain / sub_5493E0
+//  + the InterlockedDecrement IAT slot + the high-VA globals).
+static LONG WideLoadStream(void *this_)
+{
+    DWORD *o = (DWORD *)this_;
+    LONG v2 = (g_dword_20FC310 != 0) ? (LONG)*(DWORD *)((BYTE *)g_dword_20FC310 + 4) : 0;
+    F3SharedBuffer *v9 = 0;
+    sub_1893EB0(&v9, v2);                                        // sub_1893EB0 [remaining stub]
+    F3SharedBuffer *v3 = v9;                                     // the built block (for the refcount drop)
+    g_dword_1DB1114 = 0;
+    if ((F3SharedBuffer *)v9 != g_dword_20FC310)
+    {
+        if (v9 == 0)
+            return InterlockedDecrement(&g_Addend);
+        if (g_dword_20FC310 != 0 && BlocksEqual(v9, g_dword_20FC310))
+        {
+            WideLoadStreamWork(o, v3);                          // the 4-byte consume + dispatch chain
+        }
+        else
+        {
+            if (InterlockedDecrement((volatile LONG *)((BYTE *)v3 + 12)) <= 0)
+                SharedBufferFree(v3);
+        }
+        return InterlockedDecrement(&g_Addend);
+    }
+
+    WideLoadStreamWork(o, v3);                                   // v9 == stored: the work path directly
+    return InterlockedDecrement(&g_Addend);
+}
+
+
+//  FileDataInputStreamDtor  (0x18917A0 - 0x1891801)  -- the NFile::CFileDataInputStream
+//  finalize / destructor step.
+//  [NOT byte-identical] placement-independent, but refs the heap-table pointer
+//  global (0x02075B24) at the original high VA not present in this build.
+//
+//  int FileDataInputStreamDtor(void *obj)
+//
+//  Frees the 0x8000-byte read buffer (+0x20) through the heap-table free slot
+//  (the +0x24 size word rides along and is nulled too), then -- when the
+//  legacy-file object at +0x1C answers non-zero from its vtable slot 10
+//  (offset 0x28) -- reads the stream's vtable slot 2 (offset 8, thiscall on
+//  the stream) and hands the result to the legacy-file object's vtable slot 5
+//  (offset 0x14, thiscall with one stack arg).  Nulls +0x1C / +0x04 / +0x08 /
+//  +0x0C / +0x10 / +0x14 and returns the result.  The original body (97 bytes,
+//  56 8B F1 ... C3):
+//      push esi; mov esi, ecx
+//      mov eax, [esi+20h]
+//      push edi; xor edi, edi
+//      cmp eax, edi
+//      jz short loc_18917C1
+//      push eax
+//      mov eax, dword_2075B24
+//      mov ecx, [eax+10h]
+//      call ecx           ; the heap-table free slot (+16), with +0x20 as the arg
+//      add esp, 4
+//      mov [esi+20h], edi
+//      mov [esi+24h], edi
+//  loc_18917C1:
+//      mov ecx, [esi+1Ch]
+//      cmp ecx, edi
+//      jz short loc_18917EC
+//      mov edx, [ecx]         ; legacy-file vftable
+//      mov eax, [edx+28h]     ; vt slot 10 (offset 0x28)
+//      call eax               ; thiscall: the legacy-file object as `this`
+//      test al, al
+//      jz short loc_18917EC
+//      mov ecx, [esi+1Ch]
+//      mov edx, [esi]         ; the stream's vftable
+//      mov eax, [edx+8]       ; vt slot 2 (offset 8)
+//      push ebx
+//      mov ebx, [ecx]         ; the legacy-file vftable
+//      mov ecx, esi           ; the stream object as `this`
+//      call eax               ; result = vt[2](stream)
+//      mov ecx, [esi+1Ch]
+//      mov edx, [ebx+14h]     ; vt slot 5 (offset 0x14)
+//      push eax               ; the vt[2] result as the stack arg
+//      call edx               ; result = vt[5](legacyFile, vt[2](stream))
+//      pop ebx
+//  loc_18917EC:
+//      mov [esi+1Ch], edi
+//      mov [esi+4], edi
+//      mov [esi+8], edi
+//      mov [esi+10h], edi
+//      mov [esi+14h], edi
+//      mov [esi+0Ch], edi
+//      pop edi
+//      pop esi
+//      retn
+//
+//  Note: the original returns the free-slot call's int result when the +0x1C
+//  branch is skipped (or never reached); the project's heap-table model (the
+//  common/ module) is a void free slot, so that return path yields 0.  The
+//  second branch's dispatches are reproduced exactly (vtables, slot order,
+//  this/stack args, eax as `result`).
+// ============================================================
+static int FileDataInputStreamDtor(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    int result = 0;
+
+    int buffer = o[8];                 // +0x20
+    if (buffer != 0)
+    {
+        LHFree((void *)buffer);        // the heap-table free slot (+16)
+        o[8] = 0;                      // +0x20
+        o[9] = 0;                      // +0x24
+    }
+
+    void *legacyFile = (void *)o[7];    // +0x1C
+    if (legacyFile != 0)
+    {
+        int v10 = (int)((int (WINAPI *)(void *))F3_VT(legacyFile)[10])(legacyFile);
+        if ((BYTE)v10 != 0)
+        {
+            int v5 = (int)((int (WINAPI *)(void *))F3_VT(obj)[2])(obj);
+            result = (int)((int (WINAPI *)(void *, int))F3_VT(legacyFile)[5])(legacyFile, v5);
+        }
+        else
+        {
+            result = v10;
+        }
+    }
+
+    o[1] = 0;                          // +0x04
+    o[2] = 0;                          // +0x08
+    o[3] = 0;                          // +0x0C
+    o[4] = 0;                          // +0x10
+    o[5] = 0;                          // +0x14
+    o[7] = 0;                          // +0x1C
+    return result;
+}
 
 // Placeholder vtables for the stream object's dead vtable stores (the original
 // refs the NFile::CFileDataInputStream / NTools::CBaseClass vftables at their
@@ -6816,6 +7375,83 @@ static int sub_18917A0(void *stream)
 static void *g_CFileDataInputStreamVtable[10] = { 0 };   // 0x1BF90CC
 static void *g_NToolsCBaseClassVtable[10]    = { 0 };    // 0x1AF6E74
 
+//  StreamWindowAdvance  (0x1891170 - 0x18911BF)  -- the stream-window advance
+//  over the 40-byte NFile::CFileDataInputStream object (the window-reset
+//  idiom): given a new absolute offset a2, either shifts the stream window
+//  forward -- the data pointer (+0x0C) advances by (a2 - the +0x04 counter),
+//  the remaining count (+0x14) shrinks, and the counter (+0x04) becomes a2 --
+//  when the buffer is non-null and a2 lies within [+0x10, +0x04 + +0x14], or
+//  resets the window (+0x0C / +0x10 / +0x14 -> 0, +0x04 -> a2) otherwise.
+//  Returns the pre-call +0x0C (the buffer pointer, or the new data pointer in
+//  the accept branch); the caller drops it.  [NOT byte-identical] (the C++
+//  body's operand order / register allocation differs from the original prologue
+//  and refs no high-VA globals beyond the object layout).
+static unsigned int StreamWindowAdvance(void *stream, unsigned int a2)
+{
+    DWORD *o = (DWORD *)stream;
+    unsigned int result = o[3];                                     // +0x0C: the data pointer
+    if (result != 0 && a2 >= o[4] && a2 <= o[1] + o[5])             // +0x10 <= a2 <= +0x04 + +0x14
+    {
+        unsigned int v3 = o[1];                                     // +0x04: the counter
+        unsigned int v4 = v3 + o[5];                                // the window end
+        o[5] = v4 - a2;                                            // +0x14: the remaining count
+        result = a2 + result - v3;                                  // +0x0C: the new data pointer
+        o[3] = result;                                              // +0x0C
+        o[1] = a2;                                                  // +0x04: the new counter
+    }
+    else
+    {
+        o[3] = 0;                                                   // +0x0C
+        o[4] = 0;                                                   // +0x10
+        o[5] = 0;                                                   // +0x14
+        o[1] = a2;                                                  // +0x04
+    }
+    return result;
+}
+
+//  FileDataInputStreamCtor  (0x1892420 - 0x1892496)  -- the NFile::CFileDataInputStream
+//  read-buffer ctor: zero the object, install the CFileDataInputStream vftable
+//  and the legacy-file object pointer (+0x1C), and -- when size > 0 -- allocate
+//  the size-byte read buffer through LHAlloc, store it at +0x20 / +0x24, dispatch
+//  the legacy-file object's vtable slot 9 (offset 0x24) and store the result at
+//  +0x08, point +0x0C at the new buffer, reset the +0x04/+0x10/+0x14 counters,
+//  and hand the legacy-file object's vtable slot 7 (offset 0x1C) result to
+//  StreamWindowAdvance.  The stream object is discarded at the end of
+//  OpenDataStreamFile (the wide-load + finalize steps run against it).
+//  [NOT byte-identical] placement-dependent (the E8 calls to LHAlloc, the two
+//  vt[9]/vt[7] thiscall dispatches, and the StreamWindowAdvance call) + refs
+//  the CFileDataInputStream vftable placeholder at its .rdata VA.
+static void *FileDataInputStreamCtor(void *stream, void *legacyFile, int size)
+{
+    DWORD *o = (DWORD *)stream;
+    o[1] = 0;                                                       // +0x04
+    o[2] = 0;                                                       // +0x08
+    o[3] = 0;                                                       // +0x0C
+    o[4] = 0;                                                       // +0x10
+    o[5] = 0;                                                       // +0x14
+    *(BYTE *)((BYTE *)stream + 24) = 0;                             // +0x18
+    o[0] = (DWORD)g_CFileDataInputStreamVtable;                     // +0x00
+    o[7] = (DWORD)legacyFile;                                       // +0x1C
+    o[8] = 0;                                                       // +0x20
+    o[9] = 0;                                                       // +0x24
+    if (size > 0)
+    {
+        void *buffer = LHAlloc((unsigned int)size);                 // LHAlloc(size)
+        o[8] = (DWORD)buffer;                                       // +0x20
+        o[9] = (DWORD)size;                                         // +0x24
+        int v4 = (int)((int (WINAPI *)(void *))F3_VT(legacyFile)[9])(legacyFile);   // vt[9] slice
+        o[3] = o[8];                                               // +0x0C = the buffer
+        o[2] = (DWORD)v4;                                          // +0x08
+        o[1] = 0;                                                   // +0x04
+        o[4] = 0;                                                   // +0x10
+        o[5] = 0;                                                   // +0x14
+        int v5 = (int)((int (WINAPI *)(void *))F3_VT(legacyFile)[7])(legacyFile);   // vt[7] slice
+        StreamWindowAdvance(stream, (unsigned int)v5);
+    }
+    return stream;
+}
+
+
 // OpenDataStreamFile  (0x1926050 - 0x1926119)  -- open the settings-directory
 // "particle_bank.bnk" path (the slot's block data) as a data-stream file:
 // build the ANSI shared slot from the path (or the empty default string when
@@ -6823,13 +7459,18 @@ static void *g_NToolsCBaseClassVtable[10]    = { 0 };    // 0x1AF6E74
 // sub_17FE8B0, mode 1 + flag 2), drop the local slot reference (the
 // InterlockedDecrement-to-zero -> SharedBufferFree idiom), drop the global
 // live-slot counter, then release the legacy-file object (ReleaseLegacyMemoryFile,
-// sub_17FDE20) and return its result.  The stream-build / load / finalize steps
-// (sub_1892420 / sub_1922280 / sub_18917A0) are out of scope -- the 40-byte
-// NFile::CFileDataInputStream object, the 0x8000-byte read buffer, the vt[9] /
-// vt[7] dispatches over the legacy-file object, and the wide-load chain
-// (dword_20FC310 + sub_1893EB0 + SharedBufferBlocksEqual + sub_5493E0 + the
-// sub_1913F40 / sub_1913690 / sub_1912E10 / sub_19124C0 dispatch chain) are all
-// [remaining stub]s.  The stream object is local and discarded at the end of
+// sub_17FDE20) and return its result.  The stream-build step (FileDataInputStreamCtor,
+// 0x1892420) is implemented here -- the 40-byte NFile::CFileDataInputStream object,
+// the 0x8000-byte LHAlloc read buffer, and the vt[9] / vt[7] thiscall dispatches
+// over the legacy-file object (the vt[9] / vt[7] slots are unimplemented stubs in
+// this build -- LegacyMemoryFileStubMethod returns 0) and the StreamWindowAdvance
+// window-advance helper (0x1891170).  The wide-load step (WideLoadStream, 0x1922280)
+// is implemented
+// here -- its deep dispatch chain (sub_1893EB0 / sub_1891540 / sub_19230E0 /
+// sub_1913F40 / sub_1913690 / sub_1912E10 / sub_19124C0 / sub_5493E0) is [remaining
+// stub]s, so the stream-consuming path stays dormant.  The stream-object finalize
+// step (FileDataInputStreamDtor, 0x18917A0) is implemented.  The stream object is
+// local and discarded at the end of
 // the function, so the stubs keep the call graph honest without fabricating
 // the file reads.  The caller (MountPermanentBanks) discards the return value.
 // [NOT byte-identical] placement-dependent (the E8 calls + the Interlocked
@@ -6853,10 +7494,10 @@ static LONG OpenDataStreamFile(F3SharedBuffer **pathSlot)
     InterlockedDecrement(&g_Addend);                                                    // (0x2075C48)
 
     DWORD stream[10];                                                                   // the 40-byte stream object (discarded)
-    sub_1892420(&stream, &v4, 0x8000);                                                  // sub_1892420 [remaining stub]
-    sub_1922280(&stream);                                                                // sub_1922280 [remaining stub]
+    FileDataInputStreamCtor(&stream, &v4, 0x8000);                                   // 0x1892420
+    WideLoadStream(&stream);                                                             // 0x1922280
     stream[0] = (DWORD)g_CFileDataInputStreamVtable;                                     // the CFileDataInputStream vftable
-    sub_18917A0(&stream);                                                                // sub_18917A0 [remaining stub]
+    FileDataInputStreamDtor(&stream);                                                 // 0x18917A0
     stream[0] = (DWORD)g_NToolsCBaseClassVtable;                                         // the CBaseClass vftable (dead write)
 
     return ReleaseLegacyMemoryFile(&v4);                                                 // sub_17FDE20
@@ -6864,8 +7505,8 @@ static LONG OpenDataStreamFile(F3SharedBuffer **pathSlot)
 
 //  FindBankCacheEntry  (0x622E70 - 0x622F16)  -- the bank-cache lookup over the
 //  engine's +0xC8 sub-object (the 44-byte sentinel/head block + 4-byte head node +
-//  the +0x1C count, the hash-keyed red-black tree the sub_626D20 / sub_6254B0
-//  update side descends into): walks the tree keyed by the wide-string hash
+//  the +0x1C count, the hash-keyed red-black tree the UpdateBankCacheEntry /
+//  UpdateBankCacheSlot update side descends into): walks the tree keyed by the wide-string hash
 //  (the dword at +0x0C of each node; the tree is empty at this point, so the
 //  sentinel -- flagged by byte at +0x29 -- terminates the loop immediately) and
 //  writes the {node, block} pair it finds into *out.  The mount path
@@ -6910,29 +7551,346 @@ static DWORD *FindBankCacheEntry(void *obj, DWORD *out, const int *hash)
     return out;
 }
 
-//  sub_626D20 -- the bank-cache update (the +0xC8 sub-object tree insert: the
-//  4-byte owner wrapper, the sub_624FA0 node init, the sub_626AA0 node build, the
-//  sub_573390 release + LHFree idioms).  Deep dependency chain -- out of scope.
-//  Stub.  [remaining stub]
-static void *sub_626D20(void *obj, int *hash) { (void)obj; (void)hash; return (void *)obj; }
+//  sub_624FA0  (0x624FA0 - 0x625019)  [remaining stub] -- the bank-cache node
+//  init: the LHAlloc(4) self-ref block (*block = the this pointer, this[0] = the
+//  block), the BankCacheSlotReinit capacity reset over the (v16[4] - v16[3]) >> 2
+//  count, and the sub_621AD0 node copy.  Deep dependency chain (sub_621AD0) -- out
+//  of scope; the this pointer is kept unchanged.  [remaining stub]
+static DWORD *sub_624FA0(DWORD *this_block, DWORD *owner_wrapper)
+{
+    (void)this_block; (void)owner_wrapper;
+    return this_block;
+}
 
-//  sub_6254B0 -- the bank-cache slot helper (the dest/source copy-or-grow over the
-//  +0x18/+0x1C/+0x20 list words: sub_623420 / sub_621870 / sub_573390 /
-//  sub_622A10 / sub_571BB0 / LHFree).  Deep dependency chain -- out of scope.
-//  Stub.  [remaining stub]
-static void *sub_6254B0(void *thisArg, void *srcList) { (void)thisArg; (void)srcList; return thisArg; }
+//  sub_626AA0  (0x626AA0 - 0x626C35)  [remaining stub] -- the bank-cache node
+//  build: the tree insert over the +0xC8 sub-object (sub_626510 / sub_626910 /
+//  sub_61E430 / sub_61E160 / sub_61E610 -- all unimplemented).  Keeps the out-block
+//  at the tree-walk result so the caller's final validity checks stay in-bounds.  [remaining stub]
+static DWORD *sub_626AA0(void *obj, DWORD *out_block, DWORD *a2, DWORD *a3, DWORD *a4)
+{
+    (void)a2; (void)a4;
+    out_block[0] = (DWORD)obj;
+    out_block[1] = (DWORD)a3;
+    return out_block;
+}
+
+//  UpdateBankCacheEntry  (0x626D20 - 0x626EB2)  -- the bank-cache update (the
+//  +0xC8 sub-object tree insert: the 4-byte owner wrapper, the sub_624FA0 node
+//  init, the sub_626AA0 node build, the BankCacheRangeRelease + LHFree release
+//  idioms).  The write-side sibling of FindBankCacheEntry (0x622E70): walks the
+//  wide-string hash over the hash-keyed red-black tree (the dword at +0x0C of each
+//  node; the sentinel -- flagged by byte at +0x29 -- terminates the walk
+//  immediately when the tree is empty) and, when the walk lands on the block or
+//  the hash does not fit the current use, rebuilds the cache node: the 4-byte
+//  owner wrapper (LHAlloc(4), *wrapper = &v16, v16[0] = wrapper, self-referenced,
+//  freed at the end), the sub_624FA0 node init, the sub_626AA0 node build, the
+//  re-zero + LHFree idioms, and the final validity checks.  [NOT byte-identical]
+//  placement-dependent (the relative E8 calls to LHAlloc / LHFree /
+//  BankCacheRangeRelease / sub_624FA0 / sub_626AA0 + the __security_cookie
+//  prologue).
+static DWORD *UpdateBankCacheEntry(void *obj, DWORD *hash_ptr)
+{
+    DWORD *sub = (DWORD *)obj;                  // the +0xC8 sub-object
+    DWORD *block = (DWORD *)sub[6];             // the 44-byte sentinel block (+0x18)
+    DWORD *node = block;                         // the node this walk last visited
+    DWORD *cur = (DWORD *)block[1];             // the sentinel node (self-ref)
+    int hash = *(int *)hash_ptr;                 // the wide-string hash
+
+    while (*(BYTE *)((BYTE *)cur + 0x29) == 0)
+    {
+        if ((unsigned int)cur[3] >= (unsigned int)hash)
+        {
+            node = cur;
+            cur = (DWORD *)cur[0];
+        }
+        else
+        {
+            cur = (DWORD *)cur[2];
+        }
+    }
+
+    DWORD *v7 = (DWORD *)sub[0];                // the +0xC8 node (back-referencing)
+    if (v7 == 0)
+        F3InvalidParam();                       // original: __invalid_parameter_noinfo (no return)
+
+    DWORD *v25 = (DWORD *)node;                  // the tree-walk node
+
+    if (node == block || (unsigned int)hash < (unsigned int)node[3])
+    {
+        // === the owner wrapper (the 4-byte self-ref block, freed at the end) ===
+        DWORD v16[4] = { 0, 0, 0, 0 };
+        DWORD *v9 = (DWORD *)LHAlloc(4);
+        if (v9 != 0)
+        {
+            *(DWORD **)v9 = (DWORD *)v16;
+            v16[0] = (DWORD)v9;
+        }
+
+        // === the this block (the block sub_624FA0 fills; this = &thisBlock) ===
+        DWORD thisBlock[5] = { 0, 0, 0, 0, 0 };
+
+        // === the out-param slot (passed to sub_626AA0 as a4) + the hash slot ===
+        DWORD outParam = 0;                      // the out-param (the disasm's [esp+0x2C] slot)
+        DWORD hashSlot = (DWORD)hash;            // the hash slot (the disasm's [esp+0x30] slot)
+
+        sub_624FA0(thisBlock, v16);              // the node init [remaining stub]
+
+        DWORD outBlock[2] = { 0, 0 };            // the out-block (a1) -- overwritten by sub_626AA0
+        sub_626AA0(sub, outBlock, v7, node, &outParam);  // the node build [remaining stub]
+
+        v7 = (DWORD *)outBlock[0];
+        v25 = (DWORD *)outBlock[1];
+
+        // === the release idioms (the disasm's release-and-free sequence) ===
+        if (thisBlock[2] != 0)
+        {
+            BankCacheRangeRelease((DWORD *)thisBlock[2], (DWORD *)thisBlock[3]);
+            LHFree((void *)thisBlock[2]);
+        }
+        thisBlock[3] = 0;
+        thisBlock[4] = 0;
+
+        // === the hash slot (the disasm's second LHFree call) ===
+        LHFree((void *)hashSlot);
+
+        // === the owner wrapper free ===
+        if (v16[0] != 0)
+            LHFree((void *)v16[0]);
+    }
+
+    if (v7 != 0)
+        v7 = (DWORD *)*v7;                       // deref the out-block's "this"-ish pointer
+    else
+        F3InvalidParam();
+
+    if (v25 == (DWORD *)v7[6])
+        F3InvalidParam();
+
+    return v25 + 4;                              // the original returns v14 + 4 (the disasm: +0x10)
+}
+
+
+//  BankCacheRangeRelease  (0x573390 - 0x5733BA)  -- release a range of DWORD
+//  slots: for each non-null element, call its vtable slot 2 (vt+8, Release)
+//  with the element pointer (a stdcall wrapper in the original, kept as a free
+//  function).  [NOT byte-identical] placement-dependent (the relative E8 call
+//  to the vt[2] dispatch).
+static void BankCacheRangeRelease(DWORD *start, DWORD *end)
+{
+    for (DWORD *p = start; p != end; ++p)
+    {
+        if (*p != 0)
+            ((void (WINAPI *)(void *))F3_VT((void *)*p)[2])((void *)*p);
+    }
+}
+
+//  BankCacheCopyRange  (0x61F940 - 0x61F98A)  -- the range copy with ownership
+//  transfer: AddRef each source element through its vtable slot 1 (vt+4),
+//  Release the old destination element through slot 2 (vt+8), then store the
+//  pointer into the destination.  Returns the new destination end.  [NOT
+//  byte-identical] placement-dependent (the relative E8 calls to the vt[1] /
+//  vt[2] dispatches).
+static DWORD *BankCacheCopyRange(const DWORD *src, const DWORD *srcEnd, DWORD *dest)
+{
+    DWORD *v3 = (DWORD *)src;
+    if (v3 == (DWORD *)srcEnd)
+        return dest;
+    DWORD *v4 = dest;
+    do
+    {
+        if (*v3 != 0)
+            ((void (WINAPI *)(void *))F3_VT((void *)*v3)[1])((void *)*v3);   // AddRef the source
+        if (*v4 != 0)
+            ((void (WINAPI *)(void *))F3_VT((void *)*v4)[2])((void *)*v4);   // Release the old dest slot
+        *v4++ = *v3++;
+    }
+    while (v3 != (DWORD *)srcEnd);
+    return v4;
+}
+
+//  BankCacheCopyRangeEnd  (0x621870 - 0x6218B5)  -- copy the range into the
+//  destination and return the new end (the original returns dest + 4 *
+//  ((srcEnd - src) >> 2) with byte-based addresses; for a DWORD-aligned range
+//  that is dest + element count).  [NOT byte-identical]
+//  placement-dependent (the relative E8 call to BankCacheCopyRange).
+static DWORD *BankCacheCopyRangeEnd(const DWORD *src, const DWORD *srcEnd, DWORD *dest)
+{
+    BankCacheCopyRange(src, srcEnd, dest);
+    return dest + (srcEnd - src);
+}
+
+//  BankCacheAppendRange  (0x5772D0 - 0x57730E)  -- append a range of element
+//  pointers into a destination block at the end of the current use: for each
+//  source element, store it into the slot and AddRef it through its vtable
+//  slot 1 (vt+4).  Returns the new end.  [NOT byte-identical]
+//  placement-dependent (the relative E8 call to the vt[1] dispatch).
+static DWORD *BankCacheAppendRange(const DWORD *src, const DWORD *srcEnd, DWORD *dest)
+{
+    DWORD *v3 = (DWORD *)src;
+    DWORD *v4 = dest;
+    if (v3 == (DWORD *)srcEnd)
+        return v4;
+    do
+    {
+        if (v4 != 0)                                             // defensive: dest is always non-null here
+        {
+            DWORD v5 = *v3;
+            *v4 = v5;
+            if (v5 != 0)
+                ((void (WINAPI *)(void *))F3_VT((void *)v5)[1])((void *)v5);  // AddRef the source
+        }
+        ++v3;
+        ++v4;
+    }
+    while (v3 != (DWORD *)srcEnd);
+    return v4;
+}
+
+//  BankCacheAppendBlock  (0x622A10 - 0x622A3C)  -- the stdcall shallow wrapper
+//  over BankCacheAppendRange (a1, a2, a3) -> new end.  [NOT byte-identical]
+//  placement-dependent (the relative E8 call).
+static DWORD *BankCacheAppendBlock(const DWORD *src, const DWORD *srcEnd, DWORD *dest)
+{
+    return BankCacheAppendRange(src, srcEnd, dest);
+}
+
+//  BankCacheAllocElements  (0x575A00 - 0x575A6E)  -- allocate 4 * count bytes
+//  through the game heap; the original throws stdext::bad_alloc when the size
+//  overflows (0xFFFFFFFF / count < 4).  Unreachable for sane bank slots;
+//  emulated with a plain C++ throw.
+static int BankCacheAllocElements(unsigned int count)
+{
+    unsigned int v1 = count;
+    if (count != 0)
+    {
+        if (0xFFFFFFFFu / count < 4u)
+            throw 1;   // the original throws stdext::bad_alloc
+    }
+    else
+    {
+        v1 = 0;
+    }
+    return (int)LHAlloc(4 * v1);
+}
+
+//  BankCacheSlotReinit  (0x571BB0 - 0x571BFF)  -- reset the slot's capacity
+//  block: zero the +0x0C/+0x10/+0x14 list words, then bind the slot to a fresh
+//  4-byte-per-element buffer of `count` elements (this + 4 * count = the new
+//  end).  Returns 0 when count == 0, 1 on success.  The original's
+//  length_error path (count > 0x3FFFFFFF) and the bad_alloc overflow are
+//  emulated with a plain C++ throw.  [NOT byte-identical]
+//  placement-dependent (the relative E8 calls to BankCacheAllocElements + the
+//  LHAlloc dispatch).
+static char BankCacheSlotReinit(DWORD *obj, unsigned int count)
+{
+    obj[3] = 0;
+    obj[4] = 0;
+    obj[5] = 0;
+    if (count == 0)
+        return 0;
+    if (count > 0x3FFFFFFFu)
+        throw 1;   // the original throws std::length_error("vector<T> too long")
+    DWORD v4 = (DWORD)BankCacheAllocElements(count);
+    obj[3] = v4;
+    obj[4] = v4;
+    obj[5] = v4 + 4 * count;
+    return 1;
+}
+
+//  BankCacheSlotReset  (0x623420 - 0x62345F)  -- reset the slot to the empty
+//  state: validate (obj, obj+0, obj+3, obj+4), then, when the current range
+//  is non-empty, Release the elements over [obj+3, obj+4) and point the end
+//  word at the start.  The original folds in the sub_622FF0 idiom (the dead
+//  8-byte out-param is discarded by its only caller, so it carries no
+//  observable state).  [NOT byte-identical] placement-dependent (the relative
+//  E8 call to BankCacheRangeRelease).
+static DWORD *BankCacheSlotReset(DWORD *obj)
+{
+    if (obj == 0 || obj[3] > obj[4])
+        F3InvalidParam();                        // original: __invalid_parameter_noinfo
+    if (obj[0] == 0)
+        F3InvalidParam();                        // original: __invalid_parameter_noinfo
+    if (obj[3] != obj[4])
+    {
+        BankCacheRangeRelease(obj + 3, obj + 4);
+        obj[4] = obj[3];
+    }
+    return obj;
+}
+
+//  UpdateBankCacheSlot  (0x6254B0 - 0x6255B4)  -- the bank-cache slot helper:
+//  the dest/source copy-or-grow over the +0x0C/+0x10/+0x14 list words
+//  (+0x0C start / +0x10 end / +0x14 capacity end).  When the new source range
+//  is empty, reset the slot; when it fits the current use, copy the new range
+//  and Release the old tail; when it fits the remaining capacity, copy the
+//  prefix and append the remainder; otherwise Release and free the old range,
+//  re-bind the slot to a fresh allocation, and append the full range.  [NOT
+//  byte-identical] placement-dependent (the relative E8 calls to
+//  BankCacheRangeRelease / BankCacheCopyRangeEnd / BankCacheAppendBlock /
+//  BankCacheSlotReinit / BankCacheSlotReset / LHFree).
+static DWORD *UpdateBankCacheSlot(DWORD *obj, DWORD *srcList)
+{
+    if (obj == srcList)
+        return obj;
+
+    DWORD srcStart = srcList[3];
+    DWORD srcEnd = srcList[4];
+    DWORD newCount = (srcEnd - srcStart) >> 2;
+
+    if (newCount == 0)
+    {
+        BankCacheSlotReset(obj);
+        return obj;
+    }
+
+    DWORD curStart = obj[3];
+    DWORD curCount = (obj[4] - obj[3]) >> 2;
+
+    if (newCount <= curCount)
+    {
+        DWORD *newEnd = BankCacheCopyRangeEnd((const DWORD *)srcStart, (const DWORD *)srcEnd, obj + 3);
+        BankCacheRangeRelease(newEnd, obj + 4);
+        obj[4] = obj[3] + 4 * newCount;
+        return obj;
+    }
+
+    DWORD capacity;
+    if (curStart != 0)
+        capacity = (obj[5] - curStart) >> 2;
+    else
+        capacity = 0;
+
+    if (newCount <= capacity)
+    {
+        DWORD srcSplit = srcStart + 4 * curCount;
+        BankCacheCopyRangeEnd((const DWORD *)srcStart, (const DWORD *)srcSplit, obj + 3);
+        obj[4] = (DWORD)BankCacheAppendBlock((const DWORD *)srcSplit, (const DWORD *)srcEnd, obj + 4);
+        return obj;
+    }
+
+    if (curStart != 0)
+    {
+        BankCacheRangeRelease(obj + 3, obj + 4);
+        LHFree((void *)(obj + 3));
+    }
+
+    if (BankCacheSlotReinit(obj, (unsigned int)newCount) != 0)
+        obj[4] = (DWORD)BankCacheAppendBlock((const DWORD *)srcStart, (const DWORD *)srcEnd, obj + 3);
+
+    return obj;
+}
 
 //  MountLipsyncBank  (0x61C170 - 0x61C236)  -- mount one .bnk speech / lipsync bank
 //  over the engine's +0xC8 sub-object: the GetWideStringHash cache lookup
-//  (FindBankCacheEntry), the sub_625D10 wide-string build, the file-subsystem
-//  FileSubsysMountCollection (0x1801620) mount with the sub_61B730 (AnimsBankMount)
+//  (FindBankCacheEntry), the OutBlockInit wide-string build, the file-subsystem
+//  FileSubsysMountCollection (0x1801620) mount with the AnimsBankMount
 //  callback, the entry vtable slot 2 dispatch, and the cache update
-//  (sub_626D20 / sub_6254B0).  The deep dependency chain (sub_625D10 / sub_626D20
-//  / sub_6254B0 / sub_6240F0 / AnimsBankMount) remains stubbed; the wide-string
-//  build + out-block dtor run as no-ops.  [NOT byte-identical] placement-dependent
+//  (UpdateBankCacheEntry / UpdateBankCacheSlot).  The deep dependency chain
+//  (AnimsBankMount's stubbed leaves) remains stubbed; the out-block dtor runs
+//  as the OutBlockDtor implemented above.  [NOT byte-identical] placement-dependent
 //  (the relative E8 calls to GetWideStringHash / FindBankCacheEntry / GetFileSubsystem
-//  / sub_625D10 / FileSubsysMountCollection / sub_626D20 / sub_6254B0 / sub_6240F0
-//  + the entry vtable slot 2 dispatch + the __security_cookie prologue).
+//  / OutBlockInit / FileSubsysMountCollection / UpdateBankCacheEntry / UpdateBankCacheSlot /
+//  OutBlockDtor + the entry vtable slot 2 dispatch + the __security_cookie prologue).
 static void MountLipsyncBank(void *obj, F3WString *ws, int a3)
 {
     CGameEngine *g = (CGameEngine *)obj;
@@ -6951,7 +7909,7 @@ static void MountLipsyncBank(void *obj, F3WString *ws, int a3)
         void *fs = GetFileSubsystem((void *)v9[0]);   // sub_1801C20
         char outblock[64];                              // the 64-byte out block (v10)
         memset(outblock, 0, 64);
-        sub_625D10(outblock, ws, a3);                   // sub_625D10 [remaining stub]
+        OutBlockInit((F3WString *)outblock, ws, a3);    // 0x625D10 -> OutBlockInit
 
         FileSubsysMountCollection(fs, (void **)&v9[0],
                                   (unsigned char (__cdecl *)(int, int))AnimsBankMount,
@@ -6960,26 +7918,201 @@ static void MountLipsyncBank(void *obj, F3WString *ws, int a3)
         if (v9[0] != 0)
             ((void (WINAPI *)(void *))F3_VT((void *)v9[0])[2])((void *)v9[0]);  // the entry's vtable slot 2 (stdcall)
 
-        void *cacheNode = sub_626D20(base + 0xC8, &hash);   // sub_626D20 [remaining stub]
+        void *cacheNode = UpdateBankCacheEntry(base + 0xC8, (DWORD *)&hash);   // 0x626D20
         BYTE v11[24];                                       // the uninitialized 24-byte source block (dead)
         memset(v11, 0, 24);
-        sub_6254B0(cacheNode, v11);                          // sub_6254B0 [remaining stub]
+        UpdateBankCacheSlot((DWORD *)cacheNode, (DWORD *)v11);   // 0x6254B0
 
-        sub_6240F0(outblock);                               // the out-block dtor [remaining stub]
+        OutBlockDtor(outblock);                                // the out-block dtor
     }
 }
 
-//  0x719A00: the global speech callback (sub_719A00).  The original is a
-//  large thiscall function (char thiscall sub_719A00(void *this, int a2,
-//  int a3) -- this in ECX, two stack args, retn 8) that loads the
-//  "language/gui/gui_texture_headers.bnk" + "language/gui/gui_textures.bnk"
-//  archives and rebuilds the speech / gui state; the whole chain is an
-//  unimplemented deep stub in this build.  Kept as a no-op returning the
-//  original's success value (0).  [remaining stub]
-static char SpeechCallback(void *this_, int entry, int data)
+//  sub_180D3F0 (0x180D3F0 - 0x180D571) -- the per-entry VFS load: hash the path
+//  (GetWideStringHash / sub_56DFD0), look the entry up in the archive collection
+//  (sub_180F0E0 tree search), and, when the entry is a matching data entry,
+//  dispatch the matched provider's reload (the provider vtable slot 4, thiscall:
+//  (entry, providerIndex, ...)) with the provider's own ref handling.  Deep
+//  dependency chain (GetWideStringHash / sub_180F0E0 / sub_18014F0 / sub_56E080
+//  / GetFileSubsystem / GetArchiveSlot / the provider vtable dispatch) -- out of
+//  scope.  Stub.  [remaining stub]
+static void *VfsEntryLoad(void *collection, void **out, int a2, F3WString *path)
 {
-    (void)this_; (void)entry; (void)data;
+    (void)collection; (void)a2; (void)path;
+    *out = 0;
+    return out;
+}
+
+//  sub_18A5490 (0x18A5490 - 0x18A5485) -- the 60-byte out-block builder:
+//  LHAlloc(60), then sub_18A53A0(a2), then the vtable-slot-1 dispatch on the
+//  result (+0x04, stdcall: (result)).  Deep dependency chain (sub_18A53A0) --
+//  out of scope.  Stub.  [remaining stub]
+static void *RecordAllocBlock(void **out, int a2)
+{
+    (void)a2;
+    *out = 0;
+    return out;
+}
+
+//  sub_18A5410 (0x18A5410 - 0x18A5420) -- the 28-byte record-collection op: the
+//  region-bound sanity check, the vtable-slot-1 dispatch (+0x04, stdcall:
+//  (result)), the sub_5B6670 helper, and the vtable-slot-2 dispatch (+0x08).
+//  Deep dependency chain (sub_5B6670) -- out of scope.  Stub.  [remaining stub]
+static char RecordCollectionOp(void *handle, int a2)
+{
+    (void)handle; (void)a2;
     return 0;
+}
+
+//  sub_71BDF0 (0x71BDF0 - 0x71BDFE) -- the record-array walk: take the slot at
+//  +0 of the record, the [start, end) range of 28-byte entries, and the
+//  through-record-array dispatch (the sub_71BD50 helper).  Deep dependency
+//  chain (sub_71BD50) -- out of scope.  Stub.  [remaining stub]
+static DWORD RecordArrayWalk(void **slot)
+{
+    (void)slot;
+    return 0;
+}
+
+//  LookupBnk  (sub_1806060, 0x1806060 - 0x1806067)  -- the bank lookup: the
+//  per-entry "levels.bnk" / "streaming.bnk" rdata wide string looked up in the
+//  archive.  Declared here (defined below) so the SpeechCallback cluster can
+//  call it.  [remaining stub]
+static void *LookupBnk(void *out, void *cwdSlot, void *nameBuf, int flags);
+static F3SharedBuffer **GetArchiveSlot(F3SharedBuffer **out);
+
+//  SpeechCallback  (0x719A00 - 0x719C7D)  -- the global speech callback:
+//  rebuilds the speech / gui state by loading the
+//  "language/gui/gui_texture_headers.bnk" and "language/gui/gui_textures.bnk"
+//  archives over the engine's VFS archive collection (F3WStringFromAnsi +
+//  GetVfsArchiveCollection + VfsEntryLoad + the cap >= 8 LHFree idiom for
+//  each build), then registers each entry with the bank lookup (LookupBnk, the
+//  sub_1806060 stand-in) -- the returned bank handle is AddRef'd (vtable slot 1)
+//  and released (vtable slot 2).  When BOTH banks resolve (bank1 && bank2
+//  non-null): allocate the 60-byte record out-block (RecordAllocBlock), run
+//  the record-collection op on each bank (RecordCollectionOp), take the archive
+//  manager handle from its slot (GetArchiveSlot, AddRef'd) and dispatch the
+//  slot-10 ("add archive") thiscall method (archive, record, &wide string, 2, 1)
+//  -- then reset the wide string to the empty SSO layout (cap 7 / len 0 / first
+//  wchar 0), release the archive handle (vtable slot 2), walk the record array
+//  (RecordArrayWalk) and release it (vtable slot 2), then release each bank
+//  handle (vtable slot 2) and return 0.  Otherwise (either bank missing):
+//  release the resolvable bank handle(s) and return 1.  The end-of-block SSO
+//  teardown (blocks A and B) is reproduced inline but never fires in this build
+//  (the stubbed callees never allocate, so the caps are always 7/0).  The
+//  slot-10 dispatch is dead in this build (the archive slot is null, the
+//  success path is never reached) -- it is reproduced faithfully but would
+//  crash on a null manager handle exactly like the original.
+//  [NOT byte-identical] placement-dependent (the E8 calls to F3WStringFromAnsi /
+//  GetVfsArchiveCollection / VfsEntryLoad / LookupBnk / RecordAllocBlock /
+//  RecordCollectionOp / GetArchiveSlot / RecordArrayWalk + the vtable dispatches
+//  + the __security_cookie prologue of the callee).
+static char SpeechCallback(void *this_, int a2, int a3)
+{
+    (void)a3;
+
+    F3WString ws;                                   // the wide string (headers + textures)
+    DWORD entry1 = 0;                               // the per-entry out slot (headers)
+    DWORD entry2 = 0;                               // the per-entry out slot (textures)
+    DWORD bank1 = 0;                                // the per-bank out slot (headers)
+    DWORD bank2 = 0;                                // the per-bank out slot (textures)
+    DWORD record = 0;                               // the 60-byte out-block (sub_18A5490's out)
+    DWORD archive = 0;                              // the archive handle (GetArchiveSlot's out)
+    DWORD thisSlot = (DWORD)this_;                  // the v7[1] this-slot
+    DWORD v7[2] = { 0, thisSlot };                  // the 8-byte out-block: v7[0] = handle, v7[1] = this
+
+    // block A / block B -- the end-of-block SSO-like out-blocks (never
+    // allocated in this build -- the stubbed callees never write them).
+    DWORD blockACap = 7, blockALen = 0, blockAPtr = 0;
+    DWORD blockBCap = 0, blockBPtr = 0;
+
+    // --- build 1: "language/gui/gui_texture_headers.bnk" ---
+    F3WStringFromAnsi(&ws, "language/gui/gui_texture_headers.bnk");
+    GetVfsArchiveCollection();
+    VfsEntryLoad(GetVfsArchiveCollection(), (void **)&entry1, a2, &ws);   // sub_180D3F0 [remaining stub]
+    if (ws.cap >= 8)                                                      // the cap >= 8 LHFree idiom
+        LHFree((void *)ws.u.ptr);
+
+    // --- build 2: "language/gui/gui_textures.bnk" ---
+    F3WStringFromAnsi(&ws, "language/gui/gui_textures.bnk");
+    GetVfsArchiveCollection();
+    VfsEntryLoad(GetVfsArchiveCollection(), (void **)&entry2, a2, &ws);   // sub_180D3F0 [remaining stub]
+    if (ws.cap >= 8)                                                      // the cap >= 8 LHFree idiom
+        LHFree((void *)ws.u.ptr);
+
+    // --- the bank lookup for each entry ---
+    bank1 = (DWORD)LookupBnk(&bank1, (void *)(DWORD)a2, (void *)(DWORD)&entry1, 0);  // sub_1806060 [remaining stub]
+    if (bank1 != 0)
+        ((void (WINAPI *)(void *))F3_VT((void *)bank1)[1])((void *)bank1);          // the bank's vtable slot 1 (AddRef)
+    if (bank1 != 0)
+        ((void (WINAPI *)(void *))F3_VT((void *)bank1)[2])((void *)bank1);          // the bank's vtable slot 2 (Release)
+    bank2 = (DWORD)LookupBnk(&bank2, (void *)(DWORD)a2, (void *)(DWORD)&entry2, 0);  // sub_1806060 [remaining stub]
+    if (bank2 != 0)
+        ((void (WINAPI *)(void *))F3_VT((void *)bank2)[1])((void *)bank2);          // the bank's vtable slot 1 (AddRef)
+    if (bank2 != 0)
+        ((void (WINAPI *)(void *))F3_VT((void *)bank2)[2])((void *)bank2);          // the bank's vtable slot 2 (Release)
+
+    if (bank1 != 0)
+    {
+        if (bank2 != 0)
+        {
+            RecordAllocBlock((void **)&record, 0);        // sub_18A5490 [remaining stub]
+            RecordCollectionOp((void *)(DWORD)bank1, 0);  // sub_18A5410 [remaining stub]
+            RecordCollectionOp((void *)(DWORD)bank2, 0);  // sub_18A5410 [remaining stub]
+
+            archive = (DWORD)(*GetArchiveSlot((F3SharedBuffer **)v7));    // sub_180AC90
+
+            // the reset idiom: empty SSO layout (cap 7 / len 0 / first wchar 0)
+            ws.cap = 7; ws.len = 0; ws.u.buf[0] = 0;
+
+            // the slot-10 ("add archive") thiscall dispatch on the archive
+            // manager -- dead in this build (the archive slot is null)
+            {
+                typedef void (__thiscall *F3ArchiveAddArchiveFn)(void *this_, DWORD handle, F3WString *name, int f1, int f2);
+                F3ArchiveAddArchiveFn fn = (F3ArchiveAddArchiveFn)F3_VT((void *)archive)[10];
+                fn((void *)(DWORD)archive, record, &ws, 2, 1);
+            }
+
+            if (ws.cap >= 8)                               // the cap >= 8 LHFree idiom
+                LHFree((void *)ws.u.ptr);
+            ws.cap = 7; ws.len = 0; ws.u.buf[0] = 0;       // the reset idiom again
+
+            if (v7[0] != 0)
+                ((void (WINAPI *)(void *))F3_VT((void *)v7[0])[2])((void *)v7[0]);   // the archive handle's vtable slot 2
+
+            RecordArrayWalk((void **)&record);            // sub_71BDF0 [remaining stub]
+            if (record != 0)
+                ((void (WINAPI *)(void *))F3_VT((void *)record)[2])((void *)record);   // the record's vtable slot 2
+
+            ((void (WINAPI *)(void *))F3_VT((void *)bank2)[2])((void *)bank2);         // the bank's vtable slot 2
+            ((void (WINAPI *)(void *))F3_VT((void *)bank1)[2])((void *)bank1);         // the bank's vtable slot 2
+
+            // the end-of-block SSO reset idiom (blocks A and B) -- dead in this
+            // build (the stubbed callees never allocate, so cap is 7/0)
+            if (blockACap >= 8)
+                LHFree((void *)blockAPtr);
+            blockACap = 7; blockALen = 0; blockAPtr = blockAPtr & 0xFFFF0000u;
+            if (blockBCap >= 8)
+                LHFree((void *)blockBPtr);
+
+            return 0;
+        }
+    }
+    else if (bank2 != 0)
+    {
+        ((void (WINAPI *)(void *))F3_VT((void *)bank2)[2])((void *)bank2);             // the bank's vtable slot 2
+    }
+
+    if (bank1 != 0)
+        ((void (WINAPI *)(void *))F3_VT((void *)bank1)[2])((void *)bank1);             // the bank's vtable slot 2
+
+    // the end-of-block SSO reset idiom (blocks A and B) -- dead in this build
+    if (blockACap >= 8)
+        LHFree((void *)blockAPtr);
+    blockACap = 7; blockALen = 0; blockAPtr = blockAPtr & 0xFFFF0000u;
+    if (blockBCap >= 8)
+        LHFree((void *)blockBPtr);
+
+    return 1;
 }
 
 //  FileSubsysInvokeCallback  (0x71B6A0 - 0x71B78B)  -- the file-subsystem
@@ -7060,6 +8193,16 @@ static int RegisterSpeechCallback(void)
 // in this build, so the loop is dead).
 static DWORD g_dword_1DBD0F8 = 0;   // 0x1DBD0F8
 static DWORD g_dword_1DBD0FC = 0;   // 0x1DBD0FC
+// 0x1DDC830: the main (80/4096) allocation-cache object (0x58: the +0x18
+// init flag / +0x34 critical section / the +0x10/+0x14 fields).  The SpeechBank
+// record-reload chain (SpeechBankRecordReloadAudioBank) references this
+// cache before InitVirtualFileSystem runs, so it is declared up here with
+// the other speech-bank globals.
+static BYTE  g_unk_1DDC830[0x58];   // 0x1DDC830
+// 0x1D6A6E8: the audio-comms LoadAudioBank counter (read + incremented by
+// the SpeechBankRecordReloadAudioBank chain; the reload writes the
+// pre-increment value into the record's +0x08 word).
+static DWORD g_dword_1D6A6E8 = 0;   // 0x1D6A6E8
 // 0x1C86C50: the "speech-bank table pass" flag byte read by the
 // SpeechBankFlagRead prologue.  .rdata-ish; 1 in the original, 0 here (the read is discarded
 // by the caller anyway).
@@ -7465,24 +8608,410 @@ static unsigned char SpeechBankMount(int entry, int data)
     return 1;
 }
 
-// SpeechBankRecordMount (0x61B990, formerly sub_61B990) -- the per-record "speech.adb" mount + entry
-// dispatch (the 9-word record walk over the [1DBD0F8, 1DBD0FC) table, the
-// name compare, the "speech.adb" shared-slot build + the collection mount
-// with the sub_61B920 callback, the per-element GetHeapManager / sub_18FAE20
-// dispatches).  Deep dependency chain -- out of scope.  Stub.  [remaining stub]
-static void SpeechBankRecordMount(const char **nameSlotAddr)
+// SpeechBankRecordMountCallback  (sub_61B920, 0x61B920 - 0x61B981) -- the file-subsystem
+// collection mount callback for the speech-bank record mount: reload the mounted
+// entry through the VFS archive collection (GetVfsArchiveCollection + VfsReloadFileEntry)
+// and, on a successful match, release the entry (vtable slot 2, stdcall).  The
+// per-record entry update (sub_626240 -- a 44-byte entry-array sync via sub_625720 /
+// sub_625020 / sub_621300, all deep-chain stubs) is a no-op in this build: the VFS
+// reload never matches a provider, so outEntry is always null and the branch never runs.
+// The original is cdecl with a __security_cookie prologue.
+static unsigned char SpeechBankRecordMountCallback(int entry, int data)
 {
-    (void)nameSlotAddr;
+    void *collection = GetVfsArchiveCollection();                       // sub_180D9B0
+    void *outEntry = 0;
+    VfsReloadFileEntry(collection, &outEntry, (void *)entry, (void *)data);   // sub_180D220
+    if (outEntry != 0)
+    {
+        // sub_626240(this: (unsigned int *)(data + 36), a2: (unsigned int *)&outEntry);
+        // -- the per-record entry update (deep-chain stub: sub_625720 -- sub_625020 --
+        // sub_621300); never executed in this build (outEntry is always null here).
+        if (outEntry != 0)
+            ((void (__stdcall *)(int))(*(DWORD *)outEntry + 8))((int)outEntry);   // vtable slot 2 (stdcall) release
+    }
+    return 1;
 }
 
-// SpeechBankRecordReload (0x61A9B0, formerly sub_61A9B0) -- the per-record "reload the current record"
-// dispatch (the same name walk, then the +0x21 flag byte check + the
-// GetHeapManager / sub_18FADD0 re-write of the record's +0x08 word).  Deep
-// dependency chain (sub_18FADD0 / sub_145D550) -- out of scope.  Stub.
-// [remaining stub]
+// SpeechBankWideResize  (sub_436730, 0x436730 - 0x4367F6) -- the wide-string grow:
+// allocate a fresh buffer for `newLen` wide chars (the original's 1.5x grow),
+// copy the existing content over, release the outgoing heap buffer, and write the
+// terminator.  The original is __thiscall.
+static void SpeechBankWideResize(F3WString *s, unsigned int newLen)
+{
+    unsigned int cap = newLen | 7u;
+    if (cap <= 0x7FFFFFFEu)
+    {
+        unsigned int half = s->cap >> 1;
+        if (cap / 3u < half && s->cap <= 2147483646u - half)
+            cap = half + s->cap;       // the original's 1.5x grow
+    }
+    else
+    {
+        cap = newLen;
+    }
+    wchar_t *newBuf = (wchar_t *)LHAlloc(2u * (cap + 1u));
+    if (s->len != 0)
+        memcpy_s(newBuf, 2u * (cap + 1u), F3WStringData(s), 2u * s->len);
+    if (s->cap >= 8)
+        LHFree((void *)s->u.ptr);
+    s->u.ptr = (DWORD)newBuf;
+    s->cap = cap;
+    newBuf[s->len] = 0;
+}
+
+// SpeechBankWideAssign  (sub_435B20, 0x435B20 - 0x435C0D) -- the wide-string assign
+// core: copy `count` wide chars (starting at `offset`) from the source wide string
+// into the destination wide string.  The original is __thiscall + retn 0Ch (the
+// string in ECX, the source/offset/count on the stack).  The self-assign path
+// (dst == src) is never taken here (the destination is always a fresh empty
+// wide string) and is documented as a no-op.
+static F3WString *SpeechBankWideAssign(F3WString *dst, const F3WString *src,
+                                       unsigned int offset, unsigned int count)
+{
+    if (src->len < offset)
+        F3InvalidParam();                       // the original's sub_1519722 (out-of-range offset)
+    unsigned int v5 = src->len - offset;
+    if (count < v5)
+        v5 = count;
+
+    if (dst == src)
+    {
+        // the self-assign path (sub_435A80(offset + v5, -1) + sub_435A80(0, offset)):
+        // truncate the string to `offset + v5` chars.  Never taken here; documented.
+        return dst;
+    }
+    if (v5 > 0x7FFFFFFEu)
+        F3InvalidParam();                       // the original's sub_15196EA (overflow)
+
+    if (dst->cap >= v5)
+    {
+        if (v5 == 0)
+        {
+            dst->len = 0;
+            if (dst->cap < 8)
+                dst->u.buf[0] = 0;
+            else
+                *(wchar_t *)dst->u.ptr = 0;
+            return dst;
+        }
+    }
+    else
+    {
+        SpeechBankWideResize(dst, v5);
+    }
+    if (v5 != 0)
+    {
+        const wchar_t *srcData = (const wchar_t *)F3WStringData((F3WString *)src);
+        wchar_t *dstData = F3WStringData(dst);
+        memcpy_s(dstData, 2u * dst->cap, srcData + offset, 2u * v5);
+        dst->len = v5;
+        dstData[v5] = 0;
+    }
+    return dst;
+}
+
+// SpeechBankRecordMountFinalize  (sub_624A10, 0x624A10 - 0x624A72) -- the wide-string
+// finalize: release the self-ref wrapper block (the 4-byte LHAlloc(4) block: the
+// original releases it unconditionally -- LHFree(0) is a no-op) and the wide string's
+// heap buffer (if cap >= 8), then reset the string to the empty SSO layout.
+// The dead per-element loop's three iterator slots (v38/v39/v40 -- begin / end /
+// the third iterator, always 0 in this build) and the entry-release loop
+// (sub_6230B0) are no-ops; the conditional LHFree of the begin iterator can never
+// fire here.
+static void SpeechBankRecordMountFinalize(F3WString *v34, DWORD *selfRef)
+{
+    if (selfRef != 0)
+        LHFree((void *)selfRef);                     // the self-ref wrapper block (v37)
+    if (v34->cap >= 8)
+        LHFree((void *)v34->u.ptr);                  // the wide string's heap buffer
+    v34->len = 0;
+    v34->cap = 7;
+    v34->u.buf[0] = 0;
+}
+
+// SpeechBankRecordMountReload  (sub_18FAED0, 0x18FAED0 - 0x18FAF7E) -- the reload
+// path's per-record dispatch: the +0x1C heap-manager slot + the audio-pack building
+// chain (sub_145E6A0 -- the audio-pack builder) plus the shared-slot free path
+// (sub_145D520 -- CopySharedSlot).  Deep dependency chain -- out of scope here.
+// Stub: returns the null out-slot (the same result the original produces in this
+// build -- no provider is ever matched).
+static F3SharedBuffer **SpeechBankRecordMountReload(char **recordNameSlot)
+{
+    (void)recordNameSlot;
+    return 0;   // no provider matched (empty archive collection)
+}
+
+// SpeechBankRecordMountReloadDispatch  (sub_42D3D0, 0x42D3D0 - 0x42D366) -- the reload
+// path's vector-insert dispatch: the +0x14/+0x18/+0x1C record-array steps
+// (sub_42E790 -- sub_42FD30 vector insert) and the plain append (*v4 = *a2;
+// v1[6] = v4 + 1).  Deep dependency chain (sub_42E790 -- sub_42FD30) -- out of scope.
+// Stub: the v1[6] append + the vtable release of the out-slot entry.
+static DWORD SpeechBankRecordMountReloadDispatch(F3SharedBuffer **outSlot)
+{
+    (void)outSlot;
+    return 0;
+}
+
+// SpeechBankRecordMount  (0x61B990 - 0x61BCB4) -- the per-record "speech.adb" mount +
+// entry dispatch (the record-name walk over the [1DBD0F8, 1DBD0FC) table of 36-byte
+// records, the name compare, the "speech.adb" shared-slot build + the per-position
+// toupper prefix test, the collection mount (FileSubsysMountCollection with the
+// sub_61B920 callback), the per-element heap-manager / entry dispatches (dead: the
+// begin/end entry iterators are always 0), and the reload path (sub_18FAED0 +
+// sub_42D3D0).  Deep dependency chain (sub_145E440 / sub_145E6A0 / sub_625720 /
+// sub_42FD30 / sub_145D520) -- the per-element dispatch and the reload path are
+// documented stubs.
+//  [NOT byte-identical] placement-dependent (the E8 calls + the entry vtable
+//  slot-2 dispatch + the __security_cookie prologue).
+static void SpeechBankRecordMount(const char **nameSlotAddr)
+{
+    // === the record-find loop (the name compare)
+    DWORD *v1 = (DWORD *)g_dword_1DBD0F8;   // the record-array start
+
+    if (g_dword_1DBD0F8 != g_dword_1DBD0FC)   // the table is empty -> return immediately
+    {
+        for (;;)
+        {
+            const char *v2 = "";
+            if (*nameSlotAddr != 0)
+                v2 = *(const char **)*nameSlotAddr;
+            const char *v4 = "";
+            const char **slot = (const char **)((char *)v1 + 4);   // the record's +4 word (the name-slot pointer)
+            if (*slot != 0)
+                v4 = *(const char **)*slot;
+            if (stricmp(v4, v2) == 0)
+                break;
+            v1 += 9;                                               // += 0x24 (36 bytes)
+            if (v1 == (DWORD *)g_dword_1DBD0FC)
+                return;                                             // not found
+        }
+
+        // === the "speech.adb" shared-slot build
+        F3SharedBuffer *slotSpeech = 0;
+        SetSharedSlot(&slotSpeech, "speech.adb", -1);   // the original's size arg 0xFFFFFFFF
+
+        // === the prefix test (the mount decision)
+        const char *v5 = "";
+        if (*nameSlotAddr != 0)
+            v5 = *(const char **)*nameSlotAddr;
+        const char *v6 = GetSlotString(&slotSpeech);   // the "speech.adb" string (or "" fallback)
+        size_t v7 = strlen(v6);
+        char v8;
+        if (v7 != 0)
+        {
+            if (*v5 != 0)
+            {
+                v8 = 1;
+                const char *pos = v5;
+                for (;;)
+                {
+                    if (toupper((unsigned char)*pos) == toupper((unsigned char)*v6)
+                        && strnicmp(pos, v6, v7) == 0)
+                        break;
+                    if (*++pos == 0)
+                    {
+                        v8 = 0;
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                v8 = 0;
+            }
+        }
+        else
+        {
+            v8 = 1;
+        }
+        ReleaseSharedSlot(&slotSpeech);
+
+        if (v8 != 0)
+        {
+            // === the mounted path
+            F3WString mountWide;                 // v34 -- the mount wide string
+            F3WStringFromAnsi(&mountWide, "");   // the empty wide string
+
+            DWORD *selfRef = (DWORD *)LHAlloc(4);   // v37 -- the wrapper slot (the block pointer)
+            if (selfRef != 0)
+                *selfRef = (DWORD)&selfRef;          // the block contains the wrapper slot's address
+            // (the not-allocated case leaves selfRef == 0 -- the original's var_1C = 0)
+
+            F3WString recordWide;                  // v27 -- the record-name wide string
+            const char **recordSlot = (const char **)((char *)v1 + 4);   // the record's +4 word
+            const char *recordNameStr = (*recordSlot != 0) ? *(const char **)*recordSlot : "";
+            F3WStringFromAnsi(&recordWide, recordNameStr);
+            SpeechBankWideAssign(&mountWide, &recordWide, 0, 0xFFFFFFFFu);
+            // the record-name wide string's e1/e2 fields are carried into the mount
+            // wide string (the original's v35 = v29 / v36 = v30 -- the e1/e2 copy)
+            mountWide.e1 = recordWide.e1;
+            mountWide.e2 = recordWide.e2;
+
+            // the record-name wide string's heap-buffer free (the original's
+            // "if (v28 >= 8) LHFree()" -- the cap check + the heap-buffer free)
+            if (recordWide.cap >= 8)
+                LHFree((void *)recordWide.u.ptr);
+
+            // === the collection mount (FileSubsysMountCollection with sub_61B920)
+            void *fs = GetFileSubsystem(0);
+            void *outEntry = 0;
+            FileSubsysMountCollection(fs, &outEntry,
+                                      (unsigned char (__cdecl *)(int, int))SpeechBankRecordMountCallback,
+                                      (int)&mountWide);
+            if (outEntry != 0)
+                ((void (__stdcall *)(void *))F3_VT(outEntry)[2])(outEntry);   // vtable slot 2
+
+            // === the dead per-element loop head -- the wrapper null check fires
+            // (the not-allocated case); the loop itself is dead (begin == end == 0).
+            if (selfRef == 0)
+                F3InvalidParam();                    // the original fires this when the wrapper is null
+
+            // === the wide-string finalize (sub_624A10)
+            SpeechBankRecordMountFinalize(&mountWide, selfRef);
+        }
+        else
+        {
+            // === the reload path (v8 == 0 -- the record name does not prefix-match)
+            void *hm = GetHeapManager();            // the 144-byte manager (getter)
+            (void)hm;
+            // sub_18FAED0(a1: v1 + 1) -- the per-record reload (deep-chain stub:
+            // sub_145E6A0 -- the audio-pack building / OpenMemoryFile chain)
+            F3SharedBuffer **outEntry = SpeechBankRecordMountReload((char **)((char *)v1 + 4));
+            // sub_42D3D0(a1: &v26) -- the reload dispatch (deep-chain stub: the vector
+            // insert core via sub_42E790 -- sub_42FD30)
+            (void)SpeechBankRecordMountReloadDispatch(outEntry);
+        }
+    }
+}
+
+
+// ---- forward declarations for the reload chain (defined below in this file)
+static void *VfsAllocCacheAlloc(void *cache, int wait);
+static int VfsAllocCacheFinalize(void *cache);
+static void *EventObjCtor(void *obj, int manualReset, int initialState);
+static CRITICAL_SECTION *MgrCs(void);
+static int WaitForEvent(void *obj, int dwMilliseconds, int bAlertable);
+
+// CLoadAudioBankDtor  (sub_14634F0, 0x14634F0 - 0x1463514) -- the CLoadAudioBank
+// destructor (thiscall + retn 4): the shared-slot release at this+0x0C
+// (ReleaseSharedSlot), the ICommand vftable install, and the LHFree when the
+// free flag is set.
+static void *CLoadAudioBankDtor(void *obj, char a2)
+{
+    F3SharedBuffer **slot = (F3SharedBuffer **)((char *)obj + 0x0C);
+    ReleaseSharedSlot(slot);
+    *(DWORD *)obj = 0x01B6F458;   // &NLHAudio::NThreading::ICommand::`vftable' (original VA)
+    if (a2 & 1)
+        LHFree(obj);
+    return obj;
+}
+
+// CLoadAudioBankSize  (sub_14621A0, 0x14621A0 - 0x14621A7) -- the size getter
+// (no-arg, returns 20 = the 20-byte staged object).
+static int CLoadAudioBankSize(void) { return 20; }
+
+// CLoadAudioBankAtExitInit  (sub_14602D0, 0x14602D0 - 0x14602F5) -- the at-exit
+// init (thiscall + retn 4): the deep file-subsystem mount chain (sub_1465720 --
+// sub_146C2D0 / FileSubsysMountCollection / sub_146C410 / ...) is out of scope
+// here.  [STUB]
+static int CLoadAudioBankAtExitInit(void *obj) { (void)obj; return 0; }
+
+// the CLoadAudioBank vftable (0x1B6F7C0): the destructor / size getter / at-exit
+// init / rdata marker (same shape as the XAudio2System vftables).
+static const void *kCLoadAudioBankVftable[] = {
+    (const void *)CLoadAudioBankDtor,      // 0x14634F0
+    (const void *)CLoadAudioBankSize,      // 0x14621A0
+    (const void *)CLoadAudioBankAtExitInit, // 0x14602D0 (stub)
+    (const void *)0x1C410D4                // rdata entry (original VA; garbage marker)
+};
+
+// SpeechBankRecordReloadAudioBank  (sub_18FADD0, 0x18FADD0 - 0x18FAE16) -- the
+// reload-path audio-comms dispatch: the critical-section enter (stru_20FC8AC,
+// lazy-initialised via MgrCs()), the record's name read (the slot-0 deref with
+// the empty-string fallback), the sub_1460BC0 chain (EventObjCtor(this=var_88,
+// 1, 0) -> the 0x84-byte event wrapper; VfsAllocCacheAlloc(&unk_1DDC830, 1) ->
+// stage a 1-slot allocation; on success: the CLoadAudioBank vftable install +
+// InitSharedSlot(this=+0x0C) + +4 = the counter (pre-increment) + +8 = the flag
+// int + SetSaveGamePath(this=+0x0C, Source) + +0x10 = nullptr (a4 != 0) +
+// VfsAllocCacheFinalize), the event close (sub_18C45E0 / CloseHandle on the event
+// handle at +0x80), and the counter++ (the sub_145D550 tail).  Returns the
+// pre-increment counter value (the same value the original stores into the
+// record's +0x08 word).
+//  [NOT byte-identical] placement-dependent (relative calls to the shared-slot
+//  family / VfsAllocCacheAlloc / VfsAllocCacheFinalize / EventObjCtor /
+//  CloseHandle / the EnterCriticalSection IAT thunk + the __security_cookie
+//  prologue).
+static int SpeechBankRecordReloadAudioBank(const char **recordStart, int a2, char a3)
+{
+    EnterCriticalSection(MgrCs());              // EnterCriticalSection(&stru_20FC8AC)
+
+    DWORD *staged = 0;
+    const char *source = "";
+    if (*recordStart != 0)
+        source = *(const char **)*recordStart;  // v3 = **record (or Str1)
+
+    DWORD counter = g_dword_1D6A6E8;              // the a1 int param (captured pre-chain)
+
+    BYTE eventObj[0x84];                          // var_88 -- the 0x84-byte event wrapper
+    EventObjCtor(eventObj, 1, 0);                 // sub_1460BC0's step 1
+    staged = (DWORD *)VfsAllocCacheAlloc(g_unk_1DDC830, 1);
+    if (staged != 0)
+    {
+        staged[0] = (DWORD)kCLoadAudioBankVftable;               // the vftable install
+        InitSharedSlot((F3SharedBuffer **)((char *)staged + 0x0C));  // the null shared slot
+        *((DWORD *)staged + 2) = (DWORD)a2;                       // +8  = the flag-byte int (a3 of sub_1460BC0)
+        *((DWORD *)staged + 1) = counter;                          // +4  = the counter (pre-increment)
+        SetSaveGamePath((F3SharedBuffer **)((char *)staged + 0x0C), source);   // thiscall
+        *((DWORD *)staged + 4) = (a3 != 0) ? 0 : (DWORD)eventObj;  // +0x10 = nullptr when a4 (the char) != 0
+        VfsAllocCacheFinalize(g_unk_1DDC830);
+        if (a3 == 0)
+            WaitForEvent(eventObj, 0xFFFFFFFFu, 0);               // the original's a4 == 0 wait
+    }
+    CloseHandle(*(HANDLE *)((char *)eventObj + 0x80));            // sub_18C45E0 (CloseHandle(*(var_88 + 0x80)))
+
+    int ret = (int)g_dword_1D6A6E8;
+    g_dword_1D6A6E8++;                                            // the sub_145D550 counter++
+
+    LeaveCriticalSection(MgrCs());
+    return ret;
+}
+
+// SpeechBankRecordReload  (0x61A9B0 - 0x61AA1E)  -- the per-record "reload the
+// current record" dispatch: the record-name walk over the [1DBD0F8, 1DBD0FC)
+// 36-byte record table (0x24-byte steps, the name slot at record+0), the +0x21
+// flag byte check (the byte == 0 -> the int 1), the GetHeapManager call (the
+// original passes the 144-byte manager as ecx to sub_18FADD0 -- a dead load,
+// fnv-discarded here), and the SpeechBankRecordReloadAudioBank re-write of the
+// record's +0x08 word.  [NOT byte-identical] placement-dependent (the E8 calls
+// to __stricmp / GetHeapManager / SpeechBankRecordReloadAudioBank + the
+// __security_cookie prologue).
 static void SpeechBankRecordReload(const char **nameSlotAddr)
 {
-    (void)nameSlotAddr;
+    DWORD *v1 = (DWORD *)g_dword_1DBD0F8;   // the record-array start
+
+    if (g_dword_1DBD0F8 != g_dword_1DBD0FC)   // the table is empty -> return immediately
+    {
+        for (;;)
+        {
+            const char *v2 = "";
+            if (*nameSlotAddr != 0)
+                v2 = *(const char **)*nameSlotAddr;
+            const char *v3 = "";
+            if (*v1 != 0)
+                v3 = *(const char **)*v1;
+            if (stricmp(v3, v2) == 0)
+                break;
+            v1 += 9;                                    // += 0x24 (36 bytes)
+            if (v1 == (DWORD *)g_dword_1DBD0FC)
+                return;                                  // not found
+        }
+
+        // === the +0x21 flag byte check + the reload dispatch
+        int v4 = (*(BYTE *)((char *)v1 + 0x21) == 0) ? 1 : 0;
+        void *hm = GetHeapManager();                     // the 144-byte manager (getter)
+        (void)hm;
+        *(DWORD *)((char *)v1 + 8) = SpeechBankRecordReloadAudioBank((const char **)v1, v4, 1);
+    }
 }
 
 //  SpeechBankTablePass  (0x61C080 - 0x61C119)  -- the speech-bank table pass:
@@ -8457,7 +9986,6 @@ static F3SharedBuffer *g_dword_1DDC81C = 0;   // 0x1DDC81C: the GAME path slot (
 static BYTE  g_byte_1DDC828 = 0;              // 0x1DDC828: InitVirtualFileSystem done flag
 static DWORD g_dword_1DDC820 = 0;             // 0x1DDC820: the CProcessDelegateThiscall object (16 bytes)
 static DWORD g_dword_1DDC824 = 0;             // 0x1DDC824: query-table mode (2 = drain)
-static BYTE  g_unk_1DDC830[0x58];             // 0x1DDC830: the main (80/4096) allocation-cache object (0x58: the +0x18 init flag / +0x34 critical section / the +0x10/+0x14 fields)
 static DWORD g_off_1D6A80C[2] = { kCProcessDelegateStaticVftable, 0 };  // 0x1D6A80C: {vtable, VfsGetQueryTable}
 static DWORD g_off_1D6E9C8[2] = { kCProcessDelegateStaticVftable, 0 };  // 0x1D6E9C8: {vtable, AudioProcessDelegateTick}
 static BYTE  g_byte_1DDCF28 = 0;              // 0x1DDCF28: slot-1 callback registered flag

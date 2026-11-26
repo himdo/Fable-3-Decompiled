@@ -42,57 +42,63 @@
 "source": "gamemain"
 },
 {
-"name": "?sub_625D10@@YAHPAX0H@Z",
-"rva": 2252048,
+"name": "?sub_1893EB0@@YAXPAPAUF3SharedBuffer@@H@Z",
+"rva": 21577392,
+"size": 254,
+"source": "gamemain"
+},
+{
+"name": "?sub_1891540@@YAHPAXPAKH@Z",
+"rva": 21566784,
+"size": 237,
+"source": "gamemain"
+},
+{
+"name": "?sub_19230E0@@YAXPAX@Z",
+"rva": 22163680,
+"size": 388,
+"source": "gamemain"
+},
+{
+"name": "?sub_1913F40@@YAXPAX@Z",
+"rva": 22101824,
+"size": 328,
+"source": "gamemain"
+},
+{
+"name": "?sub_1913690@@YAXPAX@Z",
+"rva": 22099600,
+"size": 328,
+"source": "gamemain"
+},
+{
+"name": "?sub_1912E10@@YAXPAX@Z",
+"rva": 22097424,
+"size": 339,
+"source": "gamemain"
+},
+{
+"name": "?sub_19124C0@@YAXPAX@Z",
+"rva": 22095040,
+"size": 365,
+"source": "gamemain"
+},
+{
+"name": "?sub_5493E0@@YAXPAX@Z",
+"rva": 1348576,
 "size": 114,
 "source": "gamemain"
 },
 {
-"name": "?sub_18EBEB0@@YAHXZ",
-"rva": 21937840,
-"size": 22,
+"name": "?sub_624FA0@@YAPAKPAK0@Z",
+"rva": 2248608,
+"size": 124,
 "source": "gamemain"
 },
 {
-"name": "?sub_18ED640@@YAHPAX@Z",
-"rva": 21943872,
-"size": 1081,
-"source": "gamemain"
-},
-{
-"name": "?sub_6240F0@@YAHPAX@Z",
-"rva": 2244848,
-"size": 99,
-"source": "gamemain"
-},
-{
-"name": "?sub_1892420@@YAPAXPAX0H@Z",
-"rva": 21570592,
-"size": 121,
-"source": "gamemain"
-},
-{
-"name": "?sub_1922280@@YAXPAX@Z",
-"rva": 22160000,
-"size": 370,
-"source": "gamemain"
-},
-{
-"name": "?sub_18917A0@@YAHPAX@Z",
-"rva": 21567392,
-"size": 97,
-"source": "gamemain"
-},
-{
-"name": "?sub_626D20@@YAPAXPAXPAH@Z",
-"rva": 2256160,
-"size": 402,
-"source": "gamemain"
-},
-{
-"name": "?sub_6254B0@@YAPAXPAX0@Z",
-"rva": 2249904,
-"size": 260,
+"name": "?sub_626AA0@@YAPAKPAXPAK111@Z",
+"rva": 2255520,
+"size": 405,
 "source": "gamemain"
 },
 {
