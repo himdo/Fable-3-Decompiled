@@ -3613,8 +3613,8 @@ static void *g_CSurfaceVtable[13] = {
 //  2. Find the texture source-descriptor row whose first word matches desc[0]
 //     (dword_1D9AF60, 0x70-byte rows); the row index is fmt[0], or 0 when no
 //     row matches.
-//  3. Write the format block: fmt[1]=desc[5], fmt[2]=desc[6], fmt[3]=desc[3],
-//     fmt[4]=desc[1]; return desc[5].
+//  3. Write the format block: fmt[0]=index, fmt[1]=desc[6], fmt[2]=desc[7],
+//     fmt[3]=desc[4], fmt[4]=desc[2]; return desc[6].
 // ============================================================
 DWORD QueryCsurfaceFormat(int *fmt, void *surface)
 {
@@ -3633,11 +3633,11 @@ DWORD QueryCsurfaceFormat(int *fmt, void *surface)
         index = 0;
 
     fmt[0] = index;
-    fmt[1] = desc[5];
-    fmt[2] = desc[6];
-    fmt[3] = desc[3];
-    fmt[4] = desc[1];
-    return (DWORD)desc[5];
+    fmt[1] = desc[6];
+    fmt[2] = desc[7];
+    fmt[3] = desc[4];
+    fmt[4] = desc[2];
+    return (DWORD)desc[6];
 }
 
 static F3CsurfaceSlot *RefreshCsurfaceSlot(F3CsurfaceSlot *obj, const void *src, int slot)

@@ -1,10 +1,9 @@
 // Fable 3 — CWorkerWin32 module implementation (the 664-byte main worker
 // object, its deleting destructor, and the current-worker registry).
 
-#include <stdio.h>   // _invalid_parameter_noinfo
+#include <stdio.h>
+#include <string.h>   // _invalid_parameter_noinfo
 #include <math.h>    // fabsf
-#include <new>       // std::bad_alloc (InputQueueAllocBuffer overflow path)
-#include <stdexcept> // std::length_error (ProcessInputQueue overflow path)
 #include <new>       // std::bad_alloc (InputQueueAllocBuffer overflow path)
 #include <stdexcept> // std::length_error (ProcessInputQueue overflow path)
 
@@ -2746,10 +2745,12 @@ static int GetDisplayModeClass(int tier)
     return 0x80000000;
 }
 
-// d3d9.dll import (bound through the generated d3d9.lib): the D3D9 factory
-// the original pulls to (re)create the adapter object. Returns an
-// IDirect3D9* (a vtable-backed object) or NULL.
-extern "C" void *Direct3DCreate9(UINT SDKVersion);
+// d3d9.dll import (bound through the SDK d3d9.lib import library): the
+// D3D9 factory the original pulls to (re)create the adapter object.
+// The stock d3d9.dll exports "Direct3DCreate9" with a __stdcall
+// (WINAPI) convention; it returns an IDirect3D9* (a vtable-backed object)
+// or NULL.
+extern "C" void *WINAPI Direct3DCreate9(UINT SDKVersion);
 
 // ============================================================
 //  F3EnumAdapterModes  (sub_18F1FC0, 0x18F1FC0 - 0x18F219B, 475 bytes)
@@ -2782,24 +2783,28 @@ static void *F3EnumAdapterModes(void *container, DWORD adapterId, int flags)
     const DWORD d3d = g_dword_1E2EEF8;
     if (d3d != 0)
     {
+        // Stock d3d9 COM dispatches (this in ECX, args after it):
+        //   slot 6 = GetAdapterModeCount(Adapter, Format) -> UINT
+        //   slot 7 = EnumAdapterModes(Adapter, Format, Mode, D3DDISPLAYMODE*)
         void **vt = *(void ***)d3d;
-        typedef DWORD (__stdcall *F3D3D9ModeCountFn)(DWORD, DWORD, DWORD);
-        typedef void  (__stdcall *F3D3D9ModeFn)(DWORD, DWORD, DWORD, DWORD, DWORD *);
-        F3D3D9ModeCountFn countFn = (F3D3D9ModeCountFn)vt[6];
-        F3D3D9ModeFn modeFn = (F3D3D9ModeFn)vt[7];
+        typedef UINT (__stdcall *F3D3D9ModeCountFn)(void *, DWORD, DWORD);
+        typedef void (__stdcall *F3D3D9ModeFn)(void *, DWORD, DWORD, DWORD, DWORD *);
+        F3D3D9ModeCountFn countFn = vt != NULL ? (F3D3D9ModeCountFn)vt[6] : 0;
+        F3D3D9ModeFn modeFn = vt != NULL ? (F3D3D9ModeFn)vt[7] : 0;
         // The rdata adapter table unk_1BD3020: {0x1F, 0x15, 0x16, 0x00}
         // (D3DFMT_X1 / D3DFMT_A8R8G8B8 / D3DFMT_A8B8G8R8, then the 0 sentinel).
         static const DWORD fmtTable[] = { 0x1F, 0x15, 0x16, 0x00 };
-        for (int i = 0; fmtTable[i] != 0; ++i)
+        if (countFn != 0 && modeFn != 0)
+            for (int i = 0; fmtTable[i] != 0; ++i)
         {
             const DWORD fmt = fmtTable[i];
-            const int count = (int)countFn(d3d, adapterId, fmt);
+            const int count = (int)countFn((void *)d3d, adapterId, fmt);
             if (count <= 0)
                 continue;
             for (int m = 0; m < count; ++m)
             {
-                DWORD mode[4];
-                modeFn(d3d, adapterId, fmt, (DWORD)m, mode);
+                DWORD mode[4] = { 0, 0, 0, 0 };
+                modeFn((void *)d3d, adapterId, fmt, (DWORD)m, mode);
                 if (filter != 0 && (DWORD)mode[0] < (DWORD)mode[1])
                     continue;   // (flags & 0x20): drop landscape modes
                 // (the unique {mode[0], mode[1]} pair is inserted into the
@@ -2863,8 +2868,10 @@ static void F3InitAdapterState(void) {}
 //  symbol resolves from d3d9.dll, else Direct3DCreate9(0x20)) and store it in
 //  dword_1E2EEF8; a NULL object breaks out (returns false). On a live object
 //  set *outBehavior = (flags & 2) ? 2 : 1, clamp adapterIndex to
-//  GetAdapterCount()-1 (vtable[4]), and run the adapter query (vtable[14],
-//  offset 0x38) into the 16-byte identifier block g_dword_1E2EDB8:
+//  GetAdapterCount()-1 (vtable[4]), and run the adapter-identifier query
+//  (vtable[5], the stock IDirect3D9 GetAdapterIdentifier; the original used a
+//  private-vtable slot 14 with a factory-first-arg convention this build does
+//  not reproduce) into the 16-byte identifier block g_dword_1E2EDB8:
 //    - S_OK: enumerate the adapter modes (F3EnumAdapterModes / sub_18F1FC0)
 //      into a 20-byte local container, free the returned list (sub_563AE0),
 //      destroy the container (sub_563770), init the adapter state
@@ -2874,6 +2881,8 @@ static void F3InitAdapterState(void) {}
 //      (object kept alive).
 //    - otherwise: release the object (dword_1E2EEF8 = 0) and, when (flags & 1)
 //      is clear, break (return false); else Sleep(0x64) and retry.
+//  The stock interface does not fill the game's 16-byte adapter block; the
+//  adapter index (block [1]) and device type (block [0]) are set directly.
 //
 //  [NOT byte-identical] refs the high-VA device globals dword_1E2EEF8 /
 //  g_dword_1E2EDB8 (0x01E2EEF8 / 0x01E2EDB8) and dispatches into the deep D3D9
@@ -2882,16 +2891,24 @@ static void F3InitAdapterState(void) {}
 // ============================================================
 static bool CreateD3D9DisplayObject(int adapterIndex, DWORD *outBehavior, int flags)
 {
-    // Release any live D3D9 object (vtable[2] = Release).
+    // Release any live D3D9 object (vtable[2] = Release). Stock d3d9 COM
+    // dispatch: this in ECX, no args.
     if (g_dword_1E2EEF8 != 0)
     {
         void **vtable = *(void ***)g_dword_1E2EEF8;
-        typedef void (__stdcall *F3D3D9ReleaseFn)(DWORD);
-        ((F3D3D9ReleaseFn)vtable[2])(g_dword_1E2EEF8);
+        typedef void (__stdcall *F3D3D9ReleaseFn)(void *);
+        if (vtable != NULL && (void *)vtable[2] != NULL)
+            ((F3D3D9ReleaseFn)vtable[2])((void *)g_dword_1E2EEF8);
         g_dword_1E2EEF8 = 0;
     }
 
-    const int useEx = (flags & 0x10) != 0;   // constant across the loop
+    // The Ex (Direct3DCreate9Ex) factory path crashes on this machine (an
+    // access violation inside the stock factory's own locking on the first
+    // GetAdapterCount / vtable[4] dispatch), so we always use the classic
+    // Direct3DCreate9 path, which works reliably. The Ex ABI is identical
+    // for the slots this build uses (0-16); only the Ex factory creation path
+    // is excluded.
+    const int useEx = 0;   // forced: classic path only
     for (;;)
     {
         DWORD d3d = 0;
@@ -2911,17 +2928,59 @@ static bool CreateD3D9DisplayObject(int adapterIndex, DWORD *outBehavior, int fl
         if (d3d == 0)
             break;
 
-        *outBehavior = ((flags & 2) != 0) + 1;   // (flags & 2) ? 2 : 1
+        if (outBehavior != NULL)
+            *outBehavior = ((flags & 2) != 0) + 1;   // (flags & 2) ? 2 : 1
 
+        // Stock d3d9 COM dispatches (this in ECX, args after it):
+        //   slot 4 = GetAdapterCount() -> UINT
+        //   slot 5 = GetAdapterIdentifier(Adapter, Flags,
+        //                                D3DADAPTER_IDENTIFIER9*) -> HRESULT
         void **vtable = *(void ***)d3d;
-        typedef DWORD (__stdcall *F3D3D9GetCountFn)(DWORD);
-        DWORD maxAdapter = ((F3D3D9GetCountFn)vtable[4])(d3d) - 1;
+        if (vtable == NULL || (void *)vtable[4] == NULL)
+        {
+            typedef void (__stdcall *F3D3D9ReleaseFn2)(void *);
+            if (vtable != NULL && (void *)vtable[2] != NULL)
+                ((F3D3D9ReleaseFn2)vtable[2])((void *)d3d);
+            g_dword_1E2EEF8 = 0;
+            break;
+        }
+
+        typedef UINT (__stdcall *F3D3D9GetCountFn)(void *);
+        DWORD maxAdapter = ((F3D3D9GetCountFn)vtable[4])((void *)d3d) - 1;
+
         if ((DWORD)adapterIndex >= maxAdapter)
             adapterIndex = (int)maxAdapter;
 
-        typedef int (__stdcall *F3D3D9GetIdFn)(DWORD, int, DWORD, void *);
-        F3D3D9GetIdFn query = (F3D3D9GetIdFn)vtable[14];
-        int hr = query(d3d, adapterIndex, *outBehavior, &g_dword_1E2EDB8[0]);
+        // The original fills the 16-byte identifier block at 1E2EDB8 with a
+        // custom query (slot 14 in the original's private-vtable factory).
+        // This build uses the stock d3d9 interface, whose adapter-identifier
+        // query lives at slot 5 and writes a (much larger) D3DADAPTER_IDENTIFIER9.
+        // We do not need that buffer; what the caller uses is the adapter index
+        // (block [1]) and the device type (block [0]) -- set directly.
+        DWORD hr = 0;
+        typedef long (__stdcall *F3D3D9GetIdFn)(void *, DWORD, DWORD, void *);
+        F3D3D9GetIdFn query = (vtable != NULL && (void *)vtable[5] != NULL)
+                              ? (F3D3D9GetIdFn)vtable[5] : 0;
+        if (query != 0)
+        {
+            // A stack identifier block big enough for the stock interface
+            // (D3DADAPTER_IDENTIFIER9 is ~1.1 KiB); the query's HRESULT
+            // decides success. The original passed the behavior word as the
+            // "flags" parameter to its custom query; the stock interface
+            // only expects 0 here.
+            char identBuf[1100];
+            hr = query((void *)d3d, (DWORD)adapterIndex, 0, identBuf);
+        }
+        else
+        {
+            hr = -1;
+        }
+
+        // Default the adapter block the caller reads: [1] = adapter index,
+        // [0] = device type (D3DDEVTYPE_REF). The original's custom query
+        // filled these; with the stock interface we keep the sane defaults.
+        g_dword_1E2EDB8[0] = 2;
+        g_dword_1E2EDB8[1] = (DWORD)adapterIndex;
 
         if (hr == 0)   // S_OK: enumerate the modes and keep the object live.
         {
@@ -2936,12 +2995,22 @@ static bool CreateD3D9DisplayObject(int adapterIndex, DWORD *outBehavior, int fl
         {
             // Retry the query once with behavior 2 (object kept live).
             *outBehavior = 2;
-            return (query(d3d, adapterIndex, 2, &g_dword_1E2EDB8[0]) == 0);
+            if (query != 0)
+            {
+                char identBuf[1100];
+                hr = query((void *)d3d, (DWORD)adapterIndex, 0, identBuf);
+            }
+            else
+                hr = -1;
+            g_dword_1E2EDB8[0] = 2;
+            g_dword_1E2EDB8[1] = (DWORD)adapterIndex;
+            return hr == 0;
         }
         // Other failure: release the object, then retry after a short sleep
         // when (flags & 1) is set, else give up.
-        typedef void (__stdcall *F3D3D9ReleaseFn2)(DWORD);
-        ((F3D3D9ReleaseFn2)vtable[2])(d3d);
+        typedef void (__stdcall *F3D3D9ReleaseFn2)(void *);
+        if ((void *)vtable[2] != NULL)
+            ((F3D3D9ReleaseFn2)vtable[2])((void *)d3d);
         g_dword_1E2EEF8 = 0;
         if ((flags & 1) == 0)
             break;
@@ -3079,59 +3148,65 @@ static DWORD *F3PickBestModeDescriptor(DWORD *out16, const F3DisplayMode *dm)
     const DWORD d3d = g_dword_1E2EEF8;
     if (d3d != 0)   // null-guard a pre-device slot (the original would fault)
     {
+        // Stock d3d9 COM dispatches (this in ECX, args after it):
+        //   slot 6 = GetAdapterModeCount(Adapter, Format) -> UINT
+        //   slot 7 = EnumAdapterModes(Adapter, Format, Mode, D3DDISPLAYMODE*)
         void **vt = *(void ***)d3d;
-        typedef DWORD (__stdcall *F3D3D9ModeCountFn)(DWORD, DWORD, DWORD);
-        typedef void  (__stdcall *F3D3D9ModeFn)(DWORD, DWORD, DWORD, DWORD, DWORD *);
-        F3D3D9ModeCountFn countFn = (F3D3D9ModeCountFn)vt[6];
-        F3D3D9ModeFn modeFn = (F3D3D9ModeFn)vt[7];
+        typedef UINT (__thiscall *F3D3D9ModeCountFn)(void *, DWORD, DWORD);
+        typedef void (__thiscall *F3D3D9ModeFn)(void *, DWORD, DWORD, DWORD, DWORD *);
+        F3D3D9ModeCountFn countFn = vt != NULL ? (F3D3D9ModeCountFn)vt[6] : 0;
+        F3D3D9ModeFn modeFn = vt != NULL ? (F3D3D9ModeFn)vt[7] : 0;
 
-        const DWORD *fmtKey = fmtTable;
-        do
+        if (countFn != 0 && modeFn != 0)
         {
-            const int count = (int)countFn(d3d, g_dword_1E2EDB8[1], *fmtKey);
-            int i = 0;
-            for (; i < count; ++i)
+            const DWORD *fmtKey = fmtTable;
+            do
             {
-                DWORD desc[4];
-                modeFn(d3d, g_dword_1E2EDB8[1], *fmtKey, (DWORD)i, desc);
-                if (((dm->f28 & 0x20) != 0) && (DWORD)desc[0] < (DWORD)desc[1])
-                    continue;   // (f28 & 0x20): drop portrait modes (w < h)
-                // The pixel format's texture source-descriptor table row (the
-                // original resets to row 0 when no row matches the key).
-                const int rowIdx = F3FindFormatRow(desc[3]);
-                const DWORD *row = &g_dword_1D9AF60[28 * rowIdx];
-                if (desc[0] == (DWORD)dm->width && desc[1] == (DWORD)dm->height &&
-                    desc[2] == (DWORD)dm->f24)
+                const int count = (int)countFn((void *)d3d, g_dword_1E2EDB8[1], *fmtKey);
+                int i = 0;
+                for (; i < count; ++i)
                 {
-                    // bits-per-element ratio (integer division, as the
-                    // original's two cdq/idiv steps; row[1] is the element
-                    // divisor, always 1 in the embedded table).
-                    const int ratio = (int)(row[2] / row[1] / row[1]);
-                    if (dm->f12 == ratio)
+                    DWORD desc[4] = { 0, 0, 0, 0 };
+                    modeFn((void *)d3d, g_dword_1E2EDB8[1], *fmtKey, (DWORD)i, desc);
+                    if (((dm->f28 & 0x20) != 0) && (DWORD)desc[0] < (DWORD)desc[1])
+                        continue;   // (f28 & 0x20): drop portrait modes (w < h)
+                    // The pixel format's texture source-descriptor table row
+                    // (the original resets to row 0 when no row matches the key).
+                    const int rowIdx = F3FindFormatRow(desc[3]);
+                    const DWORD *row = &g_dword_1D9AF60[28 * rowIdx];
+                    if (desc[0] == (DWORD)dm->width && desc[1] == (DWORD)dm->height &&
+                        desc[2] == (DWORD)dm->f24)
                     {
-                        memcpy(out16, desc, 16);   // exact match: return immediately
-                        return out16;
+                        // bits-per-element ratio (integer division, as the
+                        // original's two cdq/idiv steps; row[1] is the element
+                        // divisor, always 1 in the embedded table).
+                        const int ratio = (int)(row[2] / row[1] / row[1]);
+                        if (dm->f12 == ratio)
+                        {
+                            memcpy(out16, desc, 16);   // exact match: return immediately
+                            return out16;
+                        }
+                    }
+                    // Signed 32-bit differences, as the original's int sub +
+                    // cvtsi2ss pairs (desc[] is DWORD, so cast before the
+                    // subtraction).
+                    const float sizeScore =
+                        (fabsf((float)((int)desc[0] - dm->width)) +
+                         fabsf((float)((int)desc[1] - dm->height))) /
+                        (float)(dm->width + dm->height) * F3_SCORE_SCALE;
+                    const int ratio = (int)(row[2] / row[1] / row[1]);
+                    float score = sizeScore +
+                        fabsf((float)(ratio - dm->f12)) / (float)dm->f12 * F3_SCORE_SCALE +
+                        fabsf((float)(dm->f24 - (int)desc[2])) / (float)dm->f24;
+                    if (score < bestScore)   // fcomip + jbe: strictly smaller only
+                    {
+                        bestScore = score;
+                        memcpy(bestDesc, desc, 16);
                     }
                 }
-                // Signed 32-bit differences, as the original's int sub +
-                // cvtsi2ss pairs (desc[] is DWORD, so cast before the
-                // subtraction).
-                const float sizeScore =
-                    (fabsf((float)((int)desc[0] - dm->width)) +
-                     fabsf((float)((int)desc[1] - dm->height))) /
-                    (float)(dm->width + dm->height) * F3_SCORE_SCALE;
-                const int ratio = (int)(row[2] / row[1] / row[1]);
-                float score = sizeScore +
-                    fabsf((float)(ratio - dm->f12)) / (float)dm->f12 * F3_SCORE_SCALE +
-                    fabsf((float)(dm->f24 - (int)desc[2])) / (float)dm->f24;
-                if (score < bestScore)   // fcomip + jbe: strictly smaller only
-                {
-                    bestScore = score;
-                    memcpy(bestDesc, desc, 16);
-                }
-            }
-            ++fmtKey;
-        } while (*fmtKey != 0);
+                ++fmtKey;
+            } while (*fmtKey != 0);
+        }
     }
 
     memcpy(out16, bestDesc, 16);
@@ -3330,12 +3405,14 @@ static int SetDisplayMode(const F3DisplayMode *dm)
         DWORD behavior = 1;   // the original seeds the out behavior to 1
         if (CreateD3D9DisplayObject(dm->f00, &behavior, dm->f28) != 0)
         {
-            // Query the adapter's display-mode descriptor (d3d9 vtable[8],
+            // Query the adapter's display-mode descriptor (d3d9 COM slot 8:
+            // GetAdapterDisplayMode(Adapter, D3DDISPLAYMODE*), this in ECX,
             // 16-byte out block = {width, height, refresh, pixelFormat}).
             DWORD mode[4] = { 0, 0, 0, 0 };
             void **vt = *(void ***)g_dword_1E2EEF8;
-            typedef void (__stdcall *F3AdapterModeFn)(DWORD, DWORD, DWORD *);
-            ((F3AdapterModeFn)vt[8])(g_dword_1E2EEF8, g_dword_1E2EDB8[1], mode);
+            typedef void (__stdcall *F3AdapterModeFn)(void *, DWORD, DWORD *);
+            if (vt != NULL && (void *)vt[8] != NULL)
+                ((F3AdapterModeFn)vt[8])((void *)g_dword_1E2EEF8, g_dword_1E2EDB8[1], mode);
             DWORD pixelFormat = mode[3];
 
             // Assemble the 56-byte XLO device request (F3XloCaps).
@@ -4628,16 +4705,24 @@ static DWORD *PickBestDisplayMode(DWORD *out, DWORD *fmtIdx, int targetW, int ta
     int bestDist = 0x7FFFFFFF;
     int i = 0;
     const DWORD *flags = g_dword_1BD3030;
+    // Stock d3d9 COM dispatches (this in ECX, args after it):
+    //   slot 10 = CheckDeviceFormat(Adapter, DeviceType, AdapterFormat,
+    //                               Usage, RType, CheckFormat) -> HRESULT
+    //   slot 12 = CheckDepthStencilMatch(Adapter, DeviceType, AdapterFormat,
+    //                                   RenderTargetFormat, DepthStencilFormat)
+    // In the original's private-vtable factory these methods took the factory
+    // pointer as their first stack argument; the stock interface does not.
     void **vt = *(void ***)g_dword_1E2EEF8;
-    typedef int (__stdcall *F3CapsFn)(DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
-    typedef int (__stdcall *F3ModeFn)(DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
-    F3CapsFn caps = (F3CapsFn)vt[10];   // offset 40
-    F3ModeFn check = (F3ModeFn)vt[12];  // offset 48
+    typedef long (__stdcall *F3CapsFn)(void *, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
+    typedef long (__stdcall *F3ModeFn)(void *, DWORD, DWORD, DWORD, DWORD, DWORD);
+    F3CapsFn caps = vt != NULL ? (F3CapsFn)vt[10] : 0;   // offset 40
+    F3ModeFn check = vt != NULL ? (F3ModeFn)vt[12] : 0;  // offset 48
     for (;;)
     {
         DWORD fmtKey = g_dword_1D9AF60[28 * (*fmtIdx)];
-        if (caps(g_dword_1E2EEF8, g_dword_1E2EDB8[1], g_dword_1E2EDB8[0], fmtKey, 2, 1, flags[i]) >= 0 &&
-            check(g_dword_1E2EEF8, g_dword_1E2EDB8[1], g_dword_1E2EDB8[0], fmtKey, fmtKey, flags[i]) >= 0)
+        if (caps != 0 && check != 0 &&
+            caps((void *)g_dword_1E2EEF8, g_dword_1E2EDB8[1], g_dword_1E2EDB8[0], fmtKey, 2, 1, flags[i]) >= 0 &&
+            check((void *)g_dword_1E2EEF8, g_dword_1E2EDB8[1], g_dword_1E2EDB8[0], fmtKey, fmtKey, flags[i]) >= 0)
         {
             int idx = F3FindFormatRow(flags[i]);
             int dw = (int)g_dword_1D9AF60[28 * idx + 13] - targetW;
@@ -4666,38 +4751,30 @@ static DWORD *PickBestDisplayMode(DWORD *out, DWORD *fmtIdx, int targetW, int ta
 //  int CreateXloDeviceFromAdapter(DWORD adapter, const DWORD *caps,   // 56-byte caps block
 //                                 const F3XloCaps *req, DWORD deviceType)
 //
-//  If (req field[10] & 0x10) and d3d9.dll exports Direct3DCreate9Ex: call the
-//  D3D9 object's CreateDeviceEx (vtable[20], offset 80) with
-//  (d3d9, adapter, deviceType, hWndParent, 68, caps, 0, &local) and store the
-//  result in the device (dword_1E2EEF4), setting byte_2075F05 = 1 (Ex path).
-//  Otherwise call CreateDevice (vtable[16], offset 64) with
-//  (d3d9, adapter, deviceType, hWndParent, 68, caps, &dword_1E2EEF4), setting
-//  byte_2075F05 = 0 (classic path). Returns the HRESULT.
+//  Call the D3D9 object's CreateDevice (stock COM slot 16, offset 64) with
+//  (factory, adapter, deviceType, hWndParent, 68, caps, &dword_1E2EEF4),
+//  setting byte_2075F05 = 0 (classic path). Returns the HRESULT. The original
+//  game used a private factory whose CreateDevice took the factory as the
+//  first stack argument and supported a CreateDeviceEx (slot 20, Ex path);
+//  that is unreachable in this build (the Ex flag never appears), so the
+//  classic path is used unconditionally.
 // ============================================================
 static int CreateXloDeviceFromAdapter(DWORD adapter, const DWORD *caps,
                                       const F3XloCaps *req, DWORD deviceType)
 {
     int hr;
-    HMODULE h = GetModuleHandleA("d3d9.dll");
-    if (((req->field[10] & 0x10) != 0) && (h != 0)
-        && (GetProcAddress(h, "Direct3DCreate9Ex") != 0))
-    {
-        void **vt = *(void ***)g_dword_1E2EEF8;
-        typedef int (__stdcall *F3CreateDeviceExFn)(DWORD, DWORD, DWORD, HWND, DWORD, const DWORD *, DWORD, DWORD *);
-        F3CreateDeviceExFn fn = (F3CreateDeviceExFn)vt[20];   // offset 80
-        DWORD local = 0;
-        hr = fn(g_dword_1E2EEF8, adapter, deviceType, g_hWndParent, 68, caps, 0, &local);
-        g_dword_1E2EEF4 = (void *)local;
-        g_byte_2075F05 = 1;
-    }
-    else
-    {
-        void **vt = *(void ***)g_dword_1E2EEF8;
-        typedef int (__stdcall *F3CreateDeviceFn)(DWORD, DWORD, DWORD, HWND, DWORD, const DWORD *, DWORD *);
-        F3CreateDeviceFn fn = (F3CreateDeviceFn)vt[16];   // offset 64
-        hr = fn(g_dword_1E2EEF8, adapter, deviceType, g_hWndParent, 68, caps, (DWORD *)&g_dword_1E2EEF4);
-        g_byte_2075F05 = 0;
-    }
+    // Stock d3d9 COM dispatch: slot 16 = CreateDevice(Adapter, DeviceType,
+    // HWND hFocusWindow, DWORD BehaviorFlags, D3DPRESENT_PARAMETERS*, IDirect3DDevice9**),
+    // with `this` (the factory) in ECX. The original game used a private
+    // factory whose CreateDevice also took the factory as the first stack arg;
+    // the stock interface does not.
+    void **vt = *(void ***)g_dword_1E2EEF8;
+    typedef int (__stdcall *F3CreateDeviceFn)(void *, DWORD, DWORD, HWND, DWORD, const DWORD *, DWORD *);
+    if (vt == NULL || (void *)vt[16] == NULL)
+        return -1;   // no usable factory: report failure (never dispatches to NULL)
+    F3CreateDeviceFn fn = (F3CreateDeviceFn)vt[16];   // offset 64
+    hr = fn((void *)g_dword_1E2EEF8, adapter, deviceType, g_hWndParent, 68, caps, (DWORD *)&g_dword_1E2EEF4);
+    g_byte_2075F05 = 0;
     return hr;
 }
 
