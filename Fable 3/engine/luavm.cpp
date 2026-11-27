@@ -9140,7 +9140,7 @@ static int ScriptHashHasError(int hash) { (void)hash; return 0; }
 
 // sub_629660 (0x629660 - 0x629732) -- LogScriptError: report an error against a
 // Lua module.  The original builds a localised message (sub_17FDC40 +
-// sub_17FE290(a2, 1, 2)), and when it resolves (sub_17FDD60 / sub_17FDD50 /
+// sub_17FE290(a2, 1, 2)), and when it resolves (CLegacyMemoryFileReleaseInnerStream / CLegacyMemoryFileGetLength /
 // sub_17FDD90 / sub_17FDE20) emits it via sub_6281C0(luaModule, fmt, arg, a2)
 // (the 3rd arg a3 is the fully-formed message slot, cf. the sibling
 // RunLuaStartupScripts, sub_616710, which calls sub_629660(lua, path, msg)).

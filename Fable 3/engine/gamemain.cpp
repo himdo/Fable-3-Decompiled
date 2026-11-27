@@ -23,7 +23,7 @@
 #include "manager.h"              // GetManager
 #include "netinit.h"              // InitNetworking
 #include "save/save.h"            // SetSaveGamePath (the shared-slot string setter)
-#include "worker.h"               // GetWorker
+#include "worker.h"               // GetWorker / GetInterpolatedFrameTime
 #include "xlive.h"                // the xlive.dll (XLiveAPI) import declarations
 
 #include <windows.h>
@@ -176,7 +176,7 @@ static F3SharedBuffer **ResolvePathSlot(F3SharedBuffer **a1, F3SharedBuffer **a2
 static int SplitPathIntoSlots(F3SharedBuffer **path, F3SharedBuffer **driveOut,
                               F3SharedBuffer **dirOut, F3SharedBuffer **fileOut,
                               F3SharedBuffer **extOut);
-static int EnsureParentDirectory(F3SharedBuffer **pathSlot);
+int EnsureParentDirectory(F3SharedBuffer **pathSlot);
 
 struct CDiskFileWin32
 {
@@ -490,18 +490,6 @@ DWORD *GetDefaultResolution(DWORD *out)
 // The F3OptionNode (24-byte) / F3OptionMap (32-byte) option-map types
 // live in gamemain.h (moved for CNetSaveGameCtor in gamethread.cpp).
 
-// The 24-byte LHXML::CXMLReadStream stack object (sub_17DC290 / sub_17DC2B0).
-typedef struct F3XmlStream
-{
-    void *   vtable;      // +0x00
-    DWORD    flags;       // +0x04: 0x8000 (the base ctor)
-    DWORD *  fileBuf;     // +0x08: the 8-byte {0, 4096-byte buffer} block
-    DWORD    section;     // +0x0C: the current section node
-    DWORD    sectionInfo; // +0x10
-    BYTE     sectionFound;// +0x14 (byte 20)
-    BYTE     pad[3];      // +0x15..+0x17
-} F3XmlStream;             // 24 bytes
-
 // Placeholder LHXML vtables: the stack stream's slots are never dispatched
 // in this build (the parse below is a remaining stub, so no section is ever
 // found and the option readers are unreachable).
@@ -569,6 +557,211 @@ static DWORD g_dword_1E2D7A0 = 0;
 static void *XmlHeapAlloc(unsigned int size) { InterlockedIncrement(&g_dword_1E2D7A0); return LHAlloc(size); }
 static void  XmlHeapFree(void *p) { if (p != 0) { LHFree(p); InterlockedDecrement(&g_dword_1E2D7A0); } }
 
+// sub_17FD0F0 (0x17FD0F0 - 0x17FD0FE): decrement the pool allocation counter
+// when the node is non-null.
+static int XmlDecrementPoolCounter(int node, DWORD *buffer)
+{
+    if (node != 0 && buffer != 0)
+        buffer[3]--;
+    return (int)buffer;
+}
+
+// sub_17E73D0 (0x17E73D0 - 0x17E743A): the recursive child-chain destructor
+// [NOT byte-identical].  `chainSlot` is the address of a node's +0x14 chain
+// slot (the node's first child).  For each child in the chain (head, then
+// next sibling): tear down the child's attribute chain, null the child's
+// [8..10] fields, recursively tear down the child's own child chain, and
+// finally zero the node's [5..7] chain slots.  The individual `XmlHeapFree`
+// calls in the original (freeing each child node and each attribute node via
+// the LHXML heap) are NOT reproduced: the element/attribute nodes are carved
+// out of the 4096-byte pool chunks (not individually heap-allocated), so
+// freeing them would be an invalid free (LHFree of a pool pointer).  The
+// nodes die with the pool chunks, which are freed by the buffer finalizer
+// (sub_17E4930, itself a documented no-op in this build).
+static void XmlChildChainFree(DWORD *chainSlot);
+
+// sub_17E6F70 (0x17E6F70 - 0x17E6FC6): unlink + null a node's attribute chain
+// [NOT byte-identical].  [8] = the chain head, [9] = the current attribute,
+// [10] = the attribute count.  Each node in the chain is unlinked (the head
+// is advanced, or the owner's +4 link is refreshed), nulled, and the count /
+// pool counter are decremented.  The individual attribute-node frees in the
+// original are not reproduced (same pool-pointer reasoning as
+// XmlChildChainFree); with no attribute-insertion path wired in this build
+// the chain is always empty and the loop never runs.
+static void XmlAttrChainTeardown(DWORD *node, DWORD *buffer)
+{
+    DWORD attr = (node != 0) ? node[8] : 0;
+    while (attr != 0)
+    {
+        DWORD next = ((DWORD *)attr)[1];
+        if (attr == node[8])   /* the head: advance the head */
+            node[8] = next;
+        else
+            ((DWORD *)(((DWORD *)attr)[0]))[1] = next;   /* the owner's +4 link */
+        DWORD owner = ((DWORD *)attr)[0];
+        if (attr == node[9])   /* the current attribute */
+            node[9] = owner;
+        else
+            ((DWORD *)next)[0] = owner;     /* the next node's predecessor link */
+        ((DWORD *)attr)[0] = 0;
+        ((DWORD *)attr)[1] = 0;
+        node[10]--;
+        XmlDecrementPoolCounter((int)attr, buffer);
+        attr = node[8];
+    }
+}
+
+// sub_17E7350 (0x17E7350 - 0x17E7390): free a node's attribute chain
+// [NOT byte-identical].  `attrChainSlot` is the address of a node's +0x20
+// attribute-chain slot ([8] head / [9] current / [10] count).  Tears down the
+// chain (nullsub_150 no-op + attribute-node frees in the original; skipped
+// here for the same pool-pointer reason as XmlChildChainFree -- and the
+// chain is always empty in this build) and zeroes the slot's three fields.
+static void XmlAttrChainFree(DWORD *attrChainSlot)
+{
+    DWORD attr = attrChainSlot[0];
+    while (attr != 0)
+    {
+        attr = ((DWORD *)attr)[1];
+    }
+    attrChainSlot[1] = 0;   /* [9] */
+    attrChainSlot[0] = 0;   /* [8] */
+    attrChainSlot[2] = 0;   /* [10] */
+}
+
+
+// sub_17E73D0 (0x17E73D0 - 0x17E743A): the recursive child-chain destructor.
+// `chainSlot` is the address of a node's +0x14 chain slot ([5] first child /
+// [6] current / [7] count).  For each child in the chain (head, then next
+// sibling): tear down the child's attribute chain, null the child's [8..10],
+// recurse into the child's own child chain, and finally zero the node's
+// [5..7] slots.  The individual `XmlHeapFree` (on each child node) in the
+// original is NOT reproduced (pool-carved; see XmlChildChainFree).
+static void XmlChildChainFree(DWORD *chainSlot)
+{
+    DWORD childAddr = chainSlot[0];
+    if (childAddr != 0)
+    {
+        for (;;)
+        {
+            DWORD *child = (DWORD *)childAddr;
+            DWORD attr = child[8];
+            DWORD next = child[1];
+
+            if (attr != 0)
+            {
+                /* Destroy the child's attribute chain.  The original frees
+                   each attribute node (nullsub_150 + j_XmlHeapFree_5); the
+                   frees are skipped (pool-carved, never created in this
+                   build) but the chain advances as the original does. */
+                while (attr != 0)
+                    attr = ((DWORD *)attr)[1];
+            }
+
+            child[9] = 0;
+            child[8] = 0;
+            child[10] = 0;
+
+            XmlChildChainFree(&child[5]);   /* recurse: tear down the child's own child chain */
+            /* XmlHeapFree(child) in the original -- SKIPPED (pool-carved) */
+
+            childAddr = next;
+            if (next == 0)
+                break;
+        }
+    }
+
+    chainSlot[1] = 0;   /* [6] (current) */
+    chainSlot[0] = 0;   /* [5] (first child) */
+    chainSlot[2] = 0;   /* [7] (count) */
+}
+
+// sub_17E7020 (0x17E7020 - 0x17E70C8): tear down a node's child chain
+// [NOT byte-identical].  `node` is the section/node the chain belongs to
+// (this), `buffer` the file-block pool.  For each child in the chain (the
+// chain head is re-read after each iteration): recurse the child's own child
+// chain, adjust the chain head / predecessor / current-child / next-sibling
+// links as the binary does, null the child's [0..1] and decrement the child
+// count, tear down the child's attribute chain, null the child's [8..10],
+// recurse (via XmlChildChainFree) into the child's own child chain, and
+// decrement the pool counter.
+static void XmlTeardownChildChain(DWORD *node, DWORD *buffer)
+{
+    if (node == 0)
+        return;
+
+    DWORD *child = (DWORD *)node[5];
+    while (child != 0)
+    {
+        /* Recurse: tear down the child's own child chain. */
+        XmlTeardownChildChain(child, buffer);
+
+        /* Chain fixups (mirroring the binary's cmp/branch sequence). */
+        if (child == (DWORD *)node[5])   /* the current head: advance it */
+        {
+            node[5] = child[1];
+        }
+        else                             /* fix the predecessor's next-link */
+        {
+            *(DWORD *)(child[0] + 4) = child[1];
+        }
+
+        if (child == (DWORD *)node[6])   /* the current child: current = predecessor */
+        {
+            node[6] = child[0];
+        }
+        else                             /* fix the next sibling's predecessor link */
+        {
+            *((DWORD *)child[1]) = child[0];
+        }
+
+        child[0] = 0;
+        child[1] = 0;
+        node[7]--;
+
+        /* Tear down the child's attribute chain.  The original also frees
+           the child's attribute nodes (nullsub_150 + j_XmlHeapFree_5); the
+           frees are skipped (pool-carved; the chain is always empty in this
+           build).  The child's [8..10] are nulled here and again below. */
+        XmlAttrChainTeardown(child, buffer);
+
+        child[9] = 0;
+        child[8] = 0;
+        child[10] = 0;
+
+        /* Recurse via the destructive destructor (the re-entry the binary makes). */
+        XmlChildChainFree(&child[5]);
+
+        if (buffer != 0)
+            buffer[3]--;
+
+        child = (DWORD *)node[5];
+    }
+}
+
+// sub_17E70D0 (0x17E70D0 - 0x17E7103): tear down the tree stored in a file
+// block.  [NOT byte-identical] placement-dependent.  Called with the block's
+// [0] node and [1] pool buffer.  Tears down, in order: the node's child chain
+// (XmlTeardownChildChain), the node's attribute chain
+// (XmlAttrChainTeardown + XmlAttrChainFree), and the node's child chain via
+// the recursive destructor (XmlChildChainFree), then decrements the pool
+// counter.  The node's individual node frees in the original
+// (sub_17E73D0's XmlHeapFree on each child) are skipped: the nodes are
+// pool-carved and die with the pool chunk.
+static int XmlBlockTeardown(DWORD *node, DWORD *buffer)
+{
+    if (node == 0)
+        return 0;   /* the binary leaves eax undefined here; 0 is a sane stand-in */
+
+    XmlTeardownChildChain(node, buffer);
+    XmlAttrChainTeardown(node, buffer);
+    XmlAttrChainFree(&node[8]);
+    XmlChildChainFree(&node[5]);
+    if (buffer != 0)
+        buffer[3]--;
+    return 0;
+}
+
 // sub_17E6620 (0x17E6620 - 0x17E66A8): fresh 8-byte {0, 4096-byte buffer} file block
 static DWORD *InitXmlFileBlock(DWORD *block)
 {
@@ -589,9 +782,13 @@ static DWORD *InitXmlFileBlock(DWORD *block)
 }
 
 // sub_17E68F0 (0x17E68F0 - 0x17E6939): close the 8-byte file block
+// [NOT byte-identical] placement-dependent (relative calls to XmlBlockTeardown
+// and XmlHeapFree).
 static void CloseXmlFileBlock(DWORD *block)
 {
-    // sub_17E70D0(*block, block[1]): close the (0) file handle
+    // sub_17E70D0(*block, block[1]): tear down the tree in the block (a node
+    // is stored in block[0] when the stream entered an element).
+    XmlBlockTeardown((DWORD *)block[0], (DWORD *)block[1]);
     DWORD *buf = (DWORD *)block[1];
     if (buf != 0)
     {
@@ -740,6 +937,23 @@ __declspec(naked) int XmlAdvance(F3XmlStream *obj)
         mov     [ecx+0Ch], eax   ; obj->section = node->+0x10
         ret                      ; return node->+0x10
     }
+}
+
+// sub_17DAC80 (0x17DAC80 - 0x17DAC89): the write-stream advance -- the
+// writer-side analogue of XmlAdvance (sub_17DC3A0). It loads the current
+// node (obj->section, +0x0C), stores the node's +0x10 word back into
+// obj->section and returns the previous node. Called by the write-stream
+// paths that step past the element they just wrote (ApplyDisplaySettings,
+// sub_BC9B50 and the other settings writers).
+//  [NOT byte-identical] the original is thiscall (stream in ECX, plain ret);
+//  this build declares it as a plain free function so it can be called from
+//  the worker module (worker.cpp) -- the body is pure pointer arithmetic
+//  either way.
+int WriteXmlStreamAdvance(F3XmlStream *obj)
+{
+    int result = obj->section;
+    obj->section = *(DWORD *)((DWORD *)result + 4);   // node + 0x10
+    return result;
 }
 
 // sub_17DC470 (0x17DC470 - 0x17DC4A8): read the named boolean attribute of
@@ -1015,22 +1229,314 @@ static void CXMLReadStreamDtor(F3XmlStream *obj)
     // sub_17E4390 / sub_17E63F0: the one-shot LHXML static teardowns (no-op)
 }
 
-// sub_17DB6C0 (placeholder for the CXMLWriteStream vtable[1] slot): enter a
-// named element on the (write) stream. The LHXML serializer is a remaining
-// stub in this build, so entering an element always fails (returns 0) and the
-// tree is never populated; ReadVideoOptionsValues then writes nothing, which
-// is exactly the original's behavior when the serializer is unavailable.
-static char WriteStreamEnterElement(void *stream, const char *name)
+// sub_17E4A10 (0x17E4A10 - 0x17E4A7E): grow the 4096-byte block's chunk array
+// so it can hold `count` entries.  [NOT byte-identical] placement-dependent
+// (relative calls to XmlHeapAlloc / memcpy / XmlHeapFree).
+//
+// unsigned int XmlChunkArrayEnsure(unsigned int *slot, unsigned int count)
+//
+// `slot` is the {array, capacity, count} triple at the pool block's chunk
+// array slot (block + 4): slot[0] = the array, slot[1] = capacity (in
+// entries), slot[2] = the stored count.  When the capacity is below `count`
+// the array is grown (doubling, starting from 1 when empty), the old entries
+// are copied forward, and the old array is freed.  The requested count is
+// stored back into the slot and returned.
+static unsigned int XmlChunkArrayEnsure(unsigned int *slot, unsigned int count)
 {
-    (void)stream;
-    (void)name;
-    return 0;
+    unsigned int result = count;
+    unsigned int capacity = slot[1];
+    unsigned int v5 = capacity;
+    if (capacity < count)
+    {
+        if (capacity == 0)
+            v5 = 1;
+        for (; v5 < count; v5 *= 2)
+            ;
+    }
+    if (v5 > capacity)
+    {
+        void *newArray = XmlHeapAlloc(4u * v5);
+        if (slot[2] > 0)
+            memcpy(newArray, (const void *)slot[0], 4u * slot[2]);
+        XmlHeapFree((void *)slot[0]);
+        result = count;
+        slot[0] = (unsigned int)newArray;
+        slot[1] = v5;
+    }
+    slot[2] = result;
+    return result;
+}
+
+// sub_17E4BA0 (0x17E4BA0 - 0x17E4C12): allocate a `size`-byte node from the
+// 4096-byte chunk pool.  [NOT byte-identical] placement-dependent (relative
+// calls to XmlHeapAlloc / XmlChunkArrayEnsure).
+//
+// unsigned int XmlPoolAlloc(unsigned int *buffer, unsigned int size)
+//
+// `buffer` is the 4096-byte pool block: [0] = capacity, [1] = length (the
+// bytes used in the current chunk), [2] = the current chunk index, [3] = the
+// allocation counter, [4] = the chunk-array pointer, [5] = 0, [6] = the
+// chunk count.  Returns 0 when `size` exceeds the capacity; otherwise it
+// grows the pool (fresh chunk + one more chunk-array entry) when the current
+// chunk cannot hold the node, and returns the address of the new node (the
+// start of the remaining space in the current chunk).
+static unsigned int XmlPoolAlloc(unsigned int *buffer, unsigned int size)
+{
+    unsigned int capacity = buffer[0];
+    if (size > capacity)
+        return 0;
+
+    if (buffer[1] + size >= capacity || buffer[6] == 0)
+    {
+        // grow the pool: allocate a fresh chunk, ensure the chunk array has
+        // one more entry, and install the new chunk.
+        unsigned int oldCount = buffer[6];
+        unsigned int newChunk = (unsigned int)XmlHeapAlloc(capacity);
+        XmlChunkArrayEnsure(buffer + 4, oldCount + 1);
+        ((unsigned int *)buffer[4])[oldCount] = newChunk;   // chunkArr[oldCount] = new chunk
+        buffer[2]++;                                         // buffer[2] = the new chunk's index
+        buffer[1] = 0;                                       // length resets into the new chunk
+    }
+
+    buffer[3]++;
+    unsigned int *chunkArr = (unsigned int *)buffer[4];
+    unsigned int length = buffer[1];
+    unsigned int result = chunkArr[buffer[2]] + length;      // the node's address
+    buffer[1] = length + size;
+    return result;
+}
+
+// sub_17E7110 (0x17E7110 - 0x17E715D): allocate a 0x2C-byte node from the
+// 4096-byte chunk pool (the LHXML element node).  [NOT byte-identical]
+// placement-dependent (relative calls to XmlPoolAlloc / InternXmlString).
+//
+// DWORD *XmlNodeAlloc(const void *Source, unsigned int *buffer)
+//
+// The element node layout: [0] = 0, [1] = 0, [2] = the interned handle of the
+// element name, [3] = the interned handle of the empty string (byte_1BCE523),
+// [4] .. [10] = 0 (44 bytes).  Returns the node, or nullptr when the pool
+// cannot allocate it.
+static DWORD *XmlNodeAlloc(const void *Source, unsigned int *buffer)
+{
+    DWORD *node = (DWORD *)XmlPoolAlloc(buffer, 0x2c);
+    if (node == 0)
+        return 0;
+    node[0]  = 0;
+    node[1]  = 0;
+    node[2]  = InternXmlString((const char *)Source);
+    node[3]  = InternXmlString("");            // byte_1BCE523: the empty string
+    node[4]  = 0;
+    node[5]  = 0;
+    node[6]  = 0;
+    node[7]  = 0;
+    node[8]  = 0;
+    node[9]  = 0;
+    node[10] = 0;
+    return node;
+}
+
+// sub_17E6DE0 (0x17E6DE0 - 0x17E6E23): insert a node into the current section.
+// [NOT byte-identical] the body has no calls; it is kept as a plain C
+// function so the write-stream cluster shares the plain-function convention
+// (the original is __thiscall, stream in ECX).
+//
+// void XmlInsertNodeIntoSection(DWORD *sec, DWORD *a2)
+//
+// The section (`sec`) owns a child chain: [5] = the last child, [6] = the
+// current child, [7] = the child count.  With a current child (sec[6] != 0)
+// the new node is spliced into the chain behind it (the child's handle is
+// stamped into the child's block at +4, the child is re-wired in, and the
+// node's [0] / [4] fields are set); otherwise sec[5] / sec[6] are both set
+// to the new node.  The new node's [4] field always points back at the
+// section.
+static void XmlInsertNodeIntoSection(DWORD *sec, DWORD *a2)
+{
+    DWORD v2 = sec[6];
+    if (v2 != 0)
+    {
+        // *(DWORD *)(v2 + 4) = a2
+        *(DWORD *)(v2 + 4) = (DWORD)a2;
+        v2 = sec[6];
+        a2[0] = v2;
+        a2[1] = 0;
+        sec[7]++;
+        sec[6] = (DWORD)a2;
+    }
+    else
+    {
+        sec[5] = (DWORD)a2;
+        sec[6] = (DWORD)a2;
+        a2[0] = 0;
+        a2[1] = 0;
+        sec[7]++;
+    }
+    a2[4] = (DWORD)sec;
+}
+
+// sub_17E65D0 (0x17E65D0 - 0x17E65E9): store a node in the file block.
+// [NOT byte-identical] placement-dependent (relative call to XmlBlockTeardown).
+//
+// int XmlBlockStoreNode(DWORD *block, int a2)
+//
+// Tear down the tree previously held in the block (sub_17E70D0 -- the
+// recursive child-chain / attribute-chain teardown in
+// XmlBlockTeardown), then store the new node and return the teardown result.
+static int XmlBlockStoreNode(DWORD *block, int a2)
+{
+    int result = XmlBlockTeardown((DWORD *)block[0], (DWORD *)block[1]);
+    block[0] = (DWORD)a2;
+    return result;
+}
+
+// WriteStreamEnterElement (0x17DAC00 - 0x17DAC73) -- the write-stream vtable[1]
+// slot (enter the named element on the stream).  [NOT byte-identical]
+// placement-dependent (relative calls to XmlHeapAlloc / InitXmlFileBlock /
+// XmlNodeAlloc / XmlInsertNodeIntoSection / XmlBlockStoreNode).
+//
+// char WriteStreamEnterElement(void *stream, const char *Source)
+//
+// When the stream has no file block yet, allocate the 8-byte {0, 4096-byte
+// buffer} block (InitXmlFileBlock).  The new element node is allocated from
+// the pool (XmlNodeAlloc, passing the block's current 4096-byte pool buffer
+// as the allocator target), inserted into the current section (when present)
+// or stored in the file block (when there is no current section -- the
+// root-element case), and becomes the current section.  The section-info
+// slot is cleared and 1 is returned.
+char WriteStreamEnterElement(void *stream, const char *Source)
+{
+    F3XmlStream *obj = (F3XmlStream *)stream;
+
+    if (obj->fileBuf == 0)
+    {
+        DWORD *block = (DWORD *)XmlHeapAlloc(8);
+        obj->fileBuf = (block != 0) ? InitXmlFileBlock(block) : 0;
+    }
+
+    DWORD *fileBuf = obj->fileBuf;
+    DWORD *buffer = (DWORD *)fileBuf[1];   // the 4096-byte pool buffer (the original crashes on a failed alloc, as does this)
+    DWORD *node = XmlNodeAlloc(Source, (unsigned int *)buffer);
+
+    DWORD *section = (DWORD *)obj->section;
+    if (section != 0)
+        XmlInsertNodeIntoSection(section, node);
+    else
+        XmlBlockStoreNode(fileBuf, (int)node);
+
+    obj->section = (DWORD)node;
+    obj->sectionInfo = 0;
+    return 1;
+}
+
+// The write-side value-writer slots (vt[5] writeBool / vt[8] writeInt2 /
+// vt[9] writeInt).  The tree is built for real (WriteStreamEnterElement
+// allocates and inserts the nodes).  The bool writer (vt[5]) and the int2
+// writer (vt[8]) are implemented below -- they run the real value-write chain
+// (scratch lock / %d format / intern the value type / section-info
+// propagation), with the conditional vtable[11] ("type" attribute setter)
+// dispatch skipped because this build does not install it.  The int writer
+// (vt[9], the int-writer wrapper) is implemented below as a thin forwarder
+// to the vt[8] int value-writer, mirroring the original's vtable[23] dispatch
+// (sub_17DB340).
+
+// sub_17DB3E0 (0x17DB3E0 - 0x17DB409): the write-stream bool writer -- the
+// vtable[5] slot (the bool writer; thiscall, obj in ECX, a BYTE out-pointer
+// pushed by the caller, callee-cleanup retn 4, result in EAX). The value is
+// loaded from the out-param, the out-param slot is overwritten with the byte
+// (the callee, vtable[18] = sub_17DB5E0, reads the byte from that slot), and
+// the slot address is pushed and the serializer is called.
+//  [BYTE-IDENTICAL] no E8 call / no E9 jmp / no long conditional / no high-VA
+//  refs -- the body is the original's exact instruction sequence (mov
+//  eax,[esp+4] / mov dl,[eax] / mov eax,[ecx] / mov eax,[eax+48h] / mov byte
+//  ptr [esp+4],dl / lea edx,[esp+4] / push edx / call eax / retn 4), emitted
+//  as naked asm so it matches the original 25 bytes exactly.
+//  Note: this build does not install vtable[18] (the 163-byte LHXML value
+//  serializer, sub_17DB5E0, and its callees -- InternXmlString / the value
+//  table / the attribute setter -- are a remaining stub), so no code path
+//  invokes this in this build; the install below keeps the vtable shape.
+static __declspec(naked) int XmlWriteBool(void)
+{
+    __asm
+    {
+        mov     eax, [esp+4]
+        mov     dl, [eax]
+        mov     eax, [ecx]
+        mov     eax, [eax+48h]
+        mov     byte ptr [esp+4], dl
+        lea     edx, [esp+4]
+        push    edx
+        call    eax
+        retn    4
+    }
+}
+
+// sub_17DB400 (0x17DB400 - 0x17DB45D): the write-stream int writer -- the
+// write-side value-writer for ints (the write-stream vt[23] slot, installed at
+// vt[8] in this build's model).  [NOT byte-identical] placement-dependent
+// (relative calls to the scratch lock / ensure / get / the value-type table /
+// InternXmlString / the section-info propagation).  The int value is loaded
+// from the out-param, formatted as "%d" into the 16-byte scratch buffer, the
+// "int" value-type name is interned (sub_17E7440(1) -> g_xmlValueTypes[1] ->
+// InternXmlString, the value-type table -- the 0x10-byte ensure / format /
+// interning chain), and the section-info slot is refreshed
+// (obj->sectionInfo = obj->section).  The conditional dispatch through the
+// stream's vtable[11] (the "type" attribute setter -- thiscall, obj in ECX,
+// the "type" string and the value buffer pushed by the caller, callee-cleanup
+// retn 8, the original's `if (*(this + 20) != 0)` gate, byte 20 = sectionFound)
+// is skipped in this build: the write-stream ctor installs only
+// vt[1]/[3]/[5]/[8]/[9], so the slot is null (the 163-byte LHXML value
+// serializer and its callees -- InternXmlString in full / the attribute
+// setter -- remain a stub) and no code path in this build invokes it.
+// IDA renamed sub_17DB400 -> XmlWriteInt2.
+static void XmlWriteInt2(F3XmlStream *obj, int *out)
+{
+    XmlScratchLockEnter();
+    int v1 = *out;
+    XmlScratchEnsure(16);
+    char *buf = (char *)XmlScratchGet();
+    _snprintf(buf, 16, "%d", v1);
+    InternXmlString(g_xmlValueTypes[1]);    // "int" -- the value type (sub_17E7440(1))
+    if (obj->sectionFound != 0)
+    {
+        // the stream's vtable[11] (the "type" attribute setter) is not
+        // installed in this build -- the original dispatches through the
+        // write-stream's vftable[11] (this, "type", &buffer) here; the slot is
+        // null, so the dispatch is skipped.
+    }
+    obj->sectionInfo = obj->section;
+    XmlScratchLockLeave();
+}
+
+// sub_17DB340 (0x17DB340 - 0x17DB359): the write-stream vt[9] slot -- the
+// write-side int-writer wrapper.  [NOT byte-identical] placement-dependent
+// (relative E8 call) + the flattened-vtable model: the original's 25-byte body
+// loads the out-param pointer (mov eax, [esp+4]), loads the int value from it
+// (mov edx, [eax]), reads the stream's vtable and loads the write-side
+// signed-int value-writer from vtable[23] ([eax+5Ch] -- the original's
+// 24-entry write-stream layout), stores the value into the esp+4 slot
+// (mov [esp+4], edx -- clobbering the argument slot with the value), pushes
+// the slot address (lea edx, [esp+4]; push edx), calls the writer (call eax)
+// and returns callee-cleanup retn 4. The int value-writer only reads *out (it
+// formats / interns / refreshes the section-info slot -- it never writes
+// through the pointer), so the slot the original passes is effect-equivalent
+// to the caller's out-param; the stack slot is kept here to mirror the
+// original's exact sequence. The original dispatches through the 24-entry
+// write-stream vtable's vtable[23] (the signed-int value-writer -- XmlWriteInt2);
+// this build installs the int writer at vtable[8] (offset 0x20), so the
+// dispatch is re-targeted there (the original's vtable[23] does not exist in
+// this build's model).  Result: the caller's out-param is read (never written).
+// IDA renamed sub_17DB340 -> XmlWriteInt.
+static void XmlWriteInt(F3XmlStream *obj, int *out)
+{
+    int slot = *out;
+    void (__thiscall *writer)(F3XmlStream *, int *) =
+        (void (__thiscall *)(F3XmlStream *, int *))((void **)obj->vtable)[8];
+    writer(obj, &slot);
 }
 
 // sub_17DB800 + sub_17DAA00 (0x17DB800 - 0x17DB830): the CXMLWriteStream ctor
 //  [NOT byte-identical] placement-dependent (relative calls to the base ctor
 //  sub_17DAA00 + the one-shot LHXML static initializers sub_17E42C0 / 17E6390).
-static void CXMLWriteStreamCtor(F3XmlStream *obj)
+void CXMLWriteStreamCtor(F3XmlStream *obj)
 {
     obj->vtable = (void *)g_CXMLStreamVtable;    // the sub_17DAA00 base ctor
     obj->flags = 0x8000;
@@ -1041,13 +1547,21 @@ static void CXMLWriteStreamCtor(F3XmlStream *obj)
     obj->vtable = (void *)g_CXMLWriteStreamVtable;    // the derived vtable
     if (g_CXMLWriteStreamVtable[1] == 0)
         g_CXMLWriteStreamVtable[1] = (void *)WriteStreamEnterElement;   // vt[1]
+    if (g_CXMLWriteStreamVtable[3] == 0)
+        g_CXMLWriteStreamVtable[3] = (void *)WriteXmlStreamAdvance;     // vt[3]
+    if (g_CXMLWriteStreamVtable[5] == 0)
+        g_CXMLWriteStreamVtable[5] = (void *)XmlWriteBool;               // vt[5]: write a bool
+    if (g_CXMLWriteStreamVtable[8] == 0)
+        g_CXMLWriteStreamVtable[8] = (void *)XmlWriteInt2;               // vt[8]: write an int
+    if (g_CXMLWriteStreamVtable[9] == 0)
+        g_CXMLWriteStreamVtable[9] = (void *)XmlWriteInt;                // vt[9]: write an int
     *(BYTE *)&obj->sectionFound = 1;   // byte 20 = 1 (a write stream starts "found")
 }
 
 // sub_17DB830 + sub_17DAA20 (0x17DB830 - 0x17DB84F): the CXMLWriteStream dtor
 //  [NOT byte-identical] placement-dependent (relative calls to CloseXmlFileBlock,
 //  the LHXML heap-free, and the base dtor sub_17DAA20).
-static void CXMLWriteStreamDtor(F3XmlStream *obj)
+int CXMLWriteStreamDtor(F3XmlStream *obj)
 {
     DWORD *block = obj->fileBuf;
     obj->vtable = (void *)g_CXMLWriteStreamVtable;
@@ -1057,7 +1571,11 @@ static void CXMLWriteStreamDtor(F3XmlStream *obj)
         XmlHeapFree(block);                    // j_XmlHeapFree_2 (free the 8-byte block)
     }
     obj->vtable = (void *)g_CXMLStreamVtable;   // the sub_17DAA20 base dtor
-    // sub_17E4390 / sub_17E63F0: the one-shot LHXML static teardowns (no-op)
+    // sub_17E4390 / sub_17E63F0: the one-shot LHXML static teardowns (no-op).
+    // The binary returns the base-dtor's result (sub_17E63F0); in this build
+    // the teardown chain runs for real (CloseXmlFileBlock -> XmlBlockTeardown)
+    // and the observed result is 0.
+    return 0;
 }
 
 // sub_17DB2C0 + sub_17E6870 (0x17DB2C0 - 0x17E68A9): serialize the (write)
@@ -1065,7 +1583,7 @@ static void CXMLWriteStreamDtor(F3XmlStream *obj)
 // (sub_17E6660) is a remaining stub; for the empty tree this build produces the
 // original writes only the constant prologue, so we write the same bytes here
 // (sub_17E5B70: fopen "wb" + fwrite + fclose).
-static void WriteXmlStreamToFile(F3XmlStream *obj, const char *fileName)
+void WriteXmlStreamToFile(F3XmlStream *obj, const char *fileName)
 {
     (void)obj;   // the empty-tree serializer writes only the prologue
     FILE *f = fopen(fileName, "wb");
@@ -2289,25 +2807,33 @@ int DeleteSharedFile(F3SharedBuffer **slot)
 // (worker.cpp) restores from them (see gamemain.h).
 DWORD g_dword_1D9E18C = 8;
 DWORD g_dword_1D9E194 = 8;
-// 0x1D9E19C: the SPI_GETKEYBOARDDelay snapshot (the 4-byte value block
-// passed to SystemParametersInfoA; the .data initial value is 24).
-BYTE  g_byte_1D9E19C[4] = { 0x18, 0, 0, 0 };
+// 0x1D9E19C: the SPI_GETKEYBOARDDelay snapshot (the 24-byte value block
+// passed to SystemParametersInfoA; the .data initial value is 0x18). The
+// binary treats all 24 bytes as the block (byte 4 == dword_1D9E1A0 is the
+// loaded/saved keyboard-delay value, with the keyboard-delay bytes 4-7
+// masked bit 0/1 by ApplyDisplaySettings).
+BYTE  g_byte_1D9E19C[24] = {
+    0x18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+};
 
 // 0x1D9E190 / 0x1D9E198 / 0x1D9E1A0 (byte_1D9E19C+4): the shared slots
 // (F3SharedBuffer*) of the three accessibility-setting values loaded by
 // InitAccessibilitySettings (.bss, start null).
-static F3SharedBuffer *g_dword_1D9E190 = 0;
-static F3SharedBuffer *g_dword_1D9E198 = 0;
-static F3SharedBuffer *g_dword_1D9E1A0 = 0;
+// DWORD, not F3SharedBuffer*: the binary treats these as 32-bit values
+// (the low bit of each is tested by ApplyDisplaySettings; byte_1D9E19C+4 ==
+// dword_1D9E1A0 is the loaded keyboard-delay value).
+DWORD g_dword_1D9E190 = 0;
+DWORD g_dword_1D9E198 = 0;
+DWORD g_dword_1D9E1A0 = 0;
 
 // 0x20FC8D8: the accessibility-settings section name slot (F3SharedBuffer*);
 // .bss, so empty = the "" (root) section. 0x20FC8DC / 0x20FC8E0 / 0x20FC8E4:
 // the name slots of the three accessibility-setting elements (.bss, empty =
 // the "" default).
-static F3SharedBuffer *g_dword_20FC8D8 = 0;
-static F3SharedBuffer *g_dword_20FC8DC = 0;
-static F3SharedBuffer *g_dword_20FC8E0 = 0;
-static F3SharedBuffer *g_dword_20FC8E4 = 0;
+F3SharedBuffer *g_dword_20FC8D8 = 0;
+F3SharedBuffer *g_dword_20FC8DC = 0;
+F3SharedBuffer *g_dword_20FC8E0 = 0;
+F3SharedBuffer *g_dword_20FC8E4 = 0;
 
 // ============================================================
 //  ReadXmlNamedValue  (0x18F6600 - 0x18F6641)  -- sub_18F6600
@@ -2327,8 +2853,8 @@ static F3SharedBuffer *g_dword_20FC8E4 = 0;
 //  / ApplyDisplaySettings and the save-file loaders) use this to pull one
 //  int64 value out of the current XML element.
 // ============================================================
-static DWORD ReadXmlNamedValue(F3SharedBuffer **nameSlot, F3XmlStream *stream,
-                               DWORD *out)
+DWORD ReadXmlNamedValue(F3SharedBuffer **nameSlot, F3XmlStream *stream,
+                  DWORD *out)
 {
     const char *name = (nameSlot != 0 && *nameSlot != 0) ? (*nameSlot)->data : "";
     void **vt = (void **)stream->vtable;
@@ -2409,12 +2935,12 @@ LONG InitAccessibilitySettings(void)
             const char *rootName = (g_dword_20FC8D8 != 0) ? g_dword_20FC8D8->data : "";
             if (FindXmlSection(&stream, rootName) != 0)
             {
-                F3SharedBuffer *value = 0;
-                ReadXmlNamedValue(&g_dword_20FC8DC, &stream, (DWORD *)&value);
+                DWORD value = 0;
+                ReadXmlNamedValue(&g_dword_20FC8DC, &stream, &value);
                 g_dword_1D9E190 = value;
-                ReadXmlNamedValue(&g_dword_20FC8E0, &stream, (DWORD *)&value);
+                ReadXmlNamedValue(&g_dword_20FC8E0, &stream, &value);
                 g_dword_1D9E198 = value;
-                ReadXmlNamedValue(&g_dword_20FC8E4, &stream, (DWORD *)&value);
+                ReadXmlNamedValue(&g_dword_20FC8E4, &stream, &value);
                 g_dword_1D9E1A0 = value;
                 ((int(__thiscall *)(F3XmlStream *))XmlAdvance)(&stream);
             }
@@ -2864,7 +3390,7 @@ static char SharedPathExists(F3SharedBuffer **slot)
 //  SaveVideoOptionsFile (0x775DA0), sub_BC9B50, CDiskFileWin32Open,
 //  ApplyDisplaySettings.
 // ============================================================
-static int EnsureParentDirectory(F3SharedBuffer **pathSlot)
+int EnsureParentDirectory(F3SharedBuffer **pathSlot)
 {
     int result = 1;
     F3SharedBuffer *resolved = 0;
@@ -4550,18 +5076,123 @@ static BYTE  g_unk_1DB21F0[0x3418] = { 0 }; // 0x1DB21F0  per-frame graphics-sta
 static BYTE  g_unk_2063030[0x40]   = { 0 }; // 0x2063030
 static BYTE  g_unk_2063070[0x40]   = { 0 }; // 0x2063070
 
-// sub_18DDDB0 -- per-frame graphics-state flush (device-table vtable slots,
-// the 0x2000-byte state-region 0xFE mask reset).  Remaining stub: it is its
-// own unimplemented cluster, called once per frame by BeginFrame.
-static void sub_18DDDB0(void) {}
-// sub_18CB6A0 -- flush the pending device-operation lists (0x715-byte
-// cluster over the 0x20FC98C..0x20FC9C8 object lists + the FPS records at
-// 0x2074548/0x20B5F70).  Remaining stub, called by FlushRenderFrame.
-static void sub_18CB6A0(void) {}
-// sub_18F0460 -- interpolated frame time from the per-slot time records
-// (sub_18CB350 + the 0x1E2ED74/0x1E2ED78 scalars).  Remaining stub.
-static double sub_18F0460(void) { return 0.0; }
+// 0x21153C0: 0x1000-byte state block poisoned region (PoisonFirstFrameRegion).
+static BYTE  g_unk_21153C0[0x1000] = { 0 };
+// 0x21163C0: 0x20-byte (8 DWORD) presence bit array consulted by
+// PoisonFirstFrameRegion -- region byte i is left untouched only when bit
+// (i >> 5) of word (i >> 5) of g_qword_21163C0 is set.
+static DWORD g_qword_21163C0[8] = { 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+                                   0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF };
+// 0x21163E0: the 8-bit mask enabling the per-region bit-array path in
+// PoisonFirstFrameRegion (0 = memset the whole region).  Binary initial
+// value 0xFFFFFFFF (all regions bit-checked).
+static DWORD g_dword_21163E0 = 0xFFFFFFFF;
+// 0x1DB13C0: 0xE00-byte state block poisoned by FlushFrameStateBuffers.
+static BYTE  g_unk_1DB13C0[0xE00] = { 0 };
+// 0x1DB21C0: 0x1C-byte (7 DWORD) presence bit array (one bit per 0x200-byte
+// region slot) -- a zero bit poisons the matching 0x10-byte chunk.
+static DWORD g_qword_1DB21C0[7] = { 0 };
+// 0x1DB21DC: the 7-bit mask enabling the per-region bit-array path in
+// FlushFrameStateBuffers (0 = memset the whole block to 0xFE).  Binary initial
+// value 0 -- the whole block is poisoned on the first frame.
+static DWORD g_dword_1DB21DC = 0;
 
+// The device's graphics-state flush-dispatch method (device vtable slot 94,
+// offset 0x178): __stdcall with 4 args.  Also used for slot 109 (offset
+// 0x1B4) by FlushFrameStateBuffers.  Declared for the 0x2074540 device object.
+typedef void (__stdcall *F3FrameStateFlush)(int device, DWORD a2, void *a3, int a4);
+
+//  PoisonFirstFrameRegion  (0x590030 - 0x5900EA)  -- poison the first-frame
+//  region block (unk_21153C0, 0x1000 bytes) with 0xFE.  A per-region bit-
+//  presence array selects which 16-byte chunks are untouched: a zero bit in
+//  g_qword_21163C0 poisons the matching 16-byte chunk, a set bit leaves it
+//  alone.  When g_dword_21163E0 is 0 the whole region is memset instead.
+//  Returns the running pointer past the last region (&unk_21153C0 + 0x1000);
+//  the caller discards it.
+//  [NOT byte-identical] placement-dependent (relative call + the HIGH-VA
+//  globals) and refs g_unk_21153C0 / g_qword_21163C0 / g_dword_21163E0; no
+//  null-guard, matching the original.
+static char *PoisonFirstFrameRegion(void)
+{
+    if (g_dword_21163E0 == 0)
+        return (char *)memset(g_unk_21153C0, 0xFE, 0x1000);
+    char *result = (char *)g_unk_21153C0;
+    int v1 = 0;
+    unsigned int v2 = 0;
+    char *v4 = (char *)g_unk_21153C0;
+    do
+    {
+        if ((1 << v1) & g_dword_21163E0)
+        {
+            for (unsigned int i = v2; i < v2 + 32; result += 16)
+            {
+                if ((g_qword_21163C0[i >> 5] >> (i & 0x1F) & 1) == 0)
+                    memset(result, 0xFE, 16);
+                ++i;
+            }
+        }
+        else
+        {
+            memset(result, 0xFE, 0x200);
+        }
+        ++v1;
+        result = v4 + 512;
+        v2 += 32;
+        v4 += 512;
+    } while (v1 < 8);
+    return result;
+}
+
+//  FlushFrameStateBuffers  (0x18DDDB0 - 0x18DDDF2)  -- per-frame graphics-state
+//  flush.  Dispatches the device vtable (via the 0x2074540 device mirror,
+//  slot 94: (device, 0, &unk_21153C0, 256)) and slot 109 (device, 0,
+//  &unk_1DB13C0, 224), then poisons the first-frame region (the sibling
+//  PoisonFirstFrameRegion), then 0xFE-poisons the 7-region block at
+//  unk_1DB13C0 (0xE00 bytes): when g_dword_1DB21DC == 0 the whole block is
+//  memset; otherwise each 0x200-byte region is poisoned per-bit via the
+//  0x1C-byte g_qword_1DB21C0 presence array (a zero bit poisons the matching
+//  16-byte chunk).  Returns &unk_1DB13C0 (early path) or &unk_1DB13C0 + 0xE00.
+//  [NOT byte-identical] placement-dependent (relative calls + the high-VA
+//  device global / state globals) and null-guarded (the original would fault
+//  pre-device on the vtable dispatches; PoisonFirstFrameRegion is preserved
+//  unconditional as in the original).
+static char *FlushFrameStateBuffers(void)
+{
+    DWORD dev = g_dword_2074540;
+    if (dev != 0)
+    {
+        ((F3FrameStateFlush)((*(void ***)dev)[94]))(dev, 0, g_unk_21153C0, 256);
+        ((F3FrameStateFlush)((*(void ***)dev)[109]))(dev, 0, g_unk_1DB13C0, 224);
+    }
+    PoisonFirstFrameRegion();
+    if (g_dword_1DB21DC == 0)
+        return (char *)memset(g_unk_1DB13C0, 0xFE, 0xE00);
+    char *result = (char *)g_unk_1DB13C0;
+    int v1 = 0;
+    unsigned int v2 = 0;
+    char *v4 = (char *)g_unk_1DB13C0;
+    do
+    {
+        if ((1 << v1) & g_dword_1DB21DC)
+        {
+            for (unsigned int i = v2; i < v2 + 32; result += 16)
+            {
+                if ((g_qword_1DB21C0[i >> 5] >> (i & 0x1F) & 1) == 0)
+                    memset(result, 0xFE, 16);
+                ++i;
+            }
+        }
+        else
+        {
+            memset(result, 0xFE, 0x200);
+        }
+        ++v1;
+        result = v4 + 512;
+        v2 += 32;
+        v4 += 512;
+    } while (v1 < 7);
+    return result;
+}
 //  PresentFrame  (0x18F1060 - 0x18F10A7)  -- present the previous frame.
 //  stdcall @4, arg = pointer to the 4-byte device-slot state (packed
 //  little-endian into one DWORD).  Dispatches device vtable[43] (0xAC):
@@ -4584,8 +5215,8 @@ static void PresentFrame(const DWORD *slotState)
 //  BeginFrame  (0x18F0B60 - 0x18F0BBE)  -- per-frame bookkeeping.
 //  On the first frame (frame-nesting counter 0) dispatches device vtable[41]
 //  (0xA4) with the device as its single argument; increments the counter;
-//  flushes the per-frame graphics state (sub_18DDDB0, stub); and 0xFE-poisons
-//  the three state blocks (0x1DB21F0 x 0x3418, 0x2063070 x 0x40,
+//  flushes the per-frame graphics state (FlushFrameStateBuffers); and
+//  0xFE-poisons the three state blocks (0x1DB21F0 x 0x3418, 0x2063070 x 0x40,
 //  0x2063030 x 0x40).
 //  [NOT byte-identical] placement-dependent (relative calls + the memset IAT
 //  slot at its original high VA) and refs the high-VA state globals;
@@ -4595,7 +5226,7 @@ static void BeginFrame(void)
     if (g_dword_1E2ED7C == 0 && g_dword_1E2EEF4 != 0)
         ((void (*)(void *))(*(void ***)g_dword_1E2EEF4)[41])(g_dword_1E2EEF4);
     ++g_dword_1E2ED7C;
-    sub_18DDDB0();
+    FlushFrameStateBuffers();
     memset(g_unk_1DB21F0, 0xFE, 0x3418);
     memset(g_unk_2063070, 0xFE, 0x40);
     memset(g_unk_2063030, 0xFE, 0x40);
@@ -4629,9 +5260,9 @@ static void EndFrame(void)
 //  and frame-time update.  Dispatches device vtable[17] (0x44) with
 //  (device, 0, 0, 0, 0); when the result is 0x88760868 (lost) it returns 0
 //  (the loop then closes and waits on the worker).  Otherwise it flushes the
-//  pending device operations (sub_18CB6A0, stub) and, under the device
-//  critical section stru_20FC948, stores the current frame time
-//  (sub_18F0460, stub) into dbl_20FC960, and returns 1.
+//  pending device operations (FlushDeviceOperationLists, worker.cpp) and,
+//  under the device critical section stru_20FC948, stores the current frame
+//  time (GetInterpolatedFrameTime, worker.cpp) into dbl_20FC960, and returns 1.
 //  [NOT byte-identical] placement-dependent (relative calls + the
 //  Enter/LeaveCriticalSection IAT slots at their original high VAs) and refs
 //  the high-VA device global / critical section / time slot; null-guarded (a
@@ -4645,14 +5276,14 @@ static int FlushRenderFrame(void)
         (*(void ***)g_dword_1E2EEF4)[17])(g_dword_1E2EEF4, 0, 0, 0, 0);
     if (st == 0x88760868)
         return 0;
-    sub_18CB6A0();
+    FlushDeviceOperationLists();
     if (!g_stru_20FC948Init)
     {
         InitializeCriticalSection(&g_stru_20FC948);
         g_stru_20FC948Init = 1;
     }
     EnterCriticalSection(&g_stru_20FC948);
-    g_dbl_20FC960 = sub_18F0460();
+    g_dbl_20FC960 = GetInterpolatedFrameTime();
     LeaveCriticalSection(&g_stru_20FC948);
     return 1;
 }
@@ -4802,7 +5433,7 @@ static void *SlotPairSet(void *slot, void **pair)
 void F3InvalidParam(void);
 
 //  BankStringsDtor  (0x624B10 - 0x624BEC)  -- the bank container's +0x1C
-//  string-collection destructor (the sub_72C220 init counterpart).  Frees
+//  string-collection destructor (the InitBankStringCollection init counterpart).  Frees
 //  every non-null element of the element array (each element's +0x0C data
 //  buffer first, then the element itself), then the element array, the +0x1C
 //  self-tag block, the +0x10 block, and the +0x04 self-tag block, zeroing the
@@ -5309,6 +5940,37 @@ static F3WString *WINAPI Win32FileSystemGetPath(void *obj, F3WString *out)
     return out;
 }
 
+// Win32FileSystemGetVolumeInfo  (0x18AAB60 - 0x18AAC2E)  -- the
+// CWin32FileSystem wrapper's vt[9] method: resolve the root path for
+// GetVolumeInformationA.  The wrapper's embedded SSO wide path (cap at
+// +0x20, data at +0x0C) is scanned with _wcscspn against ":" (asc_1BF7630);
+// when no colon is present the path is a bare relative root and the
+// destination is "game:\\", otherwise the path is absolute (an update
+// drive) and the destination is "update:\\".  strcpy_s into the 0x104-byte
+// ANSI Destination buffer, then GetVolumeInformationA (0x104-byte name /
+// FS-name buffers, serial number / max-component-length / flags out-params)
+// and its BOOL result is returned.  [NOT byte-identical] placement-
+// dependent (the _wcscspn / _strcpy_s / GetVolumeInformationA IAT slots and
+// the __security_cookie prologue).
+static BOOL WINAPI Win32FileSystemGetVolumeInfo(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    const wchar_t *src = (o[8] < 8) ? (const wchar_t *)(o + 3)
+                                    : (const wchar_t *)o[3];
+    size_t colon = wcscspn(src, L":");
+    size_t len = wcslen(src);
+    char dest[0x104];
+    if (colon == len)
+        strcpy_s(dest, 0x104, "game:\\");
+    else
+        strcpy_s(dest, 0x104, "update:\\");
+    char volName[0x104];
+    char fsName[0x104];
+    DWORD volSerial = 0, maxComponent = 0, fsFlags = 0;
+    return GetVolumeInformationA(dest, volName, 0x104, &volSerial,
+                                 &maxComponent, &fsFlags, fsName, 0x104);
+}
+
 // ---- LHVFS::CWin32File (72 bytes) -- the disk IFile the open (vt[4])
 //  builds over the CreateFileW handles: +0x08 read handle, +0x0C write
 //  handle, +0x10/+0x14 block words (0x1000 / -0x1000), +0x1C path
@@ -5382,6 +6044,38 @@ static LONG WINAPI Win32FileRelease(void *obj)
     return n;
 }
 
+// The two accepted IIDs for the CWin32File (and the other LHVFS IFile-derived
+// classes, which dispatch through the same vt[0] body): IUnknown and the IFile
+// interface.  Kept at their original addresses.
+static const IID g_riid_1BF7604 = { 0, 0, 0, { 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };   // 0x1BF7604: IUnknown IID
+static const IID g_riid_1BF7874 = { 0xB69307A8, 0x7143, 0x410E,
+    { 0xBD, 0x4A, 0xC8, 0x16, 0x81, 0x9D, 0xFF, 0x6C } };    // 0x1BF7874: IFile IID
+
+//  Win32FileQueryInterface  (0x5B57A0 - 0x5B580C)  -- the shared vt[0]
+//  QueryInterface body for the LHVFS IFile-derived classes (CWin32File /
+//  CMemoryFile / CBasicFileWindow / CCompositeFile / CBankFile /
+//  CCompressedBankFile / CXContentFile / CAddRelQueryImp -- all 8 classes
+//  dispatch through the same code).  stdcall, 3 stack args (self / riid / ppv),
+//  retn 0x0C.  If riid matches either accepted IID, *ppv is set to the object,
+//  the object's vtable[1] (AddRef) is dispatched, and S_OK (0) is returned.
+//  Otherwise *ppv is cleared and 0x80004002 (E_NOINTERFACE) is returned.
+//  The original has no ppv-null check (unlike the audio QI).  [NOT
+//  byte-identical] placement-dependent (relative E8 call to the 16-byte IID
+//  compare sub_5AE060 + the indirect AddRef dispatch through the object's
+//  vtable + the high-VA IID globals).
+static long __stdcall Win32FileQueryInterface(void *obj, const void *riid, void **ppv)
+{
+    if (memcmp(riid, &g_riid_1BF7604, sizeof(IID)) != 0 &&
+        memcmp(riid, &g_riid_1BF7874, sizeof(IID)) != 0)
+    {
+        *ppv = 0;
+        return (long)0x80004002;   // E_NOINTERFACE
+    }
+    *ppv = obj;
+    ((void (WINAPI *)(void *))F3_VT(obj)[1])(obj);   // AddRef (vtable[1])
+    return 0;                                         // S_OK
+}
+
 // the CWin32File vtable (original `??_7CWin32File@LHVFS@@6B@`, 13 slots:
 // the base vtable's QueryInterface / AddRef / Release, the 8 IFile methods
 // (sub_18A37C0 / sub_18A39D0 / sub_18A3BA0 / sub_18A3D30 / sub_18A3730 /
@@ -5389,7 +6083,7 @@ static LONG WINAPI Win32FileRelease(void *obj)
 // deleting dtor (sub_5C1550), and the IFile base-class descriptor).
 static void *g_Win32FileVtable[13] =
 {
-    0,                          // [0] sub_5B57A0 (QueryInterface -- stub)
+    (void *)Win32FileQueryInterface,  // [0] sub_5B57A0
     (void *)Win32FileAddRef,    // [1] sub_5B5700
     (void *)Win32FileRelease,   // [2] sub_5B5740
     0, 0, 0, 0, 0, 0, 0, 0,     // [3..10] the IFile methods (remaining stubs)
@@ -5589,6 +6283,85 @@ static void *WINAPI Win32FileSystemOpen(void *obj, void **out,
     return out;
 }
 
+// Win32FileSystemHashResolve  (0x18AACA0 - 0x18AAC30)  -- the CWin32FileSystem
+// vtable's vt[3] (the manifest hash resolve): dispatch vt[4] (the open) on
+// the wrapper with the manifest-advanced position.
+//
+// [NOT byte-identical] placement-dependent (the relative calls to the
+// manifest-index helper (sub_5AF880, reimplemented here) and the vt[4]
+// dispatch).
+//
+// The +0x2C member (the 32-byte CFileManifest) wraps a MSVC
+// debug-iterator-like dynamic array: the manifest's +0x08 slot (m[0],
+// manifest[2]) is a self-tag block whose first DWORD is a metadata pointer
+// (the [lower, upper) bounds at +0x0C / +0x10), and the manifest's +0x14
+// DWORD (m[3], manifest[5]) is the current position with the end at
+// manifest[6] (m[4]).  The index is checked against
+// (manifest[6] - manifest[5]) / 36 -- the same out-of-range guard as the
+// manifest family (sub_5AF880's magic-constant signed division, throwing
+// std::out_of_range on a violation).  The current position is then advanced
+// by 36 bytes per index step, and the bounds [DWORD at v4+12, DWORD at v4+16]
+// are re-checked (v4 = the first DWORD of the self-tag block, the metadata
+// pointer); out-of-range / out-of-bounds paths call the F3InvalidParam
+// stand-in for the original's __invalid_parameter_noinfo (which is noreturn
+// in the original, so we return gracefully -- the manifest is never null or
+// out-of-range in this build).  The vt[4] method is dispatched on the
+// wrapper with the out slot / advanced position / mode (the same arguments
+// the original passes), and the out slot is returned.
+static void *Win32FileSystemHashResolve(void *obj, void **out, int index, int mode)
+{
+    DWORD *o = (DWORD *)obj;
+    DWORD manifest = o[0x2C / 4];
+    if (manifest == 0)
+    {
+        F3InvalidParam();
+        return out;
+    }
+    DWORD *m = (DWORD *)(manifest + 8);   /* T = the manifest + 8 */
+
+    /* sub_5AF880: range = m[4] - m[3];  if (range / 36 <= index) -> throw */
+    int range = (int)m[4] - (int)m[3];
+    if (range / 36 <= index)
+        throw std::out_of_range("invalid vector<T> subscript");
+
+    int pos = (int)m[3];                  /* manifest[5] */
+    if (pos > (int)m[4])
+    {
+        F3InvalidParam();
+        return out;
+    }
+
+    /* sub_5B11F0: advance the current position by 36 bytes per index */
+    pos += 36 * index;
+
+    /* the bounds: [DWORD at (v4 + 12), DWORD at (v4 + 16)] */
+    DWORD m0 = m[0];                    /* manifest[2]: the self-tag block */
+    if (m0 == 0)
+    {
+        F3InvalidParam();
+        return out;
+    }
+    DWORD v4 = *(DWORD *)m0;            /* the first DWORD of the sub-object */
+    DWORD upper = *(DWORD *)(v4 + 16);
+    DWORD lower = *(DWORD *)(v4 + 12);
+    if ((DWORD)pos > upper || (DWORD)pos < lower)
+    {
+        F3InvalidParam();
+        return out;
+    }
+    if ((DWORD)pos >= upper)             /* the final strict >= check */
+    {
+        F3InvalidParam();
+        return out;
+    }
+
+    /* dispatch the wrapper's vt[4] (the open) */
+    ((void (WINAPI *)(void *, void **, F3WString *, int))F3_VT(obj)[4])(
+        obj, out, (F3WString *)(DWORD)pos, mode);
+
+    return out;
+}
+
 //  Win32FileSystemDeletingDtor  (0x5AF660)  -- the CWin32FileSystem
 //  deleting dtor (the wrapper vtable's vt[10]): the dtor body plus the
 //  heap free.
@@ -5601,20 +6374,20 @@ static void *WINAPI Win32FileSystemDeletingDtor(void *obj)
 
 // the wrapper vtable (original `??_7CWin32FileSystem@LHVFS@@6B@`, 11
 // slots: the base vtable's QueryInterface / AddRef / Release, the vt[3]
-// hash resolve (sub_18AACA0 -- a stub here), the vt[4] open, the vt[5..7]
+// hash resolve (sub_18AACA0, implemented), the vt[4] open, the vt[5..7]
 // methods (sub_18AB770 / sub_18AB010 / sub_18AAB50 -- remaining stubs),
-// the vt[8] root-path copy, the vt[9] method (sub_18AAB60 -- a stub), and
-// the vt[10] deleting dtor).
+// the vt[8] root-path copy, the vt[9] volume-info query (sub_18AAB60,
+// implemented), and the vt[10] deleting dtor).
 static void *g_Win32FileSystemVtable[11] =
 {
     (void *)Win32FileSystemDtor,     // [0] sub_5AFC10 (base dtor shape)
     (void *)Win32FileSystemAddRef,   // [1] sub_5AFB70 (AddRef)
     (void *)Win32FileSystemRelease,  // [2] sub_5AFBB0 (Release)
-    0,                               // [3] sub_18AACA0 (remaining stub)
+    (void *)Win32FileSystemHashResolve,  // [3] sub_18AACA0 (the manifest hash resolve)
     (void *)Win32FileSystemOpen,     // [4] sub_18AB470 (vt+16, the open)
     0, 0, 0,                         // [5..7] remaining stubs
     (void *)Win32FileSystemGetPath,  // [8] sub_5AF5E0 (root-path copy)
-    0,                               // [9] sub_18AAB60 (remaining stub)
+    (void *)Win32FileSystemGetVolumeInfo,  // [9] sub_18AAB60
     (void *)Win32FileSystemDeletingDtor  // [10] sub_5AF660
 };
 
@@ -5685,12 +6458,360 @@ static void *CreateFileSystemWrapper(void **out)
 static void F3WStringReset(F3WString *s);
 static void F3WStringClear(F3WString *s);
 
+//  CLegacyMemoryFileReleaseFileHandle  (0x17FDC60 - 0x17FDC7B) -- the
+//  CLegacyMemoryFile's vtable slot 2: release the object's +8 file handle
+//  through that handle's own vtable slot 2 (stdcall, the handle object as
+//  the argument), then null +8, and return the release result.  thiscall
+//  (obj in ECX, plain `retn`), result in EAX.
+//
+//  [BYTE-IDENTICAL] no calls / no absolute refs / no high-VA globals -- the
+//  body is the original's exact instruction sequence (push esi / mov esi,ecx /
+//  mov eax,[esi+8] / test/jz / mov ecx,[eax] / mov edx,[ecx+8] / push eax /
+//  call edx / [skip:] mov dword ptr [esi+8],0 / pop esi / retn), emitted as
+//  naked asm so it matches the original 27 bytes exactly.
+static __declspec(naked) int CLegacyMemoryFileReleaseFileHandle(void *obj)
+{
+    __asm
+    {
+        push    esi
+        mov     esi, ecx
+        mov     eax, [esi+8]          ; eax = the +8 file handle
+        test    eax, eax
+        jz      short f3_rmfrf_skip
+        mov     ecx, [eax]            ; ecx = the handle's vftable
+        mov     edx, [ecx+8]          ; edx = the handle's vtable slot 2 (offset 8)
+        push    eax                   ; the handle as the stdcall arg
+        call    edx                   ; the handle's vt[2] release (stdcall)
+    f3_rmfrf_skip:
+        mov     dword ptr [esi+8], 0  ; null the +8 handle
+        pop     esi
+        retn
+    }
+}
+
+//  CLegacyMemoryFileReadChunk  (0x17FDC80 - 0x17FDCC8) -- the
+//  CLegacyMemoryFile's vtable slot 3 (an IFile read/seek-style method):
+//  when the caller's count argument (the first stack arg, a3) is > 0 and the
+//  object's +8 file handle is non-null, stage an {out-pointer, 0} buffer,
+//  dispatch the handle's own vtable slot 3 (offset 0x0C, thiscall, the handle
+//  object as the argument) with (out=&buffer, extra=this+0x0C, extra>>31,
+//  count, 0), and then bump this+0x0C by the count.  thiscall (obj in ECX,
+//  3 stack args, callee-cleanup `retn 0Ch`), result in EAX.  The return is
+//  the vt[3] call's result; on the bail path EAX is whatever the caller left
+//  in it.
+//
+//  [BYTE-IDENTICAL] no E8 calls / no E9 jumps / no 0F 8x long conditionals /
+//  no high-VA globals -- the body is the original's exact instruction
+//  sequence (sub esp,8 / push esi / push edi / mov edi,[esp+0x18] /
+//  mov esi,ecx / test/jle / mov ecx,[esi+8] / test/jz / mov eax,[esp+0x14] /
+//  push ebx / mov [esp+0xc],eax / mov eax,[esi+0xc] / push 0 / cdq / push
+//  edi / push edx / mov [esp+0x1c],0 / mov ebx,[ecx] / push eax / mov
+//  eax,[ebx+0xc] / lea edx,[esp+0x1c] / push edx / call eax / add
+//  [esi+0xc],edi / pop ebx / pop edi / pop esi / add esp,8 / retn 0Ch), emitted
+//  as naked asm so it matches the original 72 bytes exactly.
+static __declspec(naked) int CLegacyMemoryFileReadChunk(void *obj)
+{
+    __asm
+    {
+        sub     esp, 8
+        push    esi
+        push    edi
+        mov     edi, [esp+0x18]       ; arg1 -- the count (a3)
+        mov     esi, ecx              ; esi = obj
+        test    edi, edi
+        jle     short f3_mrc_skip     ; a3 <= 0 -> bail
+        mov     ecx, [esi+8]          ; ecx = the +8 file handle
+        test    ecx, ecx
+        jz      short f3_mrc_skip     ; null handle -> bail
+        mov     eax, [esp+0x14]       ; eax = arg0 (a2, the out pointer)
+        push    ebx
+        mov     dword ptr [esp+0xc], eax   ; buffer[0] = arg0
+        mov     eax, [esi+0xc]        ; eax = the +0xC extra counter
+        push    0                     ; a6 = 0
+        cdq                           ; edx = extra >> 31
+        push    edi                   ; a5 = the count
+        push    edx                   ; a4 = extra >> 31
+        mov     dword ptr [esp+0x1c], 0   ; buffer[1] = 0
+        mov     ebx, [ecx]            ; ebx = the handle's vtable
+        push    eax                   ; a3 = the extra counter
+        mov     eax, [ebx+0xc]        ; eax = vt slot 3
+        lea     edx, [esp+0x1c]       ; edx = &buffer
+        push    edx                   ; a2 = &buffer
+        call    eax                   ; the handle's vt[3] (thiscall)
+        add     dword ptr [esi+0xc], edi   ; this+0xC += count
+        pop     ebx
+    f3_mrc_skip:
+        pop     edi
+        pop     esi
+        add     esp, 8
+        retn    0Ch
+    }
+}
+
+//  CLegacyMemoryFileWrite  (0x17FDCD0 - 0x17FDD12) -- the
+//  CLegacyMemoryFile's vtable slot 4 (the handle's own vtable slot 6, an
+//  IFile write-style method): when the object's +8 file handle is non-null,
+//  stage an {a2, 0} buffer, dispatch the handle's own vtable slot 6 (offset
+//  0x18, thiscall, the handle object as the argument) with
+//  (out=&buffer, extra=this+0x0C, extra>>31, count=a3), and then bump
+//  this+0x0C by a3.  thiscall (obj in ECX, 3 stack args, callee-cleanup
+//  `retn 0Ch`), result in EAX.  The return is the vt[6] call's result; on
+//  the bail path EAX is whatever the caller left in it.
+//
+//  [BYTE-IDENTICAL] no E8 calls / no E9 jumps / no 0F 8x long conditionals /
+//  no high-VA globals -- the body is the original's exact instruction
+//  sequence (sub esp,8 / push esi / mov esi,ecx / mov ecx,[esi+8] / test,ecx /
+//  jz short / mov eax,[esp+0x10] / push ebx / push edi / mov edi,[esp+0x1c] /
+//  mov [esp+0xc],eax / mov eax,[esi+0xc] / cdq / push edi / push edx / mov
+//  dword ptr [esp+0x18],0 / mov ebx,[ecx] / push eax / mov eax,[ebx+0x18] /
+//  lea edx,[esp+0x18] / push edx / call eax / add [esi+0xc],edi / pop edi /
+//  pop ebx / pop esi / add esp,8 / retn 0Ch), emitted as naked asm so it
+//  matches the original 66 bytes exactly.
+static __declspec(naked) int CLegacyMemoryFileWrite(void *obj)
+{
+    __asm
+    {
+        sub     esp, 8
+        push    esi
+        mov     esi, ecx              ; esi = obj
+        mov     ecx, [esi+8]          ; ecx = the +8 file handle
+        test    ecx, ecx
+        jz      short f3_mlfw_skip    ; null handle -> bail
+        mov     eax, [esp+0x10]       ; eax = arg0 (a2)
+        push    ebx
+        push    edi
+        mov     edi, [esp+0x1c]       ; edi = arg1 (a3)
+        mov     dword ptr [esp+0xc], eax   ; buffer[0] = arg0
+        mov     eax, [esi+0xc]        ; eax = the +0xC extra counter
+        cdq                           ; edx = extra >> 31
+        push    edi                   ; a4 = the count
+        push    edx                   ; a3 = extra >> 31
+        mov     dword ptr [esp+0x18], 0   ; buffer[1] = 0
+        mov     ebx, [ecx]            ; ebx = the handle's vtable
+        push    eax                   ; a2 = the extra counter
+        mov     eax, [ebx+0x18]       ; eax = vt slot 6
+        lea     edx, [esp+0x18]       ; edx = &buffer
+        push    edx                   ; a1 = &buffer
+        call    eax                   ; the handle's vt[6] (thiscall)
+        add     dword ptr [esi+0xc], edi   ; this+0xC += count
+        pop     edi
+        pop     ebx
+    f3_mlfw_skip:
+        pop     esi
+        add     esp, 8
+        retn    0Ch
+    }
+}
+
+
+//  CLegacyMemoryFileSetCounter  (0x17FDD20 - 0x17FDD30) -- the
+//  CLegacyMemoryFile's vtable slot 5: when the object's +8 file handle is
+//  non-null, store the caller's value (a2) into the +0xC extra counter and
+//  return it (thiscall: obj in ECX, one stack arg, callee-cleanup retn 4,
+//  result in EAX; on the bail path EAX is whatever the caller left in it).
+//  The sibling slots are the counter-adder (sub_17FDD30 ->
+//  CLegacyMemoryFileAddCounter) and the counter-getter (sub_17FDD40 ->
+//  CLegacyMemoryFileGetCounter, returns +0xC or 0).
+//
+//  [BYTE-IDENTICAL] no calls / no absolute refs / no high-VA globals --
+//  the body is the original's exact instruction sequence (cmp [ecx+8],0 /
+//  jz / mov eax,[esp+4] / mov [ecx+0Ch],eax / retn 4), emitted as naked asm
+//  so it matches the original 16 bytes exactly.
+static __declspec(naked) int CLegacyMemoryFileSetCounter(void *obj)
+{
+    __asm
+    {
+        cmp     dword ptr [ecx+8], 0
+        jz      short f3_mlfc_exit
+        mov     eax, [esp+4]
+        mov     dword ptr [ecx+0Ch], eax
+    f3_mlfc_exit:
+        retn    4
+    }
+}
+
+
+//  CLegacyMemoryFileAddCounter  (0x17FDD30 - 0x17FDD40) -- the
+//  CLegacyMemoryFile's vtable slot 6: when the object's +8 file handle is
+//  non-null, add the caller's value (a2) into the +0xC extra counter and
+//  return the added value (thiscall: obj in ECX, one stack arg,
+//  callee-cleanup retn 4, result in EAX; on the bail path EAX is whatever
+//  the caller left in it).
+//
+//  [BYTE-IDENTICAL] no calls / no absolute refs / no high-VA globals --
+//  the body is the original's exact instruction sequence (cmp [ecx+8],0 /
+//  jz / mov eax,[esp+4] / add [ecx+0Ch],eax / retn 4), emitted as naked asm
+//  so it matches the original 16 bytes exactly.
+static __declspec(naked) int CLegacyMemoryFileAddCounter(void *obj)
+{
+    __asm
+    {
+        cmp     dword ptr [ecx+8], 0
+        jz      short f3_mlfc_add_exit
+        mov     eax, [esp+4]
+        add     dword ptr [ecx+0Ch], eax
+    f3_mlfc_add_exit:
+        retn    4
+    }
+}
+
+
+//  CLegacyMemoryFileGetCounter  (0x17FDD40 - 0x17FDD4D) -- the
+//  CLegacyMemoryFile's vtable slot 7: when the object's +8 file handle is
+//  non-null, return the +0xC extra counter; otherwise return 0 (thiscall:
+//  obj in ECX, no stack args, plain retn, result in EAX).
+//
+//  [BYTE-IDENTICAL] no calls / no absolute refs / no high-VA globals --
+//  the body is the original's exact instruction sequence (cmp [ecx+8],0 /
+//  jz / mov eax,[ecx+0Ch] / retn / xor eax,eax / retn), emitted as naked
+//  asm so it matches the original 13 bytes exactly.
+static __declspec(naked) int CLegacyMemoryFileGetCounter(void *obj)
+{
+    __asm
+    {
+        cmp     dword ptr [ecx+8], 0
+        jz      short f3_mlfc_get_exit
+        mov     eax, [ecx+0Ch]
+        retn
+    f3_mlfc_get_exit:
+        xor     eax, eax
+        retn
+    }
+}
+
+//  CLegacyMemoryFileSlot8Stub  (0x17FD6F0 - 0x17FD6F3) -- the
+//  CLegacyMemoryFile's vtable slot 8: a no-op IFile stub -- thiscall: obj in
+//  ECX, one stack arg, callee-cleanup retn 4, no result (result value is
+//  whatever the caller left in EAX).
+//
+//  [BYTE-IDENTICAL] no calls / no absolute refs / no high-VA globals --
+//  the body is the original's exact instruction sequence (retn 4), emitted
+//  as naked asm so it matches the original 3 bytes exactly.
+static __declspec(naked) int CLegacyMemoryFileSlot8Stub(void *obj)
+{
+    __asm
+    {
+        retn    4
+    }
+}
+
+//  CLegacyMemoryFileGetLength  (0x17FDD50 - 0x17FDD5A) -- the
+//  CLegacyMemoryFile's vtable slot 9: a tail-dispatch forwarder -- unlike
+//  the slots above (which read this object's own +0xC counter), this one
+//  forwards to the object's +8 file handle (the inner LHVFS::CMemoryFile):
+//  tail-call the inner object's vtable slot 7 (offset 0x1C) with the inner
+//  object as `this` (thiscall: obj in ECX, obj = the inner object), and
+//  return that slot's result.  The inner object's slot 7 (sub_18A8A40) reads
+//  the inner object's +0x20 field and returns it -- the in-memory file's
+//  length (set from the source file's size by MemoryFileReadFromSource, or
+//  0 for an empty file).  The tail jump forwards any stack args to the inner
+//  slot, so the ABI is the inner slot's thiscall + cdecl hybrid.
+//
+//  [BYTE-IDENTICAL] no E8 calls / no E9 jmps / no 0F 8x long conditionals /
+//  no absolute refs / no high-VA globals -- the body is the original's
+//  exact instruction sequence (mov ecx,[ecx+8] / mov eax,[ecx] / mov
+//  edx,[eax+1Ch] / jmp edx), emitted as naked asm so it matches the original
+//  10 bytes exactly.
+static __declspec(naked) int CLegacyMemoryFileGetLength(void *obj)
+{
+    __asm
+    {
+        mov     ecx, [ecx+8]
+        mov     eax, [ecx]
+        mov     edx, [eax+1Ch]
+        jmp     edx
+    }
+}
+
+//  MemoryFileReleaseStreamMember  (0x18A8C30 - 0x18A8C91)  -- the
+//  LHVFS::CMemoryFile's +0x24 stream-member release: guard the +0x28
+//  critical section, read the +0x24 stream member; when it is non-null,
+//  dispatch its vtable slot 4 (offset 0x10, thiscall, the member object as
+//  `this`) and -- when that returns >= 0 -- re-read the +0x24 member and
+//  dispatch its vtable slot 2 (offset 8, stdcall, the member object as the
+//  argument), then null +0x24; otherwise zero the +0x0C / +0x10 fields.
+//  Write the +0x0C / +0x10 words into the caller's 8-byte buffer (a2) and
+//  leave the critical section.  Returns the buffer.  [NOT byte-identical]
+//  placement-dependent (the E8 calls to EnterCriticalSection /
+//  LeaveCriticalSection + the vtable dispatches).
+static DWORD *MemoryFileReleaseStreamMember(void *obj, DWORD *buf)
+{
+    DWORD *o = (DWORD *)obj;
+    EnterCriticalSection((CRITICAL_SECTION *)(o + 10));
+    DWORD member = o[9];
+    if (member != 0)
+    {
+        int (__thiscall *vt4)(void *) = (int (__thiscall *)(void *))F3_VT((void *)member)[4];
+        if (vt4((void *)member) >= 0)
+        {
+            DWORD m2 = o[9];
+            if (m2 != 0)
+            {
+                ((void (__stdcall *)(void *))F3_VT((void *)m2)[2])((void *)m2);
+                o[9] = 0;
+            }
+        }
+        else
+        {
+            o[3] = 0;
+            o[4] = 0;
+        }
+    }
+    buf[0] = o[3];
+    buf[1] = o[4];
+    LeaveCriticalSection((CRITICAL_SECTION *)(o + 10));
+    return buf;
+}
+
+//  CLegacyMemoryFileReleaseInnerStream  (0x17FDD60 - 0x17FDD83)  -- the
+//  CLegacyMemoryFile's vtable slot 10: read the +8 file handle (the inner
+//  LHVFS::CMemoryFile); when it is non-null, run the inner file's
+//  +0x24 stream-member release (MemoryFileReleaseStreamMember) and return
+//  whether the inner buffer-start word (+0x0C) is non-zero; otherwise return
+//  0 (thiscall: obj in ECX, no stack args, plain retn, result in EAX as
+//  bool).  [NOT byte-identical] placement-dependent (the E8 call to
+//  MemoryFileReleaseStreamMember).
+static int CLegacyMemoryFileReleaseInnerStream(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    DWORD handle = o[2];
+    if (handle == 0)
+        return 0;
+    DWORD buf[2];
+    MemoryFileReleaseStreamMember((void *)handle, buf);
+    return (buf[0] != 0) ? 1 : 0;
+}
+
 // the CLegacyMemoryFile vtable (original 0x1BC7FBC, 12 slots): the dtor
-// (sub_18004B0), the open-setup (sub_17FE290), and the IFile method slots
-// (sub_17FDC60 / sub_17FDC80 / sub_17FDCD0 / sub_17FDD20 / sub_17FDD30 /
-// sub_17FD6F0 / sub_17FDD50 / sub_17FDD60 / sub_17FD700 -- remaining
-// stubs; the stub build never dispatches through them).
-static int LegacyMemoryFileStubMethod(void *obj) { (void)obj; return 0; }
+// (sub_18004B0), the open-setup (sub_17FE290), the real release-file
+// (sub_17FDC60 -> CLegacyMemoryFileReleaseFileHandle), the real read-chunk
+// (sub_17FDC80 -> CLegacyMemoryFileReadChunk), the real write (sub_17FDCD0
+// -> CLegacyMemoryFileWrite), the real counter-setter (sub_17FDD20 ->
+// CLegacyMemoryFileSetCounter, byte-identical), the real counter-adder
+// (sub_17FDD30 -> CLegacyMemoryFileAddCounter, byte-identical), the real
+// counter-getter (sub_17FDD40 -> CLegacyMemoryFileGetCounter,
+// byte-identical), the real slot-8 no-op (sub_17FD6F0 ->
+// CLegacyMemoryFileSlot8Stub, byte-identical), the real slot-9 tail-dispatch
+// (sub_17FDD50 -> CLegacyMemoryFileGetLength, byte-identical), the real
+// slot-10 inner stream release (sub_17FDD60 ->
+// CLegacyMemoryFileReleaseInnerStream, [NOT byte-identical]), and the
+// remaining IFile method slot (sub_17FD700 -> WidePathToAnsiSlot).
+//
+//  WidePathToAnsiSlot  (0x17FD700 - 0x17FD712)  -- the LHSFS::CLegacyMemoryFile's
+//  vtable slot 11: convert the object's +4 wide path slot into an ANSI slot
+//  (AnsiFromWideSlot) and return the out slot.
+//  [NOT byte-identical] placement-dependent (the E8 call to AnsiFromWideSlot).
+//
+//  F3SharedBuffer ** WidePathToAnsiSlot(F3SharedBuffer **obj, F3SharedBuffer **out)
+//
+//  thiscall in the original (obj in ECX, out on the stack, retn 4); obj is
+//  the LHSFS::CLegacyMemoryFile whose +4 field holds the wide path slot, so
+//  `obj + 1` (this + 1, +4 bytes) is the address of that slot.
+static F3SharedBuffer ** WidePathToAnsiSlot(F3SharedBuffer **obj, F3SharedBuffer **out)
+{
+    AnsiFromWideSlot(obj + 1, out);
+    return out;
+}
 static void *CLegacyMemoryFileDtorAddress(void);
 static int CLegacyMemoryFileOpen(void *obj, F3SharedBuffer **slot, int mode, int a4);
 
@@ -5698,16 +6819,16 @@ static void *g_CLegacyMemoryFileVtable[12] =
 {
     CLegacyMemoryFileDtorAddress(),      // [0] sub_18004B0
     (void *)CLegacyMemoryFileOpen,       // [1] sub_17FE290
-    (void *)LegacyMemoryFileStubMethod,  // [2] sub_17FDC60
-    (void *)LegacyMemoryFileStubMethod,  // [3] sub_17FDC80
-    (void *)LegacyMemoryFileStubMethod,  // [4] sub_17FDCD0
-    (void *)LegacyMemoryFileStubMethod,  // [5] sub_17FDD20
-    (void *)LegacyMemoryFileStubMethod,  // [6] sub_17FDD30
-    (void *)LegacyMemoryFileStubMethod,  // [7] sub_17FDD40
-    (void *)LegacyMemoryFileStubMethod,  // [8] sub_17FD6F0 (nullsub)
-    (void *)LegacyMemoryFileStubMethod,  // [9] sub_17FDD50
-    (void *)LegacyMemoryFileStubMethod,  // [10] sub_17FDD60
-    (void *)LegacyMemoryFileStubMethod   // [11] sub_17FD700
+    (void *)CLegacyMemoryFileReleaseFileHandle,  // [2] sub_17FDC60
+    (void *)CLegacyMemoryFileReadChunk,  // [3] sub_17FDC80
+    (void *)CLegacyMemoryFileWrite,   // [4] sub_17FDCD0
+    (void *)CLegacyMemoryFileSetCounter,  // [5] sub_17FDD20
+    (void *)CLegacyMemoryFileAddCounter,  // [6] sub_17FDD30
+    (void *)CLegacyMemoryFileGetCounter,  // [7] sub_17FDD40
+    (void *)CLegacyMemoryFileSlot8Stub,  // [8] sub_17FD6F0
+    (void *)CLegacyMemoryFileGetLength,  // [9] sub_17FDD50
+    (void *)CLegacyMemoryFileReleaseInnerStream,  // [10] sub_17FDD60
+    (void *)WidePathToAnsiSlot           // [11] sub_17FD700
 };
 
 // The 16-byte LHSFS::CLegacyMemoryFile object.  The dtor is a real member
@@ -6364,13 +7485,159 @@ static int MountVideoFile(void *obj, F3SharedBuffer **slotId)
 // 0x2075EAC: the GDB loader wrapper (published by CreateGdbLoader).
 static void *g_dword_2075EAC = 0;
 
-// sub_50A540 (unresolved in this build) -- the 56-byte GDB file-reader ctor
-// (thiscall, the reader in ECX).  Out of scope.  Stub: returns the object.
-//  [remaining stub]
-static void *sub_50A540(void *obj) { return obj; }
+//  GdbHashGrow  (0x50A160 - 0x50A213)  -- the GDB reader state block's hash-table
+//  grow step: when the new capacity exceeds the old (or the block is empty),
+//  allocate a 4*capacity zeroed buffer, rehash the old entries (linear probe
+//  from the slot, re-inserting on a same-key match or an empty slot), free
+//  the old buffer, and publish the new (capacity, buffer) pair in the block.
+//  Same entry layout as the original (the entry pointer at each slot, the
+//  key read from *entry, the mask = capacity - 1).  [NOT byte-identical]
+//  placement-dependent (the E8 calls to LHAlloc / LHFree / _memset).
+static DWORD GdbHashGrow(DWORD newCapacity, DWORD *a2)
+{
+    DWORD oldCapacity = a2[0];
+    if (newCapacity > oldCapacity || oldCapacity == 0)
+    {
+        DWORD *oldBuffer = (DWORD *)a2[1];   // the old 4*capacity buffer
+        DWORD newSize    = 4 * newCapacity;
+        DWORD v9         = oldCapacity;      // the number of old slots to walk
+
+        a2[0] = newCapacity;                // [a2+0] = the new capacity
+        DWORD *newBuffer = (DWORD *)LHAlloc(newSize);
+        a2[1] = (DWORD)newBuffer;            // [a2+4] = the new buffer
+        memset(newBuffer, 0, newSize);
+
+        DWORD mask = a2[0] - 1;              // the slot mask (capacity - 1)
+        DWORD index = 0;
+        while (index < v9)
+        {
+            DWORD *entry = *(DWORD **)((char *)oldBuffer + 4 * index);
+            if (entry != 0)
+            {
+                DWORD key = *entry;          // the entry's key (*entry)
+                DWORD slot = mask & key;     // the initial hash slot
+                if (newBuffer[slot] == 0)
+                {
+                    newBuffer[slot] = (DWORD)entry;   // empty slot: insert
+                }
+                else
+                {
+                    // Collision: linear-probe.  The original loop is
+                    //   loop: existing = newBuffer[slot]
+                    //         if (*existing == key) break;      // equal -> store at slot
+                    //         slot = mask & (slot + 1);
+                    //         if (newBuffer[slot] == 0) break;  // empty -> store at slot
+                    // so the equal-key case keeps the ORIGINAL slot and the
+                    // empty-slot case keeps the PROBED slot.
+                    for (;;)
+                    {
+                        DWORD *existing = (DWORD *)newBuffer[slot];
+                        if (*existing == key)
+                            break;
+                        slot = mask & (slot + 1);
+                        if (newBuffer[slot] == 0)
+                            break;
+                    }
+                    newBuffer[slot] = (DWORD)entry;
+                }
+            }
+            ++index;
+        }
+        if (oldBuffer != 0)
+            LHFree(oldBuffer);               // free the old buffer (the high-VA free slot)
+    }
+    return a2[0];   // the new capacity (the original returns eax, unobservable)
+}
+
+//  GdbReaderStateCtor  (0x50C740 - 0x50C781)  -- construct the 36-byte GDB
+//  reader state block (inside the 56-byte GDB file reader): zero the capacity
+//  words, take the self-referencing 4-byte tag block (the block holds the
+//  address of this +0x8, the slot holds the block), zero the +0x14..+0x20
+//  words, then grow the hash table to 0x10000 entries through GdbHashGrow
+//  (allocates + zeroes the 4*capacity buffer and publishes it at +0x4).
+//  The original is thiscall (this in ECX, no stack args, no `retn` payload);
+//  declared object-first here.  [NOT byte-identical] placement-dependent
+//  (the E8 calls to LHAlloc / GdbHashGrow / _memset).
+static void *GdbReaderStateCtor(void *thisObj)
+{
+    DWORD *a1 = (DWORD *)thisObj;
+    a1[0] = 0;
+    a1[1] = 0;
+
+    DWORD *entry = (DWORD *)LHAlloc(4);
+    if (entry != 0)
+        *entry = (DWORD)(a1 + 2);      // the block holds the +8 slot's address
+    else
+        entry = 0;
+    a1[2] = (DWORD)entry;             // [a1+8] = the self-referencing block
+
+    a1[5] = 0;                        // [a1+0x14]
+    a1[6] = 0;                        // [a1+0x18]
+    a1[7] = 0;                        // [a1+0x1C]
+    a1[8] = 0;                        // [a1+0x20]
+    GdbHashGrow(0x10000, a1);
+    return thisObj;
+}
+
+//  GdbFileReaderCtor  (0x50A540 - 0x50A5EB)  -- construct the 56-byte GDB
+//  file-reader object: allocate + initialize the self-referencing 4-byte tag
+//  block (the block holds the reader pointer, the +0 slot holds the block),
+//  the self-referencing 16-byte block (the block holds its own address at
+//  +0 and +4), zero +0x18, run GdbReaderStateCtor over the 36-byte buffer
+//  (the reader state: capacity at +0, buffer at +4, the self-referencing tag
+//  block at +8, zeroed +0x14/+0x18/+0x1C/+0x20), allocate + zero the 2 MB
+//  buffer with capacity word 0x40000, and allocate + zero the 8 KB buffer
+//  with capacity word 0x400.  The original is usercall
+//  (the reader in ECX, returned in eax -- the same pointer); declared
+//  object-first here.  [NOT byte-identical] placement-dependent (the E8
+//  calls to LHAlloc / _memset / GdbReaderStateCtor).
+//
+//  Note: the original's v2 self-reference branch writes *(v2+4) unconditionally
+//  unless v2 == -4 (the disasm writes through ecx = v2+4, which skips only
+//  when v2 == -4 and therefore also writes to address 4 on an allocation
+//  failure); reproducing the failure-path crash is not meaningful, so the
+//  stores are skipped when the block could not be allocated (the success
+//  path is byte-identical in behavior).
+static void *GdbFileReaderCtor(void *obj)
+{
+    DWORD *a1 = (DWORD *)obj;
+
+    DWORD *v1 = (DWORD *)LHAlloc(4);
+    if (v1 != 0)
+        *v1 = (DWORD)a1;              // the block holds the reader pointer
+    a1[0] = (DWORD)v1;
+
+    DWORD *v2 = (DWORD *)LHAlloc(16);
+    if (v2 != 0 && v2 != reinterpret_cast<DWORD *>(-4))
+    {
+        *v2 = (DWORD)v2;              // the block holds its own address
+        v2[1] = (DWORD)v2;            // at +4 as well
+    }
+    a1[5] = (DWORD)v2;
+
+    a1[6] = 0;
+
+    DWORD *v3 = (DWORD *)LHAlloc(36);
+    DWORD *v4 = (v3 != 0) ? (DWORD *)GdbReaderStateCtor(v3) : 0;
+    a1[7] = (DWORD)v4;
+
+    DWORD *v5 = (DWORD *)LHAlloc(0x200000);
+    a1[8] = (DWORD)v5;
+    a1[9] = 0x40000;
+    memset(v5, 0, 0x200000);
+    a1[10] = 0;
+
+    DWORD *v6 = (DWORD *)LHAlloc(0x2000);
+    a1[11] = (DWORD)v6;
+    a1[12] = 0x400;
+    memset(v6, 0, 0x2000);
+    a1[13] = 0;
+
+    return a1;
+}
 
 //  CreateGdbLoader  (0x1A19D20 - 0x1A19D69)  -- allocate the 4-byte wrapper
-//  holding the 56-byte GDB file reader (sub_50A540 [remaining stub]) and
+//  holding the 56-byte GDB file reader (GdbFileReaderCtor) and
 //  publish the wrapper in dword_2075EAC; returns the wrapper (0 on
 //  allocation failure, in which case the global is cleared).
 //  [NOT byte-identical] placement-dependent (the LHAlloc E8 calls) and refs
@@ -6381,7 +7648,7 @@ static void *CreateGdbLoader(void)
     if (wrapper != 0)
     {
         void *reader = LHAlloc(0x38);
-        *(void **)wrapper = (reader != 0) ? sub_50A540(reader) : 0;
+        *(void **)wrapper = (reader != 0) ? GdbFileReaderCtor(reader) : 0;
         g_dword_2075EAC = wrapper;
         return wrapper;
     }
@@ -6395,13 +7662,78 @@ static BYTE g_byte_1DBD032 = 0;
 
 static void CopyFileToSharedSlot(void *file, F3SharedBuffer **out);
 
-// sub_1A19E10 (0x1A19E10 - 0x1A19F76) -- load one GDB file through the
-// reader (the sub_1A19D70 file lookup, the sub_402F00 hash build, the
-// SetSharedSlot + LegacyFileCtor memory-file open, the reader vtable slot 10
-// load dispatch, the sub_17FD970 close).  Deep dependency chain -- out of
-// scope.  Stub: returns 0 (the file did not load).  [remaining stub]
-static long sub_1A19E10(void *loader, const char *path, int a3)
-{ (void)loader; (void)path; (void)a3; return 0; }
+// 0x1A19D70 (0x1A19D70 - 0x1A19E04) -- the file lookup in the GDB reader.
+// Deep dependency chain: LHAlloc + sub_1926A10 + sub_1926AA0 + sub_1A198D0 +
+// sub_50AA60 (and sub_50CA60/sub_50A310/sub_1926950/sub_50C9F0/sub_401BD0/
+// sub_50AEA0/sub_50A440/sub_50A4C0, unimplemented).  (sub_50A540 / sub_50C740 /
+// sub_50A160 are implemented above -- the file-reader ctor / state ctor / hash grow).
+// Out of scope -- the stub returns -1 (the file was not
+// found / the load failed).  [remaining stub]
+static int sub_1A19D70(void *a1, const char *src, int a3, int a4)
+{ (void)a1; (void)src; (void)a3; (void)a4; return -1; }
+
+//  LoadOneGdbFile  (0x1A19E10 - 0x1A19F76) -- load one GDB file through the
+//  file-reader: the sub_1A19D70 file lookup (the deep GDB chain, remaining
+//  stub -> returns -1), then, on a successful lookup, build the "<path>.tu"
+//  string (F3AStringAssign + sub_50AD00, the F3AString append variant), open
+//  it through the SetSharedSlot + LegacyFileCtor memory-file trio, dispatch
+//  the reader vtable slot 10 (LegacyFileHasData: the +8 file handle is set),
+//  close the object (LegacyFileDtor), release the shared slot's refcount,
+//  drop the global live-slot counter (g_Addend), and -- when the file has
+//  data -- re-dispatch the lookup with the same string and the original
+//  lookup result, then free the heap-allocated string buffer.  Returns 1.
+//  Thiscall + `retn 8` in the original (ECX this unused -- the reader is
+//  threaded into every lookup); declared object-first here.
+//  [NOT byte-identical] placement-dependent (the E8 calls) and refs the
+//  high-VA string literal ".tu".
+static long LoadOneGdbFile(void *loader, const char *path, int a3)
+{
+    void *reader = (loader != 0) ? *(void **)loader : 0;    // the 56-byte GDB file-reader
+    int result  = sub_1A19D70(reader, path, a3, 0);
+    if (result == -1)
+        return 0;                                          // the file did not load
+
+    // Build the "<path>.tu" string (Source + ".tu").
+    F3AString str;
+    F3AStringReset(&str);                                  // default SSO ctor (cap = 15)
+    F3AStringAssign(&str, path, (unsigned int)strlen(path));
+    F3AStringAppend(&str, ".tu", 3);
+    const char *src = (str.cap < 0x10) ? str.u.buf : (const char *)str.u.ptr;
+
+    // SetSharedSlot: the slot holds the string.
+    F3SharedBuffer *slot = 0;
+    SetSharedSlot(&slot, src, -1);
+
+    // LegacyFileCtor over the path slot (the 16-byte LHSFS::CLegacyFile).
+    DWORD fileObj[4] = { 0, 0, 0, 0 };
+    void *file  = LegacyFileCtor(fileObj, &slot, 1, 2);
+
+    // The reader vtable slot 10: does the legacy file have data (+8 handle set)?
+    int hasData = LegacyFileHasData(file);
+
+    LegacyFileDtor(fileObj);
+
+    if (slot != 0)
+    {
+        if (InterlockedDecrement(&slot->refcount) <= 0 && slot != 0)
+            SharedBufferFree(slot);
+        slot = 0;
+    }
+    InterlockedDecrement(&g_Addend);
+    slot = 0;
+
+    if (hasData != 0)
+    {
+        // Re-dispatch the lookup with the same string and the original
+        // lookup result.
+        sub_1A19D70(reader, src, a3, result);
+    }
+
+    // Free the heap-allocated string buffer (the v15 >= 0x10 branch).
+    F3AStringFree(&str);
+
+    return 1;
+}
 
 //  LoadGlobalGdbFiles  (0x61A100 - 0x61A211)  -- load the five permanent
 //  global GDB files through the GDB loader: Globals.gdb, gui.gdb,
@@ -6415,11 +7747,11 @@ static long sub_1A19E10(void *loader, const char *path, int a3)
 //  calls) and refs the high-VA string literals + byte_1DBD032 / byte_1DBD02A.
 static int LoadGlobalGdbFiles(void *loader)
 {
-    long result = sub_1A19E10(loader, "data\\Globals\\Globals.gdb", 0);
-    sub_1A19E10(loader, "data\\Art\\GUI\\gui.gdb", 0);
-    sub_1A19E10(loader, "data\\Globals\\SpeechAction.gdb", 0);
-    sub_1A19E10(loader, "data\\InteractiveCutscenes\\InteractiveCutscenes.gdb", 0);
-    result = sub_1A19E10(loader, "data\\animatedcutscenes\\animatedcutscenes.gdb", 0);
+    long result = LoadOneGdbFile(loader, "data\\Globals\\Globals.gdb", 0);
+    LoadOneGdbFile(loader, "data\\Art\\GUI\\gui.gdb", 0);
+    LoadOneGdbFile(loader, "data\\Globals\\SpeechAction.gdb", 0);
+    LoadOneGdbFile(loader, "data\\InteractiveCutscenes\\InteractiveCutscenes.gdb", 0);
+    result = LoadOneGdbFile(loader, "data\\animatedcutscenes\\animatedcutscenes.gdb", 0);
     if (g_byte_1DBD032 != 0 && g_byte_1DBD02A == 0)
     {
         F3SharedBuffer *outSlot  = 0;
@@ -6435,21 +7767,94 @@ static int LoadGlobalGdbFiles(void *loader)
         int isTrue = (strncmp(s, "true", 4) == 0);
         result = ReleaseSharedSlot(&outSlot);
         if (isTrue != 0)
-            result = sub_1A19E10(loader, "data\\Entity\\Entity.gdb", 0);
+            result = LoadOneGdbFile(loader, "data\\Entity\\Entity.gdb", 0);
     }
     return (int)result;
 }
 
-// sub_72C220 -- the 192-byte bank container's +0x1C string init.
-// Deep dependency chain -- out of scope.  Stub.  [remaining stub]
-// (sub_7281F0 is now InitSubNodeTree, engine/subnode.cpp;
-// sub_5AA8F0 is now InitNameMapTree, engine/namemap.cpp;
-// sub_6527D0 is now InitBankTree, engine/banktree.cpp.)
-static void sub_72C220(void *obj, int capacity) { (void)obj; (void)capacity; }
+// Globals the +0x1C string init (InitBankStringCollection) publishes.
+// 0x1DC48E0: the bank-string buffer (the target the string collection fills).
+static void *g_bankStringBuffer = 0;   // 0x1DC48E0
+// 0x1DC28C8: the current bank-string writer object (the object writing the
+// buffer; null = none).
+static DWORD  g_bankStringWriter = 0;  // 0x1DC28C8
+// 0x1DC28CC: DestinationSize -- the bank-string buffer's size in bytes.
+static DWORD  g_destinationSize = 0;   // 0x1DC28CC (DestinationSize)
+
+//  sub_72BF00  (0x72BF00 - 0x72BF64)  -- the +0x34 block init (the +0x1C string
+//  collection's heap-object insert).  [remaining stub] -- the deep MSVC
+//  debug-string-collection insert chain (sub_72BF00 -> sub_72B7B0 ->
+//  sub_72ACE0 -> sub_729FA0 / sub_7255B0, with sub_727670 / sub_727E40 /
+//  sub_7289F0 / sub_725A60 / sub_725A40 / sub_722CD0 behind it) is out of
+//  scope; the function returns 0 so the +0x34 slot stays null.
+static void *sub_72BF00(void *obj) { (void)obj; return 0; }
+
+//  InitBankStringCollection  (0x72C220 - 0x72C2FE)  -- the 192-byte bank
+//  container's +0x1C string init.  thiscall + retn 4 (obj in ECX, the capacity
+//  word on the stack, callee-cleans); declared object-first here.  Initialises
+//  the two self-referencing 4-byte tag blocks (+0x04 / +0x1C: LHAlloc(4), the
+//  block holds the slot's address, NULL -> the slot stays NULL), zeroes the
+//  +0x10..+0x18 / +0x28..+0x30 words, writes the +0x34 heap object (sub_72BF00
+//  -- [remaining stub]) and the +0x38 capacity word, then sizes + allocates
+//  the bank-string buffer (trunc((unsigned)capacity * 1.1f), the int understood
+//  as unsigned for a negative capacity, with the FPU round-toward-zero), frees
+//  the superseded buffer (dword_1DC48E0, when the new buffer differs),
+//  publishes the new buffer, size (DestinationSize) and resets the writer
+//  object (dword_1DC28C8) to 0.  Returns this.  [NOT byte-identical]
+//  placement-dependent (the LHAlloc / LHFree E8 calls) and refs the
+//  static high-VA globals; the original also ends with a no-op LHFree(0).
+static void *InitBankStringCollection(void *obj, int capacity)
+{
+    char *base = (char *)obj;
+
+    // the +0x04 self-referencing tag block
+    void *block1 = LHAlloc(4);
+    if (block1 != 0)
+        *(void **)block1 = base + 0x04;
+    *(void **)(base + 0x04) = block1;
+    *(DWORD *)(base + 0x10) = 0;
+    *(DWORD *)(base + 0x14) = 0;
+    *(DWORD *)(base + 0x18) = 0;
+
+    // the +0x1C self-referencing tag block
+    void *block2 = LHAlloc(4);
+    if (block2 != 0)
+        *(void **)block2 = base + 0x1C;
+    *(void **)(base + 0x1C) = block2;
+    *(DWORD *)(base + 0x28) = 0;
+    *(DWORD *)(base + 0x2C) = 0;
+    *(DWORD *)(base + 0x30) = 0;
+
+    // the +0x34 heap object (sub_72BF00 -- remaining stub)
+    *(void **)(base + 0x34) = sub_72BF00(obj);
+
+    // the +0x38 capacity word
+    *(DWORD *)(base + 0x38) = (DWORD)capacity;
+
+    // the bank-string buffer sizing: trunc((unsigned)capacity * 1.1f), with
+    // the FPU set to round-toward-zero (the original's or 0x0C00 cw before
+    // fistp, restored afterwards).
+    double scaled = (double)capacity;
+    if (capacity < 0)
+        scaled += 4294967296.0;    // the 0x4F800000 constant (2^32)
+    unsigned short cw = _controlfp(0, 0);
+    _controlfp(_RC_CHOP, _MCW_RC);
+    int size = (int)(__int64)(scaled * 1.1f);
+    _controlfp(cw, 0xFFFF);
+
+    void *newBuf = LHAlloc((unsigned int)size);
+    void *oldBuf = g_bankStringBuffer;
+    if (newBuf != oldBuf)
+        LHFree(oldBuf);           // the no-op LHFree(0) at the end of the original is skipped
+    g_bankStringBuffer = newBuf;
+    g_destinationSize = (DWORD)size;
+    g_bankStringWriter = 0;       // dword_1DC28C8 = 0
+    return obj;
+}
 
 //  InitBankContainer  (0x7201B0 - 0x720248)  -- construct the 192-byte
 //  bank container in place: +0x18 = 15 (the string SSO capacity), +0x14 / +4
-//  = 0, the +0x1C string init (sub_72C220 [remaining stub] with the 0x4000
+//  = 0, the +0x1C string init (InitBankStringCollection with the 0x4000
 //  word), the 4-byte back-reference node into +0x5C, the +0x68 / +0x6C /
 //  +0x70 zero words, the +0x74 / +0x94 / +0xCC collection inits (InitSubNodeTree
 //  / InitNameMapTree / InitBankTree seeded with the 0x4000
@@ -6465,7 +7870,7 @@ static void *InitBankContainer(void *obj, int unused, int capacity)
     *(DWORD *)(o + 0x18) = 15;
     *(DWORD *)(o + 0x14) = 0;
     o[4] = 0;
-    sub_72C220(o + 0x1C, capacity);
+    InitBankStringCollection(o + 0x1C, capacity);
     void *node = LHAlloc(4);
     if (node != 0)
         *(void **)node = o + 0x5C;
@@ -6481,30 +7886,290 @@ static void *InitBankContainer(void *obj, int unused, int capacity)
     return obj;
 }
 
+// ================================================================
+//  InitGuiObject  (0x6AFD50 - 0x6AFFD0) -- the NUI::CGUI ctor
+// ================================================================
+
+// The 52-byte saved video-options record: forward-declared here so InitGuiObject
+// can call InitVideoOptionsDefaults; the typedef and the function are defined
+// in the video-options section below.
+struct F3VideoOptions;   // incomplete
+typedef struct F3VideoOptions F3VideoOptions;
+static F3VideoOptions *InitVideoOptionsDefaults(F3VideoOptions *obj);
+
 // Placeholder vtable for the stub-constructed NUI::CGUI member (the engine's
-// +0xB8 object): the original ctor (sub_6AFD50) stores the real NUI::CGUI
-// vtable (0x6AFEE0), whose slot 0 (release, the free-it flag) and slot 1
-// (the activate dispatch RebuildGuiObject tail-calls) are unimplemented in
-// this build, so both are callable no-ops.
+// +0xB8 object): the original ctor stores the real NUI::CGUI vtable
+// (0x6AFEE0), whose slot 0 (release, the free-it flag) and slot 1 (the
+// activate dispatch RebuildGuiObject tail-calls) are unimplemented in this
+// build, so both are callable no-ops.
 static int F3StubInt(void *obj) { (void)obj; return 0; }
 static void *g_CGuiVtable[2] = { (void *)F3StubRelease, (void *)F3StubInt };
 
-// sub_6AFD50 (0x6AFD50 - 0x6AFFD0) -- the NUI::CGUI ctor over the 400-byte
-// object (the full GUI / options / packet-callback sub-construct).  Deep
-// dependency chain -- out of scope.  Stub: store the placeholder vtable and
-// return this.  [remaining stub]
-static void *InitGuiObject(void *obj)
+// Placeholder NTools::CBaseObject vtable (0x01BF901C): the DNameNode base ctor
+// stores it into +0x16C (then the ctor overwrites it with the derived
+// CNetPacketCallback vtable).  Zeroed like the other placeholder vtables.
+static void *g_NToolsCBaseObjectVtable[1] = { 0 };
+
+// Placeholder NPacketCallback::CNetPacketCallback vtable (the derived vftable
+// overwritten into the +0x16C DNameNode slot by the ctor).  Zeroed like the
+// other placeholder vtables in this build.
+static void *g_CNetPacketCallbackVtable[8] = { 0 };
+
+// Forward declaration so InitGuiObject (below) can call the manager-player
+// ctor, which is defined further down in this file with the rest of the
+// manager cluster.
+static void *RegisterManagerPlayer(void *mgr, const float *vec);
+
+// The two trivial thunks the file-callback / report-handler slots point at:
+// the file-end dispatcher (sub_6AC5B0, a bare `ret`) and the report handler
+// (nullsub_23, a bare `ret`).
+static int F3FileEndNoop(void) { return 0; }
+static int F3ReportNoop(int a1, int a2) { (void)a1; (void)a2; return 0; }
+
+// The allocator-callback slots (the original ctor installs the three heap
+// callbacks through sub_19EB560): the re-alloc slot (sub_1A03580, the
+// LHBaseMemory::ReAlloc path) is not implemented in this build, so it stays
+// null; the alloc / free slots store LHAlloc / LHFree.
+static int (*g_dword_2075C8C)(int, int) = 0;   // 0x2075C8C: re-alloc callback [remaining stub]
+static void *(*g_dword_2075C90)(unsigned int) = 0;  // 0x2075C90: alloc callback (LHAlloc)
+static void (*g_dword_2075C94)(void *) = 0;     // 0x2075C94: free callback (LHFree)
+
+// The file-callback slots (the original ctor installs the four file-I/O
+// dispatchers through sub_19FAF50): the file-create / file-close / file-write
+// dispatchers (sub_6AD330 / sub_6AC590 / sub_6AC5C0) are not implemented in
+// this build, so those slots stay null; the file-end dispatcher (sub_6AC5B0,
+// the trivial `return 0`) is F3FileEndNoop.
+static void *g_off_1DADC70 = 0;                    // 0x1DADC70: file-create callback [remaining stub]
+static void *g_off_1DADC74 = 0;                    // 0x1DADC74: file-close dispatcher [remaining stub]
+static void *g_off_1DADC78 = 0;                    // 0x1DADC78: file-write dispatcher [remaining stub]
+static int (*g_off_1DADC7C)(void) = 0;              // 0x1DADC7C: file-end dispatcher (sub_6AC5B0)
+
+// The report-handler slot (off_1DADBB4) and the Lua-module / load-file slots
+// (off_1DADCB8 / off_1DADCBC) the original ctor installs through sub_19EB6B0
+// and the two direct stores: the Lua module ctor (sub_6AC620, the Kore Lua
+// module builder) and the load-file callback (sub_628F60, the file-load
+// dispatcher) are not implemented in this build, so those slots stay null; the
+// report handler (nullsub_23, a bare ret) is F3ReportNoop.
+static int (*g_off_1DADBB4)(int, int) = 0;   // 0x1DADBB4: report handler (nullsub_23)
+static void *g_off_1DADCB8 = 0;                   // 0x1DADCB8: Lua module ctor callback [remaining stub]
+static void *g_off_1DADCBC = 0;                   // 0x1DADCBC: load-file callback [remaining stub]
+
+// sub_D6FD50's 80-byte audio-subsystem block (LHAlloc(0x50) + the
+// audio-subsystem init calls sub_D6F700, which are not implemented in this
+// build -- only the block allocation + global store happen).  Set by
+// InitGuiObject.
+static DWORD g_dword_1DD4268 = 0;   // 0x1DD4268
+
+// The this-object this ctor stored (the ctor's own `this`), read back by the
+// engine-time / debug subsystem.  Set by InitGuiObject.
+static DWORD g_dword_1DC2558 = 0;   // 0x1DC2558
+
+//  sub_6B3430 / sub_6B34B0  (0x6B3430 - 0x6B34A1)  -- the 4-byte
+//  self-referencing slot block + the 48-byte self-referencing
+//  {self, self, self} block.  The ctor at this+0x74 (sub_6B3430) and this+0xEC
+//  (sub_6B34B0) are identical in behavior, so both are served by one helper.
+static void *F3SlotBlockCtor(void *obj)
 {
-    *(void **)obj = g_CGuiVtable;
+    DWORD *slot = (DWORD *)obj;
+
+    // The 4-byte block holding the slot address.
+    void *v4 = LHAlloc(4);
+    if (v4 != 0)
+        *(void **)v4 = obj;
+    else
+        v4 = 0;
+    slot[0] = (DWORD)v4;
+
+    // The 48-byte block: the first 3 words zeroed (guarded), the +0x2D/+0x2C
+    // flag pair set, the block self-referencing through slot+0x18, and
+    // slot+0x1C zeroed.
+    void *v5 = LHAlloc(48);
+    if (v5 != 0)
+        *(DWORD *)v5 = 0;
+    if ((char *)v5 + 4 != 0)
+        *(DWORD *)((char *)v5 + 4) = 0;
+    if ((char *)v5 + 8 != 0)
+        *(DWORD *)((char *)v5 + 8) = 0;
+    *(BYTE *)((char *)v5 + 45) = 0;   // +0x2D
+    *(BYTE *)((char *)v5 + 44) = 1;   // +0x2C
+    slot[6] = (DWORD)v5;              // +0x18
+    *(BYTE *)((char *)v5 + 45) = 1;
+    *(DWORD *)((char *)v5 + 4) = (DWORD)v5;   // +0x04: self-reference
+    *(DWORD *)v5 = (DWORD)v5;                  // +0x00: self-reference
+    *(DWORD *)((char *)v5 + 8) = (DWORD)v5;   // +0x08: self-reference
+    slot[7] = 0;                              // +0x1C
     return obj;
 }
+
+//  InitGuiObject  (0x6AFD50 - 0x6AFFD0)  -- the NUI::CGUI ctor
+//  [NOT byte-identical] placement-dependent (the E8 calls + the heap addrs).
+//
+//  void *InitGuiObject(void *obj)
+//
+//  The full GUI / options / packet-callback sub-construct over the 400-byte
+//  object: zero the +0x08..+0x73 fields, store the placeholder vtable, the
+//  +0x74 slot block (F3SlotBlockCtor / sub_6B3430), the +0xA0/+0xA8/+0xB0
+//  doubles, +0x94..+0x98 bytes, +0xB8..+0xC8 floats/dwords, InitSharedSlot
+//  at +0xCC, the +0xD0 4-byte self-referencing block, the +0xE4 12-byte
+//  self-referencing block, the +0xEC slot block (sub_6B34B0), +0xE8, the
+//  +0x10C..+0x130 stores, InitVideoOptionsDefaults at +0x138, the DNameNode
+//  base ctor at +0x16C (overwritten with the CNetPacketCallback vtable),
+//  +0x174/+0x180/+0x184/+0x188, the +0x50-byte audio-subsystem block, the
+//  allocator- and file-callback global slots, the this-object store
+//  dword_1DC2558, SetSaveGamePath at +0xCC (Source = "GUI"), and the +0xC8
+//  RegisterManagerPlayer.
+//
+//  The +0x08..+0x70 sub-object inits through sub_B9CC60 (the ~30-object audio
+//  / packet-callback chain) and the audio-subsystem init inside sub_D6FD50 are
+//  remaining stubs -- those fields are left zero / unwritten.
+static void *InitGuiObject(void *obj)
+{
+    char *o = (char *)obj;
+
+    // Zero the +0x08..+0x73 fields (27 dwords: [esi+8] .. [esi+0x70]).
+    for (int i = 0; i < 27; ++i)
+        *(DWORD *)(o + 8 + i * 4) = 0;
+
+    // The vtable (placeholder - the real NUI::CGUI vtable is unimplemented).
+    *(void **)o = g_CGuiVtable;
+
+    // sub_6B3430: the +0x74 slot block.
+    F3SlotBlockCtor(o + 0x74);
+
+    // +0xA0 / +0xA8 = 0.0; +0xB0 = 10.0 (the qword global at 0x1AF1FE8).
+    *(double *)(o + 0xA0) = 0.0;
+    *(double *)(o + 0xA8) = 0.0;
+    *(double *)(o + 0xB0) = 10.0;
+
+    // +0x94 = 1; +0x95..+0x98 = 0.
+    *(BYTE *)(o + 0x94) = 1;
+    *(BYTE *)(o + 0x95) = 0;
+    *(BYTE *)(o + 0x96) = 0;
+    *(BYTE *)(o + 0x97) = 0;
+    *(BYTE *)(o + 0x98) = 0;
+
+    // +0xB8..+0xC4 = 0.0f (four floats); +0xC8 = 0.
+    *(float *)(o + 0xB8) = 0.0f;
+    *(float *)(o + 0xBC) = 0.0f;
+    *(float *)(o + 0xC0) = 0.0f;
+    *(float *)(o + 0xC4) = 0.0f;
+    *(DWORD *)(o + 0xC8) = 0;
+
+    // InitSharedSlot at +0xCC (the original stores nothing from the return).
+    InitSharedSlot((F3SharedBuffer **)(o + 0xCC));
+
+    // +0xD0: the 4-byte self-referencing block (holding the +0xD0 slot).
+    void *v3 = LHAlloc(4);
+    if (v3 != 0)
+        *(void **)v3 = o + 0xD0;
+    else
+        v3 = 0;
+    *(void **)(o + 0xD0) = v3;
+
+    // +0xE4: the 12-byte self-referencing block.
+    void *v4 = LHAlloc(12);
+    if (v4 != 0)
+        *(void **)v4 = v4;
+    if ((char *)v4 + 4 != 0)
+        ((void **)v4)[1] = v4;
+    *(void **)(o + 0xE4) = v4;
+
+    // sub_6B34B0: the +0xEC slot block.
+    F3SlotBlockCtor(o + 0xEC);
+
+    // +0xE8 = 0.
+    *(DWORD *)(o + 0xE8) = 0;
+
+    // +0x10C..+0x112: 1,1,1,1,0,0,0 (the +0x113 byte is left unwritten, as the
+    // original does not store it); +0x114 = 0; +0x118..+0x124 = -1;
+    // +0x128 = 2; +0x130 = 0.0.
+    *(BYTE *)(o + 0x10C) = 1;
+    *(BYTE *)(o + 0x10D) = 1;
+    *(BYTE *)(o + 0x10E) = 1;
+    *(BYTE *)(o + 0x10F) = 1;
+    *(BYTE *)(o + 0x110) = 0;
+    *(BYTE *)(o + 0x111) = 0;
+    *(BYTE *)(o + 0x112) = 0;
+    *(DWORD *)(o + 0x114) = 0;
+    *(DWORD *)(o + 0x118) = -1;
+    *(DWORD *)(o + 0x11C) = -1;
+    *(DWORD *)(o + 0x120) = -1;
+    *(DWORD *)(o + 0x124) = -1;
+    *(DWORD *)(o + 0x128) = 2;
+    *(double *)(o + 0x130) = 0.0;
+
+    // InitVideoOptionsDefaults at +0x138.
+    InitVideoOptionsDefaults((F3VideoOptions *)(o + 0x138));
+
+    // The DNameNode base ctor at +0x16C (store the CBaseObject vtable + clear
+    // +4), then overwrite the vtable with the CNetPacketCallback vtable.
+    *(void **)(o + 0x16C) = g_NToolsCBaseObjectVtable;
+    *(DWORD *)(o + 0x16C + 4) = 0;
+    *(void **)(o + 0x16C) = g_CNetPacketCallbackVtable;
+
+    // +0x174 / +0x180 / +0x184 / +0x188 = 0.
+    *(DWORD *)(o + 0x174) = 0;
+    *(DWORD *)(o + 0x180) = 0;
+    *(DWORD *)(o + 0x184) = 0;
+    *(DWORD *)(o + 0x188) = 0;
+
+    // sub_D6FD50: the 80-byte block.  The audio-subsystem init calls
+    // (sub_D6F700, sub_19FE350 / sub_19FE6F0 / sub_19FE1E0 / sub_19FEA10 /
+    // sub_19FE470) are not implemented in this build, so only the block
+    // allocation + the global store happen.
+    void *v6 = LHAlloc(0x50);
+    if (v6 != 0)
+        g_dword_1DD4268 = (DWORD)v6;
+    else
+        g_dword_1DD4268 = 0;
+
+    // The allocator-callback slots: the re-alloc slot (sub_1A03580) is
+    // unimplemented (stays null); the alloc / free slots store LHAlloc / LHFree.
+    g_dword_2075C8C = 0;
+    g_dword_2075C90 = LHAlloc;
+    g_dword_2075C94 = LHFree;
+
+    // The file-callback slots (sub_19FAF50): the create / close / write
+    // dispatchers stay null ([remaining stubs]); the file-end dispatcher
+    // (sub_6AC5B0, the trivial return-0) is live.
+    g_off_1DADC70 = 0;
+    g_off_1DADC74 = 0;
+    g_off_1DADC78 = 0;
+    g_off_1DADC7C = F3FileEndNoop;
+
+    // The report-handler slot (nullsub_23) is live; the Lua-module ctor
+    // (sub_6AC620) and load-file (sub_628F60) slots stay null.
+    g_off_1DADBB4 = F3ReportNoop;
+    g_off_1DADCB8 = 0;
+    g_off_1DADCBC = 0;
+
+    // dword_1DC2558 = this.
+    g_dword_1DC2558 = (DWORD)obj;
+
+    // [remaining stub] sub_B9CC60 (this+0x08) -- the ~30-object audio /
+    // packet-callback sub-construct (sub_B9C6C0 + sub_B9C760).  Not implemented
+    // in this build, so the +0x08.. fields stay zero.
+
+    // SetSaveGamePath (this+0xCC, Source = "GUI" -- the original passes
+    // byte_1AF206C = "GUI").
+    SetSaveGamePath((F3SharedBuffer **)(o + 0xCC), "GUI");
+
+    // GetHeapManager + RegisterManagerPlayer over the zeroed vec4; the
+    // player is stored at +0xC8.
+    float zeroVec[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    void *hm = GetHeapManager();
+    *(DWORD *)(o + 0xC8) = (DWORD)RegisterManagerPlayer(hm, zeroVec);
+
+    return obj;
+}
+
 
 //  RebuildGuiObject  (0x61A7C0 - 0x61A832)  -- replace the engine's +0xB8
 //  NUI::CGUI object: run the old object's vtable slot 4 (the shutdown
 //  dispatch) then slot 0 (release, free-it = 1) and clear the slot, build a
-//  fresh 400-byte CGUI (LHAlloc + sub_6AFD50 [remaining stub]), release the
-//  now-old value again (the free-it flag) if it reappeared, store the new
-//  object, and tail-call its vtable slot 1 (the activate dispatch).
+//  fresh 400-byte CGUI (LHAlloc + InitGuiObject over the placeholder vtable),
+//  release the now-old value again (the free-it flag) if it reappeared, store
+//  the new object, and tail-call its vtable slot 1 (the activate dispatch).
 //  The original is thiscall (the engine in ECX); here a plain free function.
 //  [NOT byte-identical] placement-dependent (the E8 calls + the tail jump).
 static int RebuildGuiObject(void *obj)
@@ -6622,28 +8287,222 @@ static void *FileSubsysMountCollection(void *fs, void **out,
 //  callback for the bank container: reload "language\\text\\book.babel"
 //  through the VFS archive collection (GetVfsArchiveCollection +
 //  VfsReloadFileEntry) and rebuild the 240-byte bank container over the
-//  reloaded entry (InitBankContainer + sub_721F60 + sub_7217B0 +
-//  DestroyBankContainer + the entry's vtable slot 2).  The original is
-//  cdecl with a __security_cookie prologue.  The two deep leaves
-//  (sub_721F60 / sub_7217B0 -- the container-load / container-sync steps)
-//  are remaining no-op stubs; the container-build block is unreachable in
-//  this build because the VFS reload never matches a provider (VfsReloadFileEntry
-//  writes a null out slot).  [NOT byte-identical] placement-dependent
-//  (the E8 calls + the __security_cookie prologue).
+//  reloaded entry (InitBankContainer + sub_721F60 + SyncImplWithBankContainer
+//  + DestroyBankContainer + the entry's vtable slot 2).  The original is
+//  cdecl with a __security_cookie prologue.  The container-load leaf
+//  (sub_721F60 -- the reloaded-entry step) is implemented (the 72-byte object
+//  build + the entry dispatches; the 4 member-sync leaves + the self-ref
+//  iteration remain no-op stubs).  SyncImplWithBankContainer (sub_7217B0) is
+//  implemented (its four member-sync leaves remain no-op stubs).  The
+//  container-build block is unreachable in this build because the VFS reload
+//  never matches a provider (VfsReloadFileEntry writes a null out slot).
+//  [NOT byte-identical]
+//  placement-dependent (the E8 calls + the __security_cookie prologue).
 static void *GetVfsArchiveCollection(void);   // sub_180D9B0 (defined below)
 static void *VfsReloadFileEntry(void *collection, void **out, void *entry, void *path); // sub_180D220 (defined below)
-//  sub_721F60 -- the deep "reload the container over the reloaded entry"
-//  step: takes the entry (the mount's file-entry handle), re-reads it and
-//  folds it into the just-built bank container.  Deep dependency chain
-//  (sub_18A6660 / sub_4C7540 / sub_721840 / sub_4C8020 -- VM / SEH / container
-//  internals) -- out of scope.  Stub.  [remaining stub]
-static char ReloadBankContainerEntry(void *container, int entry) { (void)container; (void)entry; return 0; }
-//  sub_7217B0 -- the deep "sync the impl's bank container with the just-built
-//  stack container" step: CsGuardAcquire the impl's +0xB4 critical section,
-//  then replay the +0x1C / +0x58 / +0x74 / +0x94 members.  Deep dependency
-//  chain (CsGuardAcquire / sub_72C5F0 / sub_720250 / sub_71FD20 / sub_720010) --
+//  BuildReloadedObject  (sub_18A65B0, 0x18A65B0 - 0x18A66AE)  -- the 72-byte
+//  reloaded-object build over the LHAlloc'd buffer: the two vftable installs
+//  (the CAddRelQueryImp<...IFileStream...> install, overwritten by the
+//  LHVFS::CBasicStream vftable), the entry's +0x08 slot + the entry's vt[1]
+//  dispatch, the +0x10/+0x14 zero words, the bitscan for the +0x20 width
+//  field (1 << (pos + (value != 1 << pos))), the +0x28/+0x2C -1 words, the
+//  +0x30/+0x34 zero words, the +0x38 byte zero, the +0x30 LHAlloc of the
+//  width, and the +0x48 buffer store.  The original is userpurge (the buffer
+//  in EDI, the args on the stack).  [NOT byte-identical] a plain C++
+//  reimplementation -- placement-dependent (the LHAlloc IAT call + the vt[1]
+//  dispatch).
+static char *BuildReloadedObject(char *buffer, void *entry, unsigned int bitscanValue)
+{
+    DWORD *p = (DWORD *)buffer;
+    p[0]  = 0x1AF5B9C;         // &LHCOMUtils::CAddRelQueryImp<LHVFS::IFileStream, CNULLCompose, CNULLCompose, CNULLCompose>::vftable
+    p[1]  = 0;
+    p[0]  = 0x1BF79AC;         // &LHVFS::CBasicStream::vftable (overwrites the first install)
+    p[2]  = (DWORD)entry;      // +0x08 = the entry
+    if (entry != 0)
+        ((void (WINAPI *)(void *))F3_VT(entry)[1])(entry);   // the entry's vt[1] (stdcall)
+    p[4]  = 0;                  // +0x10 = 0 (a3)
+    p[5]  = 0;                  // +0x14 = 0 (a4)
+    p[6]  = 0;                  // +0x18
+    p[7]  = 0;                  // +0x1C
+    //  the +0x20 width: the bitscan-reverse over bitscanValue (v2)
+    unsigned int bits = 0;
+    unsigned int v = bitscanValue;
+    while (v != 0) { bits++; v >>= 1; }
+    unsigned int bitPos = (bits == 0) ? 0 : (bits - 1);
+    DWORD width = 1u << (bitPos + (bitscanValue != (1u << bitPos)));
+    p[8]  = width;              // +0x20 = the width
+    p[10] = (DWORD)-1;          // +0x28 = -1
+    p[11] = (DWORD)-1;          // +0x2C = -1
+    p[12] = 0;                  // +0x30 = 0 (placeholder)
+    p[13] = 0;                  // +0x34 = 0
+    buffer[56] = 0;              // +0x38 = 0
+    void *blk = LHAlloc(width);  // the width-sized payload block
+    p[13] = 0;                   // +0x34 = 0 (overwrite)
+    p[12] = (DWORD)blk;         // +0x30 = the payload block
+    return buffer;
+}
+
+//  SyncReloadedEntryObject  (sub_721840, 0x721840 - 0x7218E1)  -- the
+//  critical-section-guarded member sync over the just-reloaded container:
+//  CsGuardAcquire on container + 0xB4, then the +0x1C / +0x58 / +0x74 /
+//  +0x94 member chain (sub_72CE80 / sub_72B9A0 / sub_72D9C0 / sub_72BA90 --
+//  [remaining stubs]), each returning a byte stored back at [v6+4] and
+//  stopping the chain on zero.  Returns the final byte at [v6+4].
+//  The original is thiscall (the container in ECX, the out pointer on the
+//  stack).  [NOT byte-identical] placement-dependent (the E8 calls to the
+//  member-sync leaves + CsGuardAcquire / CsGuardRelease).
+static char SyncReloadedEntryObject(void *container, DWORD *object, BYTE *flag)
+{
+    (void)object;   // the object slot (the &v6) -- only the flag byte is read back in this build
+    F3CsGuard guard;
+    CsGuardAcquire(&guard, (CRITICAL_SECTION *)((char *)container + 0xB4), 0);
+    if (*flag != 0)
+    {
+        //  sub_72CE80 -- the +0x1C (string) member sync -- [remaining stub]
+        *flag = 0;
+        if (*flag != 0)
+        {
+            //  sub_72B9A0 -- the +0x58 member sync -- [remaining stub]
+            *flag = 0;
+            if (*flag != 0)
+            {
+                //  sub_72D9C0 -- the +0x74 (SubNode) member sync -- [remaining stub]
+                *flag = 0;
+                if (*flag != 0)
+                {
+                    //  sub_72BA90 -- the +0x94 (NameMap) member sync -- [remaining stub]
+                    *flag = 0;
+                }
+            }
+        }
+    }
+    CsGuardRelease(&guard);
+    return (char)*flag;
+}
+
+//  ReloadBankContainerEntry  (0x721F60 - 0x72202A)  -- the "reload the
+//  container over the reloaded entry" step: takes the freshly-built bank
+//  container (this, ECX) and the reloaded entry (the stack arg), dispatches
+//  the entry's vtable slot 7 (thiscall), runs the reload chain
+//  (sub_18A6660 -- LHAlloc(72) + the 72-byte object build + the reloaded
+//  object's vt[1] AddRef), then -- when it produced a reloaded object --
+//  dispatches its slot 1 (AddRef), runs the SEH-guarded member sync
+//  (sub_721840 -- [remaining stubs]) and the self-ref collection iteration
+//  (sub_4C8020 -- [remaining stub]), releases the entry (slot 2) and the
+//  reloaded object (slot 2), and returns the member-sync result byte.  The
+//  original is thiscall + retn 4 (the container in ECX, the entry as the
+//  stack arg, callee-cleanup retn 4).  [NOT byte-identical] placement-dependent
+//  (the E8 calls + the __security_cookie prologue).
+static char ReloadBankContainerEntry(void *container, int entry)
+{
+    if (entry == 0)
+        return 0;
+
+    //  the entry's vtable slot 7 (thiscall) -- the entry's int dispatch
+    DWORD v2 = (DWORD)((int(__thiscall *)(void *))F3_VT((void *)entry)[7])((void *)entry);
+
+    //  the reload chain (sub_18A6660) -- entry != 0 -> LHAlloc(72) -> the
+    //  72-byte object build (BuildReloadedObject) -> the reloaded object's
+    //  vt[1] dispatch (the second vt[1] below is the caller's dispatch).
+    int v5 = 0;
+    if (entry != 0)
+    {
+        void *buffer = LHAlloc(72);
+        if (buffer != 0)
+        {
+            v5 = (int)BuildReloadedObject((char *)buffer, (void *)entry, v2);
+            if (v5 != 0)
+                ((void (WINAPI *)(void *))F3_VT((void *)v5)[1])((void *)v5);   // the reloaded object's vt[1]
+        }
+    }
+
+    if (v5 == 0)
+        return 0;
+
+    int v6 = v5;
+
+    //  the reloaded object's vt[1] -- the caller's AddRef dispatch
+    ((void (WINAPI *)(void *))F3_VT((void *)v6)[1])((void *)v6);
+
+    //  the self-wrapper (sub_4C7540): LHAlloc(4); *block = &v4; v4 = block
+    //  (then the 24-byte self-ref block init -- sub_4C74F0 -- [remaining stub]).
+    DWORD v4 = 0;
+    BYTE  v7 = 1;                       // the byte flag at [v6+4]
+    BYTE  flag5 = 1;                    // the second flag byte (at [v6+5] in the original)
+    void *blk = LHAlloc(4);
+    if (blk != 0)
+    {
+        *(void **)blk = &v4;            // the block holds &v4 (the this pointer)
+        v4 = (DWORD)blk;                // v4 = the block (the self-ref wrapper)
+    }
+    else
+    {
+        v4 = 0;
+    }
+    (void)v4;                           // the wrapper's result is never read back
+    //  sub_4C74F0(&v4) -- the 24-byte self-ref block init -- [remaining stub]
+
+    //  the critical-section-guarded member sync (sub_721840) -- the flag
+    //  byte at [v6+4] is stored before the sync (the original stores bl = 1
+    //  here, then again after the sync block's self-wrapper call)
+    v7 = 1;
+    (void)flag5;
+    char v3 = SyncReloadedEntryObject(container, (DWORD *)&v6, &v7);
+
+    //  sub_4C8020(&v9) -- the self-ref collection iteration over the 32-byte
+    //  self-ref block.  Deep chain (sub_4C7F90 / sub_4C7D00 -- the iterator
+    //  advance + the release chain) -- out of scope.  Stub.  [remaining stub]
+    BYTE v9[32];
+    memset(v9, 0, sizeof(v9));
+    (void)v9;
+
+    if (v6 != 0)
+        ((void (WINAPI *)(void *))F3_VT((void *)v6)[2])((void *)v6);
+    if (v5 != 0)
+        ((void (WINAPI *)(void *))F3_VT((void *)v5)[2])((void *)v5);
+    return v3;
+}
+//  sub_72C5F0 -- the +0x1C string-collection member replay (thiscall, the
+//  container block in ECX, the stack container's block on the stack).  Deep
+//  dependency chain (sub_728270 / sub_72B820 / sub_72ACE0 / sub_72B660 /
+//  sub_72A280 / LHAlloc / memcpy_s / LHFree) -- out of scope.  Stub.  [remaining stub]
+static int SyncBankStringCollection(char *obj, DWORD *a2) { (void)obj; (void)a2; return 0; }
+
+//  sub_720250 -- the +0x74 SubNode-collection member replay (usercall hybrid:
+//  the container object in EDI, the impl block on the stack).  Deep dependency
+//  chain (sub_72D7A0 / sub_72A800 / SubNodeIterNext) -- out of scope.  Stub.  [remaining stub]
+static void SyncSubNodeCollection(char *obj, DWORD *a2) { (void)obj; (void)a2; }
+
+//  sub_71FD20 -- the +0x58 member replay (cdecl, both blocks on the stack).  Deep
+//  dependency chain (sub_72B400 / sub_7285F0 / sub_725BF0 / sub_72AAE0) --
 //  out of scope.  Stub.  [remaining stub]
-static char SyncImplWithBankContainer(int impl, void *container) { (void)impl; (void)container; return 1; }
+static void SyncNameBufferSlot(const char *a1, DWORD *a2) { (void)a1; (void)a2; }
+
+//  sub_720010 -- the +0x94 NameMap-collection member replay (cdecl, both blocks
+//  on the stack).  Deep dependency chain (sub_5AA1A0 / sub_5AAB20 / sub_5AA950 /
+//  SpeechBankWideAssign / NameMapIterNext) -- out of scope.  Stub.  [remaining stub]
+static void SyncNameMapCollection(const char *a1, DWORD **a2) { (void)a1; (void)a2; }
+
+//  SyncImplWithBankContainer  (0x7217B0 - 0x721833)  -- the deep "sync the
+//  impl's bank container with the just-built stack container" step:
+//  CsGuardAcquire the impl's +0xB4 critical section, then replay the +0x1C /
+//  +0x74 / +0x58 / +0x94 members (SyncBankStringCollection /
+//  SyncSubNodeCollection / SyncNameBufferSlot / SyncNameMapCollection --
+//  [remaining stubs]), CsGuardRelease, return 1.  The original is thiscall +
+//  retn 4 (the impl in ECX, the stack container on the stack) with a
+//  __security_cookie prologue.  [NOT byte-identical] placement-dependent (the
+//  E8 calls + the __security_cookie prologue).
+static char SyncImplWithBankContainer(int impl, void *container)
+{
+    F3CsGuard guard;
+    CsGuardAcquire(&guard, (CRITICAL_SECTION *)((char *)impl + 0xB4), 0);
+    SyncBankStringCollection((char *)impl + 0x1C, (DWORD *)((char *)container + 0x1C));
+    SyncSubNodeCollection((char *)container + 0x74, (DWORD *)((char *)impl + 0x74));
+    SyncNameBufferSlot((char *)impl + 0x58, (DWORD *)((char *)container + 0x58));
+    SyncNameMapCollection((char *)impl + 0x94, (DWORD **)((char *)container + 0x94));
+    CsGuardRelease(&guard);
+    return 1;
+}
 
 static char ReloadTextBookBank(int entry, int container)
 {
@@ -6658,8 +8517,8 @@ static char ReloadTextBookBank(int entry, int container)
     {
         char buf[0xF0];
         InitBankContainer(buf, 50, 0x4000);                       // sub_7201B0
-        ReloadBankContainerEntry(buf, (int)outEntry);             // sub_721F60 [remaining stub]
-        SyncImplWithBankContainer(container, buf);                // sub_7217B0 [remaining stub]
+        ReloadBankContainerEntry(buf, (int)outEntry);             // sub_721F60 (implemented; 4 member-sync leaves + the self-ref iteration [remaining stubs])
+        SyncImplWithBankContainer(container, buf);                // sub_7217B0 (implemented; four member-sync leaves [remaining stubs])
         DestroyBankContainer(buf);                                // sub_626EF0
         if (outEntry != 0)
             ((void (WINAPI *)(void *))F3_VT(outEntry)[2])(outEntry);   // the entry's vtable slot 2 (stdcall)
@@ -6888,7 +8747,7 @@ static int InitGlobalsOnce(void)
 //  The vt[6] collection-iterator loop and the vt[4] per-entry dispatch are
 //  dormant in this build (the fresh VFS carries a placeholder vtable, so
 //  they cannot be safely performed), as is the per-entry refcount chain
-//  (sub_18A8C30 / sub_18DD8A0 / sub_18DC400 / sub_575680 / sub_570D30 /
+//  (MemoryFileReleaseStreamMember / sub_18DD8A0 / sub_18DC400 / sub_575680 / sub_570D30 /
 //  sub_56E380) and the mount callback itself (sub_18EC4D0).
 //  [NOT byte-identical] placement-dependent (the E8 calls to LHAlloc /
 //  VirtualFileSystemCtor / F3WStringFromAnsi / FileSubsysMountCollection /
@@ -7462,8 +9321,10 @@ static void *FileDataInputStreamCtor(void *stream, void *legacyFile, int size)
 // sub_17FDE20) and return its result.  The stream-build step (FileDataInputStreamCtor,
 // 0x1892420) is implemented here -- the 40-byte NFile::CFileDataInputStream object,
 // the 0x8000-byte LHAlloc read buffer, and the vt[9] / vt[7] thiscall dispatches
-// over the legacy-file object (the vt[9] / vt[7] slots are unimplemented stubs in
-// this build -- LegacyMemoryFileStubMethod returns 0) and the StreamWindowAdvance
+// over the legacy-file object (vt[9] -> CLegacyMemoryFileGetLength, byte-identical,
+// returns the inner file's +0x20 length -- 0 for the empty CMemoryFile this build
+// constructs; vt[7] -> CLegacyMemoryFileGetCounter, byte-identical, returns +0xC) and
+// the StreamWindowAdvance
 // window-advance helper (0x1891170).  The wide-load step (WideLoadStream, 0x1922280)
 // is implemented
 // here -- its deep dispatch chain (sub_1893EB0 / sub_1891540 / sub_19230E0 /
@@ -19672,21 +21533,226 @@ static void *GetVfsArchiveCollection(void)
     return g_unk_1E2D870;
 }
 
-// sub_180D220 (0x180D220 - 0x180D3E1) -- the file subsystem's per-entry VFS
-// reload (thiscall + `retn 0Ch`; the archive collection in ECX, the out entry
-// slot, the entry, and the .vfsconfig path F3WString on the stack).  Hashes the
-// path (GetWideStringHash / sub_56DFD0), looks the entry up in the archive collection (sub_180F0E0
-// tree search), and dispatches the matched provider's reload (the entry
-// vtable[4] with the path / provider index).  Unimplemented in this build: the
-// provider-name lookup + the tree search are remaining no-op stubs because the
-// archive collection is empty, so no provider is ever matched and the reload
-// finds nothing -- the out slot is cleared and the out pointer is returned.
-static void *VfsReloadFileEntry(void *collection, void **out, void *entry, void *path)
+
+// sub_180F0E0 (0x180F0E0 - 0x180F167) -- the VFS archive-collection tree search
+// (thiscall + retn 8; the archive collection in ECX, the 2-DWORD out slot and
+// the hash on the stack).  Walks the 44-byte red-black sentinel node at
+// [collection+0x18] (the sentinel's [1] word names the search root; the walk
+// descends the left/right child links keyed by the node's [3] sort key until a
+// node whose byte at +0x29 is set -- a leaf/end marker -- is reached, keeping
+// the last candidate in v6) and then writes the out slot as (root wrapper,
+// found node or sentinel): the root wrapper (the 4-byte heap block at
+// [collection+0]) in slot 0 and the found node (the search's v6) or the
+// sentinel itself in slot 1.  The failure case (the walk never matched, or the
+// hash is strictly below the node's sort key) writes the sentinel into slot 1.
+// Pure pointer logic over the 44-byte tree node layout (VfsCollectionTreeInit's
+// sentinel; live nodes inserted by the archive framework, out of scope here).
+// [NOT byte-identical] placement-dependent (relative calls to
+// __invalid_parameter_noinfo).
+static void *VfsCollectionTreeSearch(void *collection, DWORD *out, int *hash)
 {
-    (void)collection; (void)entry; (void)path;
-    *out = 0;                    // no provider matched (empty archive collection)
+    DWORD *sentinel = (DWORD *)((DWORD *)collection)[6];
+    DWORD *v5 = (DWORD *)sentinel[1];
+    DWORD *v6 = sentinel;
+    while (((BYTE *)v5)[0x29] == 0)
+    {
+        if ((unsigned int)v5[3] >= (unsigned int)*hash)
+        {
+            v6 = v5;
+            v5 = (DWORD *)v5[0];
+        }
+        else
+        {
+            v5 = (DWORD *)v5[2];
+        }
+    }
+    DWORD *wrapper = (DWORD *)((DWORD *)collection)[0];
+    if (wrapper == 0)
+        F3InvalidParam();
+    if (v6 == sentinel || (unsigned int)*hash < (unsigned int)v6[3])
+    {
+        out[0] = (DWORD)wrapper;
+        out[1] = (DWORD)sentinel;
+    }
+    else
+    {
+        out[0] = (DWORD)wrapper;
+        out[1] = (DWORD)v6;
+    }
     return out;
 }
+
+// FileSubsysEntrySearch (sub_18014F0, 0x18014F0 - 0x180156F) -- the file
+// subsystem's 48-byte entry-list red-black tree search (thiscall: the
+// file-subsystem and the entry on the stack).  Walks the sentinel node at
+// [fs+0x7C] looking for the node whose [10] word (byte offset 0x28, the entry
+// hash slot) matches the entry, advancing the iterator (sub_1801EE0) on each
+// miss.  Not implemented in this build -- the archive framework always keeps
+// the entry list empty, so the loop breaks on the first iteration and the
+// search always returns 0.
+// [NOT byte-identical] no-op stub (see sub_18014F0).
+static int FileSubsysEntrySearch(void *fileSubsystem, void *entry)
+{
+    (void)fileSubsystem;
+    (void)entry;
+    return 0;
+}
+
+// sub_180D220 (0x180D220 - 0x180D3E1) -- the file subsystem's per-entry VFS
+// reload (thiscall + retn 0Ch; the archive collection in ECX, the out entry
+// slot, the entry, and the .vfsconfig path F3WString on the stack).  Hashes the
+// path (GetWideStringHash / sub_56DFD0), looks the entry up in the archive
+// collection (sub_180F0E0 tree search), and dispatches the matched provider's
+// reload (the entry vtable[4] with the path / provider index).
+//
+// Fast path (empty tree): the search writes the sentinel into slot 1, so the
+// entry's vtable[4] is dispatched directly with the original path and flag 1:
+// (this = entry, out = the caller's out slot, path = the F3WString, flag = 1);
+// the out pointer is returned.
+//
+// Slow path (a node was found): the archive handle is taken (GetFileSubsystem,
+// whose this is the found node used as a 4-byte scratch out-slot), the file
+// subsystem's entry list is searched (sub_18014F0 -- left as a no-op returning
+// 0, matching the empty entry list: the search never matches), and the entry's
+// vtable[4] is dispatched with the node's [7] word as the provider index: a
+// "matching data entry" (v13 != 0) takes the reload dispatch and writes the
+// reloaded entry into the out slot (releasing the new wide string through
+// vtable slots 1 + 2); otherwise the 36-byte per-index walk re-dispatches
+// vtable[4] with the out slot pointed at the node's [4] word's guarded bounds
+// and, on success, returns the out slot (releasing the new wide string through
+// vtable slots 1 + 2).  A v14 == max index in the walk clears the out slot and
+// returns the out pointer.
+//
+// [NOT byte-identical] placement-dependent (relative calls to
+// GetWideStringHash / VfsCollectionTreeSearch / GetFileSubsystem /
+// FileSubsysEntrySearch / the entry vtable[4] dispatch + the vtable[1] / [2]
+// stdcall releases + the __security_cookie prologue of the callees).
+static void *VfsReloadFileEntry(void *collection, void **out, void *entry, void *path)
+{
+    void *v4 = path;               // the original path (the F3WString address)
+
+    int hash = GetWideStringHash((F3WString *)path);   // sub_56DFD0 (the cached FNV hash)
+
+    // the tree search (sub_180F0E0): the root wrapper in slot 0, the found
+    // node (or the sentinel) in slot 1
+    DWORD search[2] = { 0, 0 };
+    VfsCollectionTreeSearch(collection, search, &hash);   // sub_180F0E0
+
+    DWORD *wrapper = (DWORD *)((DWORD *)collection)[0];
+    if (search[0] == 0 || search[0] != (DWORD)wrapper)
+        F3InvalidParam();   // __invalid_parameter_noinfo (no return)
+
+    DWORD *sentinel = (DWORD *)((DWORD *)collection)[6];
+
+    if (search[1] == (DWORD)sentinel)
+    {
+        // Fast path -- the tree search found nothing (the empty tree).
+        // The entry's vtable[4] (thiscall) on the original path.
+        typedef void (__thiscall *EntryReloadFn)(void *self, void **arg0, void *arg1, int flag);
+        void **vt = F3_VT(entry);
+        ((EntryReloadFn)vt[4])(entry, out, v4, 1);
+        return out;
+    }
+
+    // Slow path -- the tree search found a node.
+    DWORD *found = (DWORD *)search[1];
+    void *v7 = (void *)search[0];          // the root wrapper
+    if (v7 != 0)
+        v7 = *(void **)v7;                 // the root wrapper's content = the collection pointer
+    else
+        F3InvalidParam();
+    if ((DWORD)found == (DWORD)((DWORD *)v7)[6])
+        F3InvalidParam();                  // the found node must not be the sentinel (unreachable)
+
+    void *FileSubsystem = GetFileSubsystem(found);   // sub_1801C20
+
+    int v13 = FileSubsysEntrySearch(FileSubsystem, entry);   // sub_18014F0 (not implemented)
+    DWORD v14 = ((DWORD *)found)[7];        // the node's [7] word
+
+    if (v13 != 0)
+    {
+        // the entry matched a data entry: bound check, then the reload dispatch
+        if (v14 > ((DWORD *)found)[8])
+            F3InvalidParam();
+        DWORD *v15 = (DWORD *)((DWORD *)found)[4];
+        if (v15 == 0)
+            F3InvalidParam();
+        DWORD v16 = *v15;
+        if (v14 >= *(DWORD *)(v16 + 16))
+            F3InvalidParam();
+        typedef void (__thiscall *EntryReloadFn)(void *self, void **arg0, void *arg1, int flag);
+        ((EntryReloadFn)F3_VT(entry)[4])(entry, &entry, (void *)(DWORD)v14, 1);
+        if (entry != 0)
+        {
+            void *v18 = out;
+            *out = entry;
+            ((void (__stdcall *)(void *))F3_VT(entry)[1])(entry);   // vtable slot 1 (stdcall)
+            if (entry != 0)
+            {
+                ((void (__stdcall *)(void *))F3_VT(entry)[2])(entry);   // vtable slot 2 (stdcall)
+                return v18;
+            }
+            return v18;
+        }
+        else
+        {
+            *out = 0;
+            return out;
+        }
+    }
+    else
+    {
+        // the not-found path: the 36-byte per-index walk
+        if (v14 > ((DWORD *)found)[8])
+            F3InvalidParam();
+        DWORD *v21 = (DWORD *)((DWORD *)found)[4];
+        for (;;)
+        {
+            DWORD v23 = ((DWORD *)found)[8];
+            if (((DWORD *)found)[7] > v23)
+                F3InvalidParam();
+            if (v21 == 0 || v21 != (DWORD *)((DWORD *)found)[4])
+                F3InvalidParam();
+            if (v14 == v23)
+            {
+                *out = 0;
+                return out;
+            }
+            if (v21 == 0)
+                F3InvalidParam();
+            DWORD v24 = *v21;
+            if (v14 >= *(DWORD *)(v24 + 16))
+                F3InvalidParam();
+            typedef void (__thiscall *EntryReloadFn)(void *self, void **arg0, void *arg1, int flag);
+            ((EntryReloadFn)F3_VT(entry)[4])(entry, (void **)&hash, (void *)(DWORD)v14, 1);
+            if (hash != 0)
+            {
+                void *v18 = out;
+                *out = (void *)(DWORD)hash;
+                ((void (__stdcall *)(void *))F3_VT((void *)(DWORD)hash)[1])((void *)(DWORD)hash);   // vtable slot 1 (stdcall)
+                if (hash != 0)
+                {
+                    ((void (__stdcall *)(void *))F3_VT((void *)(DWORD)hash)[2])((void *)(DWORD)hash);   // vtable slot 2 (stdcall)
+                    return v18;
+                }
+                return v18;
+            }
+            else
+            {
+                if (v21 != 0)
+                {
+                    v24 = *v21;
+                    if (v14 >= *(DWORD *)(v24 + 16))
+                        F3InvalidParam();
+                }
+                else
+                    F3InvalidParam();
+                v14 += 36;
+            }
+        }
+    }
+}
+
 
 // sub_17DBD50 (0x17DBD50 - 0x17DBD9C) -- re-open the stream's 8-byte file
 // block (close + free the old, allocate + init a fresh one) and (re)read the

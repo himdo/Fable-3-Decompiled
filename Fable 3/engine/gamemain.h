@@ -133,6 +133,21 @@ int LegacyFileHasData(const void *obj);
 // LHFile::CAFile).  Returns the slot release's new g_Addend count.
 long LegacyFileDtor(void *obj);
 
+//  The 24-byte LHXML::CXMLReadStream / CXMLWriteStream stack object.
+//  (sub_17DAA00 base ctor / sub_17DAA20 base dtor). The stream's vtable is a
+//  placeholder in this build (the LHXML parse is a remaining stub), so the
+//  dispatch slots are never actually used.
+typedef struct F3XmlStream
+{
+    void *   vtable;      // +0x00
+    DWORD    flags;       // +0x04: 0x8000 (the base ctor)
+    DWORD *  fileBuf;     // +0x08: the 8-byte {0, 4096-byte buffer} block
+    DWORD    section;     // +0x0C: the current section node
+    DWORD    sectionInfo; // +0x10
+    BYTE     sectionFound;// +0x14 (byte 20)
+    BYTE     pad[3];      // +0x15..+0x17
+} F3XmlStream;             // 24 bytes
+
 // ============================================================
 //  Accessibility settings (defined in gamemain.cpp next to the
 //  CXMLReadStream / shared-slot helpers it is built from).
@@ -179,11 +194,73 @@ LONG SaveSettingsBeforeExit(void);
 // 0x1D9E18C / 0x1D9E194 / 0x1D9E19C: the system-parameter snapshot globals
 // (defined in gamemain.cpp). g_dword_1D9E18C / g_dword_1D9E194 are the
 // SPI_GETHIDCONFIRM / SPI_GETKEYBOARDSPEED snapshot values; g_byte_1D9E19C is
-// the 4-byte SPI_GETKEYBOARDDelay value block. SaveSettingsBeforeExit
+// the 24-byte SPI_GETKEYBOARDDelay block. SaveSettingsBeforeExit
 // (worker.cpp) restores from them.
 extern DWORD g_dword_1D9E18C;
 extern DWORD g_dword_1D9E194;
-extern BYTE  g_byte_1D9E19C[4];
+extern BYTE  g_byte_1D9E19C[24];
+
+// 0x1D9E190 / 0x1D9E198 / 0x1D9E1A0: the accessibility-setting values loaded
+// from AccessibilitySettings.xml (defined in gamemain.cpp). The binary treats
+// all three as DOWRDs -- the low bit of each is tested by
+// ApplyDisplaySettings before the restore parameters are (re)applied;
+// byte_1D9E19C+4 == 0x1D9E1A0 (the third loaded value).
+extern DWORD g_dword_1D9E190;
+extern DWORD g_dword_1D9E198;
+extern DWORD g_dword_1D9E1A0;
+
+// 0x20FC8D8 / 0x20FC8DC / 0x20FC8E0 / 0x20FC8E4: the empty-by-default
+// section-name and three element-name slots (F3SharedBuffer*). The section
+// name slot (dword_20FC8D8) selects the section the write stream enters;
+// the three element-name slots name the three values read back through the
+// stream. Defined in gamemain.cpp next to the accessibility globals.
+extern F3SharedBuffer *g_dword_20FC8D8;
+extern F3SharedBuffer *g_dword_20FC8DC;
+extern F3SharedBuffer *g_dword_20FC8E0;
+extern F3SharedBuffer *g_dword_20FC8E4;
+
+// ─── Write-side stream helpers (defined in gamemain.cpp) ───
+// CXMLWriteStreamCtor (0x17DB800) -- the 24-byte write-stream ctor.
+void CXMLWriteStreamCtor(F3XmlStream *obj);
+
+// CXMLWriteStreamDtor (0x17DB830) -- the write-stream dtor; returns the
+// LHXML teardown's result (the XmlBlockTeardown chain runs for real here --
+// XmlTeardownChildChain / XmlAttrChainTeardown / XmlChildChainFree, with the
+// individual pool-node heap frees skipped -- so the return is 0).
+int CXMLWriteStreamDtor(F3XmlStream *obj);
+
+// WriteStreamEnterElement (0x17DAC00 - 0x17DAC73, the write-stream vtable[1]
+// slot) -- enter the named element on the stream. Allocates the 8-byte
+// file block (InitXmlFileBlock), allocates the element node from the 4096-byte
+// chunk pool (XmlNodeAlloc over XmlPoolAlloc / XmlChunkArrayEnsure), inserts
+// it into the current section (XmlInsertNodeIntoSection) or stores it in the
+// file block (XmlBlockStoreNode, which tears down the previous tree via the
+// XmlBlockTeardown chain -- XmlTeardownChildChain / XmlAttrChainTeardown /
+// XmlAttrChainFree / XmlChildChainFree, all reproduced except the individual
+// pool-node heap frees), and returns 1. The write-side value-writer slots
+// (vt[5] / vt[8] / vt[9]) are no-op stubs, so no values are serialized and the
+// file gets only the XML prologue (the LHXML serializer is a remaining stub).
+char WriteStreamEnterElement(void *stream, const char *name);
+
+// sub_17DAC80 (0x17DAC80 - 0x17DAC89) -- the write-stream advance: the
+// stream's current section node is replaced by the node's +0x10 word and the
+// previous section is returned (the writer-side analogue of XmlAdvance,
+// 0x17DC3A0). __thiscall in the original (stream in ECX, plain `ret`);
+// declared as a plain free function in gamemain.cpp ([NOT byte-identical]).
+int WriteXmlStreamAdvance(F3XmlStream *obj);
+
+// WriteXmlStreamToFile (0x17DB2C0) -- serialize the write stream to a file.
+// The LHXML serializer is a remaining stub, so the file gets only the XML
+// prologue.
+void WriteXmlStreamToFile(F3XmlStream *obj, const char *fileName);
+
+// EnsureParentDirectory (0x18B1360) -- make the directory tree of this path
+// slot exist (resolve, split, compose, recreate recursively).
+int EnsureParentDirectory(F3SharedBuffer **pathSlot);
+
+// ReadXmlNamedValue (0x18F6600) -- enter the named section of the stream and
+// read its value into *out (0 when the named section is not found).
+DWORD ReadXmlNamedValue(F3SharedBuffer **nameSlot, F3XmlStream *stream, DWORD *out);
 
 // ============================================================
 //  F3OptionMap -- the 24-byte option-map tree node + the 32-byte

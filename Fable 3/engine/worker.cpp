@@ -419,6 +419,11 @@ static DWORD g_dword_1E2EDB8[4];   // 0x1E2EDB8 .. 0x1E2EDC7
 // read/cleared by ShutdownDevice further down).
 static DWORD g_dword_1E2EEF8 = 0;   // 0x1E2EEF8  D3D9 adapter object (vtable-backed)
 
+// 0x1D9E184: the one-word adapter state stored by F3InitAdapterState (the
+// probe result). The legacy probe that returns 0 or a negative-int out
+// value also writes 1 here, forcing the success-shaped tail.
+static DWORD g_dword_1D9E184 = 0;   // 0x1D9E184  adapter state word
+
 // 0x20FC948: the device critical section guarding the XLO device state
 // (dword_1E2EEF4 / dword_1E2ED80 / dword_1E2ED74). In the image it is
 // all-0xFF poison, as with stru_20FCA50; the game's device-subsystem init
@@ -2182,17 +2187,137 @@ static UINT HandleRawInput(void *obj, void *hRawInput)
     return result;
 }
 
+// 0x5CB8C0 -- allocate the event-queue record buffer: LHAlloc(0) when slots
+// is 0, else LHAlloc(4 * slots); throws std::bad_alloc (stdext::bad_alloc in
+// 2008, through the 0x01DDCFC8 callback) when 4 * slots overflows (the
+// 0xFFFFFFFF / slots < 4 guard). See InputQueueAllocBuffer (the 32-byte
+// sibling) for the same shape.
+// [NOT byte-identical] relative call to LHAlloc + the bad_alloc machinery.
+static void *EventQueueAllocBuffer(unsigned int slots)
+{
+    if (slots == 0)
+        return LHAlloc(0);
+    if (0xFFFFFFFFu / slots < 4u)
+    {
+        std::bad_alloc err;
+        if (g_dword_1DDCFC8 != 0)
+            g_dword_1DDCFC8(&err);
+        throw err;
+    }
+    return LHAlloc(4 * slots);
+}
+
+// 0x5CB1B0 -- the event-queue overflow guard: __debugbreak, then throw
+// std::length_error("myvector<T> too long") (invoking the non-NULL callback
+// at 0x01DDCFC8 first). No return.
+// [NOT byte-identical] refs the std::length_error / exception machinery and
+// the high-VA exception-hook global (0x01DDCFC8).
+static void EventQueueOverflowThrow(void)
+{
+    __debugbreak();
+    std::length_error err("myvector<T> too long");
+    if (g_dword_1DDCFC8 != 0)
+        g_dword_1DDCFC8(&err);
+    throw err;
+}
+
+// 0x5CAAC0 -- grow the event queue to max(3/2 * capacity, pending + 1) --
+// 0 slots on the 0x3FFFFFFF overflow -- copy [head, tail) into the new
+// buffer, insert the record at the new tail (newbuf + 4 * pending), free
+// the old buffer through the heap table (dword_2075B24 + 16 -- LHFree;
+// skipped when head is 0) and rewire head / tail / limit. Throws
+// std::length_error ("myvector<T> too long") when the pending count is
+// 0x3FFFFFFF. The fit branch (capacity >= pending + 1) is unreachable
+// from this caller: the queue is only full here, so pending >= capacity.
+// [NOT byte-identical] placement-dependent (LHAlloc / LHFree / memcpy)
+// plus the exception-hook global (0x01DDCFC8).
+static void *EventQueueInsert(DWORD *q, const void *record)
+{
+    DWORD head = q[2];
+    DWORD cap = (head != 0) ? (DWORD)((q[4] - head) >> 2) : 0;
+    DWORD tail2 = q[3];
+    DWORD pend = (DWORD)((tail2 - head) >> 2);
+    if (pend == 0x3FFFFFFu)
+        EventQueueOverflowThrow();
+    DWORD half = cap >> 1;
+    DWORD newcap = (0x3FFFFFFu - half >= cap) ? cap + half : 0;
+    if (newcap < pend + 1)
+        newcap = pend + 1;
+    DWORD newbuf = (DWORD)(DWORD_PTR)EventQueueAllocBuffer(newcap);
+    // copy the existing records [head, tail) into the new buffer
+    DWORD p = newbuf;
+    DWORD src = head;
+    while (src != tail2)
+    {
+        memcpy((void *)p, (const void *)src, 4);
+        p += 4;
+        src += 4;
+    }
+    // insert the record at the new tail (newbuf + 4 * pend)
+    *(DWORD *)((char *)newbuf + 4 * (int)pend) = ((const DWORD *)record)[0];
+    if (head != 0)
+        LHFree((void *)head);   // dword_2075B24 + 16
+    q[4] = newbuf + 4 * newcap;
+    q[3] = newbuf + 4 * (pend + 1);
+    q[2] = newbuf;
+    return (void *)newbuf;
+}
+
+// 0x5CA450 -- full-queue flush: grow the queue and insert the record at the
+// new tail (via EventQueueInsert), then report {0, the record's slot} into
+// the 8-byte out slot and return the slot (a stack address, as in the
+// original); the sole caller (sub_5C9F50's full path) discards it.
+// [NOT byte-identical] placement-dependent (EventQueueInsert / memcpy).
+static void *EventQueueFlush(DWORD *q, const void *record, DWORD tailOld)
+{
+    DWORD head = q[2];
+    DWORD ebx = 0;
+    if (((q[3] - head) & ~3u) != 0)
+        ebx = (tailOld - head) >> 2;   // pending (the record being pushed)
+    DWORD newbuf = (DWORD)(DWORD_PTR)EventQueueInsert(q, record);
+#pragma warning(push)
+#pragma warning(disable : 4172)   // intentionally returns the stack slot address
+    DWORD slot[2] = { 0, newbuf + 4 * ebx };
+    return slot;
+#pragma warning(pop)
+}
+
+// 0x5C9F50 -- push a 4-byte event record onto the event queue (head +8, tail
+// +0xC, limit +0x10 -- head/tail/limit as 4-byte slots). Appends the record
+// at the tail while the capacity allows; on a full queue it flushes through
+// EventQueueFlush (which grows the buffer and inserts the record) and returns
+// the flush out-slot. Returns the new tail in the fits path.
+// [NOT byte-identical] placement-dependent (memcpy + the flush call).
+static void *EventQueuePush(DWORD *q, const void *record)
+{
+    DWORD head = q[2];
+    DWORD cap = (head != 0) ? (DWORD)((q[4] - head) >> 2) : 0;
+    DWORD tail = q[3];
+    if ((DWORD)((tail - head) >> 2) >= cap)
+        return EventQueueFlush(q, record, tail);
+    if (tail != 0)
+        memcpy((void *)tail, record, 4);
+    tail += 4;
+    q[3] = tail;
+    return (void *)tail;
+}
+
 // 0x188F140 -- record an input event (obj, WORD code, BYTE state). The
-// original takes obj's CS and calls sub_5C9F50(&code, obj+24). The event
-// recorder is out of scope here. [remaining stub]
+// original takes obj's CS (obj + 0x4C) and calls sub_5C9F50(&record, obj + 0x18).
+// The recorder builds the 4-byte record {code (+0, WORD), state (+2, BYTE)}
+// (the +3 slot holds uninitialized stack data in the original -- zeroed here)
+// and pushes it through the event queue, then leaves the CS. The recorder's
+// return value (the flush out-slot / the new tail) is discarded.
+// [NOT byte-identical] placement-dependent (EnterCriticalSection /
+// LeaveCriticalSection IAT slots + the EventQueuePush call).
 static void RecordInputEvent(void *obj, unsigned short code, char state)
 {
-    (void)code;
-    (void)state;
     if (obj == 0)
         return;
     char *o = (char *)obj;
+    DWORD record = (DWORD)(WORD)code | ((DWORD)(BYTE)state << 16);
     EnterCriticalSection((LPCRITICAL_SECTION)(o + 76));
+    EventQueuePush((DWORD *)(o + 24), &record);
     LeaveCriticalSection((LPCRITICAL_SECTION)(o + 76));
 }
 
@@ -2823,37 +2948,364 @@ static void *F3EnumAdapterModes(void *container, DWORD adapterId, int flags)
 }
 
 // ============================================================
-//  [STUB]  F3ReserveModeList  (sub_563AE0)  -- size the shared mode buffer
-//  to hold the enumerated-mode list
+//  F3ReserveModeList  (0x563AE0 - 0x563BED)  -- size the shared mode
+//  buffer (dword_20FC978 / dword_20FC97C / dword_20FC980) to hold the
+//  enumerated-mode list
 //
-//  void F3ReserveModeList(void *list)
+//  void *__stdcall F3ReserveModeList(void *list)
 //
-//  Original: stdcall (list pointer on the stack); grows the shared mode
-//  buffer (dword_20FC978 / dword_20FC97C / dword_20FC980) to fit the list's
-//  element count (list+8 .. list+12). Out of scope here (no-op).
+//  Original: __stdcall (list pointer on the stack); the list is the 20-byte
+//  mode-list container whose vector words are +8 (begin), +12 (end) and
+//  +16 (capacity-end). Grows the shared buffer to fit the list's current
+//  element count (list+12 - list+8):
+//    - list == &unk_20FC970 (the sentinel descriptor block): trivial return.
+//    - v1 == 0 (empty list): reset the buffer to empty (sub_5648B0 -- when
+//      the buffer is non-empty, set dword_20FC97C = dword_20FC978) and return
+//      &unk_20FC970. The 4-byte stack descriptor sub_565BE0 writes is dead in
+//      the original (the function ignores its return value) and is omitted.
+//    - v1 <= used (the current fill already holds >= v1 elements): copy the
+//      list into the front of the buffer (sub_568B50) and set
+//      dword_20FC97C = buffer start + 8 * v1.
+//    - v1 <= capacity (fits the allocated buffer): sub_568B50 copies the first
+//      "used" elements of the list into the front of the buffer, then the
+//      tail call sub_568B80 appends the remaining elements after the current
+//      buffer end (dword_20FC978 .. dword_20FC97C); dword_20FC97C = the tail
+//      call's return (the new buffer end).
+//    - otherwise (needs a larger buffer): free the old buffer through the
+//      heap (dword_2075B24 + 16) and, with v5 = the list's byte length, zero
+//      the buffer words and allocate a fresh 8 * (v5 >> 3) byte buffer via
+//      sub_568D00 (the LHAlloc path): a run longer than 0x1FFFFFFF elements
+//      throws std::length_error("myvector<T> too long") (sub_565DF0), and
+//      std::bad_alloc is thrown when 0xFFFFFFFF / count < 8. sub_5648E0 then
+//      fills the fresh buffer's descriptor words (start/end/capacity-end)
+//      and returns 1; the tail call sub_568B80 copies the list into the new
+//      buffer and dword_20FC97C = its return (the new buffer end).
+//  In every path the function returns &unk_20FC970 (the sentinel descriptor
+//  block at 0x20FC970).
+//
+//  [NOT byte-identical] refs the high-VA descriptor block (0x20FC970 --
+//  unk_20FC970 / dword_20FC978 / dword_20FC97C / dword_20FC980) at its original
+//  address, is placement-dependent (relative E8 calls to sub_5648B0 /
+//  sub_568B50 / sub_568B80 / sub_5648E0 / sub_568D00 / sub_565DF0) and refs the
+//  heap-table free dispatch (dword_2075B24 + 16) and the
+//  std::length_error / std::bad_alloc machinery.
 // ============================================================
-static void F3ReserveModeList(void *list) { (void)list; }
+static DWORD g_unk_20FC970[5] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0, 0, 0 };
+                                          // 0x20FC970  the 20-byte mode-list
+                                          // descriptor block: +0x08 dword_20FC978
+                                          // (buffer start), +0x0C dword_20FC97C
+                                          // (buffer end), +0x10 dword_20FC980
+                                          // (capacity-end)
+
+// sub_568B50 -- copy the 8-byte elements [a2, a3) into [a1, ...) one element
+// at a time; returns a1 + 8 * count (the new buffer end).
+static void *F3ModeBufferCopy(DWORD a1, DWORD a2, DWORD a3)
+{
+    DWORD result = a1 + 8u * ((int)(a3 - a2) >> 3);
+    if (a2 != a3)
+    {
+        char *dest = (char *)a1;
+        for (DWORD src = a2; src != a3; src += 8u)
+        {
+            *(DWORD *)dest          = *(DWORD *)src;
+            *(DWORD *)(dest + 4)    = *((DWORD *)src + 1);
+            dest += 8;
+        }
+    }
+    return (void *)result;
+}
+
+// sub_568B80 -- copy the 8-byte elements [a1, a2) into the buffer starting at
+// a3 (the write base); returns the new buffer end. The original performs the
+// same per-iteration null guard (a null write base skips the copy for the
+// current stride and the loop advances -- a behaviour the game never reaches
+// since the allocation only fails on OOM).
+static DWORD *F3ModeBufferAppend(DWORD a1, DWORD a2, DWORD a3)
+{
+    DWORD *result = (DWORD *)a3;
+    if (a1 != a2)
+    {
+        int diff = (int)(a1 - a3);   // (a1 - bufferBase) in bytes
+        do
+        {
+            if (result != 0)
+            {
+                *result = *(DWORD *)((char *)result + diff);
+                result[1] = *(DWORD *)((char *)result + diff + 4);
+            }
+            result += 2;
+        }
+        while ((char *)result + diff != (char *)a2);
+    }
+    return result;
+}
+
+// sub_568D00 -- allocate 8 * count bytes through the LHAlloc path. Throws
+// std::bad_alloc when 0xFFFFFFFF / count < 8 (the run would overflow).
+static void *F3ModeAllocElements(unsigned int count)
+{
+    if (count == 0u)
+        return LHAlloc(0u);
+    if (0xFFFFFFFFu / count < 8u)
+    {
+        std::bad_alloc err;
+        if (g_dword_1DDCFC8 != 0)
+            g_dword_1DDCFC8(&err);
+        throw err;
+    }
+    return LHAlloc(8u * count);
+}
+
+// sub_5648E0 -- fill the fresh mode-list buffer's descriptor words (start =
+// end = the allocation, capacity-end = start + 8 * count) and return 1.
+// Throws (via sub_565DF0) std::length_error("myvector<T> too long") when
+// count > 0x1FFFFFFF before any allocation happens.
+static int F3ModeReserveFill(unsigned int count, DWORD *block)
+{
+    if (count > 0x1FFFFFFFu)
+    {
+        std::length_error err("myvector<T> too long");
+        if (g_dword_1DDCFC8 != 0)
+            g_dword_1DDCFC8(&err);
+        throw err;
+    }
+    DWORD v2 = (DWORD)F3ModeAllocElements(count);
+    block[2] = v2;
+    block[3] = v2;
+    block[4] = v2 + 8u * count;
+    return 1;
+}
+
+static void *__stdcall F3ReserveModeList(void *list)
+{
+    DWORD *block = g_unk_20FC970;
+    DWORD start = block[2];
+    DWORD end = block[3];
+
+    if (list == (void *)block)
+        return (void *)block;
+
+    DWORD begin = *(DWORD *)((DWORD)list + 8);
+    DWORD listEnd = *(DWORD *)((DWORD)list + 12);
+    unsigned int v1 = (int)(listEnd - begin) >> 3;
+
+    if (v1 == 0u)
+    {
+        // sub_5648B0 -- reset the buffer to empty (start != end).
+        if (start != end)
+            block[3] = start;
+        return (void *)block;
+    }
+
+    if (v1 <= (end - start) >> 3)
+    {
+        // v1 <= used: copy the list into the front of the buffer and set the
+        // new end (sub_568B50; the result is ignored).
+        (void)F3ModeBufferCopy(start, begin, listEnd);
+        block[3] = start + 8u * v1;
+        return (void *)block;
+    }
+
+    DWORD capacity = (block[4] - start) >> 3;
+    DWORD used = (end - start) >> 3;
+    if (v1 <= capacity)
+    {
+        // v1 <= capacity: sub_568B50 copies the first "used" elements of the
+        // list into the front of the buffer, then the shared tail calls
+        // sub_568B80 with the current buffer end as the write base.
+        (void)F3ModeBufferCopy(start, begin, begin + 8u * used);
+        block[3] = (DWORD)F3ModeBufferAppend(begin + 8u * used, listEnd, end);
+        return (void *)block;
+    }
+
+    // v1 > capacity: free the old buffer and allocate a fresh one.
+    if (start != 0u)
+        LHFree((void *)start);
+    int v5 = (int)(listEnd - begin);
+    block[2] = 0;
+    block[3] = 0;
+    block[4] = 0;
+    if ((v5 >> 3) == 0 || F3ModeReserveFill((unsigned int)(v5 >> 3), block) == 0)
+        return (void *)block;
+
+    // The shared tail (realloc path): copy the list into the fresh buffer.
+    block[3] = (DWORD)F3ModeBufferAppend(begin, listEnd, block[2]);
+    return (void *)block;
+}
 
 // ============================================================
-//  [STUB]  F3DestroyModeListContainer  (sub_563770)  -- destroy the local
-//  20-byte mode-list container built by F3EnumAdapterModes
+//  F3DestroyModeListContainer  (0x563770 - 0x56379F, 47 bytes)  -- destroy the
+//  local 20-byte mode-list container built by F3EnumAdapterModes
 //
 //  void F3DestroyModeListContainer(void *container)
 //
-//  Original: thiscall (container in ECX); releases container[2] through the
-//  operator-delete thunk and zeroes words 2..4. Out of scope here (no-op).
+//  Original: thiscall-like (container in ECX; retn with no stack cleanup).
+//  Loads the container's begin word (+8, the 8-byte-element buffer) and, when
+//  it is non-null, releases it through the heap-table free slot (the
+//  dword_2075B24 + 0x10 dispatch); the result lands in EAX as the function's
+//  return value. Then zeroes the vector words (+8/+0xC/+0x10) and returns.
+//  (The original leaves EAX = the free-slot result, which this build cannot
+//  reproduce -- the heap table's free slot is void here and the one call
+//  site discards the result -- so this build returns void, matching the
+//  original's observable behavior at the single call site.) The header words
+//  (+0/+4) are left untouched.
+//
+//  [NOT byte-identical] refs the heap-table pointer global (0x02075B24) at
+//  the original high VA not present in this build and dispatches through the
+//  heap table's free slot.
 // ============================================================
-static void F3DestroyModeListContainer(void *container) { (void)container; }
+static void F3DestroyModeListContainer(void *container)
+{
+    DWORD *c = (DWORD *)container;
+    if (c[2] != 0u)
+        LHFree((void *)c[2]);
+    c[2] = 0;
+    c[3] = 0;
+    c[4] = 0;
+}
 
 // ============================================================
-//  [STUB]  F3InitAdapterState  (sub_18F1150)  -- initialize the adapter state
+//  F3IsOsMajorVersionAtLeast6  (0x1887820 - 0x188787F)  -- the OS >= 6 gate
 //
-//  void F3InitAdapterState(void)
+//  int F3IsOsMajorVersionAtLeast6(void)
 //
-//  Original: seeds a one-word state and calls sub_1887790(dword_1E2EDBC, &w)
-//  (dword_1D9E184 = the result). Out of scope here (no-op).
+//  Original (sub_1887820): fills an 148-byte OSVERSIONINFOA with
+//  dwOSVersionInfoSize = 148 and calls GetVersionExA; returns 1 when the
+//  call succeeds and dwMajorVersion >= 6, else 0.
 // ============================================================
-static void F3InitAdapterState(void) {}
+static int F3IsOsMajorVersionAtLeast6(void)
+{
+    OSVERSIONINFOA vi;
+    memset(&vi, 0, sizeof(vi));
+    vi.dwOSVersionInfoSize = 148;
+    if (GetVersionExA(&vi))
+        return vi.dwMajorVersion >= 6 ? 1 : 0;
+    return 0;
+}
+
+// ============================================================
+//  F3QueryAdapterViaExtEscape  (0x1887880 - 0x188793A)  -- the legacy
+//  CreateDCA / ExtEscape adapter probe (OS < 6 only)
+//
+//  int F3QueryAdapterViaExtEscape(int *outValue)
+//
+//  Original (sub_1887880): zeroes a 320-byte out buffer, fills a 4-byte
+//  input word with 16, runs CreateDCA("DISPLAY", NULL, NULL, NULL), then
+//  ExtEscape(hdc, 0x7306, 0x50, InData, 0x140, OutData) (cjInput 80 /
+//  cjOutput 320), DeleteDC(hdc). When ExtEscape returns 0 (success), the
+//  2nd DWORD of the out buffer (OutData[4..7]) is written to *outValue and
+//  1 is returned; otherwise 0.
+// ============================================================
+static int F3QueryAdapterViaExtEscape(int *outValue)
+{
+    BYTE OutData[320];
+    BYTE InData[4];
+    HDC hdc;
+    int v11;
+
+    memset(OutData, 0, sizeof(OutData));
+    *(DWORD *)InData = 16;
+    hdc = CreateDCA("DISPLAY", NULL, NULL, NULL);
+    v11 = ExtEscape(hdc, 29446 /* 0x7306 */, 80 /* 0x50 */, (LPCSTR)InData, 320 /* 0x140 */, (LPSTR)OutData);
+    DeleteDC(hdc);
+    if (v11 == 0)
+    {
+        *outValue = *(int *)&OutData[4];
+        return 1;
+    }
+    return 0;
+}
+
+// ============================================================
+//  [STUB]  sub_1887940  (0x1887940 - 0x1887BB6)  -- the Vista+ D3DKMT probe
+//
+//  The 630-byte D3DKMT adapter probe (LoadLibraryA("user32.dll") +
+//  EnumDisplayDevicesA, LoadLibraryA("gdi32.dll") + D3DKMTEscape +
+//  D3DKMTOpenAdapterFromHdc, then sub_1887BC0's display-device walk + the
+//  D3DKMTEscape call with a 0x218-byte struct) is a documented remaining
+//  stub. It returns 0 here, which sends the caller down the v5 == 0 ->
+//  v4 = 1 -> return 1 path.
+// ============================================================
+static int sub_1887940(int *outValue)
+{
+    (void)outValue;
+    return 0;
+}
+
+// ============================================================
+//  F3QueryAdapterState  (0x1887790 - 0x1887814)  -- seed the one-word state
+//  and run the OS-gated adapter probe
+//
+//  int F3QueryAdapterState(int adapterIndex, int *outValue)
+//
+//  Original (sub_1887790): checks the OS gate (F3IsOsMajorVersionAtLeast6);
+//  null outValue -> return 0. When the gate is set, runs the Vista+
+//  D3DKMT probe (sub_1887940, stubbed here); otherwise runs the legacy
+//  CreateDCA / ExtEscape probe (F3QueryAdapterViaExtEscape). On probe
+//  failure (v5 == 0) or a zero out word, forces v4 = 1. When v4 >= 1,
+//  writes *outValue = v4 and returns 1; otherwise writes *outValue = 1
+//  and returns 0 (the reachable case is a negative-int legacy out word,
+//  which is < 1 after the forced-1 check).
+// ============================================================
+static int F3QueryAdapterState(int adapterIndex, int *outValue)
+{
+    int v3;   // F3IsOsMajorVersionAtLeast6 result
+    int v5;   // probe result
+    int v4 = 0;   // probe out word
+
+    (void)adapterIndex;   // unused in the original
+    v3 = F3IsOsMajorVersionAtLeast6();
+    if (outValue == NULL)
+        return 0;
+    if (v3 == 1)
+        v5 = sub_1887940(&v4);
+    else
+        v5 = F3QueryAdapterViaExtEscape(&v4);
+    if (v5 == 0 || v4 == 0)
+        v4 = 1;
+    if (v4 >= 1)
+    {
+        *outValue = v4;
+        return 1;
+    }
+    else
+    {
+        *outValue = 1;
+        return 0;
+    }
+}
+
+// ============================================================
+//  F3InitAdapterState  (0x18F1150 - 0x18F11B3)  -- initialize the adapter state
+//
+//  int F3InitAdapterState(void)
+//
+//  Original (sub_18F1150): seeds the one-word state with 1, calls
+//  F3QueryAdapterState(dword_1E2EDBC, &v1), and -- when the probe returns
+//  1 -- writes the result into dword_1D9E184 and returns it; otherwise
+//  writes 1 into dword_1D9E184 and returns the probe result.
+//
+//  [NOT byte-identical] refs the high-VA globals g_dword_1E2EDB8[1]
+//  (0x01E2EDBC) and g_dword_1D9E184 (0x01D9E184) and calls F3QueryAdapterState
+//  -- no byte-exact replay is possible.
+// ============================================================
+static int F3InitAdapterState(void)
+{
+    int v1 = 1;
+    int result;
+
+    result = F3QueryAdapterState(g_dword_1E2EDB8[1], &v1);   // dword_1E2EDBC
+    if (result == 1)
+    {
+        g_dword_1D9E184 = (DWORD)v1;
+        return v1;
+    }
+    else
+    {
+        g_dword_1D9E184 = 1;
+    }
+    return result;
+}
 
 // ============================================================
 //  CreateD3D9DisplayObject  (0x18F21A0 - 0x18F230F)  -- (re)create the D3D9
@@ -2873,8 +3325,9 @@ static void F3InitAdapterState(void) {}
 //  private-vtable slot 14 with a factory-first-arg convention this build does
 //  not reproduce) into the 16-byte identifier block g_dword_1E2EDB8:
 //    - S_OK: enumerate the adapter modes (F3EnumAdapterModes / sub_18F1FC0)
-//      into a 20-byte local container, free the returned list (sub_563AE0),
-//      destroy the container (sub_563770), init the adapter state
+//      into a 20-byte local container, size the shared mode buffer
+//      (F3ReserveModeList / sub_563AE0), destroy the container
+//      (F3DestroyModeListContainer / sub_563770), init the adapter state
 //      (sub_18F1150) and return true (the object is kept alive).
 //    - D3DERR_NOTAVAILABLE (0x8876086A) with (flags & 4): force *outBehavior
 //      to 2 and re-run the query once, returning whether it now succeeds
@@ -2887,7 +3340,9 @@ static void F3InitAdapterState(void) {}
 //  [NOT byte-identical] refs the high-VA device globals dword_1E2EEF8 /
 //  g_dword_1E2EDB8 (0x01E2EEF8 / 0x01E2EDB8) and dispatches into the deep D3D9
 //  / XLO mode-enumeration subsystem (sub_18F1FC0 / sub_563AE0 / sub_563770 /
-//  sub_18F1150), which is stubbed out.
+//  sub_18F1150), of which only F3EnumAdapterModes, F3ReserveModeList and
+//  F3DestroyModeListContainer are implemented; F3InitAdapterState remains a
+//  no-op stub.
 // ============================================================
 static bool CreateD3D9DisplayObject(int adapterIndex, DWORD *outBehavior, int flags)
 {
@@ -3486,15 +3941,108 @@ static int ResizeWorkerWindow(CWorkerWin32 *obj)
 }
 
 // ============================================================
-//  [STUB]  ApplyDisplaySettings  (0x18F7E60 - ...)  -- apply / restore the
+//  ApplyDisplaySettings  (0x18F7E60 - 0x18F805C)  -- apply / restore the
 //  system display settings on a windowed <-> fullscreen transition
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  SaveSettingsBeforeExit / SystemParametersInfoA / CXMLWriteStreamCtor /
+//  RefSharedSlot / AppendSharedSlot / EnsureParentDirectory /
+//  ReleaseSharedSlot / WriteStreamEnterElement / ReadXmlNamedValue /
+//  WriteXmlStreamAdvance / WriteXmlStreamToFile / CXMLWriteStreamDtor and the
+//  /GS cookie / high-VA Str1) plus the high-VA accessibility globals
+//  (g_dword_1D9E18C / g_dword_1D9E190 / g_dword_1D9E194 / g_dword_1D9E198 /
+//  g_dword_1D9E1A0 / g_byte_1D9E19C / g_dword_1DBE2F0 / g_dword_20FC8D8 /
+//  g_dword_20FC8DC / g_dword_20FC8E0 / g_dword_20FC8E4).
 //
-//  void __stdcall ApplyDisplaySettings(int windowed)
+//  int __stdcall ApplyDisplaySettings(int windowed)
 //
-//  Deep system-settings path (SystemParametersInfoA + accessibility-settings
-//  save/load + locale strings); out of scope here. No-op.
+//  When `windowed` is non-zero, the settings are restored (the windowed
+//  <-> fullscreen transition path) through SaveSettingsBeforeExit and its
+//  result is returned. Otherwise the three snapshotted system parameters
+//  are (re)applied: SPI_SETHIDCONFIRM (0x3B, 8, &g_dword_1D9E18C) when the
+//  loaded HIDCONFIRM value (g_dword_1D9E190) has bit 0 clear,
+//  SPI_SETKEYBOARDSPEED (0x35, 8, &g_dword_1D9E194) when the loaded
+//  KEYBOARDSPEED value (g_dword_1D9E198) has bit 0 clear, and
+//  SPI_SETKEYBOARDDelay (0x33, 0x18, the 24-byte g_byte_1D9E19C snapshot with
+//  bits 0/1 of the loaded keyboard-delay value (g_dword_1D9E1A0, bytes 4-7 of
+//  the snapshot) cleared) when that loaded value is even. The keyboard-delay
+//  snapshot is copied to a stack buffer first; the two-word (bits 0/1) mask
+//  is applied to the copy only. When the loaded keyboard-delay value is odd
+//  and no other parameter was applied, the function returns 0 and skips the
+//  XML-save path. Otherwise a CXMLWriteStream is built; EnsureParentDirectory
+//  (the settings directory + "AccessibilitySettings.xml") is run and the
+//  slot released; the section named by g_dword_20FC8D8 (empty = root) is
+//  entered through the write stream and, on success, the three named values
+//  (g_dword_20FC8DC / E0 / E4) are re-entered through the stream with the
+//  loaded values passed by reference (ReadXmlNamedValue, the loaded value is
+//  the in/out local), and the stream is advanced (WriteXmlStreamAdvance).
+//  AccessibilitySettings.xml is then serialized (the LHXML serializer is a
+//  remaining stub, so only the XML prologue reaches the file), the slot is
+//  released and the stream destroyed. This is the display-transition
+//  counterpart of InitAccessibilitySettings (the start-up load).
 // ============================================================
-static void __stdcall ApplyDisplaySettings(int windowed) { (void)windowed; }
+static int __stdcall ApplyDisplaySettings(int windowed)
+{
+    if (windowed != 0)
+        return SaveSettingsBeforeExit();
+
+    DWORD pvParam = g_dword_1D9E18C;   // the SPI_GETHIDCONFIRM snapshot
+    int result = 0;
+
+    if ((g_dword_1D9E190 & 1) == 0)
+    {
+        SystemParametersInfoA(0x3B, 8u, (PVOID)&pvParam, 0);   // SPI_SETHIDCONFIRM
+        result = 1;
+    }
+
+    DWORD v5 = g_dword_1D9E194;        // the SPI_GETKEYBOARDSPEED snapshot
+    if ((g_dword_1D9E198 & 1) == 0)
+    {
+        SystemParametersInfoA(0x35u, 8u, (PVOID)&v5, 0);       // SPI_SETKEYBOARDSPEED
+        result = 1;
+    }
+
+    BYTE v10[24];
+    memcpy(v10, g_byte_1D9E19C, 24);
+    if ((v10[4] & 1) != 0)             // the loaded keyboard-delay value (bytes 4-7)
+    {
+        if (result == 0)
+            return 0;                  // return 0; skip the XML-save path
+    }
+    else
+    {
+        *(DWORD *)&v10[4] &= 0xFFFFFFF3u;                   // bits 0/1 cleared
+        SystemParametersInfoA(0x33u, 0x18u, (PVOID)v10, 0);   // SPI_SETKEYBOARDDelay
+    }
+
+    F3XmlStream stream;
+    CXMLWriteStreamCtor(&stream);                             // sub_17DB800
+
+    F3SharedBuffer *path = 0;
+    RefSharedSlot(&path, &g_dword_1DBE2F0);
+    AppendSharedSlot(&path, "AccessibilitySettings.xml");
+    EnsureParentDirectory(&path);
+    ReleaseSharedSlot(&path);
+
+    const char *sectionName = (g_dword_20FC8D8 != 0) ? g_dword_20FC8D8->data : "";
+    if (WriteStreamEnterElement(&stream, sectionName) != 0)
+    {
+        DWORD value = g_dword_1D9E190;
+        ReadXmlNamedValue(&g_dword_20FC8DC, &stream, &value);
+        value = g_dword_1D9E198;
+        ReadXmlNamedValue(&g_dword_20FC8E0, &stream, &value);
+        value = g_dword_1D9E1A0;
+        ReadXmlNamedValue(&g_dword_20FC8E4, &stream, &value);
+        WriteXmlStreamAdvance(&stream);
+    }
+
+    F3SharedBuffer *path2 = 0;
+    RefSharedSlot(&path2, &g_dword_1DBE2F0);
+    AppendSharedSlot(&path2, "AccessibilitySettings.xml");
+    const char *fileName = (path2 != 0) ? path2->data : "";
+    WriteXmlStreamToFile(&stream, fileName);
+    ReleaseSharedSlot(&path2);
+    return CXMLWriteStreamDtor(&stream);
+}
 
 //  The manager's GetWindow virtual method (vtable slot 8, 0x20): the manager
 //  window used for error boxes (see EnsureWorkerWindow's failure path).
@@ -3618,22 +4166,156 @@ shown:
 }
 
 // ============================================================
-//  [STUB]  HandleDisplayModeChange  (0x18F8060 - 0x18F82D6)  -- apply a
+//  HandleDisplayModeChange  (0x18F8060 - 0x18F82D6)  -- apply a
 //  pending display-mode change (the request stashed by sub_18F6BA0 at
 //  +0x274..+0x27D)
+//  [NOT byte-identical] placement-dependent (relative calls to
+//  InitDisplayMode / TrySetDisplayMode / SetDisplayMode / ApplyDisplaySettings /
+//  ResizeWorkerWindow / FindActiveInputDevice / the SetWindowLongA / SetWindowPos /
+//  ShowWindow / SetEvent IAT slots) and refs the high-VA manager pair
+//  dword_20FC8C4 and the input-manager dispatch (dword_20FC8C4 + 0x20).
 //
 //  int __thiscall HandleDisplayModeChange(CWorkerWin32 *obj)   -- worker in ECX
 //
 //  Called from PumpWorkerMessages under the worker CS (nested entry) when
-//  the display-mode-pending flag (+0x281) is set. Applies the requested mode
-//  (the TrySetDisplayMode fullscreen path when +0x27C is set, else the
-//  SetDisplayMode windowed path); on success it calls the +0x26C callback,
+//  the display-mode-pending flag (+0x281) is set. Reads the pending request
+//  (width/height at +0x274/+0x278, fullscreen/refresh bytes at +0x27C/+0x27D,
+//  render-mode field at +0x250), applies it (the TrySetDisplayMode fullscreen
+//  path when +0x27C is set, else the SetDisplayMode windowed path). On
+//  success (result 0) it calls the +0x26C callback, stores the requested
+//  width/height + the fullscreen/refresh bytes, runs
 //  ApplyDisplaySettings(!windowed), ResizeWorkerWindow, ShowWindow(hwnd,
-//  SW_SHOW), updates the manager's display record (dword_20FC8C4 pair) via
-//  its vtable, clears the pending/done flags, and SetEvents event4 (+0x228).
-//  Returns 0 (unhandled) for now.
+//  10), updates the manager's display record (dword_20FC8C4 pair) via its
+//  vtable[1], activates the active input device (device vtable[12]), clears
+//  the pending flag, and SetEvents event4 (+0x228). On result 1 it leaves
+//  the pending flag clear (+0x282 = 1) and SetEvents event4; on result 2
+//  it re-arms the pending flag (+0x281) and returns unhandled.
 // ============================================================
-static int HandleDisplayModeChange(CWorkerWin32 *obj) { (void)obj; return 0; }
+static int HandleDisplayModeChange(CWorkerWin32 *obj)
+{
+    int result;
+    int width  = obj->displayPendingWidth;      // +0x274 requested client width
+    int height = obj->displayPendingHeight;      // +0x278 requested client height
+
+    if (obj->displayPendingFullscreen != 0)      // +0x27C requested fullscreen byte
+    {
+        if ((unsigned char)obj->windowFlags == 0)   // +0x24C current fullscreen byte clear
+        {
+            // Drop out of fullscreen before re-applying the mode. The original
+            // installs the class procedure at 0xCA0000 / 0x80080000 here; keep
+            // the module's own wndproc (sub_18F7A70) in this build.
+            SetWindowLongA(obj->hwnd, GWLP_WNDPROC, (LONG)WorkerWndProc);
+            SetWindowLongA(obj->hwnd, GWLP_HINSTANCE, 0);
+            SetWindowPos(obj->hwnd, HWND_TOP, 0, 0, 0, 0, 0x23u /*SWP_NOSIZE|SWP_NOMOVE|SWP_SHOWWINDOW*/);
+        }
+
+        F3DisplayMode dm;
+        InitDisplayMode(&dm);
+        dm.width = width;
+        dm.height = height;
+        *(unsigned char *)&dm.f28 = (unsigned char)obj->displayPendingRefresh;  // low byte of f28
+        dm.f36 = obj->f_0250;
+        result = TrySetDisplayMode(&dm);
+
+        if (result != 0 && (unsigned char)obj->windowFlags == 0)
+        {
+            // The mode was not applied and the window is not fullscreen:
+            // restore the window proc / instance / position.
+            SetWindowLongA(obj->hwnd, GWLP_WNDPROC, (LONG)WorkerWndProc);
+            SetWindowLongA(obj->hwnd, GWLP_HINSTANCE, 0);
+            SetWindowPos(obj->hwnd, HWND_TOP, 0, 0, 0, 0, 0x23u /*SWP_NOSIZE|SWP_NOMOVE|SWP_SHOWWINDOW*/);
+        }
+    }
+    else
+    {
+        F3DisplayMode dm;
+        memset(&dm, 0, sizeof(dm));
+        dm.width = width;
+        dm.height = height;
+        dm.f12 = 24;
+        dm.f16 = 8;
+        dm.f20 = 0;
+        dm.f24 = 1;
+        dm.f28 = 0;
+        result = SetDisplayMode(&dm);
+    }
+
+    switch (result)
+    {
+    case 0:
+        obj->onResetDevice();   // +0x26C on-reset-device callback
+        {
+            int fullscreen = (unsigned char)obj->displayPendingFullscreen;  // +0x27C
+            int refresh    = (unsigned char)obj->displayPendingRefresh;      // +0x27D
+
+            *(unsigned char *)&obj->windowFlags = (unsigned char)fullscreen;        // +0x24C
+            obj->displayPendingDone = 0;        // +0x282
+            obj->windowWidth  = width;          // +0x244
+            obj->windowHeight = height;         // +0x248
+            *((unsigned char *)&obj->windowFlags + 1) = (unsigned char)refresh;      // +0x24D
+            ApplyDisplaySettings(fullscreen == 0);
+
+            if ((unsigned char)obj->windowFlags == 0)   // not fullscreen (now)
+            {
+                ResizeWorkerWindow(obj);
+                SetWindowLongA(obj->hwnd, GWLP_WNDPROC, (LONG)WorkerWndProc);
+                SetWindowLongA(obj->hwnd, GWLP_HINSTANCE, 0);
+                SetWindowPos(obj->hwnd, HWND_TOP, 0, 0, 0, 0, 0x23u /*SWP_NOSIZE|SWP_NOMOVE|SWP_SHOWWINDOW*/);
+            }
+
+            ShowWindow(obj->hwnd, 10);   // SW_SHOWDEFAULT
+
+            // Update the manager's display record (dword_20FC8C4 + 0x20).
+            {
+                void *mgr = GetManager();
+                if (mgr != 0)
+                {
+                    void *inputManager = *(void **)((char *)mgr + 0x20);
+                    if (inputManager != 0)
+                    {
+                        DWORD *io = (DWORD *)inputManager;
+                        io[16] = (DWORD)width;   // +0x40 requested width
+                        io[17] = (DWORD)height;  // +0x44 requested height
+
+                        // vtable[1] (sub_188ED80): walk the device list and notify
+                        // each device -- slot 1 is stubbed (0) in this build, so
+                        // the notification is skipped (the device list stays empty).
+                        void **vt = *(void ***)inputManager;
+                        if (vt != 0 && vt[1] != 0)
+                        {
+                            typedef void (__stdcall *F3StdcallNotifyFn)(int);
+                            ((F3StdcallNotifyFn)vt[1])(0);
+                        }
+
+                        void *activeDevice = FindActiveInputDevice(inputManager);
+                        if (activeDevice != 0)
+                        {
+                            void **devVt = *(void ***)activeDevice;
+                            if (devVt != 0 && devVt[12] != 0)
+                            {
+                                typedef void (__thiscall *F3ThiscallFn0)(void *);
+                                ((F3ThiscallFn0)devVt[12])(activeDevice);
+                            }
+                        }
+                    }
+                }
+            }
+
+            obj->displayModePending = 0;   // +0x281
+            return SetEvent(obj->event4);  // +552
+        }
+    case 1:
+        obj->displayPendingDone = 1;      // +0x282
+        obj->displayModePending = 0;      // +0x281
+        return SetEvent(obj->event4);     // +552
+    case 2:
+        obj->displayModePending = 1;      // +0x281
+        break;
+    default:
+        break;
+    }
+    return result;
+}
 
 // ============================================================
 //  PumpWorkerMessages  (0x18F8530 - 0x18F85FB)  -- drain the worker's
@@ -4067,7 +4749,7 @@ struct F3ObjectListContainer   // 64 bytes
     DWORD f00;                // +0x00
     F3ObjectList l04;         // +0x04
     F3ObjectList l20;         // +0x20
-    DWORD f3C[3];             // +0x3C
+    DWORD f3C;                // +0x3C  container counter (++ per flush)
 };
 
 // 0x20FC988: the device object-list container (64 bytes; 0xFF-poison in the
@@ -4254,7 +4936,7 @@ static void EnsureObjectListInit(F3ObjectList *list)
 }
 
 // ============================================================
-//  FlushDeviceOperationLists  (0x18CB6A0 - 0x18CB95F)  -- flush the pending
+//  FlushDeviceOperationLists  (0x18CB6A0 - 0x18CB96F)  -- flush the pending
 //  device-operation object lists
 //  [NOT byte-identical] placement-dependent (relative calls to LHAlloc /
 //  GetEngineTime / Sleep / FreeObjectListContainer / F3ListRemoveNode) and
@@ -4283,6 +4965,7 @@ static void EnsureObjectListInit(F3ObjectList *list)
 //  FPS record, and return the record index * 3.
 // ============================================================
 static double g_dbl_1DBBFE0 = 1.0;       // 0x1DBBFE0  flush time threshold (seconds)
+static DWORD  g_dword_20FC9C8 = 0;        // 0x20FC9C8  flush scratch (write-only, never read)
 static DWORD  g_dword_20B5F74 = 0;        // 0x20B5F74  current FPS record index
 static DWORD  g_dword_20B5F70 = 0;        // 0x20B5F70  global frame counter
 static double g_dbl_2074580 = 0.0;        // 0x2074580  last flush time
@@ -4333,6 +5016,7 @@ int FlushDeviceOperationLists(void)
         DWORD pad0C = last->pad0C;
         DWORD data16_lo = last->data16_lo;
         DWORD data16_hi = last->data16_hi;
+        g_dword_20FC9C8 = pad0C;   // 0x20FC9C8  write-only scratch (never read)
 
         F3ObjectListAddNode(&g_stru_20FC988.l04, obj, pad0C, data16_lo, data16_hi);
 
@@ -4392,7 +5076,7 @@ int FlushDeviceOperationLists(void)
     ;
 
     // counter bump
-    ++g_stru_20FC988.f3C[0];
+    ++g_stru_20FC988.f3C;
 
     // FPS record update
     g_dbl_2074580 = GetEngineTime();

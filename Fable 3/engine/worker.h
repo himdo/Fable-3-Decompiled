@@ -35,6 +35,8 @@ typedef int (WINAPI *F3PreTranslateFn)(LPMSG msg);
 //    +156  event1   +288 event2   +420 event3   +552 event4  (auto-reset)
 //    +560  hInstance   +564 nShowCmd
 //    +604  pauseGameOnVMState (+0x25C)    +608  multiplayerPauseOnVMState (+0x260)    +612  armedPauseOnVMState (+0x264)    +620  onResetDevice (+0x26C)
+//    +624  preTranslate (+0x270)  +628 requested display-mode width (+0x274)    +632 height (+0x278)    +636 fullscreen byte (+0x27C)    +637 refresh byte (+0x27D)
+//    +641  pending flag (+0x281)    +642 done flag (+0x282)    +648 shown    +649 ready
 //    +656  timing (double, seconds since engine start)
 // ============================================================
 typedef struct CWorkerWin32
@@ -67,9 +69,14 @@ typedef struct CWorkerWin32
     F3CallbackFn     netHeldCoopFailed; // +616 (0x268) net-held coop-failed callback (setter SetNetHeldCoopFailed)
     F3CallbackFn     onResetDevice; // +620 (0x26C) on-reset-device callback
     F3PreTranslateFn preTranslate;  // +624 (0x270) pre-translate hook (XLive; setter SetPreTranslate)
-    char             _pad7a1[13];   // +628 .. +641
-    char             displayModePending; // +641 (0x281) display-mode change pending (set by sub_18F6BA0)
-    char             _pad7a2[6];    // +642 .. +648
+    int              displayPendingWidth;     // +628 (0x274) requested client width (sub_18F6BA0)
+    int              displayPendingHeight;    // +632 (0x278) requested client height (sub_18F6BA0)
+    char             displayPendingFullscreen; // +636 (0x27C) requested fullscreen byte (sub_18F6BA0)
+    char             displayPendingRefresh;    // +637 (0x27D) requested refresh byte (sub_18F6BA0)
+    char             _padEndFull[3];         // +638 .. +640
+    char             displayModePending;      // +641 (0x281) display-mode change pending (set by sub_18F6BA0)
+    char             displayPendingDone;     // +642 (0x282) completion flag (sub_18F6BA0's success check)
+    char             _pad7a2[5];    // +643 .. +647
     char             shown;         // +648 (0x288) set by EnsureWorkerWindow
     char             ready;         // +649 (0x289) set by EnsureWorkerWindow
     char             _pad7b[6];     // +650 .. +656

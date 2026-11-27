@@ -6,39 +6,15 @@
 "source": "gamemain"
 },
 {
-"name": "?sub_18DDDB0@@YAXXZ",
-"rva": 21880240,
-"size": 66,
+"name": "?sub_1A19D70@@YAHPAXPBDHH@Z",
+"rva": 23174512,
+"size": 148,
 "source": "gamemain"
 },
 {
-"name": "?sub_18CB6A0@@YAXXZ",
-"rva": 21804704,
-"size": 719,
-"source": "gamemain"
-},
-{
-"name": "?sub_18F0460@@YANXZ",
-"rva": 21955680,
-"size": 80,
-"source": "gamemain"
-},
-{
-"name": "?sub_50A540@@YAPAXPAX@Z",
-"rva": 1090880,
-"size": 171,
-"source": "gamemain"
-},
-{
-"name": "?sub_1A19E10@@YAJPAXPBDH@Z",
-"rva": 23174672,
-"size": 358,
-"source": "gamemain"
-},
-{
-"name": "?sub_72C220@@YAXPAXH@Z",
-"rva": 3326496,
-"size": 222,
+"name": "?sub_72BF00@@YAPAXPAX@Z",
+"rva": 3325696,
+"size": 100,
 "source": "gamemain"
 },
 {
@@ -220,5 +196,11 @@
 "rva": 3340240,
 "size": 5,
 "source": "gamethread"
+},
+{
+"name": "?sub_1887940@@YAHPAH@Z",
+"rva": 21526848,
+"size": 630,
+"source": "worker"
 }
 ]
