@@ -37,6 +37,7 @@ __pycache__/
 venv/
 node_modules/
 .cache/
+**/orig/
 
 # ---- Reverse-engineering / large binary artifacts ----
 # Uncomment to keep IDA Pro databases & workspace files out of git
@@ -53,4 +54,4 @@ node_modules/
 *.dll
 *.exe
 *.txt
-build.log
+*.log

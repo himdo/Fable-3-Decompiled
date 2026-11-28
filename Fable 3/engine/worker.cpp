@@ -106,7 +106,7 @@ static BYTE   g_byte_2123048 = 0;       // 0x2123048 engine-time initialized fla
 //  reads the globals captured by InitEngineTime; if that has not run yet we
 //  lazily capture them here so the first call still returns valid seconds.
 // ============================================================
-static double GetEngineTime(void)
+double GetEngineTime(void)
 {
     LARGE_INTEGER now;
 
@@ -3217,19 +3217,180 @@ static int F3QueryAdapterViaExtEscape(int *outValue)
 }
 
 // ============================================================
-//  [STUB]  sub_1887940  (0x1887940 - 0x1887BB6)  -- the Vista+ D3DKMT probe
+//  F3GetPrimaryAdapterHandle  (0x1887BC0 - 0x1887CC6)  -- the display-device
+//  walk + CreateDCA + D3DKMTOpenAdapterFromHdc helper
 //
-//  The 630-byte D3DKMT adapter probe (LoadLibraryA("user32.dll") +
-//  EnumDisplayDevicesA, LoadLibraryA("gdi32.dll") + D3DKMTEscape +
-//  D3DKMTOpenAdapterFromHdc, then sub_1887BC0's display-device walk + the
-//  D3DKMTEscape call with a 0x218-byte struct) is a documented remaining
-//  stub. It returns 0 here, which sends the caller down the v5 == 0 ->
-//  v4 = 1 -> return 1 path.
+//  int F3GetPrimaryAdapterHandle(DWORD *outAdapterHandle, DWORD *outValue,
+//      FARPROC openAdapterFromHdc, FARPROC enumDisplayDevices)
+//
+//  Original (sub_1887BC0): zeroes a 106-DWORD (0x1A8-byte) display-device
+//  buffer (cbSize word set to 0x1A8) and walks EnumDisplayDevicesA(0, i,
+//  v8, 0) until enumeration ends or the device flags carry the primary bit
+//  (0x4, read from v8[41]), then runs CreateDCA(NULL, &v8[1], NULL, NULL) on
+//  the found device name. A NULL DC returns -2147467259 (0x80004005);
+//  otherwise D3DKMTOpenAdapterFromHdc (a4) fills a 5-DWORD struct (slot 0 =
+//  DC), and on a negative result the DC is deleted and 0x80004005 is
+//  returned; otherwise the DC is deleted, *outAdapterHandle = struct[1],
+//  *outValue = struct[4], and 0 is returned.
+//
+//  [NOT byte-identical] calls CreateDCA / DeleteDC / EnumDisplayDevicesA /
+//  D3DKMTOpenAdapterFromHdc through inline function pointers -- placement-
+//  dependent (function-pointer dispatch), so no byte-exact replay.
 // ============================================================
-static int sub_1887940(int *outValue)
+static int F3GetPrimaryAdapterHandle(DWORD *outAdapterHandle, DWORD *outValue,
+    FARPROC openAdapterFromHdc, FARPROC enumDisplayDevices)
 {
-    (void)outValue;
+    typedef int (__stdcall *F3EnumDisplayDevicesAFn)(DWORD a1, int iDevNum, DWORD *lpDisplayDevice, DWORD flags);
+    typedef int (__stdcall *F3D3DKMTOpenAdapterFromHdcFn)(DWORD *inOut);
+
+    DWORD v8[106];
+    DWORD v7[5];
+    int i;
+    HDC hdc;
+
+    *outAdapterHandle = 0;
+    *outValue = 0;
+    memset(v8, 0, sizeof(v8));
+    v8[0] = 424;   // 0x1A8 = sizeof(v8)
+
+    i = 0;
+    for (;;)
+    {
+        if (((F3EnumDisplayDevicesAFn)enumDisplayDevices)(0, i, v8, 0) == 0)
+            break;
+        if ((v8[41] & 4) != 0)
+            break;
+        i++;
+    }
+
+    hdc = CreateDCA(NULL, (LPCSTR)&v8[1], NULL, NULL);
+    if (hdc == NULL)
+        return -2147467259;
+
+    v7[0] = (DWORD)hdc;
+    if (((F3D3DKMTOpenAdapterFromHdcFn)openAdapterFromHdc)(v7) < 0)
+    {
+        DeleteDC(hdc);
+        return -2147467259;
+    }
+    DeleteDC(hdc);
+    *outAdapterHandle = v7[1];
+    *outValue = v7[4];
     return 0;
+}
+
+// ============================================================
+//  F3QueryAdapterViaD3DKMT  (0x1887940 - 0x1887BB6)  -- the Vista+ D3DKMT
+//  adapter probe
+//
+//  int F3QueryAdapterViaD3DKMT(int *outValue)
+//
+//  Original (sub_1887940): loads user32.dll (LoadLibraryA) and resolves
+//  EnumDisplayDevicesA via GetProcAddress; on failure frees the user32
+//  handle, prints "ERROR: Could Not Find Required procs in user32.dll\n",
+//  and returns 0. Loads gdi32.dll and resolves D3DKMTEscape /
+//  D3DKMTOpenAdapterFromHdc; if either is missing, prints "ERROR: \n" plus
+//  the matching "\tCould Not Find D3DKMT* in gdi32.dll\n" line(s) and
+//  returns 0x80004005 (-2147467259). Otherwise runs F3GetPrimaryAdapterHandle
+//  (sub_1887BC0) to get the primary adapter handle; on failure frees both
+//  DLLs, prints "ERROR: Could Not Get Primary Adapter Handle\n", and
+//  returns 0. On success zeroes a 134-DWORD (0x218-byte) out struct and fills
+//  the probe-config words (0x80 / 0x10000 / 0x3000003 / 80 / 16 / 0x400134 /
+//  0 / 0 / 64 / 1 / 320 / 320), zeroes the 7-DWORD escape input struct, sets
+//  the adapter handle (+0), the data pointer (+0x10), the size (+0x14 = 536)
+//  and the flag word (+8 = 0), runs D3DKMTEscape, and on a >= 0 result writes
+//  the 0x218-byte struct's word at v2[55] to *outValue and returns 1; on a
+//  negative result returns 0. Either way both DLLs are freed.
+//
+//  [NOT byte-identical] refs LoadLibraryA/FreeLibrary/GetProcAddress/
+//  CreateDCA/DeleteDC/printf/EnumDisplayDevicesA/D3DKMTEscape/
+//  D3DKMTOpenAdapterFromHdc through inline function pointers -- placement-
+//  dependent, so no byte-exact replay.
+// ============================================================
+static int F3QueryAdapterViaD3DKMT(int *outValue)
+{
+    DWORD v2[134];
+    FARPROC v3;      // D3DKMTOpenAdapterFromHdc
+    FARPROC v5;      // D3DKMTEscape
+    DWORD v6[7];
+    FARPROC ProcAddress;   // EnumDisplayDevicesA
+    HMODULE hModule;  // user32
+    DWORD v11 = 0;
+    DWORD v12 = 0;
+    int v9 = 0;
+    HMODULE hLibModule = NULL;   // gdi32
+
+    hModule = LoadLibraryA("user32.dll");
+    if (hModule == NULL)
+    {
+        printf("ERROR: Could Not Load user32.dll\n");
+        return 0;
+    }
+
+    ProcAddress = GetProcAddress(hModule, "EnumDisplayDevicesA");
+    if (ProcAddress == NULL)
+    {
+        FreeLibrary(hModule);
+        printf("ERROR: Could Not Find Required procs in user32.dll\n");
+        return 0;
+    }
+
+    hLibModule = LoadLibraryA("gdi32.dll");
+    if (hLibModule == NULL)
+    {
+        printf("ERROR: Could Not Load gdi32.dll\n");
+        return 0;
+    }
+
+    v5 = GetProcAddress(hLibModule, "D3DKMTEscape");
+    v3 = GetProcAddress(hLibModule, "D3DKMTOpenAdapterFromHdc");
+    if (v5 == NULL || v3 == NULL)
+    {
+        printf("ERROR: \n");
+        if (v5 == NULL)
+            printf("\tCould Not Find D3DKMTEscape in gdi32.dll\n");
+        if (v3 == NULL)
+            printf("\tCould Not Find D3DKMTOpenAdapterFromHdc in gdi32.dll\n");
+        return -2147467259;
+    }
+
+    if (F3GetPrimaryAdapterHandle(&v12, &v11, v3, ProcAddress) != 0)
+    {
+        FreeLibrary(hModule);
+        FreeLibrary(hLibModule);
+        printf("ERROR: Could Not Get Primary Adapter Handle\n");
+        return 0;
+    }
+
+    memset(v2, 0, sizeof(v2));
+    v2[0] = 128;
+    v2[1] = 0x10000;
+    v2[2] = 50331651;
+    v2[32] = 80;
+    v2[33] = 16;
+    v2[34] = 4194612;
+    v2[35] = 0;
+    v2[36] = 0;
+    v2[37] = 64;
+    v2[38] = 1;
+    v2[53] = 320;
+    v2[54] = 320;
+
+    memset(v6, 0, sizeof(v6));
+    v6[0] = v12;
+    v6[2] = 0;
+    v6[4] = (DWORD)(DWORD_PTR)v2;
+    v6[5] = 536;
+
+    if (((int (__stdcall *)(DWORD *))v5)(v6) >= 0)
+    {
+        v9 = 1;
+        *outValue = (int)v2[55];
+    }
+
+    FreeLibrary(hModule);
+    FreeLibrary(hLibModule);
+    return v9;
 }
 
 // ============================================================
@@ -3240,8 +3401,8 @@ static int sub_1887940(int *outValue)
 //
 //  Original (sub_1887790): checks the OS gate (F3IsOsMajorVersionAtLeast6);
 //  null outValue -> return 0. When the gate is set, runs the Vista+
-//  D3DKMT probe (sub_1887940, stubbed here); otherwise runs the legacy
-//  CreateDCA / ExtEscape probe (F3QueryAdapterViaExtEscape). On probe
+//  D3DKMT probe (F3QueryAdapterViaD3DKMT, sub_1887940); otherwise runs the
+//  legacy CreateDCA / ExtEscape probe (F3QueryAdapterViaExtEscape). On probe
 //  failure (v5 == 0) or a zero out word, forces v4 = 1. When v4 >= 1,
 //  writes *outValue = v4 and returns 1; otherwise writes *outValue = 1
 //  and returns 0 (the reachable case is a negative-int legacy out word,
@@ -3258,7 +3419,7 @@ static int F3QueryAdapterState(int adapterIndex, int *outValue)
     if (outValue == NULL)
         return 0;
     if (v3 == 1)
-        v5 = sub_1887940(&v4);
+        v5 = F3QueryAdapterViaD3DKMT(&v4);
     else
         v5 = F3QueryAdapterViaExtEscape(&v4);
     if (v5 == 0 || v4 == 0)

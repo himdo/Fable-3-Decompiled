@@ -128,6 +128,47 @@ void *LegacyFileCtor(void *obj, F3SharedBuffer **slot, int a3, int a4);
 // set (did the open succeed)?
 int LegacyFileHasData(const void *obj);
 
+// sub_17FDC40 (0x17FDC40 - 0x17FDC5C) -- the LHSFS::CLegacyMemoryFile's
+// initialisation step (no open-setup): store the CLegacyMemoryFile vtable,
+// run the wide null-ctor on the +4 path slot, zero the +8 file handle, and
+// return the object.  Declared for the Lua-module error report
+// (engine/luavm.cpp -- LogScriptError).
+void *CLegacyMemoryFileCtorInit(void *obj);
+
+// CLegacyMemoryFileOpen (sub_17FE290) -- the CLegacyMemoryFile open-setup
+// (private lowercased path block, prefix check + substring rebuild, lazy
+// file-system wrapper, vt[4] open, file+8 store).  Exposed for the Lua-
+// module error report (engine/luavm.cpp -- LogScriptError).
+int CLegacyMemoryFileOpen(void *obj, F3SharedBuffer **slot, int mode, int a4);
+
+// CLegacyMemoryFileReleaseInnerStream (sub_17FDD60) -- the CLegacyMemoryFile
+// vtable slot 10: release the +8 inner file's stream member and return
+// whether the inner buffer-start word (+0x0C) is non-zero.  Exposed for the
+// Lua-module error report (engine/luavm.cpp -- LogScriptError).
+int CLegacyMemoryFileReleaseInnerStream(void *obj);
+
+// CLegacyMemoryFileGetLength (sub_17FDD50) -- the CLegacyMemoryFile vtable
+// slot 9: tail-dispatch the +8 inner file's vtable slot 7 (the length).
+// Exposed for the Lua-module error report (engine/luavm.cpp --
+// LogScriptError).
+int CLegacyMemoryFileGetLength(void *obj);
+
+// MemoryFileReleaseStreamMember (sub_18A8C30) -- the LHVFS::CMemoryFile's
+// +0x24 stream-member release: guard the +0x28 critical section, dispatch
+// the stream member's vtable slot 4 / slot 2 (or zero the +0x0C / +0x10
+// fields), write the +0x0C / +0x10 words into the caller's buffer, and
+// return it.  Exposed for the Lua-module error report (engine/luavm.cpp --
+// LogScriptError) via the sub_17FDD90 helper.
+DWORD *MemoryFileReleaseStreamMember(void *obj, DWORD *buf);
+
+// sub_17FDE20 (0x17FDE20 - 0x17FDE5D) -- the LHSFS::CLegacyMemoryFile dtor:
+// re-store the vtable, release the +8 file handle through vtable slot 2,
+// null +8, release the +4 wide path slot (ReleaseSharedSlotWide), swap the
+// vtable to LHFile::CAFile, and return the ReleaseSharedSlotWide result.
+// Exposed for the Lua-module error report (engine/luavm.cpp --
+// LogScriptError).
+LONG ReleaseLegacyMemoryFile(void *obj);
+
 // LegacyFileDtor (0x17FD970 - 0x17FD9A7) -- the LHSFS::CLegacyFile dtor
 // (release +0xC / +8, release the shared slot, reset the vtable to
 // LHFile::CAFile).  Returns the slot release's new g_Addend count.

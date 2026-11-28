@@ -89,6 +89,11 @@ typedef char CWorkerWin32SizeCheck[(sizeof(CWorkerWin32) == 664) ? 1 : -1];
 // CWorkerWin32Ctor (0x18F7040) -- construct the main worker (see worker.cpp).
 void *CWorkerWin32Ctor(void *obj, int hInstance, int nShowCmd);
 
+// 0x18A88E0 - seconds since engine start. Reads the globals InitEngineTime captures
+// (qword_20B5FC0 / dbl_20B5FB8); lazily captures them on the first call so
+// the first call still returns valid seconds.  [NOT byte-identical].
+double GetEngineTime(void);
+
 // 0x18A89A0 - one-time engine-time init: captures the QPC start counter and
 // frequency (globals 0x020B5FC0 / 0x020B5FB8) that GetEngineTime's pump code
 // reads. Returns the start counter's high 32 bits & 0x7FFFFFFF on the first

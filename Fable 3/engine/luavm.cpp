@@ -15,6 +15,7 @@
 #include "gamemain.h"             // SharedSlotConcat / SharedSlotConcatLiteral / F3WString / F3WStringFromAnsi
 #include "xlip.h"                 // MakeSettingsFilePath / GetSlotString (shared-slot helpers)
 #include "netinit.h"              // GetNetManager / CNetLuaEventManagerListReset
+#include "worker.h"             // GetEngineTime (0x18A88E0)
 
 #include <windows.h>
 #include <setjmp.h>               // setjmp / longjmp (the VM-heap OOM expand)
@@ -115,6 +116,7 @@ static void   KoreRegisterBuiltinClosure(int mod, int fn, int v);               
 static void   KoreRegisterBuiltinName(int mod, int key, const char *name);         // sub_4076D0
 static void   KoreRegisterBuiltinName2(int mod, const char *name);                 // sub_407760
 static int    KoreBuiltinStringOp(int mod, int a, int b, int c, int d);            // sub_5E4EE0
+static int    KoreRegistryLookup(int obj, int out, int key, int hash);       // sub_60C5E0
 static int    KoreBuiltinA(void);                                                  // sub_629200
 static int    KoreBuiltinB(void);                                                  // sub_629370
 
@@ -390,43 +392,44 @@ static void KorePushClosureValue(int mod, int fn, int count, unsigned short tag)
 // KoreGrowRegistry).
 static int KoreModuleSetParam(int mod, int cmd, int a3)
 {
-    int *h = *(int **)mod;     // the 1032-byte host
+    unsigned char *h = *(unsigned char **)mod;     // the 1032-byte host
     switch (cmd)
     {
-    case 0:  *(h + 144) = 1;  return 0;
-    case 1:  *(h + 144) = 0;  return 0;
+    case 0:  *(unsigned char *)(h + 0x90) = 1;  return 0;
+    case 1:  *(unsigned char *)(h + 0x90) = 0;  return 0;
     case 2:
     {
         int inited;
         do
         {
-            int (*f)(int) = (int (*)(int))(*(int *)(h + 148));
-            int *v9 = (int *)(h + 44);
+            int (*f)(int) = (int (*)(int))(*(unsigned int *)(h + 0x94));
+            unsigned char *v9 = (unsigned char *)(h + 0x2C);
             do
             {
-                f  = (int (*)(int))(*(int *)(h + 148));
-                v9 = (int *)(h + 44);
-            } while (f != 0 && f(*(h + 48)) != 0);
-            int v10  = v9[28];
-            v9[28] = 10000;
-            v9[27] = 10000;
+                f  = (int (*)(int))(*(unsigned int *)(h + 0x94));
+                v9 = (unsigned char *)(h + 0x2C);
+            } while (f != 0 && f(*(unsigned int *)(h + 0x30)) != 0);
+            int *v9p = (int *)v9;
+            int v10  = v9p[28];
+            v9p[28] = 10000;
+            v9p[27] = 10000;
             inited  = KoreHeapInitGrow((int)v9, mod);
-            v9[28]  = v10;
+            v9p[28] = v10;
         } while (inited != 1);
         return 0;
     }
-    case 3:  return *(h + 4) / 1024;
-    case 4:  return *(h + 4) % 1024;
-    case 5:  return KoreGrowRegistry((int)(h + 44), mod, a3);
-    case 6:  { int v = *(h + 136); *(h + 136) = a3; return v; }
+    case 3:  return (int)*(unsigned int *)(h + 0x04) / 1024;
+    case 4:  return (int)*(unsigned int *)(h + 0x04) % 1024;
+    case 5:  return KoreGrowRegistry((int)(h + 0x2C), mod, a3);
+    case 6:  { int v = *(unsigned int *)(h + 0x88); *(unsigned int *)(h + 0x88) = a3; return v; }
     case 7:  {
         int v5 = a3;
-        int v6 = *(h + 140);
-        int v7 = (int)(h + 44);
+        int v6 = *(unsigned int *)(h + 0x8C);
+        int v7 = (int)(h + 0x2C);
         if (a3 <= 0) v5 = -1;
-        *(h + 156) = v5;
-        *(int *)(v7 + 96) = v5;
-        *(int *)(v7 + 108) = v5;
+        *(unsigned int *)(h + 0x9C) = v5;
+        *(int *)((unsigned char *)v7 + 96)  = v5;
+        *(int *)((unsigned char *)v7 + 108) = v5;
         return v6;
     }
     default: return -1;
@@ -503,7 +506,8 @@ static void  KoreBuiltinInitStack(int mod) { (void)mod; }                       
 static void  KoreRegisterBuiltinClosure(int mod, int fn, int v) { (void)mod; (void)fn; (void)v; } // sub_5FD310
 static void  KoreRegisterBuiltinName(int mod, int key, const char *name) { (void)mod; (void)key; (void)name; } // sub_4076D0
 static void  KoreRegisterBuiltinName2(int mod, const char *name) { (void)mod; (void)name; } // sub_407760
-static int   KoreBuiltinStringOp(int mod, int a, int b, int c, int d) { (void)mod; (void)a; (void)b; (void)c; (void)d; return 0; } // sub_5E4EE0
+// ---- sub_5E4EE0 (KoreBuiltinStringOp): the builtin string op is implemented
+//      below, right after KoreLookupStringRegistry (the helper it calls). ----
 static int   KoreBuiltinA(void) { return 0; }                                          // sub_629200
 static int   KoreBuiltinB(void) { return 0; }                                          // sub_629370
 
@@ -823,6 +827,78 @@ static int KoreLookupStringRegistry(int obj, int out, int key, int hash, int a4)
     *(int *)out = 0;       // dword_1DBCFE0 (zero-init "not found" global)
     *(int *)(out + 4) = 0; // dword_1DBCFE4
     return out;
+}
+
+// ---- sub_60C5E0 (0x60C5E0 - 0x60C689): the registry lookup (the tag-12
+// path of the builtin string op).  The object's +0x04 word is a POINTER to a
+// block whose [0] word is the row count and whose 16-byte rows live at
+// block+0x18.  The 16-byte row's first word is the key; a hit reads the
+// row's +0x0D descriptor byte (the tag this overflows off[18]), writes
+// the obj's [desc] word (obj + 4*desc) into out[0] and the byte at
+// obj + 4*(desc & ~3) + (desc & 3) into out[1].  On a miss (or an empty
+// array) it falls back to the sub-table at obj+0x0C through
+// KoreLookupStringTable, or the zero globals when that is null.
+// [NOT byte-identical] placement-dependent and refs the two high-VA zero
+// globals.  Declared thiscall-style (obj first) in the original.
+static int KoreRegistryLookup(int obj, int out, int key, int hash)
+{
+    int *block = (int *)*(int *)(obj + 4);
+    if (block != NULL)
+    {
+        int count = *(int *)block;
+        if (count > 0)
+        {
+            int *row = (int *)(block + 6);   // the row array at block + 0x18
+            for (int i = 0; i < count; ++i, row += 4)
+            {
+                if (row[0] == key)
+                {
+                    int desc = *(unsigned char *)(row + 13);
+                    *(int *)out = *(int *)(obj + 4 * desc);
+                    *(unsigned char *)(out + 4) = *(unsigned char *)(obj + 4 * (desc & ~3) + (desc & 3));
+                    return out;
+                }
+            }
+        }
+    }
+    int sub = *(int *)(obj + 12);
+    if (sub != 0)
+    {
+        int tmp[2];
+        (void)KoreLookupStringTable(sub, (int)tmp, key, hash);
+        *(int *)out = tmp[0];
+        *(int *)(out + 4) = tmp[1];
+        return out;
+    }
+    *(int *)out = 0;       // dword_1DBCFE0 (zero-init "not found" global)
+    *(int *)(out + 4) = 0; // dword_1DBCFE4
+    return out;
+}
+
+// ---- sub_5E4EE0 (0x5E4EE0 - 0x5E4FBE): the builtin string op.  Tag 5
+// (closure/string): KoreLookupStringTable(fetchedValue, out, key, hash).  Tag
+// 12 (registry): KoreRegistryLookup.  Any other tag: the recursive __index
+// chain (sub_5E45E0) -- a documented [remaining stub] (the deep gettable
+// resolver sub_5E3290 is not reimplemented here).  [NOT byte-identical].
+static int KoreBuiltinStringOp(int mod, int a2, int a3, int a4, int a5)
+{
+    (void)mod;
+    int out[2] = { 0, 0 };
+    if (a3 == 5)
+    {
+        KoreLookupStringTable(a2, (int)out, a4, a5);
+        if (out[1] != 0)
+            return out[0];
+        return 0;   // the fail path: sub_5E4500 -- [remaining stub]
+    }
+    if (a3 == 12)
+    {
+        KoreRegistryLookup(a2, (int)out, a4, a5);
+        if (out[1] != 0)
+            return out[0];
+        return 0;   // the fail path: sub_5E4570 -- [remaining stub]
+    }
+    return 0;       // any other tag: sub_5E45E0 -- [remaining stub]
 }
 
 // sub_5DDE20 (0x5DDE20 - 0x5DDE86) -- KoreLookupInternedString: resolve an
@@ -9023,32 +9099,505 @@ static void *CBaseClassNonCopyableCtor(void *obj)
 static void CBaseClassDtor(void *obj)
 { *(void **)obj = g_NToolsCBaseClassVtable; }
 
+// HandleMapEmptyInit (defined further down, before the CEntityScriptHandleManager
+// ctor) -- the shared "empty handle-map" owner-wrapper ctor (the sub_708370 /
+// sub_6ECEC0 family, 28-byte element here).
+static void *HandleMapEmptyInit(void *obj, unsigned int elemSize);
+
 // sub_6F7F60 (0x6F7F60 - 0x6F844A) -- CLuaManagerImplCtor: the 708-byte
-// (0x2C4) CLuaManager implementation object (thiscall: the impl in ECX,
-// then the Lua module, the engine's +0x98 sorted map, and the back-pointer
-// to the CLuaManager).  +0 the Lua module, +4 the back-pointer, then the
-// script-table cluster: the four 4-byte owner wrappers (this+2 / this+9 /
-// this+16 / this+45), the 12- / 28-byte script-handle tables (this+28 /
-// this+35 / this+42 / this+56), 16 InitSharedSlot'd shared slots, five
-// Concurrency reader-writer locks, the two handle-map objects (sub_708370 /
-// sub_6ECEC0), the script-handle table (sub_18F5E10 over the Lua module),
-// the byte flags at +604..+611, and the sub_18F2DB0 (sub_6EF380) /
-// sub_18F2DA0 (sub_6EF390) registrations.  Remaining stub: the LHAlloc'd
-// block is left as LHAlloc leaves it and the whole init is skipped (the
-// CLuaManagerImplDtor stub pairs with it -- nothing constructed, nothing
-// released).
+// (0x2C4) CLuaManager implementation object.
+// [NOT byte-identical] placement-dependent (relative calls to LHAlloc /
+// InitSharedSlot / HandleMapEmptyInit / ScriptHandleTableCtor / the slot
+// writer) and it refs the high-VA NLuaConsole vtable; the script-handle
+// table is a documented VM-internal stub (see below).
+//
+//  void *CLuaManagerImplCtor(void *obj, void *luaModule, void *sortedMap, void *manager)
+//
+//  thiscall (the impl in ECX) + `retn 0Ch`: the impl is built in the
+//  LHAlloc(708) block the CLuaManagerCtor handed it.  The three stack args
+//  are (luaModule, sortedMap, manager):
+//    +0  the Lua module (a2)
+//    +4  the back-pointer to the CLuaManager (a4)
+//  Then the script-table cluster, in disasm order:
+//    - 6 owner-wrappers (LHAlloc(4), each storing the slot's address):
+//      this+2 (+0x08) / this+9 (+0x24) / this+16 (+0x40) / this+23 (+0x5C)
+//      / this+45 (+0xB4) / this+51 (+0xCC)
+//    - 3 self-linked 12-byte nodes (LHAlloc(12): node[0] = node[1] = node):
+//      this+7 (+0x1C) / this+14 (+0x38) / this+21 (+0x54), each with the word
+//      at +0x20 / +0x3C / +0x58 zeroed
+//    - one self-linked 28-byte node (LHAlloc(28)) at this+28 (+0x70), with
+//      [this+29] (+0x74) = 0 and [this+32..39] / [this+42..44]
+//      (+0x80/0x84/0x88/0x94/0x98/0x9C/0xA8/0xAC/0xB0) = 0
+//    - [this+45] (+0xB4) owner-wrapper with [this+48..50] (+0xC0/0xC4/0xC8) = 0
+//    - [this+51] (+0xCC) owner-wrapper with [this+55..57] (+0xD8/0xDC/0xE0) = 0
+//    - the handle-map owner-wrapper ctor (sub_708370) at +0xE4
+//    - 20 InitSharedSlot'd shared slots (+0x10C .. +0x210), each with its
+//      pre-zeroed words; the +0x1E0 zero precedes the slot at +0x1E4 and the
+//      +0x1DC zero follows the slot at +0x1D8
+//    - 4 _ReaderWriterLock ctors (zero both words): +0x128 / +0x148 /
+//      +0x198 / +0x1E8
+//    - the handle-map owner-wrapper ctor (sub_6ECEC0) at +0x214
+//    - words +0x23C/+0x240/+0x244/+0x250/+0x254/+0x258 = 0
+//    - the 8 byte flags at +0x25C..+0x263 (0,0,1,1,1,0,0,0)
+//    - words +0x264/+0x268/+0x26C/+0x270 = 0
+//    - 20 words +0x274..+0x2C0 = -2 (0xFFFFFFFE)
+//    - LHAlloc(152) for the script-handle table; its result is stored in
+//      this+153 (+0x264)
+//    - sub_18F3B20 (the script-handle table's +0x38 back-pointer writer) is
+//      called with the sorted map as the stack arg (the manager is NOT used
+//      here; ebp = sortedMap, the engine's +0x98 sorted map)
+//    - the two high-VA function-pointer slots (0x2075EF4/0x2075EF8) are
+//      installed via sub_18F2DB0 (sub_6EF380) and sub_18F2DA0 (sub_6EF390)
+//  Remaining stub: the script-handle table's deep VM-internal content
+//  (sub_18F5E10: the NLuaConsole CLuaPlusConsole / CLuaConsoleBase vtables,
+//  the CLuaConsoleBase ctor, the "autocomplete" builtin registration, the
+//  two Addend bumps, the sub_561C50 / sub_561820 / Kore* registrations) is a
+//  documented no-op: the 152-byte block is zeroed and returned.  Same
+//  allocation size and storage as the original, so the +0x264 slot and the
+//  sub_18F3B20 back-pointer write land in bounds.  Note the [4] wild-write
+//  the original performs on the LHAlloc failure path (node == 0) is
+//  deliberately NOT replicated; a null node simply leaves the slots alone.
+// ============================================================
+
+// The two high-VA function-pointer slots the script-handle table's cprint
+// path reads; this build never dispatches them (the table is never built
+// for real), but the ctor installs the helper addresses faithfully.
+static DWORD g_dword_2075EF4 = 0;   // 0x2075EF4: the pause-flag-setter slot
+static DWORD g_dword_2075EF8 = 0;   // 0x2075EF8: the pause-flag-clearer slot
+static BYTE  g_byte_1DC2660 = 0;     // 0x1DC2660: the 2-byte pause flag
+
+// sub_6EF380 / sub_6EF390 -- the two 2-byte flag helpers (set / clear
+// byte_1DC2660).  Stored in the g_dword_2075EF4/EF8 function-pointer slots.
+static void SetPauseFlag1()
+{ g_byte_1DC2660 = 1; }              // sub_6EF380
+static void SetPauseFlag0()
+{ g_byte_1DC2660 = 0; }              // sub_6EF390
+
+// The 4-byte owner-wrapper helper: LHAlloc(4), *wrap = the slot address; the
+// caller stores the wrapper (or null) into the impl.
+static void *OwnerSlotWrapper(DWORD *slot)
+{
+    DWORD *wrap = (DWORD *)LHAlloc(4);
+    if (wrap != 0)
+        wrap[0] = (DWORD)slot;
+    return wrap;
+}
+
+// The self-linked 12-byte / 28-byte node (node[0] = node[1] = node).  The
+// original's -4 sentinel path (node == -4 -- never returned by LHAlloc)
+// simply leaves the tail bytes unwritten; a null node leaves nothing.
+static DWORD *SelfLinkedNode(unsigned int size)
+{
+    DWORD *node = (DWORD *)LHAlloc(size);
+    if (node != 0)
+    {
+        node[0] = (DWORD)node;
+        node[1] = (DWORD)node;
+    }
+    return node;
+}
+
+// The 8-byte _ReaderWriterLock ctor (zeroes both words).
+static void ReaderWriterLockCtor(void *lock)
+{
+    DWORD *dw = (DWORD *)lock;
+    dw[0] = 0;
+    dw[1] = 0;
+}
+
+// sub_18F3B20 (0x18F3B20) -- the script-handle-table back-pointer writer:
+// *(this + 14) = a2 (the sorted map); return a2.
+static void *ScriptHandleTableSlotWriter(void *table, void *sortedMap)
+{
+    DWORD *t = (DWORD *)table;
+    t[14] = (DWORD)sortedMap;
+    return t;
+}
+
+// The placeholder vtable for the stub script-handle table (the table's
+// +0 vtable slot).  Slot 0 is a callable no-op (the deleting-dtor dispatch
+// in the dtor -- vt[0](table, 1) -- never dereferences an unconstructed
+// table); the same pattern as the g_CEntityScriptHandleManagerVtable
+// placeholder below.  The original installed the real NLuaConsole vtable
+// (sub_55E0A0's deleting-dtor) here.
+static void *g_ScriptHandleTableVtable[2] = { (void *)F3StubRelease, 0 };
+
+// sub_18F5E10 (0x18F5E10) -- the 152-byte script-handle table ctor.
+// [STUB] the deep VM-internal content is out of scope (see the ctor header);
+// the block is zeroed (152 bytes) and returned.  Same allocation size and
+// storage as the original, except the +0 vtable slot installs the
+// placeholder (below) so the dtor's vt[0](table, 1) dispatch is a no-op
+// call rather than a crash.
+static void *ScriptHandleTableCtor(void *table, int luaModule)
+{
+    (void)luaModule;
+    memset(table, 0, 152);
+    *(void **)table = g_ScriptHandleTableVtable;   // +0: the placeholder vtable
+    return table;
+}
+
 static void *CLuaManagerImplCtor(void *obj, void *luaModule, void *sortedMap, void *manager)
-{ (void)luaModule; (void)sortedMap; (void)manager; return obj; }
+{
+    DWORD *this8 = (DWORD *)obj;
+
+    this8[0] = (DWORD)luaModule;                       // +0  the Lua module
+    this8[1] = (DWORD)manager;                          // +4  the back-pointer
+
+    // owner-wrapper 0x08 -> self-linked 12-byte node 0x1C + zero 0x20:
+    this8[2]  = (DWORD)OwnerSlotWrapper((DWORD *)((char *)obj + 0x08));
+    this8[7]  = (DWORD)SelfLinkedNode(12);              // +0x1C
+    this8[8]  = 0;                                      // +0x20
+    // owner-wrapper 0x24 -> self-linked 12-byte node 0x38 + zero 0x3C:
+    this8[9]  = (DWORD)OwnerSlotWrapper((DWORD *)((char *)obj + 0x24));
+    this8[14] = (DWORD)SelfLinkedNode(12);              // +0x38
+    this8[15] = 0;                                      // +0x3C
+    // owner-wrapper 0x40 -> self-linked 12-byte node 0x54 + zero 0x58:
+    this8[16] = (DWORD)OwnerSlotWrapper((DWORD *)((char *)obj + 0x40));
+    this8[21] = (DWORD)SelfLinkedNode(12);              // +0x54
+    this8[22] = 0;                                      // +0x58
+    // owner-wrapper 0x5C -> self-linked 28-byte node 0x70 + zero 0x74:
+    this8[23] = (DWORD)OwnerSlotWrapper((DWORD *)((char *)obj + 0x5C));
+    this8[28] = (DWORD)SelfLinkedNode(28);              // +0x70
+    this8[29] = 0;                                      // +0x74
+
+    // +0x80/0x84/0x88 = 0
+    this8[32] = 0; this8[33] = 0; this8[34] = 0;
+    // +0x94/0x98/0x9C = 0
+    this8[37] = 0; this8[38] = 0; this8[39] = 0;
+    // +0xA8/0xAC/0xB0 = 0
+    this8[42] = 0; this8[43] = 0; this8[44] = 0;
+
+    // owner-wrapper 0xB4, then +0xC0/0xC4/0xC8 = 0:
+    this8[45] = (DWORD)OwnerSlotWrapper((DWORD *)((char *)obj + 0xB4));
+    this8[48] = 0; this8[49] = 0; this8[50] = 0;
+
+    // owner-wrapper 0xCC, then +0xD8/0xDC/0xE0 = 0:
+    this8[51] = (DWORD)OwnerSlotWrapper((DWORD *)((char *)obj + 0xCC));
+    this8[55] = 0; this8[56] = 0; this8[57] = 0;
+
+    HandleMapEmptyInit((char *)obj + 0xE4, 0x1C);       // sub_708370
+
+    // the 20 InitSharedSlot'd shared slots + their pre-zeroed words
+    this8[65] = 0; this8[66] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x10C));
+    this8[68] = 0; this8[69] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x118));
+    this8[71] = 0; this8[72] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x124));
+    ReaderWriterLockCtor((char *)obj + 0x128);
+    this8[76] = 0; this8[77] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x138));
+    this8[79] = 0; this8[80] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x144));
+    ReaderWriterLockCtor((char *)obj + 0x148);
+    this8[84] = 0; this8[85] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x158));
+    this8[87] = 0; this8[88] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x164));
+    this8[90] = 0; this8[91] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x170));
+    this8[93] = 0; this8[94] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x17C));
+    this8[96] = 0; this8[97] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x188));
+    this8[99] = 0; this8[100] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x194));
+    ReaderWriterLockCtor((char *)obj + 0x198);
+    this8[104] = 0; this8[105] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x1A8));
+    this8[107] = 0; this8[108] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x1B4));
+    this8[110] = 0; this8[111] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x1C0));
+    this8[113] = 0; this8[114] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x1CC));
+    this8[116] = 0; this8[117] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x1D8));
+    this8[119] = 0;
+    this8[120] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x1E4));
+    ReaderWriterLockCtor((char *)obj + 0x1E8);
+    this8[124] = 0; this8[125] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x1F8));
+    this8[127] = 0; this8[128] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x204));
+    this8[130] = 0; this8[131] = 0;
+    InitSharedSlot((F3SharedBuffer **)((char *)obj + 0x210));
+
+    HandleMapEmptyInit((char *)obj + 0x214, 0x1C);       // sub_6ECEC0
+
+    // +0x23C/+0x240/+0x244/+0x250/+0x254/+0x258 = 0
+    this8[143] = 0; this8[144] = 0; this8[145] = 0;
+    this8[148] = 0; this8[149] = 0; this8[150] = 0;
+
+    // the 8 byte flags at +0x25C..+0x263
+    BYTE *flags = (BYTE *)obj + 0x25C;
+    flags[0] = 0; flags[1] = 0; flags[2] = 1; flags[3] = 1;
+    flags[4] = 1; flags[5] = 0; flags[6] = 0; flags[7] = 0;
+
+    // +0x264/+0x268/+0x26C/+0x270 = 0
+    this8[153] = 0; this8[154] = 0; this8[155] = 0; this8[156] = 0;
+
+    // the 20 -2 words at +0x274..+0x2C0
+    this8[157] = 0xFFFFFFFE; this8[158] = 0xFFFFFFFE; this8[159] = 0xFFFFFFFE;
+    this8[160] = 0xFFFFFFFE; this8[161] = 0xFFFFFFFE; this8[162] = 0xFFFFFFFE;
+    this8[163] = 0xFFFFFFFE; this8[164] = 0xFFFFFFFE; this8[165] = 0xFFFFFFFE;
+    this8[166] = 0xFFFFFFFE; this8[167] = 0xFFFFFFFE; this8[168] = 0xFFFFFFFE;
+    this8[169] = 0xFFFFFFFE; this8[170] = 0xFFFFFFFE; this8[171] = 0xFFFFFFFE;
+    this8[172] = 0xFFFFFFFE; this8[173] = 0xFFFFFFFE; this8[174] = 0xFFFFFFFE;
+    this8[175] = 0xFFFFFFFE; this8[176] = 0xFFFFFFFE;
+
+    // the 152-byte script-handle table over the Lua module
+    DWORD *table = (DWORD *)LHAlloc(152);
+    if (table != 0)
+        table = (DWORD *)ScriptHandleTableCtor(table, (int)luaModule);
+    else
+        table = 0;
+    this8[153] = (DWORD)table;             // [this+153] = the table
+    // (the original's [this+153] vtable-call check is dead here: the word was
+    //  zeroed just above and never re-touched before the check, so v22 is
+    //  always null and the branch never executes.)
+    if (table != 0)
+        ScriptHandleTableSlotWriter(table, sortedMap);   // sub_18F3B20
+
+    // the two high-VA function-pointer slots (sub_18F2DB0 / sub_18F2DA0)
+    g_dword_2075EF4 = (DWORD)&SetPauseFlag1;            // sub_6EF380
+    g_dword_2075EF8 = (DWORD)&SetPauseFlag0;            // sub_6EF390
+
+    return obj;
+}
+
+// The owner-wrapper release shared by the 20 shared-slot blocks and the
+// handle-map loops (sub_707A60 / sub_706D70): when [slotWord] holds a live
+// owner-wrapper block, drop its refcount; on zero, call the block's function
+// at [owner + 4] with the arg at [owner + 8], and LHFree the block.  Then
+// zero [slotWord].  (the original: `if (*slotWord != 0) { InterlockedDecrement(*slotWord); if (*slotWord == 0) { fn(arg); LHFree(*slotWord); } }`)
+static void OwnerBlockRelease(DWORD *slotWord)
+{
+    DWORD *owner = (DWORD *)*slotWord;
+    if (owner != 0 && InterlockedDecrement((volatile LONG *)owner) == 0)
+    {
+        ((void (*)(DWORD))((DWORD *)owner + 1)[0])(*((DWORD *)owner + 2));
+        LHFree(owner);
+    }
+    *slotWord = 0;
+}
 
 // sub_6F7680 (0x6F7680 - 0x6F7F60) -- CLuaManagerImplDtor: the impl
-// destructor -- zeroes +0 / +4, releases the +0x3C8 script-handle table
-// (vt[0](obj, 1)), the +0x24C / +0x22C handle maps (sub_707A60 / sub_70BE70
+// destructor -- zeroes +0 / +4, releases the script-handle table
+// (vt[0](obj, 1)), the +0x250 / +0x23C handle maps (sub_707A60 / sub_70BE70
 // + LHFree), and walks the shared-slot / lock / owner-wrapper cluster in
-// reverse (sub_7088A0 / sub_70A460 / sub_707690 / sub_707570 / sub_7031C0 /
-// sub_55F120 / ReleaseSharedSlot / the SEH-block InterlockedDecrement
-// releases), LHFree'ing every member.  Remaining stub: no-op (pairs with
-// the CLuaManagerImplCtor stub above).
-static void CLuaManagerImplDtor(void *obj) { (void)obj; }
+// reverse (the 20 InitSharedSlot'd blocks / the sub_7088A0 / sub_70A460 /
+// sub_707690 / sub_7031C0 / sub_55F120 release walks / ReleaseSharedSlot /
+// the SEH-block InterlockedDecrement releases), LHFree'ing every member.
+//
+// [NOT byte-identical] placement-dependent (relative calls to
+// ReleaseSharedSlot / LHFree / InterlockedDecrement) and it refs no
+// high-VA globals (the table's placeholder vtable, g_ScriptHandleTableVtable,
+// is module-local).  The original is a thiscall + `retn 0`; the C++ body
+// matches the original's observable behavior, not its byte stream.
+//
+// The handle-map destructors (sub_6EDDE0 / sub_7088A0) carry a full
+// iterator-walk path for a non-empty map (std::map/set-style node
+// iteration + std::out_of_range throws) that is unreachable in this build
+// -- the ctor only ever creates empty 28-byte map heads and no code ever
+// inserts into them.  The empty case (the only reachable case) is
+// reproduced exactly: the sub_6EB2C0/sub_705710 empty-node release is a
+// no-op, the v9 stack buffer is discarded, and the dtor LHFrees the wrapper
+// + the 28-byte node and zeroes the two slots.  The +0x80 cluster's inner
+// sub_707570 walk (the 32-byte element loop + the
+// PauseDebugSharedNodeFinalize helper, gamemain-internal) is likewise
+// unreachable in this build (the +0x80 slot is always null): the guard +
+// LHFree + zeroing is kept and the walk is documented, not reproduced.
+//
+//  void CLuaManagerImplDtor(void *obj)
+static void CLuaManagerImplDtor(void *obj)
+{
+    DWORD *this8 = (DWORD *)obj;
+
+    this8[0] = 0;     // the Lua module
+    this8[1] = 0;     // the back-pointer
+
+    // the 152-byte script-handle table: the deleting-dtor dispatch
+    // vt[0](table, 1) -- the original's vt[0] (the NLuaConsole deleting-dtor)
+    // releases the table's members and frees the block; in this build the
+    // placeholder slot 0 is a no-op, so LHFree(table) below performs the
+    // block free directly (the block is a documented VM-internal stub with
+    // no real members to release).
+    DWORD *table = (DWORD *)this8[153];
+    if (table != 0)
+    {
+        void **vtable = (void **)*(void **)table;
+        if (vtable != 0 && vtable[0] != 0)
+            ((void (*)(void *, int))vtable[0])(table, 1);
+        LHFree(table);
+    }
+    this8[153] = 0;
+
+    // +0x250: the 16-byte-element handle map (sub_707A60) + LHFree
+    DWORD *mapA = (DWORD *)this8[148];
+    if (mapA != 0)
+    {
+        DWORD *end = (DWORD *)this8[149];
+        DWORD *start = mapA;
+        while (start != end)
+        {
+            ReleaseSharedSlot((F3SharedBuffer **)((char *)start + 12));
+            OwnerBlockRelease((DWORD *)((char *)start + 8));
+            start[1] = 0;                     // the element's +4 word
+            start = (DWORD *)((char *)start + 16);
+        }
+        LHFree((void *)mapA);
+    }
+    this8[148] = 0;
+    this8[149] = 0;
+    this8[150] = 0;
+
+    // +0x23C: the 24-byte-element handle map (sub_70BE70) + LHFree
+    DWORD *mapB = (DWORD *)this8[143];
+    if (mapB != 0)
+    {
+        DWORD *end = (DWORD *)this8[144];
+        DWORD *start = mapB;
+        while (start != end)
+        {
+            DWORD *block = (DWORD *)start[3];
+            if (block != 0)
+                LHFree(block);
+            start[3] = 0;
+            start[4] = 0;
+            start[5] = 0;
+            start = (DWORD *)((char *)start + 24);
+        }
+        LHFree((void *)mapB);
+    }
+    this8[143] = 0;
+    this8[144] = 0;
+    this8[145] = 0;
+
+    // +0x214: the 28-byte handle-map (sub_6ECEC0) -- empty-case release
+    if (this8[139] != 0)
+        LHFree((void *)this8[139]);       // the 28-byte node (the sub_6EB2C0 no-op)
+    this8[139] = 0;
+    if (this8[85] != 0)
+        LHFree((void *)this8[85]);        // the +0x214 wrapper
+    this8[140] = 0;                // the +0x230 size slot
+
+    // the 20 shared-slot blocks (disasm order: 0x210 .. 0x10C)
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[132]); OwnerBlockRelease(&this8[131]); this8[130] = 0;   // slot=0x210
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[129]); OwnerBlockRelease(&this8[128]); this8[127] = 0;   // slot=0x204
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[126]); OwnerBlockRelease(&this8[125]); this8[124] = 0;   // slot=0x1F8
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[121]); OwnerBlockRelease(&this8[120]); this8[119] = 0;   // slot=0x1E4
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[118]); OwnerBlockRelease(&this8[117]); this8[116] = 0;   // slot=0x1D8
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[115]); OwnerBlockRelease(&this8[114]); this8[113] = 0;   // slot=0x1CC
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[112]); OwnerBlockRelease(&this8[111]); this8[110] = 0;   // slot=0x1C0
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[109]); OwnerBlockRelease(&this8[108]); this8[107] = 0;   // slot=0x1B4
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[106]); OwnerBlockRelease(&this8[105]); this8[104] = 0;   // slot=0x1A8
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[101]); OwnerBlockRelease(&this8[100]); this8[99]  = 0;   // slot=0x194
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[98]);  OwnerBlockRelease(&this8[97]);  this8[96]  = 0;   // slot=0x188
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[95]);  OwnerBlockRelease(&this8[94]);  this8[93]  = 0;   // slot=0x17C
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[92]);  OwnerBlockRelease(&this8[91]);  this8[90]  = 0;   // slot=0x170
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[89]);  OwnerBlockRelease(&this8[88]);  this8[87]  = 0;   // slot=0x164
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[86]);  OwnerBlockRelease(&this8[85]);  this8[84]  = 0;   // slot=0x158
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[81]);  OwnerBlockRelease(&this8[80]);  this8[79]  = 0;   // slot=0x144
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[78]);  OwnerBlockRelease(&this8[77]);  this8[76]  = 0;   // slot=0x138
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[73]);  OwnerBlockRelease(&this8[72]);  this8[71]  = 0;   // slot=0x124
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[70]);  OwnerBlockRelease(&this8[69]);  this8[68]  = 0;   // slot=0x118
+    ReleaseSharedSlot((F3SharedBuffer **)&this8[67]);  OwnerBlockRelease(&this8[66]);  this8[65]  = 0;   // slot=0x10C
+
+    // +0xE4: the 28-byte handle-map (sub_708370) -- empty-case release
+    if (this8[63] != 0)
+        LHFree((void *)this8[63]);      // the 28-byte node (the sub_705710 no-op)
+    this8[63] = 0;
+    if (this8[58] != 0)
+        LHFree((void *)this8[58]);       // the +0xE4 wrapper
+    this8[64] = 0;                // the +0x100 size slot
+
+    // +0xD8: if set, free it; zero +0xD8 / +0xDC / +0xE0
+    if (this8[54] != 0)
+        LHFree((void *)this8[54]);
+    this8[54] = 0;
+    this8[55] = 0;
+    this8[56] = 0;
+    LHFree((void *)this8[51]);           // the +0xCC owner-wrapper (unconditional)
+
+    // +0xB4: the sub_70A460 cluster -- the 8-byte-element handle map (sub_706D70)
+    if (this8[48] != 0)          // [0xC0] -- the start
+    {
+        DWORD *end = (DWORD *)this8[49];   // [0xC4]
+        DWORD *start = (DWORD *)this8[48];
+        while (start != end)
+        {
+            OwnerBlockRelease((DWORD *)((char *)start + 4));
+            start[0] = 0;              // the element's +0 word
+            start = (DWORD *)((char *)start + 8);
+        }
+        LHFree((void *)((DWORD *)this8[48]));    // the start block
+    }
+    this8[48] = 0;
+    this8[49] = 0;
+    this8[50] = 0;
+    LHFree((void *)this8[45]);           // the +0xB4 owner-wrapper (unconditional)
+
+    // +0x94: the 32-byte-element handle map (sub_707690)
+    DWORD *mapE = (DWORD *)this8[37];   // [0x94]
+    if (mapE != 0)
+    {
+        DWORD *end = (DWORD *)this8[38];  // [0x98]
+        DWORD *start = mapE;
+        while (start != end)
+        {
+            ReleaseSharedSlot((F3SharedBuffer **)((char *)start + 4));
+            ReleaseSharedSlot((F3SharedBuffer **)start);
+            start = (DWORD *)((char *)start + 32);
+        }
+        LHFree((void *)mapE);
+    }
+    this8[37] = 0;
+    this8[38] = 0;
+    this8[39] = 0;
+
+    // +0x80: the +0x84 handle-map slots -- a no-op in this build (the +0x80
+    // slot is always null; the inner sub_707570 walk is documented, not
+    // reproduced).  The guard + LHFree + zeroing is kept faithfully.
+    if (this8[32] != 0)
+        LHFree((void *)this8[32]);
+    this8[32] = 0;
+    this8[33] = 0;
+    this8[34] = 0;
+
+    // +0x5C: the 28-byte self-linked node (sub_7031C0)
+    if (this8[28] != 0)
+        this8[29] = 0;            // the +0x74 size slot
+    LHFree((void *)this8[28]);            // the 28-byte node
+    this8[28] = 0;
+    if (this8[23] != 0)
+        LHFree((void *)this8[23]);        // the +0x5C wrapper
+
+    // +0x40: the 12-byte self-linked node (sub_55F120)
+    if (this8[21] != 0)
+        this8[22] = 0;            // the +0x58 size slot
+    LHFree((void *)this8[21]);            // the 12-byte node
+    this8[21] = 0;
+    if (this8[16] != 0)
+        LHFree((void *)this8[16]);        // the +0x40 wrapper
+
+    // +0x24: the 12-byte self-linked node (sub_55F120)
+    if (this8[14] != 0)
+        this8[15] = 0;            // the +0x3C size slot
+    LHFree((void *)this8[14]);            // the 12-byte node
+    this8[14] = 0;
+    if (this8[9] != 0)
+        LHFree((void *)this8[9]);         // the +0x24 wrapper
+
+    // +0x8: the 12-byte self-linked node (sub_55F120)
+    if (this8[7] != 0)
+        this8[8] = 0;             // the +0x20 size slot
+    LHFree((void *)this8[7]);             // the 12-byte node
+    this8[7] = 0;
+    if (this8[2] != 0)
+        LHFree((void *)this8[2]);         // the +0x8 wrapper
+}
 
 // sub_70DB40 (0x70DB40 - 0x70DB7E) -- CLuaManagerDeletingDtor: the
 // CLuaManager vtable slot 0 (the one-slot 0x1AF41A4 vtable) -- release the
@@ -9125,8 +9674,8 @@ static void *CLuaManagerCtor(void *obj, void *luaModule, void *sortedMap)
 //  GetWideStringHash (sub_56DFD0, now implemented in gamemain.cpp with the
 //  F3WString family and declared in gamemain.h) are deep VM / Kore /
 //  localisation internals (out of scope for this module), so each is a
-//  documented no-op stub -- the same pattern as the CLuaManagerImplCtor /
-//  CLuaManagerImplDtor stubs above.  Each keeps its original IDA address in
+//  documented no-op stub -- the same pattern as the script-handle-table
+//  stub above.  Each keeps its original IDA address in
 //  the comment.
 // ============================================================
 
@@ -9138,15 +9687,76 @@ static void *CLuaManagerCtor(void *obj, void *luaModule, void *sortedMap)
 // Stub: returns 0 (no error, so the caller's error branch is not taken).
 static int ScriptHashHasError(int hash) { (void)hash; return 0; }
 
-// sub_629660 (0x629660 - 0x629732) -- LogScriptError: report an error against a
-// Lua module.  The original builds a localised message (sub_17FDC40 +
-// sub_17FE290(a2, 1, 2)), and when it resolves (CLegacyMemoryFileReleaseInnerStream / CLegacyMemoryFileGetLength /
-// sub_17FDD90 / sub_17FDE20) emits it via sub_6281C0(luaModule, fmt, arg, a2)
-// (the 3rd arg a3 is the fully-formed message slot, cf. the sibling
-// RunLuaStartupScripts, sub_616710, which calls sub_629660(lua, path, msg)).
-// Returns that result byte.  VM-internal -- out of scope.  Stub: returns 0.
+// sub_17FDD90 (0x17FDD90 - 0x17FDDAF) -- the inner memory-file's data word:
+// guard the +8 file handle, run the inner stream-member release
+// (MemoryFileReleaseStreamMember), and return the inner buffer-start word
+// (+0x0C); 0 when the handle is unset.  thiscall in the original (the file
+// object in ECX); a plain free function per the project convention.
+//  [NOT byte-identical] placement-dependent (the E8 call to
+//  MemoryFileReleaseStreamMember + the stack spill).
+static int LegacyMemoryFileGetDataWord(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    DWORD handle = o[2];
+    if (handle == 0)
+        return 0;
+    DWORD buf[2];
+    MemoryFileReleaseStreamMember((void *)handle, buf);
+    return (int)buf[0];
+}
+
+// sub_6281C0 (0x6281C0 - 0x6282E7) -- the Lua-module error report emitter:
+// takes the Lua module (Size, a size_t), the inner buffer-start word, the
+// inner file length, the path slot and the message slot and reports the
+// error (the deep Lua VM chain: KoreFormatValue / KoreValueEq /
+// KoreHashTableInsert / sub_18AFB90 / sub_604CF0).  Deep VM-internal --
+// out of scope.  Stub: returns 0 (no report; the caller's result byte is 0).
+static int Sub6281C0(size_t Size, int v3, int length,
+                     F3SharedBuffer **pathSlot, F3SharedBuffer **msgSlot)
+{
+    (void)Size; (void)v3; (void)length; (void)pathSlot; (void)msgSlot;
+    return 0;
+}
+
+// sub_629660 (0x629660 - 0x629732) -- LogScriptError: report an error against
+// a Lua module.  The original builds a 16-byte LHSFS::CLegacyMemoryFile over
+// the caller's path slot (sub_17FDC40: vtable + InitSharedSlotWide + zero the
+// +8 handle, then the CLegacyMemoryFileOpen-setup, sub_17FE290, with mode 1
+// and flag 2) and, when the file resolves (CLegacyMemoryFileReleaseInnerStream,
+// sub_17FDD60 -- the +8 inner file's stream member releases and its
+// buffer-start word is non-zero), reads the inner file's length
+// (CLegacyMemoryFileGetLength, sub_17FDD50) and data word (sub_17FDD90) and
+// emits the error via sub_6281C0(Size = the Lua module, the data word,
+// the length, the path slot, the message slot).  Otherwise
+// (the open returned no inner stream) it releases the file and returns 0.
+// ReleaseLegacyMemoryFile (sub_17FDE20) releases the object either way.
+//  cdecl (the Lua module, the path-slot address and the message-slot address
+//  as arg_0 / arg_4 / arg_8); returns the sub_6281C0 result byte.
+//  [NOT byte-identical] placement-dependent (the E8 calls to the memory-file
+//  helpers + the __security_check_cookie prologue) and it refs the high-VA
+//  vtables / globals through the helpers.  Sub-callees: CLegacyMemoryFileCtorInit,
+//  CLegacyMemoryFileOpen, CLegacyMemoryFileReleaseInnerStream,
+//  CLegacyMemoryFileGetLength (gamemain.cpp, implemented), Sub6281C0 +
+//  LegacyMemoryFileGetDataWord (documented stub / local).
 static int LogScriptError(int luaModule, F3SharedBuffer **pathSlot, F3SharedBuffer **msgSlot)
-{ (void)luaModule; (void)pathSlot; (void)msgSlot; return 0; }
+{
+    DWORD file[4];   // the 16-byte LHSFS::CLegacyMemoryFile (v8)
+
+    CLegacyMemoryFileCtorInit(file);          // sub_17FDC40
+    CLegacyMemoryFileOpen(file, pathSlot, 1, 2);
+
+    if (CLegacyMemoryFileReleaseInnerStream(file) != 0)
+    {
+        int length = CLegacyMemoryFileGetLength(file);   // sub_17FDD50
+        int v3     = LegacyMemoryFileGetDataWord(file);  // sub_17FDD90
+        int result = Sub6281C0((size_t)(DWORD)luaModule, v3, length, pathSlot, msgSlot);
+        ReleaseLegacyMemoryFile(file);                   // sub_17FDE20
+        return result;
+    }
+
+    ReleaseLegacyMemoryFile(file);
+    return 0;
+}
 
 // sub_6F0BF0 (0x6F0BF0 - 0x6F0D12) -- CLuaManagerImplInitialisePermanents:
 // initialise the "Permanents" save/load tables for the serialise run:
@@ -9157,23 +9767,267 @@ static int LogScriptError(int luaModule, F3SharedBuffer **pathSlot, F3SharedBuff
 // (the impl in ECX).  VM-internal -- out of scope.  Stub.
 static void CLuaManagerImplInitialisePermanents(void *impl) { (void)impl; }
 
+// ---- The 30 per-component serialise initialisers (sub_6F9690's callees) ----
+// Each is a VM-internal Lua-builtin registration routine (the per-table /
+// per-metatable register set driven by the "serialise" finalise path); the
+// full bodies are out of scope for this build, so each is a documented no-op
+// stub.  The original's IDA addresses are kept in the comments.
+
+// sub_6F87C0 (0x6F87C0 - 0x6F9682) -- CLuaManagerImplRegisterWorld: the world/entity registration pass:
+// registers the per-entity create/rebind builtins + the IsReloadingAI /
+// GetDrawBehaviourNames / GetDrawCombatGroupDebug / AddConsoleKeyShortcut /
+// GetWorldMapInstance / StartMGSProfiler / StopMGSProfiler closures.  thiscall
+// (the impl in ECX) + one stack arg (the impl's +0 word).  VM-internal -- out
+// of scope.  Stub: returns 0.
+static int CLuaManagerImplRegisterWorld(void *impl, int size) { (void)impl; (void)size; return 0; }
+
+// sub_E60EB0 (0xE60EB0 - 0xE60FA8) -- CLuaManagerImplRegisterGdb: the "GDB" table: GetRecord /
+// RecordExists / RecordExistsInGlobalDatabase / GetHashFromString.
+// Stub: returns 0.
+static int CLuaManagerImplRegisterGdb(int size) { (void)size; return 0; }
+
+// sub_62CD50 (0x62CD50 - 0x62D471) -- CLuaManagerImplRegisterVector2: the CI32Vector2Metatable: GetX / GetY /
+// __tostring / __viz / __gc.  Stub: returns 0.
+static int CLuaManagerImplRegisterVector2(int size) { (void)size; return 0; }
+
+// sub_629910 (0x629910 - 0x629ACD) -- CLuaManagerImplRegisterPlatform: the "Platform" table: GetPlatform /
+// GetMemoryStats.  Stub: returns 0.
+static int CLuaManagerImplRegisterPlatform(int size) { (void)size; return 0; }
+
+// sub_629AD0 (0x629AD0 - 0x629B65) -- CLuaManagerImplRegisterGarbageCollector: the garbage-collector setters:
+// SetGarbageCollectorStepSize / SetToUseGarbageCollectorStepSize /
+// SetMillisecondsForGarbageCollectorToTake.  Stub: returns 0.
+static int CLuaManagerImplRegisterGarbageCollector(int size) { (void)size; return 0; }
+
+// sub_637B20 (0x637B20 - 0x63A3C1) -- CLuaManagerImplRegisterConsoleScripts: the console-script / video-mode debug
+// table: AddOptionalStartupConsoleScript / ReloadShaderBank /
+// ResetShaderUsageRecorder / RunDetailSettingsBenchmark / SetVideoMode.
+// Stub: returns 0.
+static int CLuaManagerImplRegisterConsoleScripts(int size) { (void)size; return 0; }
+
+// sub_6E9A10 (0x6E9A10 - 0x6E9DA5) -- CLuaManagerImplRegisterEntityMeta: the EntityMetatable: IsAlive / IsCorpse /
+// IsManagedLocally / GetCorpse / GetPosition.  Stub: returns 0.
+static int CLuaManagerImplRegisterEntityMeta(int size) { (void)size; return 0; }
+
+// sub_EC4800 (0xEC4800 - 0xEC49D9) -- CLuaManagerImplRegisterInventoryItem: the InventoryItemPtrMetatable: GetRecord /
+// GetOwner / GetCount / GetWeaponLevel / GetDamageEstimate.  Stub: returns 0.
+static int CLuaManagerImplRegisterInventoryItem(int size) { (void)size; return 0; }
+
+// sub_EC2D50 (0xEC2D50 - 0xEC3045) -- CLuaManagerImplRegisterAnimControl: the AnimControlSimpleMetatable: __gc /
+// GetAnimDuration / GetDeltaMovementBetweenTimes / GetTotalMovementDistance /
+// GetTotalRotationAngle.  Stub: returns 0.
+static int CLuaManagerImplRegisterAnimControl(int size) { (void)size; return 0; }
+
+// sub_7787A0 (0x7787A0 - 0x77891E) -- CLuaManagerImplRegisterSearchHandle: the SearchHandleMetatable: GetPersistData /
+// __viz / __gc + the "SearchHandlePersist" pair.  Stub: returns 0.
+static int CLuaManagerImplRegisterSearchHandle(int size) { (void)size; return 0; }
+
+// sub_9FA4E0 (0x9FA4E0 - 0x9FA675) -- CLuaManagerImplRegisterMessageEvents: the "MessageEvents" table: PostMessage /
+// IsMessagePosted / IsMessageSentBy / IsMessageSentTo.  Stub: returns 0.
+static int CLuaManagerImplRegisterMessageEvents(int size) { (void)size; return 0; }
+
+// sub_9F8230 (0x9F8230 - 0x9F83A9) -- CLuaManagerImplRegisterMessageEvent: the MessageEventMetatable: GetType /
+// GetTypeName / GetPosition / GetExtraDataAsNumber / GetExtraDataAsID.
+// Stub: returns 0.
+static int CLuaManagerImplRegisterMessageEvent(int size) { (void)size; return 0; }
+
+// sub_E60FB0 (0xE60FB0 - 0xE611D4) -- CLuaManagerImplRegisterRecord: the RecordPtrMetatable: IsNull / GetBoolean /
+// GetU32 / GetS32 / GetFloat.  Stub: returns 0.
+static int CLuaManagerImplRegisterRecord(int size) { (void)size; return 0; }
+
+// sub_EC20D0 (0xEC20D0 - 0xEC2331) -- CLuaManagerImplRegisterDummyObjects: the "DummyObjects" table.  Stub: returns 0.
+static int CLuaManagerImplRegisterDummyObjects(int size) { (void)size; return 0; }
+
+// sub_EBD600 (0xEBD600 - 0xEBECE9) -- CLuaManagerImplRegisterGui: the "GUI" table (IsHero / SetHourGlassFillState /
+// SetShowHourGlass / SetShowWorldMapKingdomCash).  Stub: returns 0.
+static int CLuaManagerImplRegisterGui(int size) { (void)size; return 0; }
+
+// sub_D48870 (0xD48870 - 0xD48B35) -- CLuaManagerImplRegisterSoundTools: the "SoundTools" table: PlayMusicAndAtmosForLevel /
+// SetMusicAndAtmosToStartOnNextLevelLoad / PlayMainMusic / RestartMainMusic.
+// Stub: returns 0.
+static int CLuaManagerImplRegisterSoundTools(int size) { (void)size; return 0; }
+
+// sub_EB27A0 (0xEB27A0 - 0xEB2915) -- CLuaManagerImplRegisterLookAtHandle: the LookAtHandleMetatable: IsValid / Clear /
+// GetPersistData / __viz / __gc.  Stub: returns 0.
+static int CLuaManagerImplRegisterLookAtHandle(int size) { (void)size; return 0; }
+
+// sub_6C5D60 (0x6C5D60 - 0x6C6006) -- CLuaManagerImplRegisterEntityManager: the "EntityManager" table: GetEntityFromRecordID /
+// E3BodgeReload / SetLayerToPreserve / SetAllowDeferECMessages.  Stub: returns 0.
+static int CLuaManagerImplRegisterEntityManager(int size) { (void)size; return 0; }
+
+// sub_D519C0 (0xD519C0 - 0xD51ADF) -- CLuaManagerImplRegisterCreature: the "Creature" table: PlaceNear / PlaceNearButNotTooNear /
+// GetHollowManMoveDest / PlaceAllyNearHero.  Stub: returns 0.
+static int CLuaManagerImplRegisterCreature(int size) { (void)size; return 0; }
+
+// sub_EB1810 (0xEB1810 - 0xEB196B) -- CLuaManagerImplRegisterZoomer: the CZoomerMetatable: GetPosition / GetDestination /
+// SetPosition / SetDestination.  Stub: returns 0.
+static int CLuaManagerImplRegisterZoomer(int size) { (void)size; return 0; }
+
+// sub_B6BF80 (0xB6BF80 - 0xB6C13B) -- CLuaManagerImplRegisterMusic: the "CrescendoMusic" table: StartMusic /
+// VictoryMusicThenStop / StopMusic / SetMusicLevels.  Stub: returns 0.
+static int CLuaManagerImplRegisterMusic(int size) { (void)size; return 0; }
+
+// sub_ABCF30 (0xABCF30 - 0xABD024) -- CLuaManagerImplRegisterVisibility: the entity-visibility globals:
+// IsEntityToUpdateWithFrequency / IsEntityVisibleOnScreen /
+// StartRequestIsEntityVisibleOnRemoteScreen / IsPositionVisibleOnScreen /
+// IsPositionInCameraFrustrum.  Stub: returns 0.
+static int CLuaManagerImplRegisterVisibility(int size) { (void)size; return 0; }
+
+// sub_BC2CD0 (0xBC2CD0 - 0xBC2DA2) -- CLuaManagerImplRegisterSleepMenu: the "SleepMenu" table: ShowSleepMenu /
+// IsVisible.  Stub: returns 0.
+static int CLuaManagerImplRegisterSleepMenu(int size) { (void)size; return 0; }
+
+// sub_9C02F0 (0x9C02F0 - 0x9C0385) -- CLuaManagerImplRegisterDebugNav: the debug table: SetDrawNavGraph /
+// SetDrawNavMesh / SetDrawBoundingBoxes.  Stub: returns 0.
+static int CLuaManagerImplRegisterDebugNav(int size) { (void)size; return 0; }
+
+// sub_825E60 (0x825E60 - 0x825F41) -- CLuaManagerImplRegisterDebugEntityNames: the debug table: SetDrawEntityNames /
+// SetDrawEntityNamesFilter / SetDrawEntityNamesRadius / SetDrawEntityTypes /
+// SetDrawEntityTypesFilter.  Stub: returns 0.
+static int CLuaManagerImplRegisterDebugEntityNames(int size) { (void)size; return 0; }
+
+// sub_EAA780 (0xEAA780 - 0xEAA7EF) -- CLuaManagerImplRegisterDebugLookAt: the debug table: SetEnableLookAt.  Stub: returns 0.
+static int CLuaManagerImplRegisterDebugLookAt(int size) { (void)size; return 0; }
+
+// sub_85B360 (0x85B360 - 0x85B6C2) -- CLuaManagerImplRegisterDebugFreeCamera: the debug table: SetUseFreeCamera /
+// SetFreeCamController / GetUseFreeCamera / SetTrackedEntity / GetTrackedEntity.
+// Stub: returns 0.
+static int CLuaManagerImplRegisterDebugFreeCamera(int size) { (void)size; return 0; }
+
+// sub_AC2730 (0xAC2730 - 0xAC27B2) -- CLuaManagerImplRegisterDebugNavPaths: the debug table: SetDrawNavPaths /
+// SetDrawNavLines.  Stub: returns 0.
+static int CLuaManagerImplRegisterDebugNavPaths(int size) { (void)size; return 0; }
+
+// sub_E9AAA0 (0xE9AAA0 - 0xE9AB0F) -- CLuaManagerImplRegisterDebugLoco: the debug table: SetDrawLocoDebug.  Stub: returns 0.
+static int CLuaManagerImplRegisterDebugLoco(int size) { (void)size; return 0; }
+
+// sub_A13350 (0xA13350 - 0xA1361D) -- CLuaManagerImplRegisterWorldMap: the CWorldMapEntity / CWorldMapCharacter
+// metatable registration (the "CWorldMapEntity" / "CWorldMapCharacterPersist" /
+// CWorldMapCharacter pair).  Stub: returns 0.
+static int CLuaManagerImplRegisterWorldMap(int size) { (void)size; return 0; }
+
 // sub_6F9690 (0x6F9690 - 0x6F978B) -- CLuaManagerImplInitialiseSerialise:
 // run the ~30 per-component serialise initialisers in sequence (sub_6F87C0,
-// sub_E60EB0, sub_62CD50, sub_629910, sub_629AD0, sub_637B20, sub_6E9A10, ...,
-// sub_E9AAA0, sub_A13350) over the impl's +0; returns the last one's eax.
-// thiscall (the impl in ECX).  VM-internal -- out of scope.  Stub: returns 0.
-static int CLuaManagerImplInitialiseSerialise(void *impl) { (void)impl; return 0; }
+// sub_E60EB0, sub_62CD50, sub_629910, sub_629AD0, sub_637B20, sub_6E9A10,
+// sub_EC4800, sub_EC2D50, sub_7787A0, sub_9FA4E0, sub_9F8230, sub_E60FB0,
+// sub_EC20D0, sub_EBD600, sub_D48870, sub_EB27A0, sub_6C5D60, sub_D519C0,
+// sub_EB1810, sub_B6BF80, sub_ABCF30, sub_BC2CD0, sub_9C02F0, sub_825E60,
+// sub_EAA780, sub_85B360, sub_AC2730, sub_E9AAA0, sub_A13350) over the impl's +0
+// (the *impl word each callee takes); returns the last one's eax.
+// thiscall (the impl in ECX).
+// [NOT byte-identical] placement-dependent (the ~30 relative calls into the
+// VM-internal registration helpers) and it reads the impl's +0 slot.  The 30
+// callees are documented no-op stubs below (each keeps its IDA address).
+//
+//  int CLuaManagerImplInitialiseSerialise(void *impl)
+static int CLuaManagerImplInitialiseSerialise(void *impl)
+{
+    int size = *(int *)impl;
 
-// sub_627FC0 (0x627FC0 - 0x6280FA) -- KoreModulePacing: pace / throttle a Kore
-// module: build a local guard object (CsGuardAcquire (sub_1A22480)
-// over stru_1DC4B40), set byte_1DBDB9C = 1, read param 3 (KoreModuleSetParam),
-// and -- when the flag is set or the param exceeds 1.1x the cached
-// dword_1C8B12C -- stamp the engine time (GetEngineTime) and reset params 2 / 0
-// / 3; otherwise set param 5 (250) in a busy-wait until GetEngineTime() +
-// dbl_1C8B100 elapses (param 5 = 250), then clear byte_1DBDB9C and release the
-// guard (CsGuardRelease (sub_1A22460)).  cdecl (the Kore module in a1, the flag in a2).  VM-
-// internal -- out of scope.  Stub.
-static void KoreModulePacing(int koreModule, int flag) { (void)koreModule; (void)flag; }
+    CLuaManagerImplRegisterWorld(impl, size);         // sub_6F87C0
+    CLuaManagerImplRegisterGdb(size);                 // sub_E60EB0
+    CLuaManagerImplRegisterVector2(size);             // sub_62CD50
+    CLuaManagerImplRegisterPlatform(size);            // sub_629910
+    CLuaManagerImplRegisterGarbageCollector(size);    // sub_629AD0
+    CLuaManagerImplRegisterConsoleScripts(size);      // sub_637B20
+    CLuaManagerImplRegisterEntityMeta(size);          // sub_6E9A10
+    CLuaManagerImplRegisterInventoryItem(size);       // sub_EC4800
+    CLuaManagerImplRegisterAnimControl(size);         // sub_EC2D50
+    CLuaManagerImplRegisterSearchHandle(size);        // sub_7787A0
+    CLuaManagerImplRegisterMessageEvents(size);       // sub_9FA4E0
+    CLuaManagerImplRegisterMessageEvent(size);        // sub_9F8230
+    CLuaManagerImplRegisterRecord(size);              // sub_E60FB0
+    CLuaManagerImplRegisterDummyObjects(size);        // sub_EC20D0
+    CLuaManagerImplRegisterGui(size);                 // sub_EBD600
+    CLuaManagerImplRegisterSoundTools(size);          // sub_D48870
+    CLuaManagerImplRegisterLookAtHandle(size);        // sub_EB27A0
+    CLuaManagerImplRegisterEntityManager(size);       // sub_6C5D60
+    CLuaManagerImplRegisterCreature(size);            // sub_D519C0
+    CLuaManagerImplRegisterZoomer(size);              // sub_EB1810
+    CLuaManagerImplRegisterMusic(size);               // sub_B6BF80
+    CLuaManagerImplRegisterVisibility(size);          // sub_ABCF30
+    CLuaManagerImplRegisterSleepMenu(size);           // sub_BC2CD0
+    CLuaManagerImplRegisterDebugNav(size);            // sub_9C02F0
+    CLuaManagerImplRegisterDebugEntityNames(size);    // sub_825E60
+    CLuaManagerImplRegisterDebugLookAt(size);         // sub_EAA780
+    CLuaManagerImplRegisterDebugFreeCamera(size);     // sub_85B360
+    CLuaManagerImplRegisterDebugNavPaths(size);       // sub_AC2730
+    CLuaManagerImplRegisterDebugLoco(size);           // sub_E9AAA0
+    return CLuaManagerImplRegisterWorldMap(size);     // sub_A13350
+}
+
+//  KoreModulePacing globals (original IDs kept):
+//  0x1C8B12C cached param-3 (KB) value, 0x1C8B100 the busy-wait tolerance
+//  (seconds), 0x1C88FF4 the param-5 payload for the byte_1DBDB9D branch,
+//  0x1DBDB9C/0x1DBDB9D the entry/mode bytes, 0x1DBDBA0 the stamped engine
+//  time (int), 0x1DC4B40 the pacing critical section.  The first-time-init
+//  flags / the critical section start zero (BSS).
+static CRITICAL_SECTION g_stru_1DC4B40;                   // 0x1DC4B40
+static int               g_stru_1DC4B40_inited = 0;
+static unsigned char     g_byte_1DBDB9C = 0;              // 0x1DBDB9C
+static unsigned char     g_byte_1DBDB9D = 0;              // 0x1DBDB9D
+static float             g_dword_1C8B12C = 5120.0f;       // 0x1C8B12C
+static double            g_dbl_1C8B100 = 0.002;           // 0x1C8B100
+static int               g_dword_1C88FF4 = 180;           // 0x1C88FF4
+static int               g_dword_1DBDBA0 = 0;             // 0x1DBDBA0
+
+//  KoreModulePacing  (0x627FC0 - 0x6280FA)  -- pace / throttle a Kore module:
+//  guard the pacing critical section (stru_1DC4B40), set byte_1DBDB9C = 1,
+//  read param 3 via KoreModuleSetParam (the module is in esi, cdecl), and --
+//  when the flag is set OR the param exceeds 1.1x the cached dword_1C8B12C --
+//  stamp the engine time into dword_1DBDBA0 (x87 round-toward-zero fistp, i.e.
+//  truncation toward zero) and reset params 2 / 0 / 3 (the new param 3, KB, is
+//  cached back into dword_1C8B12C); otherwise, when byte_1DBDB9D != 0, set
+//  param 5 (dword_1C88FF4 = 180) and param 0 = 0; else busy-wait with param 5
+//  = 250 until GetEngineTime() + dbl_1C8B100 elapses, then set param 0 = 0.
+//  Finally clear byte_1DBDB9C and release the guard (CsGuardRelease).
+//  cdecl (the Kore module in a1, the flag in a2).  [NOT byte-identical]
+//  placement-dependent (the relative calls to GetEngineTime / KoreModuleSetParam
+//  and the Enter / Leave IAT slots) and reads the high-VA globals at their
+//  original addresses.
+static void KoreModulePacing(int koreModule, int flag)
+{
+    if (!g_stru_1DC4B40_inited)
+    {
+        InitializeCriticalSection(&g_stru_1DC4B40);
+        g_stru_1DC4B40_inited = 1;
+    }
+
+    // CsGuardAcquire(&guard, &stru_1DC4B40, 0): unconditional enter, held = 1
+    EnterCriticalSection(&g_stru_1DC4B40);
+    g_byte_1DBDB9C = 1;
+
+    float v2 = (float)KoreModuleSetParam(koreModule, 3, 0);
+
+    if (flag != 0 || v2 > g_dword_1C8B12C * 1.1f)   // 0x1AE9F10 = 1.1f (rdata)
+    {
+        double t = GetEngineTime();
+        // The original saves the x87 control word, sets rounding to chop and
+        // fistp's the double into an int (truncation toward zero); engine
+        // time is >= 0, so floor(t) == truncation toward zero.
+        g_dword_1DBDBA0 = (int)floor(t);
+        KoreModuleSetParam(koreModule, 2, 0);
+        KoreModuleSetParam(koreModule, 0, 0);
+        g_dword_1C8B12C = (float)KoreModuleSetParam(koreModule, 3, 0);
+    }
+    else if (g_byte_1DBDB9D != 0)
+    {
+        KoreModuleSetParam(koreModule, 5, g_dword_1C88FF4);
+        KoreModuleSetParam(koreModule, 0, 0);
+    }
+    else
+    {
+        double v3 = GetEngineTime() + g_dbl_1C8B100;
+        do
+        {
+            KoreModuleSetParam(koreModule, 5, 250);
+        } while (v3 > GetEngineTime());
+        KoreModuleSetParam(koreModule, 0, 0);
+    }
+
+    g_byte_1DBDB9C = 0;
+    LeaveCriticalSection(&g_stru_1DC4B40);          // CsGuardReleased
+}
 
 // sub_6F9790 (0x6F9790 - 0x6F9875) -- CLuaManagerImplRunSerialiseScript:
 // the impl method the CLuaManager::RunSerialiseScript wrapper (0x6F9880)
@@ -9194,9 +10048,13 @@ static void KoreModulePacing(int koreModule, int flag) { (void)koreModule; (void
 // caller: the CLuaManagerRunSerialiseScript wrapper (0x6F9883).
 // [NOT byte-identical] placement-dependent (the relative calls to the shared-
 // slot / wide-string / release helpers + the __security_check_cookie) and it
-// reads the high-VA serialise-script globals; the five remaining
-// VM-internal callees are the documented no-op stubs above (the sixth,
-// GetWideStringHash sub_56DFD0, is implemented in gamemain.cpp).
+// reads the high-VA serialise-script globals; the three remaining
+// VM-internal callees are the documented no-op stubs above (LogScriptError
+// sub_629660 is now implemented -- see its row in the byte-identity table;
+// the fifth, GetWideStringHash sub_56DFD0, is implemented in gamemain.cpp;
+// CLuaManagerImplInitialiseSerialise sub_6F9690 is now implemented as the
+// call-graph dispatcher over 30 no-op stub leaves).  KoreModulePacing
+// (sub_627FC0) is now implemented -- see its row above.
 //
 //  int CLuaManagerImplRunSerialiseScript(void *impl)
 static int CLuaManagerImplRunSerialiseScript(void *impl)
@@ -9268,7 +10126,7 @@ static int CLuaManagerRunSerialiseScript(void *obj)
 //  KoreRegisterBuiltinClosure) with ("LuaName", wrapper-fn) -- each helper
 //  reserves 8 bytes on the VM value stack, writes the wrapper pointer,
 //  installs the builtin closure, stores the name in the global table
-//  (sub_67C540) and registers it with the builtin-name registry
+//  (EngineLuaStoreGlobalName, sub_67C540) and registers it with the builtin-name registry
 //  (KoreRegisterBuiltinName, -2).  The tail releases the accessor's
 //  refcounted control block (InterlockedDecrement; on zero, dispatch its
 //  release callback + LHFree).  All the registration machinery is VM-
@@ -9344,8 +10202,8 @@ static int g_list_1DBD11C = 0;   // 0x1DBD11C: tail node's next pointer
 // (sub_673C50 returns it; 0 = no live VM).
 static int g_dword_1DBDD4C = 0;   // 0x1DBDD4C: the Kore VM core object
 // 0x1DBD0F0: the audio-bank registry AddAudioBank adds banks into
-// (sub_619520's this object).
-static int g_unk_1DBD0F0 = 0;     // 0x1DBD0F0: the audio-bank registry object
+// (AudioBankRegistryAdd's this object).
+static int g_unk_1DBD0F0[5] = { 0 };  // 0x1DBD0F0: the audio-bank registry object (5 dwords)
 
 // 0x1C86BD5-0x1C86C58: the engine Lua renderer / gameplay flags and the
 // SpotCheck expected/actual pairs.  (byte_1DBD02A / byte_1DBD02B live in
@@ -9381,7 +10239,7 @@ static int           g_dword_1C86C58 = 0;   // 0x1C86C58: screen height
 //  KoreRegisterBuiltinClosure(vm, <upvalue fn>, 1)
 //  (the upvalue fn sub_617AD0..sub_618790 marshals the Lua args -- a string
 //  to a shared slot, a bool, a float, ... -- per the builtin's signature),
-//  sub_67C540 (hash the name + store it in the global table),
+//  EngineLuaStoreGlobalName (sub_67C540; hash the name + store it in the global table),
 //  KoreRegisterBuiltinName(vm, -2, name), then roll the stack back.  VM-
 //  internal -- out of scope; no-op stubs (the 11 variants differ ONLY in
 //  the upvalue-marshalling function they hand KoreRegisterBuiltinClosure).
@@ -9608,17 +10466,153 @@ static void EngineLuaNoop_615F30(void) { }
 // nullsub_4 (0x615DA0 - 0x615DA1) -- the SetFrontEndDemoMode no-op body.
 static void EngineLuaNoop_615DA0(void) { }
 
-// VmCoreSlot1C (sub_673E80) + VM string ctor + sub_6477E0 (sub_646560): the VM-internal
-// string-object probe SetLevelNameStartsWithACS drives -- build the string
-// object for the arg text from the VM's string-ctor slot (*(vmcore+0xC)+0x1C)
-// and look it up in the VM global table.  No-op stub.
-static int KoreVmStringOp(const char *name) { (void)name; return 0; }
+// ---- the VM string-object probe (the VmCoreSlot1C + TopologyObjectGetId +
+// VmStringProbeThunk / VmStringGlobalProbe chain) -----------------------------
+// sub_673E80 (0x673E80 - 0x673E87) -- VmCoreSlot1C (thiscall): the +0x1C slot of
+// the VM core's +0x0C sub-object (*(*(this + 0x0C) + 0x1C)) -- 7-byte thiscall
+// getter.  The gamemain.cpp copy is static there; this is a local copy.
+static int VmCoreSlot1C(int core)
+{
+    return (int)*(DWORD *)(*(DWORD *)(core + 0x0C) + 0x1C);
+}
+// sub_658EA0 (0x658EA0 - 0x658EA7) -- TopologyObjectGetId (thiscall): the +0x10
+// word of the object at (this + 4) -- *(*(this + 4) + 16) -- 7-byte thiscall
+// getter.  (the "VM string ctor" slot helper the probe drives; it and its 352
+// sibling callers are left byte-unchanged in IDA.)
+static int TopologyObjectGetId(int obj)
+{
+    return (int)*(DWORD *)(*(DWORD *)(obj + 4) + 16);
+}
+// sub_9BE4A0 (0x9BE4A0 - 0x9BE4AA) -- TopologyObjectSlotD0 (thiscall): the +0xD0
+// word of the object at (this + 4) -- *(*(this + 4) + 208) -- 10-byte thiscall
+// getter.
+static int TopologyObjectSlotD0(int obj)
+{
+    return (int)*(DWORD *)(*(DWORD *)(obj + 4) + 208);
+}
+// ---- the deep VM-internal table leaves (documented no-op stubs) -------------
+// sub_651860 (0x651860 - 0x651904) -- the 8-byte {table, id} out-buffer writer
+// over the VM global-table context (this + 0x1C0).  The original walks the
+// interned-string table (byte +21 flag, the *a3 >= v5[3] comparison and the
+// tree descent) and writes {v8, v9} into the 8-byte out-buffer.  [STUB] the
+// tree-descent is documented no-op: the out-buffer is left zeroed (the
+// "empty table" case the probe falls out of).
+static void VmStringGlobalLookup(int tableCtx, int outBuf[2], unsigned int hash)
+{
+    outBuf[0] = 0;
+    outBuf[1] = 0;
+    (void)tableCtx;
+    (void)hash;
+}
+// sub_643BB0 (0x643BB0 - 0x643E0A) -- the +0x14 slot-concat + hash helper:
+// RefSharedSlot the name slot, concat "\\" + the lower-cased concat over the
+// slot and hash it.  [STUB] documented no-op.
+static int VmStringSlotConcatHash(int thisPlus14, int slot)
+{
+    (void)thisPlus14;
+    (void)slot;
+    return 0;
+}
+// sub_655710 (0x655710 - 0x6557A8) -- the table-release step in the
+// SetSharedSlot branch: writes the found id into the hash slot.  [STUB]
+// documented no-op.
+static void VmStringTableRelease(unsigned int *hashSlot, int v11, int tableCtx)
+{
+    (void)hashSlot;
+    (void)v11;
+    (void)tableCtx;
+}
+static int VmStringGlobalProbe(int thisObj, const char *name);
+// sub_6477E0 (0x6477E0 - 0x6477E8) -- VmStringProbeThunk: the 8-byte thiscall
+// thunk -- resolves the +4 word of the probe target and tail-calls the global
+// table probe (sub_646560).
+static int VmStringProbeThunk(int obj, const char *name)
+{
+    return VmStringGlobalProbe(*(int *)(obj + 4), name);
+}
+// sub_646560 (0x646560 - 0x64666B) -- VmStringGlobalProbe: the VM global-table
+// string probe (269 bytes; thiscall, the string text on the stack as the a2
+// argument; retn 4).  Returns 1 when the found leaf value equals the +0xD0 word
+// of the object at the +0x38 pointer, 0 otherwise.  [NOT byte-identical]
+// placement-dependent + the deep VM-internal table leaves above are documented
+// no-op stubs (the FNV string hash, the [this + 0x38] null check and the
+// branch/return structure are faithful).  The original's SEH / security-cookie
+// prologue and the CRT abort guard are not represented here (no SEH support in
+// this build) -- F3InvalidParam is the no-op stand-in for the original's
+// __invalid_parameter_noinfo() call sites.
+static int VmStringGlobalProbe(int thisObj, const char *name)
+{
+    int v15 = *(int *)(thisObj + 0x38);                 // [this + 0x38]
+    if (v15 == 0)
+        return 0;
+    // the FNV-1-style string hash: seed 0x811C9DC5, prime 16777619,
+    // hash = v5 ^ (prime * hash) per byte.
+    unsigned int hash = 0x811C9DC5u;
+    const unsigned char *p = (const unsigned char *)name;
+    unsigned char v5 = p[0];
+    if (v5 != 0)
+    {
+        do
+        {
+            ++p;
+            hash = v5 ^ (16777619u * hash);
+            v5 = p[0];
+        } while (p[0] != 0);
+    }
+    // sub_651860 (0x651860): the 8-byte out-buffer writer over the VM
+    // global-table context (this + 0x1C0).
+    int outBuf[2] = { 0, 0 };
+    VmStringGlobalLookup(thisObj + 0x1C0, outBuf, hash);
+    int v8  = outBuf[0];                                 // the table header
+    int v9  = outBuf[1];                                 // the table id
+    int v16 = *(int *)(thisObj + 0x1D8);                 // [this + 0x1D8]
+    int v10 = *(int *)(thisObj + 0x1C0);                 // [this + 0x1C0]
+    if (v8 == 0 || v8 != v10)
+        F3InvalidParam();                                // __invalid_parameter_noinfo (no-op here)
+    int v11;
+    if (v9 == v16)
+    {
+        // the SetSharedSlot branch: build a fresh shared slot for the name,
+        // hash it over the +0x14 slot, release it, and write the result into
+        // the hash slot.
+        F3SharedBuffer *localSlot = 0;
+        SetSharedSlot(&localSlot, name, 0xFFFFFFFF);
+        v11 = VmStringSlotConcatHash(thisObj + 0x14, (int)(void *)localSlot);   // sub_643BB0
+        ReleaseSharedSlot(&localSlot);
+        VmStringTableRelease(&hash, v11, thisObj + 0x1C0);                      // sub_655710
+    }
+    else
+    {
+        if (v8 == 0)
+            F3InvalidParam();
+        else
+            v8 = *(int *)v8;                             // *v8
+        if (v9 == *(int *)(v8 + 0x18))
+            F3InvalidParam();
+        v11 = *(int *)(v9 + 16);                         // *(v9 + 0x10)
+    }
+    return (v11 == TopologyObjectSlotD0(v15)) ? 1 : 0;
+}
+// KoreVmStringOp -- the VM-internal string-object probe SetLevelNameStartsWithACS
+// drives: build the string object for the arg text from the VM's string-ctor
+// slot (*(vmcore + 0x0C) + 0x1C) and look it up in the VM global table.
+// [NOT byte-identical] placement-dependent + the VM-internal table leaves are
+// documented no-op stubs.
+static int KoreVmStringOp(const char *name)
+{
+    int vmcore = KoreGetVMCore();
+    if (vmcore == 0)
+        return 0;
+    int slot = VmCoreSlot1C(vmcore);      // the VM's string-ctor slot
+    int id = TopologyObjectGetId(slot);   // the probe target object
+    return VmStringProbeThunk(id, name);
+}
 // sub_6166C0 (0x6166C0 - 0x6166FB) -- SetLevelNameStartsWithACS: when the
 // Kore VM is live (g_dword_1DBDD4C, sub_673C50), build the string object
-// for the arg slot's text (VmCoreSlot1C + the VM's string ctor slot) and
-// probe it against the global table (sub_6477E0 / sub_646560); when the
-// probe fails (or there is no VM) copy the 0x1DBD0EC level-name slot over
-// the arg.  Also called from code: sub_677010 (0x677151).
+// for the arg slot's text (VmCoreSlot1C + TopologyObjectGetId) and
+// probe it against the global table (VmStringProbeThunk / VmStringGlobalProbe);
+// when the probe fails (or there is no VM) copy the 0x1DBD0EC level-name
+// slot over the arg.  Also called from code: sub_677010 (0x677151).
 // [NOT byte-identical] placement-dependent + the VM-internal string /
 // global-table helpers are documented no-op stubs.
 static F3SharedBuffer **SetLevelNameStartsWithACS(F3SharedBuffer **slot)
@@ -9626,7 +10620,7 @@ static F3SharedBuffer **SetLevelNameStartsWithACS(F3SharedBuffer **slot)
     if (g_dword_1DBDD4C != 0)
     {
         const char *name = (slot[0] != 0) ? GetSlotString(slot) : "";   // Str1 = ""
-        if (KoreVmStringOp(name) != 0)   // VmCoreSlot1C + VM string ctor + sub_6477E0 (stubs)
+        if (KoreVmStringOp(name) != 0)   // VmCoreSlot1C + TopologyObjectGetId + VmStringProbeThunk
             return slot;                // the probe passed: keep the arg slot as-is
     }
     return CopySharedSlot(slot, &g_slot_1DBD0EC);
@@ -9634,49 +10628,336 @@ static F3SharedBuffer **SetLevelNameStartsWithACS(F3SharedBuffer **slot)
 
 // ---- the optional-startup-script list appenders (VM-internal stubs) ------
 // sub_618960 (0x618960 - 0x6189AC) -- F3ListProbe: build the 8-byte
-// (head, tail) list probe over the optional-startup-script list.
-static void   F3ListProbe(int *probe, int *head, int tailNode, int slot) { (void)probe; (void)head; (void)tailNode; (void)slot; }
-// sub_55F1E0 (0x55F1E0) -- F3ListBump: the list append's one-word bump.
-static void   F3ListBump(int v) { (void)v; }
+// (head, matched-or-tail) list probe over the optional-startup-script list.
+// Walks the node chain from the tail's first link (the tail node's [0],
+// i.e. the first appended node) back to the tail (the loop bound),
+// comparing each node's +8 script block against the given slot's block --
+// the same block (pointer equality) or a block with the same length +
+// content (the generic byte-wise C-string compare, SpeechBankStrCompare) --
+// and writes the probe {head node ptr, the matched node or the tail node}
+// to the out buffer.  a2 / a4 are the same head node ptr (a4's value is
+// read but never used by the walker -- the original's a4 only seeds the
+// out[0] word); a3 is the tail node's first link (tail node[0]); a5 is the
+// tail node ptr (the loop bound); a6 is the slot address (its block
+// pointer, read via *a6, is the block every node is compared against).
+// [NOT byte-identical] placement-dependent (the strcmp IAT slot + the
+// F3InvalidParam stand-in for __invalid_parameter_noinfo) and it reads /
+// walks the high-VA list globals (the caller passes them).
+static int *F3ListProbe(int *out, int *headNodePtr, int tailPrevLink, int *headNodePtr2, int tailPtr, int slotAddr)
+{
+    (void)headNodePtr2;   // the original reads this as the head-node[0] word
+                           // but never uses it (the walker's out[0] word is
+                           // arg2's value, which both are).
+    F3SharedBuffer *given = (F3SharedBuffer *)(size_t)*(int *)slotAddr;   // the given slot's block
+    int node = tailPrevLink;   // the tail node's first link (tail node[0])
+    while (node != tailPtr)    // the chain: first node -> prev links -> tail
+    {
+        F3SharedBuffer *nodeBlock = (F3SharedBuffer *)(size_t)((int *)node)[2];   // the node's +8 slot block
+        if (nodeBlock == given
+            || (nodeBlock != 0 && given != 0
+                && nodeBlock->length == given->length
+                && strcmp(nodeBlock->data, given->data) == 0))
+            break;                                                          // the slot is present
+        node = ((int *)node)[0];                // the node's prev link
+    }
+    out[0] = (int)(size_t)headNodePtr;          // the head node ptr (out[0])
+    out[1] = node;                              // the matched node, or the tail node
+    if (headNodePtr != (int *)out[0])
+        F3InvalidParam();                       // __invalid_parameter_noinfo (never fires)
+    return out;
+}
+// sub_55F1E0 (0x55F1E0 - 0x55F2F2) -- F3ListBump: the list append's size-word
+// bump.  The original __userpurge routine computes the unsigned remainder
+// 0x3FFFFFFF - *(obj + 0x18) (obj in ECX, the 0x1DBD104 container; the count
+// at obj+0x18 is the list size global 0x1DBD11C), and when that remainder is
+// smaller than the passed count (a stack arg), it builds std::length_error
+// ("list<T> too long") -- the std::string construction (F3AStringAssign) +
+// the length_error vftable + the dword_1DDCFC8 callback + std::_Throw -- and
+// throws.  Otherwise it adds the count to the size word and returns the
+// count in eax.  The default argument layout differs (the container address
+// is passed as the size-word address here); the overflow path is unreachable
+// for any real list, so the throw is emulated with a plain C++ throw.
+// [NOT byte-identical] placement-dependent (the E8 calls to F3AStringAssign /
+// sub_401BD0 / std::_Throw + the high-VA vftable / callback slots) and it
+// reads / writes the high-VA size global.
+static unsigned int F3ListBump(int sizeObj, int a2, unsigned int count)
+{
+    (void)a2;   // the original (ebx) is only used by the throw path's exception
+                 // construction (&node->next, passed to the vftable slot)
+    unsigned int *size = (unsigned int *)sizeObj;   // the list size word (0x1DBD11C)
+    if (0x3FFFFFFFu - *size < count)
+        throw 1;   // the original throws std::length_error("list<T> too long")
+    *size += count;
+    return count;
+}
 // sub_55EAF0 (0x55EAF0 - 0x55EF2A) -- F3ListAppend: append a shared slot to
 // the (head, tail, next) list: LHAlloc(12) node { tail variable, old next,
 // slot ref }, link it in and return the old next node.
 static int F3ListAppend(int headVar, int tailVar, int slot)
 {
-    int   next  = *(int *)(tailVar + 4);   // the tail's next pointer (0x1DBD11C)
+    int   next  = *(int *)(tailVar + 4);   // the tail node's [1] word (the old next)
     int  *node  = (int *)LHAlloc(12);
     if (node == 0)
         return next;
     node[0]  = tailVar;
     node[1]  = next;
     RefSharedSlot((F3SharedBuffer **)&node[2], (F3SharedBuffer **)(size_t)slot);
-    F3ListBump(1);                          // sub_55F1E0
+    F3ListBump((int)(size_t)&g_list_1DBD11C, (int)(node + 1), 1);  // sub_55F1E0 (the +0x18 size word)
     *(int *)(tailVar + 4) = (int)node;
     if (node[1] != 0)
         *(int *)node[1] = (int)node;
-    (void)headVar;
+    (void)headVar;                          // the head node ptr (the container's +0 field)
     return next;
 }
 // sub_6168A0 (0x6168A0 - 0x616904) -- AddOptionalStartupScript: probe the
-// optional-startup-script list (sub_618960) and, when the probe matches
-// (head, tail), append the script slot (F3ListAppend / sub_55EAF0).
-// [NOT byte-identical] placement-dependent; the list-probe / bump are VM-
-// internal stubs.
-static void AddOptionalStartupScript(int slot)
+// optional-startup-script list (F3ListProbe / sub_618960) and, when the
+// probe reports the slot is not already present (the tail node), append the
+// script slot (F3ListAppend / sub_55EAF0) -- the same block-or-content match
+// the probe uses.  cdecl (the slot pointer as arg_0, retn 0).
+// [NOT byte-identical] placement-dependent (the relative calls to
+// F3ListProbe / F3ListAppend + the __invalid_parameter_noinfo stand-in) and
+// it refs the high-VA list globals (g_list_1DBD104 / g_list_1DBD118).
+static void AddOptionalStartupScript(F3SharedBuffer **slot)
 {
     int probe[2] = { 0, 0 };   // the 8-byte list probe (var_8)
-    F3ListProbe(probe, (int *)&g_list_1DBD104, g_list_1DBD118, slot);
-    if (probe[0] == g_list_1DBD104 && probe[1] == g_list_1DBD118)
-        F3ListAppend((int)&g_list_1DBD104, (int)&g_list_1DBD118, slot);
+    F3ListProbe(probe,
+                (int *)(size_t)g_list_1DBD104,      // a2: the head node ptr
+                *(int *)(size_t)g_list_1DBD118,     // a3: the tail node's first link (tail node[0])
+                (int *)(size_t)g_list_1DBD104,      // a4: the head node ptr (dead in the probe)
+                g_list_1DBD118,                     // a5: the tail node ptr
+                (int)(size_t)slot);                 // a6: the slot address
+    if (probe[0] == 0 || probe[0] != g_list_1DBD104)
+        F3InvalidParam();                          // __invalid_parameter_noinfo (never fires)
+    if (probe[1] == g_list_1DBD118)
+        F3ListAppend(g_list_1DBD104, g_list_1DBD118, (int)(size_t)slot);
 }
 
-// sub_619520 (0x619520 - 0x6195A2) -- AudioBankRegistryAdd: the registry
-// insert the AddAudioBank wrapper drives (VM-internal -- no-op stub).
-static long   AudioBankRegistryAdd(int *registry, int *entry) { (void)registry; (void)entry; return 0; }
+// ===============================================================
+//  AudioBankRegistryAdd  (0x619520 - 0x6195A2)  + its helpers.
+//  The audio-bank registry (g_unk_1DBD0F0) is a 5-dword, 36-byte-slot-array
+//  block:
+//    +8  (this[2]) = the 36-byte-slots buffer base (start)
+//    +12 (this[3]) = the first free slot (end)
+//    +16 (this[4]) = the buffer end (capacity)
+//  Each 36-byte slot is { base slot (+0), wide slot (+4), dword (+8),
+//  internal buffer ptr (+20), internal buffer ptr (+24), internal buffer
+//  end (+28), flag byte (+32), flag byte (+33) }.
+//
+//  AudioBankRegistryAdd drives one of two paths:
+//  - non-full: copy the entry into the slot at `end` (AudioBankSlotCopy) and advance
+//    the end by 36 -- the common registry-append case.
+//  - full / first-insert: the resize path (AudioBankRegistryResizeInsert + AudioBankRegistryResizeBody) -- allocate
+//    a fresh 36-byte-slots buffer, copy the old slots into it, append the new
+//    entry at the new end, destroy + free the old block, and update the
+//    registry (start / end / capacity).
+//  The internal buffer in the entry is copied, not shared: the destination
+//  slot owns its own freshly-allocated copy (sub_471FD0 + sub_4C3560); the
+//  caller (AddAudioBank) frees the source buffer via extra[0] after the
+//  insert. [NOT byte-identical] placement-dependent (relative calls to
+//  RefSharedSlot / LHAlloc / LHFree / ReleaseSharedSlot).
+// ===============================================================
+
+// AudioBankVecAlloc  (0x4330B0 - 0x4330BA)  -- internal-buffer allocator:
+// LHAlloc(4 * size); throws stdext::bad_alloc when the size overflows
+// (0xFFFFFFFF / size < 4). Unreachable for registry-sized buffers; emulated
+// with a plain C++ throw (the project's throw-1 pattern).
+static int AudioBankVecAlloc(unsigned int size)
+{
+    if (size != 0 && 0xFFFFFFFFu / size < 4u)
+        throw 1;   // the original throws stdext::bad_alloc
+    return (int)LHAlloc(4u * size);
+}
+
+// sub_471FD0 (0x471FD0 - 0x471FCB) + sub_4C3560 (0x4C3560 - 0x4C356C) -- the
+// internal-buffer region writer, called by the 36-byte slot copy. Zeroes
+// +20/+24/+28, then (for a non-empty source span) allocates a 4 * size
+// buffer and stores it as +20 / +24 (buffer) and +28 (buffer end); the
+// SOURCE's internal buffer data is copied into the fresh buffer. The throw
+// path is unreachable here.
+static int AudioBankSlotCopy(int slot, int entry)
+{
+    F3SharedBuffer **dst = (F3SharedBuffer **)(size_t)slot;   // the 36-byte slot
+    F3SharedBuffer **src = (F3SharedBuffer **)(size_t)entry;  // the 36-byte entry
+    RefSharedSlot(dst, src);             // the base slot
+    RefSharedSlot(dst + 1, src + 1);     // the wide slot
+    *(int *)((char *)slot + 8) = *(int *)((char *)entry + 8);
+    // sub_471FD0: zero the internal region; the entry's internal span is
+    // (entry+24 - entry+20) >> 2 dwords.
+    *(int *)((char *)slot + 20) = 0;
+    *(int *)((char *)slot + 24) = 0;
+    *(int *)((char *)slot + 28) = 0;
+    int size = (*(int *)((char *)entry + 24) - *(int *)((char *)entry + 20)) >> 2;
+    if (size != 0)
+    {
+        if (size > 0x3FFFFFFF)
+            throw 1;   // the original throws std::length_error("myvector<T> too long")
+        int v4 = AudioBankVecAlloc((unsigned int)size);
+        *(int *)((char *)slot + 20) = v4;
+        *(int *)((char *)slot + 24) = v4;
+        *(int *)((char *)slot + 28) = v4 + 4 * size;
+        // sub_4C3560: copy the source internal buffer into the fresh one
+        // (the loop is a no-op when the source span is empty).
+        int srcPtr = *(int *)((char *)entry + 20);
+        int srcEnd = *(int *)((char *)entry + 24);
+        int dstPtr = *(int *)((char *)slot + 20);
+        int result = dstPtr;
+        for (int i = srcPtr; i != srcEnd; ++result)
+        {
+            if (result != 0)
+                *(int *)result = *(int *)i;
+            ++i;
+        }
+        *(int *)((char *)slot + 24) = result;
+    }
+    ((unsigned char *)slot)[32] = ((unsigned char *)entry)[32];   // the flag byte
+    ((unsigned char *)slot)[33] = ((unsigned char *)entry)[33];   // the flag byte
+    return slot;
+}
+
+// AudioBankSlotCopyRange  (0x618F50 - 0x618F82)  -- copy slots [srcStart, srcEnd) from the
+// old block into the new buffer `dst`; returns the new end.
+static int AudioBankSlotCopyRange(int srcStart, int srcEnd, int dst)
+{
+    if (srcStart == srcEnd)
+        return dst;
+    int src = srcStart;
+    int dest = dst;
+    do
+    {
+        if (dest != 0)
+            AudioBankSlotCopy(dest, src);
+        src += 36;
+        dest += 36;
+    }
+    while (src != srcEnd);
+    return dest;
+}
+
+// AudioBankSlotAppend  (0x619180 - 0x6191A5)  -- append `count` slots (the local entry)
+// into the buffer at `dst`; returns dst + 36 * count.
+static int AudioBankSlotAppend(int dst, int count, int src)
+{
+    int v3 = dst;
+    for (int i = count; i != 0; --i)
+    {
+        if (v3 != 0)
+            AudioBankSlotCopy(v3, src);
+        v3 += 36;
+    }
+    return dst + 36 * count;
+}
+
+// AudioBankSlotDestroy  (0x618C10 - 0x618C59)  -- destroy the old slots in [start, end):
+// free the internal buffer when set, null the three dwords, and release the
+// base + wide shared slots.
+static void AudioBankSlotDestroy(int start, int end)
+{
+    if (start == end)
+        return;
+    int slot = start;
+    while (slot != end)
+    {
+        int buf = *(int *)((char *)slot + 20);
+        if (buf != 0)
+            LHFree((void *)(size_t)buf);
+        *(int *)((char *)slot + 20) = 0;
+        *(int *)((char *)slot + 24) = 0;
+        *(int *)((char *)slot + 28) = 0;
+        ReleaseSharedSlot((F3SharedBuffer **)((char *)slot + 4));   // the wide slot
+        ReleaseSharedSlot((F3SharedBuffer **)((char *)slot));       // the base slot
+        slot += 36;
+    }
+}
+
+// AudioBankRegistryResizeInsert + AudioBankRegistryResizeBody (0x619480/0x619220) -- the
+// resize path (the first-insert / registry-full case): allocate a fresh
+// 36-byte-slots buffer, copy the old slots into it, append the new entry at
+// the new end, destroy + free the old block, update start/end/capacity, and
+// release the local copy. Returns the new slot's address.
+static int AudioBankRegistryResizeInsert(int *registry, int entry, int start, int end)
+{
+    // the resize-path prologue: copy the entry into a local 36-byte buffer.
+    unsigned char v17[36];
+    AudioBankSlotCopy((int)(size_t)v17, entry);   // AudioBankSlotCopy(&v17, entry)
+
+    // v6 = *(registry + 2) (start) -- v7 = capacity in slots
+    int capacity = (start != 0) ? (*(int *)((char *)registry + 16) - start) / 36 : 0;
+    // v9 = (v8 - v6) / 36 -- the old slot count
+    int count = (end - start) / 36;
+
+    if (119304647 - count < 1)
+        throw 1;   // the original throws std::length_error("myvector<T> too long")
+
+    // the resize branch (capacity < count + 1 -- the live path for this insert)
+    int v10 = (119304647 - (capacity >> 1) >= capacity) ? (capacity >> 1) + capacity : 0;
+    if (v10 < count + 1)
+        v10 = count + 1;
+
+    // sub_6172F0: LHAlloc(36 * v10) with the overflow throw.
+    if (v10 != 0 && 0xFFFFFFFFu / v10 < 36u)
+        throw 1;   // the original throws stdext::bad_alloc
+    int v16 = (int)LHAlloc(36u * (unsigned int)v10);
+
+    int v11 = AudioBankSlotCopyRange(start, end, v16);   // copy the old slots in
+    int v12 = AudioBankSlotAppend(v11, 1, (int)(size_t)v17);  // append the new entry
+    (void)v12;
+    // (the no-op AudioBankSlotCopyRange(end, end, v12) -- copies nothing since end == end)
+
+    int v13 = start;   // the old start (this[2], unchanged)
+    int v14 = (end - v13) / 36 + 1;
+    if (v13 != 0)
+    {
+        AudioBankSlotDestroy(v13, end);   // the old slots
+        LHFree((void *)(size_t)v13);       // the old 36-byte-slots buffer
+    }
+    *(int *)((char *)registry + 16) = v16 + 36 * v10;   // capacity end
+    *(int *)((char *)registry + 12) = v16 + 36 * v14;   // end (the new first free slot)
+    *(int *)((char *)registry + 8) = v16;              // start
+
+    // the cleanup: free the local internal buffer (when set), null the
+    // extra dwords, and release the local copy's base + wide slots.
+    int buf = *(int *)((char *)&v17 + 20);
+    if (buf != 0)
+        LHFree((void *)(size_t)buf);
+    *(int *)((char *)&v17 + 20) = 0;
+    *(int *)((char *)&v17 + 24) = 0;
+    *(int *)((char *)&v17 + 28) = 0;
+    ReleaseSharedSlot((F3SharedBuffer **)((char *)&v17 + 4));   // the wide slot
+    ReleaseSharedSlot((F3SharedBuffer **)((char *)&v17));       // the base slot
+
+    // the return value: the new slot's address (v11)
+    return v11;
+}
+
+// AudioBankRegistryAdd  (0x619520 - 0x6195A2)  -- the audio-bank registry insert
+// insert the AddAudioBank wrapper drives (VM-internal). cdecl-style
+// __thiscall: the registry object in ECX (a1), the 36-byte entry on the
+// stack. Returns the new slot's address (ignored by the only caller).
+static long   AudioBankRegistryAdd(int *registry, int *entry)
+{
+    int entryAddr = (int)(size_t)entry;   // the 36-byte entry address
+    int start = *(int *)((char *)registry + 8);     // this[2]
+    int cap = 0;
+    if (start != 0)
+        cap = (*(int *)((char *)registry + 16) - start) / 36;   // this[4]
+    int end = *(int *)((char *)registry + 12);     // this[3]
+    int used = (end - start) / 36;
+    unsigned int result = (unsigned int)used;
+    if (used >= cap)
+    {
+        // the resize path (AudioBankRegistryResizeInsert + AudioBankRegistryResizeBody)
+        return (long)AudioBankRegistryResizeInsert(registry, entryAddr, start, end);
+    }
+    if (end != 0)
+        result = (unsigned int)AudioBankSlotCopy(end, entryAddr);
+    *(int *)((char *)registry + 12) = end + 36;
+    return (long)result;
+}
+
 // sub_616910 (0x616910 - 0x6169C0) -- AddAudioBank: build the 32-byte bank
 // entry { arg-2 slot, arg-1 slot, 12 pad, int[3], 2 flag bytes } on the
 // caller's stack (the var_28 / var_24 slots), add the entry to the
-// audio-bank registry (sub_619520, over g_unk_1DBD0F0), free the payload
+// audio-bank registry (AudioBankRegistryAdd, over g_unk_1DBD0F0), free the payload
 // the registry stashed in the entry (the first extra dword, when set), and
 // release both slots (var_24 first, then var_28).  Also called from code:
 // sub_71A230 (0x71A33B).
@@ -9696,7 +10977,7 @@ static long AddAudioBank(int bankSlot, int nameSlot, int a3, int a4)
     CopySharedSlot(&slots[0], (F3SharedBuffer **)(size_t)nameSlot);   // var_28 <- arg 2
     bytes[1] = (unsigned char)a4;   // arg 4 -> +0x21
     bytes[0] = (unsigned char)a3;   // arg 3 -> +0x20
-    AudioBankRegistryAdd(&g_unk_1DBD0F0, (int *)(size_t)slots);      // sub_619520
+    AudioBankRegistryAdd(g_unk_1DBD0F0, (int *)(size_t)slots);      // the registry insert
     if (extra[0] != 0)
         LHFree((void *)(size_t)extra[0]);
     extra[0] = extra[1] = extra[2] = 0;
@@ -9895,12 +11176,11 @@ static int ClearOptionalStartupScriptList(void)
 // [NOT byte-identical] placement-dependent (the relative calls to the
 // shared-slot / file / logging helpers + the __security_check_cookie IAT
 // slot) and it refs the high-VA list + path-prefix globals.  The log
-// emitter (LogScriptError, sub_629660) is the documented stub; the marker
-// files open via the implemented LegacyFileCtor / CLegacyFileOpen, but
-// the disk open typically fails (no marker files on disk in this build),
-// so the error branch is not taken; the original's
-// __invalid_parameter_noinfo list-iterator guards are unreachable for the
-// same reason.
+// emitter (LogScriptError, sub_629660) is now implemented (see its row in
+// the byte-identity table); the disk open typically fails (no marker
+// files on disk in this build), so the error branch is not taken; the
+// original's __invalid_parameter_noinfo list-iterator guards are
+// unreachable for the same reason.
 //
 //  long RunLuaStartupScripts(int luaModule, F3SharedBuffer **scriptSlot)
 static long RunLuaStartupScripts(int luaModule, F3SharedBuffer **scriptSlot)
@@ -9982,26 +11262,305 @@ static void *HandleMapEmptyInit(void *obj, unsigned int elemSize)
     return obj;
 }
 
-// sub_5DEC20 (0x5DEC20 - 0x5DEC4D) -- KorePushEmptyTable: allocate a fresh
-// (empty) hash table (KoreAllocHashTable(a1, 0, 0)) and append the {table, 5}
-// 8-byte record to the module value array at the a1[7] cursor, advancing the
-// cursor by 8.  cdecl.  VM-internal -- out of scope.  Stub: no-op (0).
-static void *KorePushEmptyTable(int mod, int a2, int a3)
-{ (void)mod; (void)a2; (void)a3; return 0; }
+// KorePushEmptyTable (0x5DEC20 - 0x5DEC4D) -- KorePushEmptyTable: allocate a
+// fresh (empty) VM hash table (KoreAllocHashTable(mod, a2, a3)) and append
+// the {table, 5} 8-byte record to the module value array at the cursor in the
+// module word at +0x1C (a1[7]), then advance that cursor by 8.  cdecl.
+// VM-internal.  [NOT byte-identical] placement-dependent (the relative E8
+// call to KoreAllocHashTable).
+static int KorePushEmptyTable(int mod, int a2, int a3)
+{
+    int result = KoreAllocHashTable(mod, a2, a3);
+    int *modB = (int *)mod;
+    int cursor = modB[7];              // a1[7] -- the module value-array cursor
+    *(int *)(cursor + 4) = 5;          // the record's type word
+    *(int *)cursor = result;           // the record's hash-table pointer
+    modB[7] = cursor + 8;              // advance the cursor
+    return result;
+}
 
-// sub_5FC530 (0x5FC530 - 0x5FC54A) -- KoreValueArraySet: a thin wrapper over
-// sub_5F9E40, the tag-dispatching "write a value into the module value array
-// at an offset" op.  cdecl.  VM-internal -- out of scope.  Stub: no-op.
-static void KoreValueArraySet(int mod, int a2, int a3)
-{ (void)mod; (void)a2; (void)a3; }
 
-// sub_5E18A0 (0x5E18A0 - 0x5E1957) -- KoreLookupSlotByIndex: resolve / create
-// a value-array slot addressed by a (negative) index over a module using
-// sub_407970 / sub_5D93D0 / sub_55DFE0 / sub_407A90, and return its index
-// (-1 when the top slot is a non-tagged empty hole).  cdecl.  VM-internal --
-// out of scope.  Stub: returns -1 (no slot).
+// ---- sub_607AD0 (0x607AD0 - 0x607AE6): the "meta" value set (+0) ----
+// thiscall + retn 4.  *(this) = (arg != 0) ? (arg | 1) : 0.  The type-12
+// value-pair write for the meta slot's +0 word; used by KoreValueArraySetCore
+// for the empty-table (type 5) record when the second record is a type-12
+// pair.  [NOT byte-identical] placement-dependent (thiscall + the stack-arg
+// read).
+static void KoreSetMetaSlotValue(int obj, int arg)
+{
+    if (arg != 0)
+        *(int *)obj = arg | 1;
+    else
+        *(int *)obj = 0;
+}
+
+// ---- sub_606770 (0x606770 - 0x606788): the "meta" value set (+4) ----
+// thiscall + retn 4.  *(this + 4) = (arg != 0) ? (arg | 1) : 0.  The type-12
+// value-pair write for the meta slot's +4 word; used by KoreValueArraySetCore
+// for the dense-table (type 7) record when the second record is a type-12
+// pair.  [NOT byte-identical] placement-dependent (thiscall + the stack-arg
+// read).
+static void KoreSetMetaSlotValue4(int obj, int arg)
+{
+    if (arg != 0)
+        *(int *)(obj + 4) = arg | 1;
+    else
+        *(int *)(obj + 4) = 0;
+}
+
+// ---- sub_5E3E50 (0x5E3E50 - 0x5E3EF6): the meta-slot write ----
+// the type-12 ("meta") value-pair write, reached by KoreValueArraySetCore
+// when the record's type word is 12.  thiscall + retn 8.  `this` = the
+// record's backing-object pointer (the +0 word of the record the slot
+// identifies); `Size` = the module (vmcore); `a3` = the value-pair slot.
+//  1. When the backing object's +0x04 word is 0 it panics
+//     ("Cannot set meta slot as it is not defined in structure '%s'.").
+//  2. When the type word (a3[1]) is non-zero, the type-check byte at the
+//     backing object's +0x04 (hash mask) + 0x2E is compared against the
+//     type; a mismatch (or, for a type-12 mismatch, the name-word check at
+//     mask + 0x2C) raises "Type check failed when setting meta slot on
+//     instance of '%s':".
+//  3. The write then stores the value: type 12 -> (value | 1), type 5 ->
+//     value, anything else -> 0, into *(this + 8); the return value is the
+//     value for type 12, else the record's type word.
+//  [NOT byte-identical] placement-dependent (thiscall + the stack-arg read
+//  + the two panic paths).
+static int KoreSetMetaSlot(int table, int mod, int a3)
+{
+    int *t    = (int *)table;
+    int mask  = t[1];                   // [this + 4]: the table's +4 word
+    if (*(int *)(mask + 4) == 0)        // [mask + 4] == 0
+        KoreTablePanic(mod,
+                       "Cannot set meta slot as it is not defined in structure '%s'.",
+                       (const char *)(*(int *)(mask + 0x14) + 8));
+    int type = *(int *)(a3 + 4);        // a3[1]: the record's type word
+    if (type != 0)
+    {
+        int v7 = *(unsigned char *)(mask + 0x2E);
+        if (v7 != 0 &&
+            (type != v7 ||
+             (v7 == 12 && *(unsigned short *)(*(int *)(*(int *)a3 + 4) + 16)
+                               != *(unsigned short *)(mask + 0x2C))))
+            KoreTypeCheckFail2(mod, mask + 0x28, a3,
+                               "Type check failed when setting meta slot on instance of '%s':",
+                               (const char *)(*(int *)(mask + 0x14) + 8));
+    }
+    if (type == 12)
+    {
+        int value = *(int *)a3 | 1;
+        *(int *)(table + 8) = value;
+        return value;
+    }
+    if (type == 5)
+        *(int *)(table + 8) = *(int *)a3;
+    else
+        *(int *)(table + 8) = 0;
+    return type;
+}
+
+// ---- sub_5F9E40 (0x5F9E40 - 0x5F9F61): the value-array slot write ----
+// the tag-dispatching "write a value into the module value array at an
+// offset" op.  cdecl.  `Size` = the module, `a2` = the record's slot,
+// `a3` = the value-pair slot.  Switches on the record's type word (a2[1]):
+//   case 5  (a2[1] == 5):  the empty-table record -- writes the second
+//         record's value into the first record's backing object; for a
+//         type-12 second record the meta-slot +0 writer is used.  Debug-
+//         marks the first record's backing table when the host's +0x3C byte
+//         is 1.
+//   case 7  (a2[1] == 7):  the dense-table record -- the same for the
+//         meta-slot +4 word (a2[1] == 7), with the type-12 path through the
+//         meta-slot +4 writer.
+//   case 12 (a2[1] == 12):  the meta-slot record -- writes through
+//         KoreSetMetaSlot (sub_5E3E50).
+//   default:  the record's type word is an opaque tag -- writes through
+//         KoreTableSet into the registry table at the record's key.
+//  [NOT byte-identical] placement-dependent (relative calls to the shared
+//  helpers).
+static void KoreValueArraySetCore(int mod, int a2, int a3)
+{
+    int *t = (int *)a2;
+    int rec = t[1];                    // a2[1]: the record's type word
+    if (rec == 5)
+    {
+        if (*(int *)(*(int *)mod + 60) == 1)   // [host + 0x3C]
+            KoreDebugMarkDirty(*(int *)a2 - 8, a3);
+        int v5 = *(int *)(a3 + 4);
+        int rec1 = *(int *)a2;                 // the record 1's table pointer
+        int rec2 = *(int *)a3;                 // the record 2's table pointer
+        if (v5 == 5)
+        {
+            *(int *)rec1 = rec2;
+        }
+        else if (v5 == 12)
+        {
+            KoreSetMetaSlotValue(rec1, rec2);
+        }
+        else
+        {
+            *(int *)rec1 = 0;
+        }
+        return;
+    }
+    if (rec == 7)
+    {
+        if (*(int *)(*(int *)mod + 60) == 1)   // [host + 0x3C]
+            KoreDebugMarkDirty(*(int *)a2 - 4, a3);
+        int v4 = *(int *)(a3 + 4);
+        int rec1 = *(int *)a2;                 // the record 1's table pointer
+        int rec2 = *(int *)a3;                 // the record 2's table pointer
+        if (v4 == 5)
+        {
+            *(int *)(rec1 + 4) = rec2;
+        }
+        else if (v4 == 12)
+        {
+            KoreSetMetaSlotValue4(rec1, rec2);
+        }
+        else
+        {
+            *(int *)(rec1 + 4) = 0;
+        }
+        return;
+    }
+    if (rec == 12)
+    {
+        if (*(int *)(*(int *)mod + 60) == 1)   // [host + 0x3C]
+            KoreDebugMarkDirty(*(int *)a2 - 8, a3);
+        (void)KoreSetMetaSlot(*(int *)a2, mod, a3);
+        return;
+    }
+    // default: the record's type word is an opaque tag -- set the registry
+    // table slot through KoreTableSet.
+    int host = *(int *)mod;
+    int table = *(int *)(host + 0xCC);
+    int key = host + rec * 8 + 0x174;
+    (void)KoreTableSet(table, mod, key, a3);
+    if (*(int *)(host + 0x3C) == 1)
+        KoreDebugMarkDirty(table - 8, a3);
+}
+
+// sub_5FC530 (0x5FC530 - 0x5FC54A) -- KoreValueArraySet: the thin wrapper
+// over KoreValueArraySetCore -- a do-nothing cdecl that writes a record
+// into the module value array.  VM-internal.  [NOT byte-identical]
+// placement-dependent (the relative call to KoreValueArraySetCore).
+static int KoreValueArraySet(int mod, int a2, int a3)
+{
+    KoreValueArraySetCore(mod, a2, a3);
+    return 0;
+}
+
+// ---- sub_407970 (0x407970 - 0x4079FB) -- KoreSlotCellFor: resolve the
+// cell for an index over a module using the same dispatch as
+// KoreArgNumberValue.  [NOT byte-identical] cdecl.  VM-internal.
+static int KoreSlotCellFor(int mod, int a2)
+{
+    int *vm = (int *)mod;
+    if (a2 <= -10000)
+    {
+        if (a2 == -10000)
+            return vm[0] + 204;
+        if (a2 == -10002)
+            return mod + 48;
+        int base = vm[8];
+        if (a2 == -10001)
+        {
+            vm[14] = *(int *)(base - 4);
+            vm[15] = 5;
+            return mod + 56;
+        }
+        return *(int *)(base - 8) - 8 * a2 - 80012;
+    }
+    if (a2 < 0)
+        return vm[7] + 8 * a2;
+    if (a2 > 0)
+        return vm[8] + 8 * a2 - 8;
+    return 0;
+}
+
+// ---- sub_407970 (0x407970 - 0x4079FB) -- KoreSlotPush: resolve / create
+// a value-array slot for an index, then push the {payload, type} record at
+// the module's cursor (modB[7]), advancing the cursor by 8.  cdecl.  VM-internal.
+// The cell's +4 word selects between the type-5 (hash-table) path and the
+// other paths (a freshly written type-5 record sees 0 from
+// KorePopNumberValue, which is why the zero path is always taken for the
+// original create-slot push).
+static int KoreSlotPush(int mod, int a2, int payload)
+{
+    int *vm = (int *)mod;
+    int cell = KoreSlotCellFor(mod, a2);
+    int cursor = vm[7];
+    int out[2] = { 0, 0 };
+    KoreGlobalGetByIntPair(mod, cell, payload, out);
+    *(int *)cursor = out[0];
+    *(int *)(cursor + 4) = out[1];
+    vm[7] = cursor + 8;
+    return out[0];
+}
+
+// ---- sub_407A90 (0x407A90 - 0x407BB3) -- KoreSlotSet: resolve / create a
+// value-array slot for an index and set the record at the OUT slot
+// (modB[7] - 8), decrementing the cursor by 8.  cdecl.  VM-internal.
+// The type-5 path goes straight through KoreArraySet (the cell is the
+// table descriptor -- the thiscall arg of sub_5D3210); the other path
+// lazily creates a backing table through KoreEnsureBackingTable first,
+// then KoreArraySet.
+static int KoreSlotSet(int mod, int a2, int payload)
+{
+    int *vm = (int *)mod;
+    int cell = KoreSlotCellFor(mod, a2);
+    int cursor = vm[7];
+    int *cellp = (int *)cell;
+    if (cellp[1] == 5)
+    {
+        KoreArraySet(cell, mod, a2, cursor - 8);
+    }
+    else
+    {
+        int backing = KoreEnsureBackingTable(cell, mod, 0, 0, a2);
+        KoreArraySet(backing, mod, a2, cursor - 8);
+    }
+    vm[7] = cursor - 8;
+    return 0;
+}
+
+// ---- sub_5E18A0 (0x5E18A0 - 0x5E1957) -- KoreLookupSlotByIndex: resolve /
+// create a value-array slot addressed by a (negative) index over a module,
+// and return the index.  cdecl.  VM-internal.
+// The early-return path (top slot is a non-tagged empty hole) returns -1
+// and restores the cursor; the resolve path pushes the type-5 record at the
+// cursor, reads the freshly written cell (which returns 0 from
+// KorePopNumberValue for the type-5 record), and takes the zero path.
 static int KoreLookupSlotByIndex(int mod, int a2)
-{ (void)mod; (void)a2; return -1; }
+{
+    int *vm = (int *)mod;
+    int v2 = vm[7] - 8;
+    if (v2 < vm[8] || *(int *)(v2 + 4) != 0)
+    {
+        int v4 = a2;
+        (void)KoreSlotPush(mod, a2, 0);
+        double v5 = 0.0;
+        if (vm[7] - 8 >= vm[8])
+            v5 = KorePopNumberValue(mod, vm[7] - 8);
+        vm[7] -= 8;   // restore the cursor to the original value
+        int v6 = (int)v5;
+        if (v5 != 0)
+        {
+            v4 = (a2 >= 0xFFFFD8F1 || a2 == 0) ? a2 + ((vm[7] - vm[8]) >> 3) + 1 : a2;
+            (void)KoreSlotPush(mod, v4, v6);
+            (void)KoreSlotSet(mod, v4, 0);
+            (void)KoreSlotSet(mod, v4, v6);
+            return v6;
+        }
+        // zero path -- increment the cell's value and set the record
+        int v7 = (int)KorePopNumberValue(mod, KoreSlotCellFor(mod, a2)) + 1;
+        (void)KoreSlotSet(mod, a2, v7);
+        return v7;
+    }
+    // early-return path -- the top slot is a non-tagged empty hole.
+    vm[7] -= 8;
+    return -1;
+}
+
 
 // sub_6E9620 (0x6E9620 - 0x6E96DF) -- CEntityScriptHandleManagerCtor: the
 // 80-byte CEntityScriptHandleManager (0x50 bytes).  thiscall + `retn 4` (the
@@ -10088,27 +11647,338 @@ static F3SharedBuffer *g_slot_1DBDC78 = 0;   // 0x1DBDC78: "Debug" class-name sl
 // as KoreGlobalGetByIntPair (the earlier "reserve 8 bytes" reading was
 // wrong: the 8-byte reserve in the registration helpers is the sub_5DC450
 // slot push).
-// sub_5DC450 (0x5DC450) -- return a pointer to a freshly reserved 4-byte
-// value-array slot.  2777 callers; VM-internal.  Stub: 0 (no slot).
+// ---- sub_5DA940 + sub_5DC450 (0x5DC450 - 0x5DC49E) -- KoreValueArraySlot:
+// reserve a fresh 4-byte value-array slot over the module's value array.
+// cdecl (the table object in arg_0, the size in arg_4).  Returns the slot
+// pointer + 16 (the caller writes the 4-byte record at +0).  [NOT
+// byte-identical] placement-dependent (relative calls to KoreAllocVmMem).
+//
+//  sub_5DA940 stamps the 16-byte record the KoreAllocVmMem (sub_5DA410)
+//  block returns: [0] the record payload (the row-base read at
+//  *(table + 0x18) + 4 when the free-space diff (table + 0x0C minus table
+//  + 0x04) is >= 16, else table + 0x30), [1] 0, [2] the module's +0xE0
+//  word (then that word is overwritten with the new record), [3] the size.
+//  The target then stores the record pointer in the current value cell
+//  (table + 0x1C), stamps tag 7 in the cell, advances the cell by 8 bytes,
+//  and -- for the case-3 host payload word (module + 0x3C) with a non-zero
+//  word at module + 0xB4, or the case-4 host payload word -- clears the low
+//  bit of the block header (the module-base word at slot - 4).  Returns
+//  slot + 16.
 static void *KoreValueArraySlot(void *table, int size)
-{ (void)table; (void)size; return 0; }
-// sub_67C180 (0x67C180) -- intern/look up a builtin name on a module: push
-// the name string on the module value stack, run the builtin string op, and
-// write the {value, ctrl} pair to out ({0, 0} when the name is unregistered
-// or the module context is empty).  thiscall (the {value, ctrl} pair in
-// ECX); VM-internal.  Stub: {0, 0}.
-static void KoreLookupBuiltinValue(DWORD *thisPair, DWORD *out, const char *name)
-{ (void)thisPair; out[0] = 0; out[1] = 0; (void)name; }
+{
+    int *slot = (int *)KoreAllocVmMem((int)table, (unsigned int)size + 16);
+    int mod = *(int *)table;
+
+    int diff = *(int *)((char *)table + 0x0C) - *(int *)((char *)table + 0x04);
+    if (diff >= 16)
+        slot[0] = *(int *)(*(int *)((char *)table + 0x20 - 8) + 4);
+    else
+        slot[0] = *(int *)((char *)table + 0x30);
+    slot[1] = 0;
+    slot[2] = *(int *)(mod + 0xE0);
+    *(int *)(mod + 0xE0) = (int)slot;
+    slot[3] = size;
+
+    int cursor = *(int *)((char *)table + 0x1C);
+    *(int *)(cursor) = (int)slot;
+    *(int *)(cursor + 4) = 7;
+    *(int *)((char *)table + 0x1C) = cursor + 8;
+
+    int edx = *(int *)(mod + 0x3C);
+    if ((edx == 3 && *(int *)(mod + 0xB4) != 0) || edx == 4)
+        *(int *)(slot - 1) &= ~1u;
+    return (char *)slot + 16;
+}
+// ---- the builtin-value ctrl-block chain (sub_67C090 / sub_67B9E0 /
+// sub_67C7F0 / sub_67C7B0 / sub_5E1960) ----
+
+// sub_5E1960 (0x5E1960 - 0x5E196B) -- KoreBuiltinValueMetaSlotWrite: the
+// meta-slot number write (KoreSlotPush + KoreSlotSet + the float store at the
+// cursor + KoreSlotSet) over the caller's buffer.  cdecl, three stack args.
+// Documented [remaining stub] -- the ctrl-block path is unreachable in this
+// build (the fetched tag never reaches 5/12 while the string op's fail path
+// is a stub).
+static int KoreBuiltinValueMetaSlotWrite(int buffer, int constant, int result)
+{ (void)buffer; (void)constant; (void)result; return 0; }
+
+// sub_67C7B0 (0x67C7B0 - 0x67C7E5) -- KoreBuiltinValueCtrlBlockRelease: the
+// ctrl-block release callback.  Run the meta-slot number write over the
+// block's buffer, zero the context word, release the block's shared slot and
+// LHFree the block.  cdecl, one arg (the block).  VM-internal.
+static void KoreBuiltinValueCtrlBlockRelease(void *block)
+{
+    DWORD *b = (DWORD *)block;
+    if (b == NULL)
+        return;
+    (void)KoreBuiltinValueMetaSlotWrite(b[0], 0xFFFFD8F0, b[1]);
+    b[0] = 0;                                    // block[0] = 0
+    ReleaseSharedSlot((F3SharedBuffer **)(b + 2));   // the +0x08 shared slot
+    LHFree(b);
+}
+
+// sub_67B9E0 (0x67B9E0 - 0x67BA19) -- KoreBuiltinValueNewBlock: stamp the
+// 16-byte new block over the caller's buffer.  +0 = the buffer, +4 = the result
+// of KoreLookupSlotByIndex(buffer, 0xFFFFD8F0) (the pre-lookup word is -2),
+// the +8 shared slot over the name (SetSharedSlot, size -1), +0x0C = 1.
+// thiscall, one stack arg each (the buffer, the name).  VM-internal.
+static DWORD *KoreBuiltinValueNewBlock(DWORD *buffer, const char *name)
+{
+    DWORD *block = (DWORD *)LHAlloc(16);
+    if (block == NULL)
+        return NULL;
+    block[0] = (DWORD)buffer;
+    block[1] = 0xFFFFFFFE;                       // -2 pre-lookup
+    SetSharedSlot((F3SharedBuffer **)(block + 2), name, -1);
+    block[3] = 1;                                // +0x0C = 1
+    block[1] = (DWORD)KoreLookupSlotByIndex((int)buffer, 0xFFFFD8F0);   // sub_5E18A0
+    return block;
+}
+
+// sub_67C7F0 (0x67C7F0 - 0x67C85B) -- KoreBuiltinValueWriteCtrlBlock: write the
+// {block, ctrl} pair into the caller's temp block.  Release any superseded ctrl
+// block (InterlockedDecrement + dispatch + LHFree at zero), store the new
+// block, and when the new block is live allocate the 12-byte ctrl block
+// (refcount 1, the release callback, the block context).  thiscall, one stack
+// arg (the new block).  VM-internal.
+static void KoreBuiltinValueWriteCtrlBlock(DWORD *temp, DWORD *newBlock)
+{
+    if (temp[1] != 0 && InterlockedDecrement((volatile LONG *)temp[1]) == 0)
+    {
+        DWORD *b = (DWORD *)temp[1];
+        ((void (*)(DWORD))b[1])(b[2]);
+        LHFree(b);
+    }
+    temp[1] = 0;
+    temp[0] = (DWORD)newBlock;
+    if (newBlock == NULL)
+        return;
+    DWORD *result = (DWORD *)LHAlloc(12);
+    if (result == NULL)
+    {
+        temp[1] = 0;
+        return;
+    }
+    DWORD context = temp[0];
+    result[0] = 1;
+    result[1] = (DWORD)KoreBuiltinValueCtrlBlockRelease;
+    result[2] = context;
+    temp[1] = (DWORD)result;
+}
+
+// sub_67C090 (0x67C090 - 0x67C104) -- KoreBuiltinValueCtrlBlock: the
+// {value, ctrl} pair assembler.  On the fast path the caller's new cell (the
+// builtin string op's result) must be >= the value-stack base and carry tag 5
+// or 12: the new block is then stamped and the temp is written through
+// KoreBuiltinValueWriteCtrlBlock.  Otherwise the buffer cursor is rolled back
+// 8 and the temp stays {0, 0}.
+static void KoreBuiltinValueCtrlBlock(DWORD *buffer, const char *name, DWORD *temp, DWORD newCellBase, DWORD tag)
+{
+    if ((unsigned int)newCellBase >= (unsigned int)buffer[8] && (tag == 5 || tag == 12))
+    {
+        DWORD *block = KoreBuiltinValueNewBlock(buffer, name);   // LHAlloc(16) + the init
+        if (block != NULL)
+            KoreBuiltinValueWriteCtrlBlock(temp, block);
+        else
+            KoreBuiltinValueWriteCtrlBlock(temp, NULL);          // the LHAlloc(16) failure path
+        return;
+    }
+    // the fail path: roll the cursor back 8
+    buffer[7] -= 8;
+}
+
+// sub_67C180 (0x67C180 - 0x67C2AD) -- KoreLookupBuiltinValue: intern/look up a
+// builtin name on a module: push the name string on the module value stack,
+// run the builtin string op, and write the {value, ctrl} pair to out ({0, 0}
+// when the name is unregistered or the module context is empty).  thiscall
+// (the {value, ctrl} pair in ECX); VM-internal.  [NOT byte-identical]
+// placement-dependent (the relative calls + the __security_cookie prologue)
+// and refs the two high-VA zero globals via KoreRegistryLookup /
+// KoreLookupStringTable.
+static DWORD *KoreLookupBuiltinValue(DWORD *thisPair, DWORD *out, const char *name)
+{
+    DWORD value = thisPair[0];
+    if (value == 0)
+    {
+        out[0] = 0;
+        out[1] = 0;
+        return out;
+    }
+    DWORD *table  = (DWORD *)value;
+    DWORD *buffer = (DWORD *)table[0];
+
+    // the pair fetch over the buffer's +0xCC cell
+    DWORD cell[2];
+    DWORD cursor = buffer[7];
+    KoreGlobalGetByIntPair((int)buffer, (int)buffer[0] + 0xCC, (int)table[1], (int *)cell);
+    DWORD fetchedValue = cell[0];
+    DWORD fetchedTag   = cell[1];
+
+    // the new cell (the interned {entry, 4})
+    DWORD newCursor = cursor + 8;
+    buffer[7] = (int)newCursor;
+    DWORD *newCell = (DWORD *)(newCursor);
+
+    if (name != NULL)
+    {
+        // the intern: KoreAppendString stamps the {entry, 4} pair at the new
+        // cell and advances the cursor by 8.
+        (void)KoreAppendString((int)buffer, name, (int)strlen(name));
+    }
+    else
+    {
+        // the null-name path: zero the new cell, advance the cursor by 16.
+        newCell[0] = 0;
+        newCell[1] = 0;
+        buffer[7] = (int)newCursor + 8;
+    }
+
+    // the builtin string op: the {entry, tag} cell feeds the lookup
+    DWORD string = (DWORD)KoreBuiltinStringOp((int)buffer, fetchedValue, fetchedTag, newCell[0], newCell[1]);
+
+    // the rollback: buffer[0x1C] -= 8
+    buffer[7] -= 8;
+    newCell[0] = string;
+    DWORD tag = newCell[1];
+    buffer[7] = (int)newCell + 8;
+
+    // the success check: the new cell must be >= the value-stack base and
+    // carry tag 5 or 12.
+    if ((unsigned int)newCell >= (unsigned int)buffer[8] && (tag == 5 || tag == 12))
+    {
+        // the ctrl-block path
+        DWORD temp[2];
+        temp[0] = 0;
+        temp[1] = 0;
+        KoreBuiltinValueCtrlBlock(buffer, name, temp, (DWORD)newCell, tag);
+        buffer[7] -= 8;   // the caller's rollback after the callee
+
+        DWORD addend = temp[1];
+        out[0] = temp[0];
+        out[1] = temp[1];
+        if (addend != 0)
+            InterlockedIncrement((volatile LONG *)addend);
+        // the release of the temp pair (sub_6179D0)
+        if (addend != 0 && InterlockedDecrement((volatile LONG *)addend) == 0)
+        {
+            DWORD *b = (DWORD *)addend;
+            ((void (*)(DWORD))b[1])(b[2]);
+            LHFree(b);
+        }
+        temp[0] = 0;
+        temp[1] = 0;
+        return out;
+    }
+
+    // the fail path ({0, 0})
+    buffer[7] -= 16;
+    out[0] = 0;
+    out[1] = 0;
+    return out;
+}
+
 // sub_6179D0 (0x6179D0) -- release a KoreLookupBuiltinValue {value, ctrl}
 // temp: InterlockedDecrement the ctrl block (dispatch its release callback +
-// LHFree at zero) and zero the pair.  thiscall; VM-internal.  Stub: no-op.
+// LHFree at zero) and zero the pair.  thiscall; VM-internal.  [NOT byte-identical]
+// (the whole-pair release is inlined in the ctrl-block path; this stand-in is
+// kept for the EngineLuaEnsureTable re-look-up call site).
 static void KoreReleaseLookupPair(DWORD *pair)
-{ (void)pair; }
-// sub_67C540 (0x67C540) -- hash a name and store it in the module's global
-// table over a reserved value-array slot.  thiscall (the {value, ctrl} pair
-// in ECX); 2643 callers; VM-internal.  Stub: no-op.
-static void EngineLuaStoreGlobalName(DWORD *pair, void *table, const char *name)
-{ (void)pair; (void)table; (void)name; }
+{
+    if (pair[1] != 0 && InterlockedDecrement((volatile LONG *)pair[1]) == 0)
+    {
+        DWORD *b = (DWORD *)pair[1];
+        ((void (*)(DWORD))b[1])(b[2]);
+        LHFree(b);
+    }
+    pair[0] = 0;
+    pair[1] = 0;
+}
+
+// Forward declarations -- the Save/Load table siblings (sub_67C3E0 / sub_67C490),
+// the {value, ctrl} pair assemblers EngineLuaStoreGlobalName drives.  [documented
+// no-op stubs -- the builtin string op (sub_5E4E10) they depend on is not
+// reimplemented here; the pair always stays {0, 0}]
+static void EngineLuaPermanentsSaveTable(DWORD *pair, DWORD *Size);
+static void EngineLuaPermanentsLoadTable(DWORD *pair, DWORD *Size);
+
+// sub_67C540 (0x67C540 - 0x67C6DC) -- hash a name and store it in the
+// module's global table over a reserved value-array slot.  thiscall (the
+// {value, ctrl} pair in ECX); 2643 callers; VM-internal.  [NOT byte-
+// identical] placement-dependent (relative E8 calls into the VM-internal
+// Save/Load siblings + KoreReleaseLookupPair + InterlockedDecrement + the
+// __security_check_cookie prologue) and refs the high-VA .rdata strings.
+//
+// The original (0x67C540) gates on the byte at (pair[0]+12) != 0, runs the
+// Save sibling (sub_67C3E0 -- the "PermanentsSaveTable" pair assembler over
+// the module value stack) into the local {value, ctrl} save-pair, and -- when
+// the value is live -- merges the name string (sub_1A02230), releases the
+// temp pair (sub_1A01320), hashes the merged string (seed 0x811C9DC5, the
+// FNV-ish edi = byte ^ (16777619 * edi) loop), fetches the {value, tag} pair
+// over the module global table (sub_5DF650), writes the {hash, 2} cell over
+// the cursor, snapshots the tag cell, runs the slot-write (sub_5E9150), rolls
+// the cursor back, and runs the Load sibling (sub_67C490 -- the
+// "PermanentsLoadTable" pair assembler); when the Load pair is live, the
+// same cell is re-stamped and the slot-write re-run.  The addend (the Save
+// sibling's ctrl block) is released in the epilogue (at zero: the release
+// callback + LHFree) and the worker refcount is decremented (sub_1A01320).
+//
+// This build implements the flag check and the addend-release epilogue
+// faithfully; the Save/Load siblings and every name-merge / hash / pair-fetch
+// / slot-write helper are VM-internal and remain documented no-op stubs, so
+// in this build the pair always fails ({0, 0}) and the epilogue is skipped.
+static void EngineLuaStoreGlobalName(DWORD *pair, DWORD *Size, const char *Source)
+{
+    (void)Source;   // the name -- consumed by the documented merge stub below
+    if (*(BYTE *)(pair[0] + 12) != 0)
+    {
+        // the Save sibling (sub_67C3E0): the {value, ctrl} pair assembler for
+        // the name save.
+        //
+        // [documented no-op stub] -- the builtin string op (sub_5E4E10) it
+        // depends on is not reimplemented here, so the pair always fails
+        // ({0, 0}) and the name-merge / hash / pair-fetch / cell write below
+        // is never reached in this build.  See the comment block above for
+        // the original's data flow.
+        DWORD savePair[2] = { 0, 0 };
+        EngineLuaPermanentsSaveTable(savePair, Size);
+
+        // the addend epilogue -- REAL
+        DWORD addend = savePair[1];
+        if (addend != 0)
+        {
+            DWORD r = InterlockedDecrement((volatile LONG *)addend);
+            if (r == 0)
+            {
+                DWORD *b = (DWORD *)addend;
+                ((void (*)(DWORD))b[1])(b[2]);
+                LHFree(b);
+            }
+        }
+    }
+    return;
+}
+
+// sub_67C3E0 (0x67C3E0 - 0x67C467) -- EngineLuaPermanentsSaveTable: the
+// "PermanentsSaveTable" table pair assembler (the sibling of sub_67C490 --
+// the two differ only in the fallback string and the release callback).
+// cdecl, two stack args (the pair, the Size/table).  VM-internal.
+// [documented no-op stub -- the builtin string op (sub_5E4E10) it depends on
+// is not reimplemented here, so the pair always stays {0, 0}]
+static void EngineLuaPermanentsSaveTable(DWORD *pair, DWORD *Size)
+{ (void)pair; (void)Size;
+    pair[0] = 0;
+    pair[1] = 0;
+}
+
+// sub_67C490 (0x67C490 - 0x67C517) -- EngineLuaPermanentsLoadTable: the
+// "PermanentsLoadTable" table pair assembler (the sibling of sub_67C3E0).
+// cdecl, two stack args (the pair, the Size/table).  VM-internal.
+// [documented no-op stub -- the builtin string op (sub_5E4E10) it depends on
+// is not reimplemented here, so the pair always stays {0, 0}]
+static void EngineLuaPermanentsLoadTable(DWORD *pair, DWORD *Size)
+{ (void)pair; (void)Size;
+    pair[0] = 0;
+    pair[1] = 0;
+}
 // sub_408200 (0x408200) -- pull the Nth Lua number argument off a VM stack.
 // 1236 callers; VM-internal.  Stub: 0.0f.
 static float KoreGetNumberArg(int vm, int idx)
@@ -10555,7 +12425,7 @@ static DWORD *EngineLuaDebugTable(DWORD *out, int luaModule)
 // (storing its result in the current top value cell), take the fresh value
 // array slot from sub_5DC450 (the 8-byte reserve), store the C wrapper
 // pointer in the slot, install the builtin closure (the upvalue fn, 1
-// upvalue), store the name in the global table (sub_67C540),
+// upvalue), store the name in the global table (EngineLuaStoreGlobalName),
 // register the builtin name (KoreRegisterBuiltinName, -2), and roll the stack
 // back.  thiscall + `retn 8` (the context pair in ECX, NAME and WRAPPER on
 // the stack).  VM-internal.  (sub_640870 / sub_70E530 are shared with other
@@ -10574,7 +12444,7 @@ static DWORD EngineLuaRegisterNamedClosure(DWORD *pair, const char *name, int wr
         DWORD *slot = (DWORD *)KoreValueArraySlot(table, 4);              // sub_5DC450
         *slot = (DWORD)wrapper;
         KoreRegisterBuiltinClosure((int)table, upvalue, 1);
-        EngineLuaStoreGlobalName(pair, table, name);                      // sub_67C540
+        EngineLuaStoreGlobalName(pair, table, name);                      // EngineLuaStoreGlobalName (sub_67C540)
         KoreRegisterBuiltinName((int)table, -2, name);                    // sub_4076D0
         *(DWORD *)(table + 0x1C) = cursor;                                // roll back
     }

@@ -6712,7 +6712,7 @@ static __declspec(naked) int CLegacyMemoryFileSlot8Stub(void *obj)
 //  exact instruction sequence (mov ecx,[ecx+8] / mov eax,[ecx] / mov
 //  edx,[eax+1Ch] / jmp edx), emitted as naked asm so it matches the original
 //  10 bytes exactly.
-static __declspec(naked) int CLegacyMemoryFileGetLength(void *obj)
+__declspec(naked) int CLegacyMemoryFileGetLength(void *obj)
 {
     __asm
     {
@@ -6734,7 +6734,7 @@ static __declspec(naked) int CLegacyMemoryFileGetLength(void *obj)
 //  leave the critical section.  Returns the buffer.  [NOT byte-identical]
 //  placement-dependent (the E8 calls to EnterCriticalSection /
 //  LeaveCriticalSection + the vtable dispatches).
-static DWORD *MemoryFileReleaseStreamMember(void *obj, DWORD *buf)
+DWORD *MemoryFileReleaseStreamMember(void *obj, DWORD *buf)
 {
     DWORD *o = (DWORD *)obj;
     EnterCriticalSection((CRITICAL_SECTION *)(o + 10));
@@ -6771,7 +6771,7 @@ static DWORD *MemoryFileReleaseStreamMember(void *obj, DWORD *buf)
 //  0 (thiscall: obj in ECX, no stack args, plain retn, result in EAX as
 //  bool).  [NOT byte-identical] placement-dependent (the E8 call to
 //  MemoryFileReleaseStreamMember).
-static int CLegacyMemoryFileReleaseInnerStream(void *obj)
+int CLegacyMemoryFileReleaseInnerStream(void *obj)
 {
     DWORD *o = (DWORD *)obj;
     DWORD handle = o[2];
@@ -6813,7 +6813,7 @@ static F3SharedBuffer ** WidePathToAnsiSlot(F3SharedBuffer **obj, F3SharedBuffer
     return out;
 }
 static void *CLegacyMemoryFileDtorAddress(void);
-static int CLegacyMemoryFileOpen(void *obj, F3SharedBuffer **slot, int mode, int a4);
+int CLegacyMemoryFileOpen(void *obj, F3SharedBuffer **slot, int mode, int a4);
 
 static void *g_CLegacyMemoryFileVtable[12] =
 {
@@ -6879,7 +6879,7 @@ struct CLegacyMemoryFile
 // placement-dependent (the E8 calls) plus the high-VA globals
 // (g_ShapeSpawnPrefixSlot 0x1E2D7BC, the 0x1BD44D7 default string, and the
 // Interlocked IAT slots).
-static int CLegacyMemoryFileOpen(void *obj, F3SharedBuffer **slot, int mode, int a4)
+int CLegacyMemoryFileOpen(void *obj, F3SharedBuffer **slot, int mode, int a4)
 {
     (void)a4;
     DWORD *o = (DWORD *)obj;
@@ -6986,6 +6986,24 @@ static void *CLegacyMemoryFileDtorAddress(void)
     } u;
     u.pm = &CLegacyMemoryFile::Dtor;
     return u.p;
+}
+
+// sub_17FDC40 (0x17FDC40 - 0x17FDC5C) -- the LHSFS::CLegacyMemoryFile's
+// initialisation step (no open-setup): store the CLegacyMemoryFile vtable,
+// run the wide null-ctor on the +4 path slot (InitSharedSlotWide,
+// sub_19FF580), zero the +8 file handle, and return the object.  This is the
+// ctor that LogScriptError (sub_629660) runs on its stack CLegacyMemoryFile
+// before the open-setup, and it is kept separate from CLegacyMemoryFileCtor
+// (sub_17FE8B0, which runs the open-setup itself).  [NOT byte-identical]
+// placement-dependent (the E8 call to the wide null-ctor) plus the CLegacyMemoryFile
+// vtable ref (original 0x1BC7FBC).
+void *CLegacyMemoryFileCtorInit(void *obj)
+{
+    DWORD *o = (DWORD *)obj;
+    o[0] = (DWORD)g_CLegacyMemoryFileVtable;
+    InitSharedSlotWide((F3SharedBuffer **)(o + 1));
+    o[2] = 0;
+    return obj;
 }
 
 // sub_17FE8B0 (0x17FE8B0 - 0x17FE8E4) -- the LHSFS::CLegacyMemoryFile ctor
@@ -7662,19 +7680,145 @@ static BYTE g_byte_1DBD032 = 0;
 
 static void CopyFileToSharedSlot(void *file, F3SharedBuffer **out);
 
-// 0x1A19D70 (0x1A19D70 - 0x1A19E04) -- the file lookup in the GDB reader.
-// Deep dependency chain: LHAlloc + sub_1926A10 + sub_1926AA0 + sub_1A198D0 +
-// sub_50AA60 (and sub_50CA60/sub_50A310/sub_1926950/sub_50C9F0/sub_401BD0/
-// sub_50AEA0/sub_50A440/sub_50A4C0, unimplemented).  (sub_50A540 / sub_50C740 /
-// sub_50A160 are implemented above -- the file-reader ctor / state ctor / hash grow).
-// Out of scope -- the stub returns -1 (the file was not
-// found / the load failed).  [remaining stub]
-static int sub_1A19D70(void *a1, const char *src, int a3, int a4)
-{ (void)a1; (void)src; (void)a3; (void)a4; return -1; }
+//  GdbLookupBlockInit  (0x1926A10 - 0x1926A69) -- the 64-byte lookup block
+//  init: publish the reader's +0x1C slot pointer at the block's +0x18 word
+//  (the caller passes the reader's +0x1C slot address as the first argument,
+//  the block as the second), zero +0x20, write 15 at +0x3C, zero +0x38 and
+//  +0x28, then return the block.  When the slot pointer is null (never taken
+//  at the sub_1A19D70 call site, where it is always reader+0x1C), the
+//  original allocates a 4-byte block holding the 36-byte state block (the
+//  GdbReaderStateCtor return value, or 0 on allocation failure) and
+//  publishes the 4-byte block instead -- reproduced for fidelity.
+//  [NOT byte-identical] placement-dependent (the E8 calls to LHAlloc /
+//  GdbReaderStateCtor).
+static void *GdbLookupBlockInit(void *slot, void *block)
+{
+    if (slot == 0)
+    {
+        DWORD *d4 = (DWORD *)LHAlloc(4);
+        if (d4 != 0)
+        {
+            void *state = LHAlloc(0x24);
+            DWORD *init = (state != 0) ? (DWORD *)GdbReaderStateCtor(state) : 0;
+            *d4 = (DWORD)init;
+        }
+        slot = d4;
+    }
+    *(DWORD *)((char *)block + 0x18) = (DWORD)slot;
+    *(DWORD *)((char *)block + 0x20) = 0;
+    *(DWORD *)((char *)block + 0x3C) = 15;
+    *(DWORD *)((char *)block + 0x38) = 0;
+    *(BYTE *)((char *)block + 0x28) = 0;
+    return block;
+}
+
+// Forward decls for the deep GDB chain (remaining stubs: defined below).
+static int sub_1926AA0(void *block, const char *src, int a3);
+static int sub_1A198D0(int a1, int a2);
+static int sub_50AA60(int a1, int a2, int a3, DWORD *a4);
+
+//  GdbReaderLookup  (0x1A19D70 - 0x1A19E04) -- the file lookup in the GDB reader:
+// allocate the 4-byte block, grow the 64-byte lookup block via
+// GdbLookupBlockInit (sub_1926A10), run the file lookup through sub_1926AA0,
+// and -- when the lookup succeeds -- dispatch sub_1A198D0 and sub_50AA60 over
+// the reader.  [remaining stub] the deep GDB chain behind sub_1926AA0
+// (sub_50CA60 / sub_50C9F0 / sub_50C8D0 / GdbReaderHashGrow / sub_401BD0 /
+// sub_50AEA0 / sub_50A440 / sub_50A4C0 and the sub_50A310 / sub_1926950 reader
+// rebuilds) is out of scope, so sub_1926AA0 / sub_1A198D0 / sub_50AA60 are
+// stubs and the lookup always returns -1 (the file was not found / the load
+// failed).  (sub_50A540 / sub_50C740 / sub_50A160 are implemented above --
+// the file-reader ctor / state ctor / hash grow.)
+// [NOT byte-identical] placement-dependent (the E8 calls) -- the deep chain is
+// not byte-identical.
+static int GdbReaderLookup(void *reader, const char *src, int a3, int a4)
+{
+    DWORD *block4 = (DWORD *)LHAlloc(4);
+    char *block64 = 0;
+
+    if (block4 != 0)
+    {
+        // grow the 64-byte lookup block via GdbLookupBlockInit; on a
+        // 64-byte-alloc failure the block stores 0 (as the original does).
+        block64 = (char *)LHAlloc(0x40);
+        if (block64 != 0)
+        {
+            GdbLookupBlockInit((char *)reader + 0x1C, block64);
+            *block4 = (DWORD)block64;                  // the 64-byte block
+        }
+        else
+        {
+            *block4 = 0;
+            block64 = 0;
+        }
+    }
+
+    if (block4 == 0)
+    {
+        // the original dereferences address 0 here (the 4-byte-block alloc
+        // failure path crashes in the binary) -- treated as a lookup failure
+        // for safety.
+        return -1;
+    }
+
+    // The file lookup (sub_1926AA0); its `this` = the 64-byte block.
+    int v6 = sub_1926AA0(block64, src, a4);
+
+    if (v6 != -1)
+    {
+        // sub_1A198D0(block4, a3) -- [remaining stub]
+        sub_1A198D0((int)(void *)block4, a3);
+
+        // The reader's 16-byte self-ref block (+0x14) and the self-tag
+        // block (+0x00) are threaded into the heap-publish.
+        DWORD v7 = *(DWORD *)((char *)reader + 0x14);   // the 16-byte v2 block
+        v7 = *(DWORD *)v7;                              // v2[0] = the same block
+        DWORD v8 = *(DWORD *)reader;                    // the 4-byte self-tag block
+
+        // v10 = { block4, a3 }
+        DWORD v10[2];
+        v10[0] = (DWORD)block4;
+        v10[1] = (DWORD)a3;
+
+        // sub_50AA60(reader, v8, v7, v10) -- [remaining stub]
+        sub_50AA60((int)(void *)reader, (int)v8, (int)v7, v10);
+    }
+
+    return v6;
+}
+
+//  sub_1926AA0  (0x1926AA0 - 0x1926C7D) -- the GDB file lookup over the
+//  64-byte lookup block: the SetSharedSlot + CLegacyMemoryFileCtor memory-file
+//  trio (the 16-byte LHSFS::CLegacyMemoryFile), the F3AStringAssign over the
+//  Source string, the inner-stream release, the CLegacyMemoryFileReadChunk
+//  over the +0x18.., the hash-entry buffer allocation, the sub_50CA60
+//  hash-insert, the CLegacyMemoryFileReleaseFileHandle and the entry-loop.
+//  [remaining stub] the deep GDB chain (sub_50CA60 / sub_50C9F0 / sub_50C8D0 /
+//  GdbReaderHashGrow / sub_401BD0 / sub_50AEA0 / sub_50A440 / sub_50A4C0,
+//  unimplemented) is out of scope -- returns -1.
+static int sub_1926AA0(void *block, const char *src, int a3)
+{ (void)block; (void)src; (void)a3; return -1; }
+
+//  sub_1A198D0  (0x1A198D0 - 0x1A1991F) -- the state rebuild: sub_1926950
+//  (the capacity regrow over the 36-byte state block, with the hash-slot
+//  re-init loop) and sub_50A310 (the hash-table rebuild), then the old-buffer
+//  free (dword_2075B24 + 16).  [remaining stub] the deep GDB chain
+//  (sub_1926950 / sub_50A310 / sub_50A440 / sub_50A4C0, unimplemented) is out
+//  of scope -- returns 0.
+static int sub_1A198D0(int a1, int a2)
+{ (void)a1; (void)a2; return 0; }
+
+//  sub_50AA60  (0x50AA60 - 0x50AABF) -- the heap-block publish: LHAlloc(16),
+//  the self-ref 16-byte block (the new block holds the old block + the v10
+//  words), the reader +0x14 word re-publish (sub_50AEA0), then overwrite the
+//  reader's 16-byte block with the new block.  [remaining stub] the sub_50AEA0
+//  throw path (std::logic_error / std::length_error EH machinery) is out of
+//  scope -- returns 0.
+static int sub_50AA60(int a1, int a2, int a3, DWORD *a4)
+{ (void)a1; (void)a2; (void)a3; (void)a4; return 0; }
 
 //  LoadOneGdbFile  (0x1A19E10 - 0x1A19F76) -- load one GDB file through the
-//  file-reader: the sub_1A19D70 file lookup (the deep GDB chain, remaining
-//  stub -> returns -1), then, on a successful lookup, build the "<path>.tu"
+//  file-reader: the GdbReaderLookup file lookup (the deep GDB chain,
+//  remaining stubs -> returns -1), then, on a successful lookup, build the "<path>.tu"
 //  string (F3AStringAssign + sub_50AD00, the F3AString append variant), open
 //  it through the SetSharedSlot + LegacyFileCtor memory-file trio, dispatch
 //  the reader vtable slot 10 (LegacyFileHasData: the +8 file handle is set),
@@ -7689,7 +7833,7 @@ static int sub_1A19D70(void *a1, const char *src, int a3, int a4)
 static long LoadOneGdbFile(void *loader, const char *path, int a3)
 {
     void *reader = (loader != 0) ? *(void **)loader : 0;    // the 56-byte GDB file-reader
-    int result  = sub_1A19D70(reader, path, a3, 0);
+    int result  = GdbReaderLookup(reader, path, a3, 0);
     if (result == -1)
         return 0;                                          // the file did not load
 
@@ -7726,7 +7870,7 @@ static long LoadOneGdbFile(void *loader, const char *path, int a3)
     {
         // Re-dispatch the lookup with the same string and the original
         // lookup result.
-        sub_1A19D70(reader, src, a3, result);
+        GdbReaderLookup(reader, src, a3, result);
     }
 
     // Free the heap-allocated string buffer (the v15 >= 0x10 branch).
@@ -7781,21 +7925,51 @@ static DWORD  g_bankStringWriter = 0;  // 0x1DC28C8
 // 0x1DC28CC: DestinationSize -- the bank-string buffer's size in bytes.
 static DWORD  g_destinationSize = 0;   // 0x1DC28CC (DestinationSize)
 
-//  sub_72BF00  (0x72BF00 - 0x72BF64)  -- the +0x34 block init (the +0x1C string
-//  collection's heap-object insert).  [remaining stub] -- the deep MSVC
-//  debug-string-collection insert chain (sub_72BF00 -> sub_72B7B0 ->
-//  sub_72ACE0 -> sub_729FA0 / sub_7255B0, with sub_727670 / sub_727E40 /
-//  sub_7289F0 / sub_725A60 / sub_725A40 / sub_722CD0 behind it) is out of
-//  scope; the function returns 0 so the +0x34 slot stays null.
-static void *sub_72BF00(void *obj) { (void)obj; return 0; }
+//  sub_72B7B0  (0x72B7B0 - 0x72B814)  -- the +0x1C string-collection insert
+//  chain head.  [remaining stub] -- the deep MSVC debug-string-collection
+//  insert chain (sub_72B7B0 -> sub_72ACE0 -> sub_729FA0 / sub_7255B0, with
+//  sub_727670 / sub_727E40 / sub_7289F0 / sub_725A60 / sub_725A40 /
+//  sub_722CD0 behind it) is out of scope; the element returned by
+//  CreateBankStringElement is passed in through a byref but the insert is
+//  skipped.  The original is __thiscall (this in ECX = the +0x1C member,
+//  a single stack arg = &element); here a plain free function.  [NOT
+//  byte-identical] placement-dependent (the E8 calls).
+static void *sub_72B7B0(void *obj, void **a2) { (void)obj; (void)a2; return 0; }
+
+//  CreateBankStringElement  (0x72BF00 - 0x72BF64)  -- the +0x34 block init
+//  (the +0x1C string collection's heap-object insert): allocate the 16-byte
+//  string element ([0] = 2, [1] = 0, [2] = 0, [3] = a separately-allocated
+//  0-byte data buffer from LHAlloc), pass its address by reference into the
+//  +0x1C insert chain (sub_72B7B0 -- [remaining stub], out of scope), and
+//  return the element in EAX (0 when the 16-byte allocation failed).  The
+//  original is __thiscall (this in ECX, no stack args); here a plain free
+//  function.  [NOT byte-identical] placement-dependent (the E8 calls to
+//  LHAlloc / sub_72B7B0) and refs the __security_cookie prologue.
+static void *CreateBankStringElement(void *obj)
+{
+    void *element = LHAlloc(16);
+    if (element != 0)
+    {
+        DWORD *el = (DWORD *)element;
+        el[0] = 2;
+        el[1] = 0;
+        el[2] = 0;
+        el[3] = (DWORD)LHAlloc(0);
+    }
+
+    //  the +0x1C insert chain (sub_72B7B0 -- [remaining stub]): the original
+    //  calls it with (this = obj + 0x1C, a2 = &element).
+    sub_72B7B0((char *)obj + 0x1C, &element);
+    return element;
+}
 
 //  InitBankStringCollection  (0x72C220 - 0x72C2FE)  -- the 192-byte bank
 //  container's +0x1C string init.  thiscall + retn 4 (obj in ECX, the capacity
 //  word on the stack, callee-cleans); declared object-first here.  Initialises
 //  the two self-referencing 4-byte tag blocks (+0x04 / +0x1C: LHAlloc(4), the
 //  block holds the slot's address, NULL -> the slot stays NULL), zeroes the
-//  +0x10..+0x18 / +0x28..+0x30 words, writes the +0x34 heap object (sub_72BF00
-//  -- [remaining stub]) and the +0x38 capacity word, then sizes + allocates
+//  +0x10..+0x18 / +0x28..+0x30 words, writes the +0x34 heap object (CreateBankStringElement
+//  -- the insert chain [remaining stub]) and the +0x38 capacity word, then sizes + allocates
 //  the bank-string buffer (trunc((unsigned)capacity * 1.1f), the int understood
 //  as unsigned for a negative capacity, with the FPU round-toward-zero), frees
 //  the superseded buffer (dword_1DC48E0, when the new buffer differs),
@@ -7825,8 +7999,8 @@ static void *InitBankStringCollection(void *obj, int capacity)
     *(DWORD *)(base + 0x2C) = 0;
     *(DWORD *)(base + 0x30) = 0;
 
-    // the +0x34 heap object (sub_72BF00 -- remaining stub)
-    *(void **)(base + 0x34) = sub_72BF00(obj);
+    // the +0x34 heap object (CreateBankStringElement -- the insert chain [remaining stub])
+    *(void **)(base + 0x34) = CreateBankStringElement(obj);
 
     // the +0x38 capacity word
     *(DWORD *)(base + 0x38) = (DWORD)capacity;
@@ -8969,7 +9143,7 @@ static int MountAnimsBank(void *obj)
 // is unreachable -- +8 is nulled immediately after the first dispatch, so the
 // re-read of +8 can never be non-null -- so it is omitted.)  [NOT
 // byte-identical] placement-dependent (the E8 calls) + the high-VA vtable refs.
-static LONG ReleaseLegacyMemoryFile(void *obj)
+LONG ReleaseLegacyMemoryFile(void *obj)
 {
     DWORD *o = (DWORD *)obj;
     o[0] = (DWORD)g_CLegacyMemoryFileVtable;
@@ -21582,19 +21756,105 @@ static void *VfsCollectionTreeSearch(void *collection, DWORD *out, int *hash)
     return out;
 }
 
+// FileSubsysEntryAdvance (sub_1801EE0, 0x1801EE0 - 0x1801F43) -- the
+// file-subsystem entry-list iterator walker.  Takes the 8-byte frame [the
+// iterator, the current search target] (the caller is FileSubsysEntrySearch,
+// which keeps the 2-DWORD slot at the iterator position): the caller expects
+// [this] == the iterator (must be non-null, else __invalid_parameter_noinfo)
+// and [this+1] == the current search target (the 48-byte sub-object whose
+// byte at +0x2D must be zero).  On a "leaf" target (byte +0x2D == 0), walks
+// the sub-object at [target+8]: when that node's own +0x2D byte is non-zero,
+// walks the +4 chain (the [1] word of the root walk target, then +1 each
+// step), keeping the last node whose byte +0x2D was zero and writing it back
+// into [this+1]; when that sub-object's +0x2D byte is zero, walks the root
+// sub-object's chain ([root+0]) the same way, leaving the last node
+// ([this+1] updated each step) until a byte +0x2D is non-zero.  On any
+// "invalid parameter" (the iterator is null, or the target's byte +0x2D is
+// non-zero) the original __invalid_parameter_noinfo fires (noreturn); here
+// F3InvalidParam is a no-op and we return gracefully.
+// [NOT byte-identical] placement-dependent (relative calls to
+// __invalid_parameter_noinfo).
+static void FileSubsysEntryAdvance(DWORD *frame)
+{
+    if (frame[0] == 0)
+    {
+        // the iterator is null -- the original jumps to the noreturn
+        // __invalid_parameter_noinfo; here we return gracefully.
+        F3InvalidParam();
+        return;
+    }
+    DWORD target = frame[1];
+    if (((BYTE *)target)[45] != 0)
+    {
+        // the target is not a leaf/sentinel node -- the original jumps to the
+        // noreturn __invalid_parameter_noinfo; here we return gracefully.
+        F3InvalidParam();
+        return;
+    }
+    {
+        DWORD v3 = ((DWORD *)target)[2];   // [target+8]
+        if (((BYTE *)v3)[45] != 0)
+        {
+            // the +0x2D byte of v3 is set: the [1]-chain walk
+            DWORD i = ((DWORD *)target)[1];   // [target+4]
+            while (((BYTE *)i)[45] == 0)
+            {
+                if (frame[1] != ((DWORD *)i)[2])
+                    break;
+                frame[1] = i;
+                i = ((DWORD *)i)[1];   // [i+4]
+            }
+            frame[1] = i;
+        }
+        else
+        {
+            // the +0x2D byte of v3 is clear: the root chain walk
+            DWORD j = ((DWORD *)v3)[0];
+            while (((BYTE *)j)[45] == 0)
+            {
+                v3 = j;
+                j = ((DWORD *)j)[0];
+            }
+            frame[1] = v3;
+        }
+    }
+}
+
 // FileSubsysEntrySearch (sub_18014F0, 0x18014F0 - 0x180156F) -- the file
 // subsystem's 48-byte entry-list red-black tree search (thiscall: the
 // file-subsystem and the entry on the stack).  Walks the sentinel node at
 // [fs+0x7C] looking for the node whose [10] word (byte offset 0x28, the entry
-// hash slot) matches the entry, advancing the iterator (sub_1801EE0) on each
-// miss.  Not implemented in this build -- the archive framework always keeps
-// the entry list empty, so the loop breaks on the first iteration and the
-// search always returns 0.
-// [NOT byte-identical] no-op stub (see sub_18014F0).
+// hash slot) matches the entry, advancing the iterator (FileSubsysEntryAdvance,
+// sub_1801EE0) on each miss.
+// [NOT byte-identical] placement-dependent (relative calls to
+// __invalid_parameter_noinfo / FileSubsysEntryAdvance).
 static int FileSubsysEntrySearch(void *fileSubsystem, void *entry)
 {
-    (void)fileSubsystem;
-    (void)entry;
+    DWORD *fs = (DWORD *)fileSubsystem;
+    DWORD frame[2];   // [0] = the iterator (the wrapper), [1] = the search target
+    frame[0] = *(DWORD *)(fs + 25);            // *(fs+100)
+    frame[1] = ((DWORD *)(*(DWORD *)(fs + 31)))[0];   // **(fs+124)
+
+    for (;;)
+    {
+        DWORD v5 = *(DWORD *)(fs + 31);      // *(fs+124)
+        DWORD iter = frame[0];
+        DWORD target = frame[1];
+        if (iter == 0 || iter != *(DWORD *)(fs + 25))
+            F3InvalidParam();   // __invalid_parameter_noinfo (no return)
+        if (target == v5)
+            break;               // target == the sentinel -> stop, return 0
+        DWORD node = 0;
+        if (iter == 0)
+            F3InvalidParam();
+        else
+            node = *(DWORD *)iter;          // *v4
+        if (target == ((DWORD *)node)[6])
+            F3InvalidParam();
+        if (*(DWORD *)(target + 40) == (DWORD)entry)
+            return 1;                        // [target+0x28] == the entry
+        FileSubsysEntryAdvance(frame);
+    }
     return 0;
 }
 
@@ -21612,8 +21872,10 @@ static int FileSubsysEntrySearch(void *fileSubsystem, void *entry)
 //
 // Slow path (a node was found): the archive handle is taken (GetFileSubsystem,
 // whose this is the found node used as a 4-byte scratch out-slot), the file
-// subsystem's entry list is searched (sub_18014F0 -- left as a no-op returning
-// 0, matching the empty entry list: the search never matches), and the entry's
+// subsystem's entry list is searched (sub_18014F0 -- the 48-byte entry-list
+// red-black tree search (FileSubsysEntrySearch / FileSubsysEntryAdvance,
+// sub_1801EE0); in this build the list is always empty so the search breaks
+// on the first iteration and returns 0), and the entry's
 // vtable[4] is dispatched with the node's [7] word as the provider index: a
 // "matching data entry" (v13 != 0) takes the reload dispatch and writes the
 // reloaded entry into the out slot (releasing the new wide string through
@@ -21666,7 +21928,7 @@ static void *VfsReloadFileEntry(void *collection, void **out, void *entry, void 
 
     void *FileSubsystem = GetFileSubsystem(found);   // sub_1801C20
 
-    int v13 = FileSubsysEntrySearch(FileSubsystem, entry);   // sub_18014F0 (not implemented)
+    int v13 = FileSubsysEntrySearch(FileSubsystem, entry);   // sub_18014F0
     DWORD v14 = ((DWORD *)found)[7];        // the node's [7] word
 
     if (v13 != 0)
